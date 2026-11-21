@@ -11,6 +11,9 @@ on:
       repeat:
         description: "Boots per configuration"
         default: "40"
+      tough_repeat:
+        description: "Runs per tough-conditions scenario"
+        default: "10"
 
 permissions:
   contents: read
@@ -51,4 +54,44 @@ jobs:
           path: |
             build/boot-logs/
             build/test-logs/
+          retention-days: 14
+
+  # Tough conditions (scripts/tough-test.sh), every scenario 10 times, on its
+  # own runner so it runs alongside the boot soak.
+  soak-tough:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable KVM so QEMU runs at full speed
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Install QEMU, firmware, signing and stress tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 xorriso ovmf \
+            stress-ng sbsigntool mtools python3-virt-firmware
+
+      - name: Build kernel, ISOs and Secure Boot images, fetch extra firmware
+        env:
+          STRICT: "1"
+        run: |
+          ./scripts/build-iso.sh
+          ./scripts/secureboot.sh
+          ./scripts/fetch-firmware.sh
+
+      - name: Soak tough conditions
+        env:
+          REPEAT: ${{ inputs.tough_repeat || '10' }}
+        run: ./scripts/tough-test.sh
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: soak-tough-failure-logs
+          path: build/tough-logs/
           retention-days: 14
