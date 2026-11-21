@@ -30,7 +30,8 @@ These are decided now because they are expensive to change later.
 
 ## How we know it is good
 
-- **CI on every change:** build, `rustfmt`, `clippy` with warnings as errors, and a boot test in QEMU on both BIOS and UEFI.
+- **CI on every change:** build, `rustfmt`, `clippy` with warnings as errors, and a boot matrix in QEMU: 64 virtual PCs (BIOS and UEFI, old and new chipsets, 128 MiB to 8 GiB of RAM, 1 to 16 cores), each booted 3 times.
+- **Nightly soak:** the same matrix booted 40 times per configuration (over 2,500 boots) to catch rare, timing-dependent bugs. Soak tests grow with every phase: hour-long scheduler stress, 24-hour filesystem runs, continuous fuzzing.
 - **In-kernel test suite** (from Phase 1): unit tests that run inside the kernel under QEMU, so allocators, page tables and the scheduler are tested in the real environment.
 - **Benchmarks from Phase 2 on:** context switch time, syscall round trip, page fault cost, memory allocation, boot time and idle memory. Every result is compared with Linux on the same QEMU setup and, later, the same real PC. CI flags any change that makes a benchmark more than 3% slower.
 - **Fuzzing** (from Phase 4): system calls are fuzzed with random inputs to find crashes before users do.
