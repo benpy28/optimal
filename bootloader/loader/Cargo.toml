@@ -1,0 +1,15 @@
+[package]
+name = "optimal-boot"
+description = "Optimal Boot: the UEFI bootloader for Optimal."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "optimal-boot"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+optimal-boot-core = { path = "../core" }
