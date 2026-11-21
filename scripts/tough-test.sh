@@ -188,12 +188,15 @@ scenario "topo-2s-2c-2t" boot "$ISO" bios q35 1G 8,sockets=2,cores=2,threads=2 3
 scenario "topo-6-cores-not-pow2" boot "$ISO" bios q35 1G 6,sockets=2,cores=3,threads=1 30 kvm
 scenario "topo-2-of-8-present" boot "$ISO" bios q35 1G 2,maxcpus=8 30 kvm
 scenario "topo-dies" boot "$ISO" bios q35 1G 8,sockets=1,dies=2,cores=4,threads=1 30 kvm
-scenario "topo-64-cores" boot "$ISO" bios q35 2G 64 30 kvm
-# UEFI with 64 vCPUs runs under TCG: under KVM on the 4-core CI runners
-# (Ubuntu 24.04 OVMF, QEMU 8.2.2, host kernel 7.0) the firmware stops with a
-# KVM internal error at the same OVMF address (RIP 0x7ecffc20/24) on most
-# attempts, three in a row in run 44902042113, long before Limine runs.
-# TCG still boots the kernel with all 64 CPUs on UEFI, without the host bug.
+# 64 vCPUs run under TCG. QEMU itself warns that 64 exceeds what KVM
+# supports on the 4-core CI runners, and there KVM stops the firmware with
+# an internal error on most attempts: in OVMF at the same address (RIP
+# 0x7ecffc20/24) and in SeaBIOS's VGA option ROM (CS=c000, port writes to
+# 0x3c4/0x3ce), three attempts in a row in runs 44902042113 and
+# 44903476305, long before Limine runs. TCG still boots the kernel with all
+# 64 CPUs on both firmwares, without the host bug; heavy oversubscription
+# under KVM is covered by the contention scenarios.
+scenario "topo-64-cores" boot "$ISO" bios q35 2G 64 30 tcg
 has_uefi && scenario "topo-64-cores-uefi" boot "$ISO" uefi q35 2G 64 30 tcg
 
 numa2=(-object memory-backend-ram,id=m0,size=1G -object memory-backend-ram,id=m1,size=1G
