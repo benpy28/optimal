@@ -430,3 +430,68 @@ fn fragmented_free_space_gets_shorter_chunks() {
     );
     h.fsck();
 }
+
+#[test]
+fn moving_any_single_chunk_keeps_its_slot_map_exact() {
+    // Each chunk moved on its own, on a fresh mount (so the space map is
+    // clean and marking the new runs rewrites a bitmap, freeing the old
+    // bitmap block, which may sit in the very chunk being moved). The
+    // chunk's used-slot map must end exactly as fsck derives it.
+    for seed in 0..4u64 {
+        let enc = seed % 2 == 0;
+        let chunk = [1, 4, 0, 2][seed as usize];
+        let mut h = populated(0x5107 + seed, enc, 3000, chunk, 80);
+        let model = h.model.clone();
+        let img = h.fs.take().unwrap().unmount().unwrap().clean_image();
+        let ids: Vec<u64> = remount(img.clone(), enc, seed)
+            .metadata_chunks()
+            .unwrap()
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        assert!(ids.len() >= 2, "seed {seed}");
+        for id in ids {
+            let fs = remount(img.clone(), enc, seed);
+            let mut rh = Harness::from_mounted(fs, model.clone(), enc, seed);
+            rh.fs().relocate_metadata_chunk(id).unwrap();
+            rh.fs().commit().unwrap();
+            let rep = fsck::check(rh.fs(), true).unwrap();
+            assert!(rep.ok(), "seed {seed} chunk {id}: {:?}", rep.errors);
+            rh.verify(&model);
+        }
+    }
+}
+
+#[test]
+fn a_bad_chunk_table_copy_alone_is_repaired_by_rewriting_it() {
+    // Only one copy of one chunk-table block is damaged, so nothing else
+    // in the repairing commit touches the table: the repair itself must
+    // rewrite that block to a new pair, leaving the damaged one in place.
+    for seed in 0..6u64 {
+        let enc = seed % 2 == 1;
+        // Chunk size 1 on a larger volume makes a deeper table.
+        let chunk = [1, 1, 4, 0, 1, 2][seed as usize];
+        let mut h = populated(0x7ab1e + seed, enc, 6000, chunk, 200);
+        let model = h.model.clone();
+        let img = h.fs.take().unwrap().unmount().unwrap().clean_image();
+        let mut fs = remount(img.clone(), enc, seed);
+        let pairs = fs.chunk_table_blocks_for_tests().unwrap();
+        let mut r = Rng::new(seed);
+        let (a, b) = pairs[r.below(pairs.len() as u64) as usize];
+        let bad = if r.chance(1, 2) { a } else { b };
+        let mut img = img;
+        damage(&mut r, &mut img, bad);
+        let damaged = img[bad as usize * BS..][..BS].to_vec();
+        let fs = remount(img, enc, seed);
+        let mut rh = Harness::from_mounted(fs, model.clone(), enc, seed);
+        let sc = fsck::scrub_metadata(rh.fs()).unwrap();
+        assert_eq!((sc.bad_copies, sc.repaired, sc.dropped), (1, 1, 0), "seed {seed}");
+        let rep = fsck::check(rh.fs(), true).unwrap();
+        assert!(rep.ok() && rep.bad_copies == 0, "seed {seed}: {:?}", rep.errors);
+        let now = rh.fs().chunk_table_blocks_for_tests().unwrap();
+        assert!(!now.iter().any(|&(x, y)| x == bad || y == bad), "seed {seed}: still used");
+        let img = rh.fs().device().clean_image();
+        assert_eq!(&img[bad as usize * BS..][..BS], &damaged[..], "never written in place");
+        rh.verify(&model);
+    }
+}
