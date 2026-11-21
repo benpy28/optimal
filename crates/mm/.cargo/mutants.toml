@@ -1,0 +1,14 @@
+# cargo-mutants settings for optimal-mm.
+#
+# Excluded on purpose, with the reason:
+# - proofs:: is Kani proof code (cfg(kani)); it isn't built by cargo test,
+#   so its mutants can't be caught by tests. Kani itself checks it in CI.
+# - `replace | with ^` in Flags::bits, AddressSpace::map, AddressSpace::protect
+#   and for_each_leaf::walk: every one of those ORs combines bit fields that
+#   can't overlap (an aligned address with flag bits 0-8 and 63, or a table
+#   index shifted into place over an aligned base), and on disjoint bits
+#   OR and XOR give the same value, so these mutants are equivalent.
+exclude_re = [
+    "proofs::",
+    "replace \\| with \\^ in (Flags::bits|AddressSpace::map|AddressSpace::protect|AddressSpace::for_each_leaf::walk)",
+]

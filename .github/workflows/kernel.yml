@@ -138,3 +138,40 @@ jobs:
 
       - name: Kani proofs
         run: cargo kani
+
+  mm-mutation-tests:
+    # Deliberately breaks the code in hundreds of small ways (cargo-mutants);
+    # every break must make a test fail or hang. Equivalent mutants are
+    # excluded, each with its reason, in crates/mm/.cargo/mutants.toml.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: crates/mm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-mutants
+        run: cargo install --locked cargo-mutants --version 27.1.0
+
+      - name: Mutation tests (any surviving mutant fails the job)
+        env:
+          PROPTEST_CASES: "400"
+        # Exit code 3 means some mutants made the tests hang (for example an
+        # infinite loop in a walk); a hang is a detected break, so it counts
+        # as caught. Anything else non-zero, or any missed mutant, fails.
+        run: |
+          code=0
+          cargo mutants -j 4 --timeout 180 || code=$?
+          echo "cargo-mutants exit code $code"
+          cat mutants.out/missed.txt
+          [ "$code" -eq 0 ] || [ "$code" -eq 3 ]
+          [ ! -s mutants.out/missed.txt ]
+
+      - name: Upload mutation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mm-mutants
+          path: crates/mm/mutants.out/
+          retention-days: 14

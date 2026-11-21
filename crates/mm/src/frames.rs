@@ -60,6 +60,8 @@ pub enum FreeError {
     NotAllocated,
     /// The block was allocated with a different order.
     WrongOrder { allocated: u8 },
+    /// The order is larger than this allocator's largest block.
+    BadOrder,
 }
 
 /// A buddy allocator over frames `base .. base + meta.len()`.
@@ -74,6 +76,10 @@ pub struct Buddy<'m, const MAX: usize = MAX_ORDER> {
     base: u64,
     heads: [u32; 32],
     free_frames: u64,
+    /// Metadata entries written so far; tests use it to check that adding
+    /// memory takes linear time rather than O(n log n).
+    #[cfg(test)]
+    meta_writes: u64,
 }
 
 impl<'m, const MAX: usize> Buddy<'m, MAX> {
@@ -89,6 +95,8 @@ impl<'m, const MAX: usize> Buddy<'m, MAX> {
             base,
             heads: [NIL; 32],
             free_frames: 0,
+            #[cfg(test)]
+            meta_writes: 0,
         }
     }
 
@@ -132,10 +140,13 @@ impl<'m, const MAX: usize> Buddy<'m, MAX> {
                 continue;
             }
             // Largest aligned block starting at f that fits and is all reserved.
+            // `release` would merge order-0 blocks into the same result, but
+            // only after rewriting each frame's metadata up to 18 times; this
+            // loop makes adding memory linear in its size.
             let mut order = 0;
             while order < MAX {
                 let size = 1u64 << (order + 1);
-                if !(f - self.base).is_multiple_of(size) || f + size > hi {
+                if !f.is_multiple_of(size) || f + size > hi {
                     break;
                 }
                 if !self.all_reserved(idx, size as usize) {
@@ -160,10 +171,8 @@ impl<'m, const MAX: usize> Buddy<'m, MAX> {
 
     /// Allocate a block of 2^order frames. Returns its first frame number,
     /// aligned to 2^order frames.
+    /// Orders above `MAX` find no list and return None.
     pub fn alloc(&mut self, order: usize) -> Option<u64> {
-        if order > MAX {
-            return None;
-        }
         let mut have = order;
         while have <= MAX && self.heads[have] == NIL {
             have += 1;
@@ -187,7 +196,10 @@ impl<'m, const MAX: usize> Buddy<'m, MAX> {
 
     /// Free a block previously returned by `alloc(order)`.
     pub fn free(&mut self, frame: u64, order: usize) -> Result<(), FreeError> {
-        if frame < self.base || frame >= self.end() || order > MAX {
+        if order > MAX {
+            return Err(FreeError::BadOrder);
+        }
+        if frame < self.base || frame >= self.end() {
             return Err(FreeError::OutOfZone);
         }
         let idx = (frame - self.base) as usize;
@@ -234,6 +246,10 @@ impl<'m, const MAX: usize> Buddy<'m, MAX> {
 
     fn mark_block(&mut self, idx: usize, order: usize, head: State) {
         let len = 1usize << order;
+        #[cfg(test)]
+        {
+            self.meta_writes += len as u64;
+        }
         self.meta[idx] = FrameMeta {
             next: NIL,
             prev: NIL,
@@ -431,6 +447,329 @@ mod tests {
         assert_eq!(b.add_range(0, 32), 32);
         assert_eq!(b.add_range(0, 32), 0);
         b.check().unwrap();
+    }
+
+    #[test]
+    fn zone_bounds_and_allocated_order() {
+        let mut m = zone(64);
+        let mut b: Buddy<6> = Buddy::new(&mut m, 128);
+        assert_eq!((b.base(), b.end()), (128, 192));
+        b.add_range(128, 64);
+        let a = b.alloc(2).unwrap();
+        assert_eq!(b.allocated_order(a), Some(2));
+        // Inside the block, free memory, and both sides of the zone: None.
+        assert_eq!(b.allocated_order(a + 1), None);
+        let free_frame = if a == 128 { 132 } else { 128 };
+        assert_eq!(b.allocated_order(free_frame), None);
+        assert_eq!(b.allocated_order(127), None);
+        assert_eq!(b.allocated_order(192), None);
+        assert_eq!(b.allocated_order(0), None);
+        let c = b.alloc(0).unwrap();
+        assert_eq!(b.allocated_order(c), Some(0));
+        // The last frame of the zone can be allocated and is reported.
+        let mut m2 = zone(4);
+        let mut b2: Buddy<2> = Buddy::new(&mut m2, 4);
+        b2.add_range(7, 1);
+        assert_eq!(b2.alloc(0), Some(7));
+        assert_eq!(b2.allocated_order(7), Some(0));
+    }
+
+    #[test]
+    fn orders_above_max_are_refused() {
+        let mut m = zone(16);
+        let mut b: Buddy<4> = Buddy::new(&mut m, 0);
+        b.add_range(0, 16);
+        assert_eq!(b.alloc(5), None);
+        assert_eq!(b.alloc(31), None);
+        assert_eq!(b.alloc(usize::MAX), None);
+        assert_eq!(b.free(0, 5), Err(FreeError::BadOrder));
+        assert_eq!(b.free(0, 9), Err(FreeError::BadOrder));
+        assert_eq!(b.free(0, usize::MAX), Err(FreeError::BadOrder));
+        // The largest order itself works, both ways.
+        let a = b.alloc(4).unwrap();
+        assert_eq!(a, 0);
+        assert_eq!(b.free_frames(), 0);
+        b.free(a, 4).unwrap();
+        assert_eq!(b.free_blocks(4), 1);
+        b.check().unwrap();
+    }
+
+    #[test]
+    fn range_end_cuts_an_aligned_block() {
+        // Zone of 16 frames, add 0..12. Worked by hand: at 0 the order-4
+        // block (0..16) would pass the end, so 0..8 (order 3); at 8 the
+        // order-3 block (8..16) would pass the end, so 8..12 (order 2).
+        // Each block is marked twice (used, then free): 2 * 12 writes.
+        let mut m = zone(16);
+        let mut b: Buddy<4> = Buddy::new(&mut m, 0);
+        assert_eq!(b.add_range(0, 12), 12);
+        assert_eq!(b.free_frames(), 12);
+        assert_eq!(b.free_blocks(3), 1);
+        assert_eq!(b.free_blocks(2), 1);
+        assert_eq!(b.free_blocks(4) + b.free_blocks(1) + b.free_blocks(0), 0);
+        assert_eq!(b.meta_writes, 24);
+        b.check().unwrap();
+        // Frames 12..16 stay reserved: allocating everything gives 0..12 only.
+        let mut got = Vec::new();
+        while let Some(f) = b.alloc(0) {
+            got.push(f);
+        }
+        got.sort();
+        assert_eq!(got, (0..12).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn adding_memory_is_linear() {
+        // An exact fit is one block: 2 * 1024 writes. Building it from
+        // order-0 blocks and merging would take about 1024 * 11.
+        let mut m = zone(1 << 10);
+        let mut b: Buddy<10> = Buddy::new(&mut m, 0);
+        b.add_range(0, 1 << 10);
+        assert_eq!(b.meta_writes, 2 << 10);
+        // A zone twice the largest block: two maximal blocks, still linear.
+        let mut m = zone(32);
+        let mut b: Buddy<4> = Buddy::new(&mut m, 32);
+        assert_eq!(b.add_range(32, 32), 32);
+        assert_eq!(b.meta_writes, 64);
+        assert_eq!(b.free_blocks(4), 2);
+        // Next to already-free memory: 0..4 then 4..8 merge into 0..8.
+        let mut m = zone(8);
+        let mut b: Buddy<3> = Buddy::new(&mut m, 0);
+        b.add_range(0, 4);
+        b.add_range(4, 4);
+        assert_eq!(b.free_blocks(3), 1);
+        b.check().unwrap();
+    }
+
+    #[test]
+    fn blocks_of_the_largest_order_never_merge() {
+        // Zone holds two order-4 blocks; freeing both must keep two blocks,
+        // not build an order-5 block the allocator has no list for.
+        let mut m = zone(32);
+        let mut b: Buddy<4> = Buddy::new(&mut m, 0);
+        b.add_range(0, 32);
+        let x = b.alloc(4).unwrap();
+        let y = b.alloc(4).unwrap();
+        assert_eq!(b.alloc(0), None);
+        b.free(x, 4).unwrap();
+        b.free(y, 4).unwrap();
+        assert_eq!(b.free_blocks(4), 2);
+        assert_eq!(b.free_frames(), 32);
+        b.check().unwrap();
+        assert!(b.alloc(4).is_some() && b.alloc(4).is_some());
+    }
+
+    #[test]
+    fn zone_not_a_multiple_of_the_block_size() {
+        // 12 frames: blocks 0..8 and 8..12. The buddy of 8..12 would be
+        // 12..16, past the end, so neither release nor check may look there.
+        let mut m = zone(12);
+        let mut b: Buddy<3> = Buddy::new(&mut m, 0);
+        assert_eq!(b.add_range(0, 12), 12);
+        b.check().unwrap();
+        let mut got = Vec::new();
+        while let Some(f) = b.alloc(0) {
+            got.push(f);
+        }
+        assert_eq!(got.len(), 12);
+        for f in got {
+            b.free(f, 0).unwrap();
+            b.check().unwrap();
+        }
+        assert_eq!(b.free_blocks(3), 1);
+        assert_eq!(b.free_blocks(2), 1);
+    }
+
+    #[test]
+    fn max_order_zero_keeps_every_frame_separate() {
+        // With MAX = 0 nothing merges: a free list exactly as long as the
+        // zone is valid, not a cycle.
+        let mut m = zone(4);
+        let mut b: Buddy<0> = Buddy::new(&mut m, 0);
+        assert_eq!(b.add_range(0, 4), 4);
+        assert_eq!(b.free_blocks(0), 4);
+        assert_eq!(b.check(), Ok(()));
+    }
+
+    // check() must notice each kind of corruption. The tests reach into the
+    // private metadata to break exactly one rule at a time.
+
+    fn head(order: u8, state: State) -> FrameMeta {
+        FrameMeta {
+            next: NIL,
+            prev: NIL,
+            order,
+            state,
+        }
+    }
+    const TAIL: FrameMeta = FrameMeta {
+        next: NIL,
+        prev: NIL,
+        order: 0,
+        state: State::Tail,
+    };
+
+    #[test]
+    fn check_finds_a_free_list_cycle() {
+        let mut m = zone(4);
+        let mut b: Buddy<0> = Buddy::new(&mut m, 0);
+        b.add_range(0, 4);
+        let first = b.heads[0];
+        let mut last = first;
+        while b.meta[last as usize].next != NIL {
+            last = b.meta[last as usize].next;
+        }
+        b.meta[last as usize].next = first;
+        assert_eq!(b.check(), Err("free list cycle"));
+    }
+
+    #[test]
+    fn check_finds_wrong_entries_in_a_free_list() {
+        let msg = Err("free list entry is not a free head of its order");
+        // Right order, wrong state.
+        let mut m = zone(8);
+        let mut b: Buddy<3> = Buddy::new(&mut m, 0);
+        b.add_range(0, 8);
+        b.meta[0].state = State::UsedHead;
+        assert_eq!(b.check(), msg);
+        // Right state, wrong order.
+        let mut m = zone(8);
+        let mut b: Buddy<3> = Buddy::new(&mut m, 0);
+        b.add_range(0, 8);
+        b.meta[0].order = 2;
+        assert_eq!(b.check(), msg);
+    }
+
+    #[test]
+    fn check_finds_a_broken_back_link() {
+        let mut m = zone(4);
+        let mut b: Buddy<0> = Buddy::new(&mut m, 0);
+        b.add_range(0, 4);
+        let second = b.meta[b.heads[0] as usize].next;
+        b.meta[second as usize].prev = NIL;
+        assert_eq!(b.check(), Err("free list back link broken"));
+    }
+
+    #[test]
+    fn check_finds_a_misaligned_free_block() {
+        let mut m = zone(4);
+        let mut b: Buddy<1> = Buddy::new(&mut m, 0);
+        b.meta[1] = head(1, State::FreeHead);
+        b.meta[2] = TAIL;
+        b.heads[1] = 1;
+        b.free_frames = 2;
+        assert_eq!(b.check(), Err("free block misaligned"));
+    }
+
+    #[test]
+    fn check_finds_a_wrong_free_count() {
+        let mut m = zone(8);
+        let mut b: Buddy<3> = Buddy::new(&mut m, 0);
+        b.add_range(0, 6);
+        b.free_frames += 1;
+        assert_eq!(b.check(), Err("free frame count wrong"));
+        b.free_frames -= 2;
+        assert_eq!(b.check(), Err("free frame count wrong"));
+    }
+
+    #[test]
+    fn check_finds_a_stray_tail_frame() {
+        let mut m = zone(4);
+        let b: Buddy<2> = Buddy::new(&mut m, 0);
+        b.meta[2] = TAIL;
+        assert_eq!(b.check(), Err("tail frame outside any block"));
+    }
+
+    #[test]
+    fn check_finds_blocks_out_of_range_or_misaligned() {
+        let msg = Err("block out of range or misaligned");
+        // Aligned, but runs past the end of the zone.
+        let mut m = zone(4);
+        let b: Buddy<3> = Buddy::new(&mut m, 0);
+        b.meta[0] = head(3, State::UsedHead);
+        b.meta[1..4].fill(TAIL);
+        assert_eq!(b.check(), msg);
+        // In range, but misaligned.
+        let mut m = zone(4);
+        let b: Buddy<3> = Buddy::new(&mut m, 0);
+        b.meta[1] = head(1, State::UsedHead);
+        b.meta[2] = TAIL;
+        assert_eq!(b.check(), msg);
+        // Ends exactly at the end of the zone: fine.
+        let mut m = zone(4);
+        let b: Buddy<3> = Buddy::new(&mut m, 0);
+        b.meta[2] = head(1, State::UsedHead);
+        b.meta[3] = TAIL;
+        assert_eq!(b.check(), Ok(()));
+    }
+
+    #[test]
+    fn check_finds_a_block_body_that_is_not_tail() {
+        let mut m = zone(4);
+        let b: Buddy<2> = Buddy::new(&mut m, 0);
+        b.meta[0] = head(1, State::UsedHead);
+        assert_eq!(b.check(), Err("block body not all tail frames"));
+    }
+
+    #[test]
+    fn check_finds_unmerged_free_buddies() {
+        let mut m = zone(4);
+        let mut b: Buddy<2> = Buddy::new(&mut m, 0);
+        b.meta[0] = FrameMeta {
+            next: 2,
+            ..head(1, State::FreeHead)
+        };
+        b.meta[1] = TAIL;
+        b.meta[2] = FrameMeta {
+            prev: 0,
+            ..head(1, State::FreeHead)
+        };
+        b.meta[3] = TAIL;
+        b.heads[1] = 0;
+        b.free_frames = 4;
+        assert_eq!(b.check(), Err("two free buddies not merged"));
+        // Same at order 2 (blocks 0..4 and 4..8), where the buddy index
+        // times the block length would overshoot the zone.
+        let mut m = zone(8);
+        let mut b: Buddy<3> = Buddy::new(&mut m, 0);
+        b.meta[0] = FrameMeta {
+            next: 4,
+            ..head(2, State::FreeHead)
+        };
+        b.meta[1..4].fill(TAIL);
+        b.meta[4] = FrameMeta {
+            prev: 0,
+            ..head(2, State::FreeHead)
+        };
+        b.meta[5..8].fill(TAIL);
+        b.heads[2] = 0;
+        b.free_frames = 8;
+        assert_eq!(b.check(), Err("two free buddies not merged"));
+        // A one-frame zone: the buddy of frame 0 is past the end.
+        let mut m = zone(1);
+        let mut b: Buddy<1> = Buddy::new(&mut m, 0);
+        assert_eq!(b.add_range(0, 1), 1);
+        assert_eq!(b.check(), Ok(()));
+        let f = b.alloc(0).unwrap();
+        b.free(f, 0).unwrap();
+        assert_eq!(b.check(), Ok(()));
+        // A free buddy of a different order is not a merge failure.
+        let mut m = zone(4);
+        let mut b: Buddy<2> = Buddy::new(&mut m, 0);
+        b.add_range(0, 3);
+        b.check().unwrap();
+        assert_eq!((b.free_blocks(1), b.free_blocks(0)), (1, 1));
+    }
+
+    #[test]
+    fn check_finds_a_free_block_missing_from_the_lists() {
+        let mut m = zone(2);
+        let b: Buddy<1> = Buddy::new(&mut m, 0);
+        b.meta[0] = head(0, State::FreeHead);
+        assert_eq!(
+            b.check(),
+            Err("blocks marked free don't match the free count")
+        );
     }
 
     #[derive(Debug, Clone)]

@@ -16,7 +16,7 @@
 
 use crate::PAGE_SIZE;
 
-pub const PRESENT: u64 = 1 << 0;
+pub const PRESENT: u64 = 1;
 pub const WRITABLE: u64 = 1 << 1;
 pub const USER: u64 = 1 << 2;
 pub const WRITE_THROUGH: u64 = 1 << 3;
@@ -606,48 +606,343 @@ mod tests {
         assert_eq!(big, 0);
     }
 
+    /// Map one page into empty tables and return every raw entry on the
+    /// walk, root first. Tables are allocated in order: root 0x1000, then
+    /// 0x2000, 0x3000, 0x4000.
+    fn raw_walk(virt: u64, phys: u64, size: PageSize, flags: Flags) -> Vec<u64> {
+        let mut m = Mem::new(8);
+        let a = AddressSpace::new(&mut m).unwrap();
+        a.map(&mut m, virt, phys, size, flags).unwrap();
+        let mut out = Vec::new();
+        let mut table = a.root;
+        for level in (size.level()..=4).rev() {
+            let e = m.read(table, index(virt, level));
+            out.push(e);
+            table = e & ADDR_MASK;
+        }
+        out
+    }
+
+    #[test]
+    fn exact_entry_bits() {
+        // Worked by hand from the Intel SDM vol. 3 table 4-19/4-20 layouts:
+        // P=bit0 W=bit1 U=bit2 PWT=bit3 PCD=bit4 PS=bit7 G=bit8 XD=bit63.
+        // Kernel intermediate entries: next table | P | W = 0x..003.
+        const NX: u64 = 1 << 63;
+        let kernel_path = [0x2003, 0x3003, 0x4003];
+        let cases = [
+            (Flags::READ, NX | 0x5001),
+            (Flags::READ_WRITE, NX | 0x5003),
+            (Flags::READ_EXECUTE, 0x5001),
+            (
+                Flags {
+                    global: true,
+                    ..Flags::READ
+                },
+                NX | 0x5101,
+            ),
+            (
+                Flags {
+                    cache: Cache::Uncached,
+                    ..Flags::READ_WRITE
+                },
+                NX | 0x501b,
+            ),
+            (
+                Flags {
+                    global: true,
+                    ..Flags::READ_EXECUTE
+                },
+                0x5101,
+            ),
+        ];
+        for (flags, leaf) in cases {
+            let mut want = kernel_path.to_vec();
+            want.push(leaf);
+            assert_eq!(
+                raw_walk(K, 0x5000, PageSize::Size4K, flags),
+                want,
+                "{flags:?}"
+            );
+        }
+        // User page at 0x1000: every level carries U (bit 2) so the leaf
+        // decides; the leaf is P | W | U | XD.
+        let user_rw = Flags {
+            user: true,
+            ..Flags::READ_WRITE
+        };
+        assert_eq!(
+            raw_walk(0x1000, 0x5000, PageSize::Size4K, user_rw),
+            [0x2007, 0x3007, 0x4007, NX | 0x5007]
+        );
+        // 2 MiB page: leaf in the PD with PS (bit 7): 0x40_0000 | 0x80 | P.
+        assert_eq!(
+            raw_walk(K, 0x40_0000, PageSize::Size2M, Flags::READ_EXECUTE),
+            [0x2003, 0x3003, 0x40_0081]
+        );
+        // 1 GiB page: leaf in the PDPT: P | W | PS | G | XD.
+        let g_rw = Flags {
+            global: true,
+            ..Flags::READ_WRITE
+        };
+        assert_eq!(
+            raw_walk(K, 0x4000_0000, PageSize::Size1G, g_rw),
+            [0x2003, NX | 0x4000_0183]
+        );
+    }
+
+    #[test]
+    fn flag_constants_are_what_they_say() {
+        let plain = |writable, executable| Flags {
+            writable,
+            executable,
+            user: false,
+            global: false,
+            cache: Cache::WriteBack,
+        };
+        assert_eq!(Flags::READ, plain(false, false));
+        assert_eq!(Flags::READ_WRITE, plain(true, false));
+        assert_eq!(Flags::READ_EXECUTE, plain(false, true));
+    }
+
+    #[test]
+    fn canonical_addresses() {
+        for v in [
+            0,
+            0x1000,
+            0x0000_7fff_ffff_ffff,
+            0xffff_8000_0000_0000,
+            0xffff_ffff_ffff_f000,
+            u64::MAX,
+        ] {
+            assert!(is_canonical(v), "{v:#x}");
+        }
+        for v in [
+            0x0000_8000_0000_0000,
+            0xffff_0000_0000_0000,
+            0xffff_7fff_ffff_ffff,
+            0x8000_0000_0000_0000,
+            0x7fff_ffff_ffff_ffff,
+            0x0001_0000_0000_0000,
+        ] {
+            assert!(!is_canonical(v), "{v:#x}");
+        }
+        let mut m = Mem::new(16);
+        let a = AddressSpace::new(&mut m).unwrap();
+        // Upper half by bit 63 but not canonical: only the canonical check
+        // stops it.
+        assert_eq!(
+            a.map(
+                &mut m,
+                0xffff_0000_0000_0000,
+                0,
+                PageSize::Size4K,
+                Flags::READ
+            ),
+            Err(MapError::BadVirtual)
+        );
+        // 0x0000_8000_0000_0000 has the same PML4 index (256) as K, so
+        // without the canonical check translate would find K's page.
+        a.map(&mut m, K, 0x7000, PageSize::Size4K, Flags::READ)
+            .unwrap();
+        assert_eq!(a.translate(&m, 0x0000_8000_0000_0000), None);
+        assert_eq!(a.translate(&m, 0x7fff_8000_0000_0000), None);
+        assert_eq!(a.translate(&m, K).unwrap().phys, 0x7000);
+        assert_eq!(
+            a.unmap(&mut m, 0x0000_8000_0000_0000, PageSize::Size4K),
+            Err(MapError::NotMapped)
+        );
+        assert_eq!(
+            a.protect(
+                &mut m,
+                0xffff_0000_0000_0000,
+                PageSize::Size4K,
+                Flags::READ_WRITE
+            ),
+            Err(MapError::NotMapped)
+        );
+        assert_eq!(a.translate(&m, K).unwrap().flags, Flags::READ);
+    }
+
+    #[test]
+    fn leaves_are_reported_with_the_right_half() {
+        let mut m = Mem::new(32);
+        let a = AddressSpace::new(&mut m).unwrap();
+        let user = Flags {
+            user: true,
+            ..Flags::READ
+        };
+        // PT index 256 in the user half and in the kernel half.
+        a.map(&mut m, 0x10_0000, 0x1000, PageSize::Size4K, user)
+            .unwrap();
+        a.map(&mut m, 0x1000, 0x2000, PageSize::Size4K, user)
+            .unwrap();
+        a.map(&mut m, K + 0x10_0000, 0x3000, PageSize::Size4K, Flags::READ)
+            .unwrap();
+        a.map(
+            &mut m,
+            K + (1 << 30),
+            0x20_0000,
+            PageSize::Size2M,
+            Flags::READ,
+        )
+        .unwrap();
+        a.map(
+            &mut m,
+            0xffff_ffff_c000_0000,
+            0x4000_0000,
+            PageSize::Size1G,
+            Flags::READ,
+        )
+        .unwrap();
+        let mut got = Vec::new();
+        a.for_each_leaf(&m, |v, t| got.push((v, t.phys, t.size, t.flags.user)));
+        assert_eq!(
+            got,
+            [
+                (0x1000, 0x2000, PageSize::Size4K, true),
+                (0x10_0000, 0x1000, PageSize::Size4K, true),
+                (K + 0x10_0000, 0x3000, PageSize::Size4K, false),
+                (K + (1 << 30), 0x20_0000, PageSize::Size2M, false),
+                (0xffff_ffff_c000_0000, 0x4000_0000, PageSize::Size1G, false),
+            ]
+        );
+        // Each one translates back the same way.
+        for (v, p, s, _) in got {
+            let t = a.translate(&m, v).unwrap();
+            assert_eq!((t.phys, t.size), (p, s));
+        }
+    }
+
+    #[test]
+    fn protect_keeps_page_size_and_frame() {
+        let mut m = Mem::new(16);
+        let a = AddressSpace::new(&mut m).unwrap();
+        a.map(&mut m, K, 0x60_0000, PageSize::Size2M, Flags::READ)
+            .unwrap();
+        a.protect(&mut m, K, PageSize::Size2M, Flags::READ_WRITE)
+            .unwrap();
+        // P | W | PS | XD, same frame.
+        assert_eq!(m.read(0x3000, 0), (1 << 63) | 0x60_0083);
+        let t = a.translate(&m, K + 0x1234).unwrap();
+        assert_eq!(
+            (t.phys, t.size, t.flags),
+            (0x60_1234, PageSize::Size2M, Flags::READ_WRITE)
+        );
+        a.map(&mut m, K + (1 << 30), 0x8000, PageSize::Size4K, Flags::READ)
+            .unwrap();
+        a.protect(&mut m, K + (1 << 30), PageSize::Size4K, Flags::READ_EXECUTE)
+            .unwrap();
+        let t = a.translate(&m, K + (1 << 30)).unwrap();
+        assert_eq!(
+            (t.phys, t.size, t.flags),
+            (0x8000, PageSize::Size4K, Flags::READ_EXECUTE)
+        );
+        // Refusals: wrong half, wrong size, misaligned, not mapped.
+        let user = Flags {
+            user: true,
+            ..Flags::READ
+        };
+        assert_eq!(
+            a.protect(&mut m, K, PageSize::Size2M, user),
+            Err(MapError::BadVirtual)
+        );
+        assert_eq!(
+            a.protect(&mut m, 0x1000, PageSize::Size4K, Flags::READ),
+            Err(MapError::BadVirtual)
+        );
+        assert_eq!(
+            a.protect(&mut m, K, PageSize::Size4K, Flags::READ),
+            Err(MapError::NotMapped)
+        );
+        assert_eq!(
+            a.protect(&mut m, K + 0x1000, PageSize::Size2M, Flags::READ),
+            Err(MapError::Misaligned)
+        );
+        assert_eq!(
+            a.protect(&mut m, K + (2 << 30), PageSize::Size4K, Flags::READ),
+            Err(MapError::NotMapped)
+        );
+        assert_eq!(
+            a.unmap(&mut m, K + 0x1000, PageSize::Size2M),
+            Err(MapError::Misaligned)
+        );
+        // Nothing above changed the two mappings.
+        assert_eq!(a.translate(&m, K).unwrap().flags, Flags::READ_WRITE);
+    }
+
+    #[test]
+    fn neighbouring_pages_share_tables() {
+        // Two 4K pages in the same page table: the second map must reuse the
+        // tables and succeed, using no new memory.
+        let mut m = Mem::new(4);
+        let a = AddressSpace::new(&mut m).unwrap();
+        a.map(&mut m, K, 0x1000, PageSize::Size4K, Flags::READ)
+            .unwrap();
+        a.map(&mut m, K + 0x1000, 0x2000, PageSize::Size4K, Flags::READ)
+            .unwrap();
+        assert_eq!(m.tables.len(), 4);
+        assert_eq!(a.translate(&m, K + 0x1000).unwrap().phys, 0x2000);
+    }
+
     fn size_of(i: u8) -> PageSize {
         [PageSize::Size4K, PageSize::Size2M, PageSize::Size1G][i as usize % 3]
     }
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(crate::test_cases(3000)))]
-        /// Random map/unmap/protect sequences against a reference model of
-        /// what each page should translate to.
+        /// Random map/unmap/protect sequences in both halves against an exact
+        /// reference model: every call's result is predicted, not just
+        /// allowed, and every probe translates exactly as the model says.
         #[test]
         fn random_ops_match_model(
-            ops in prop::collection::vec((0u8..3, 0u64..64, 0u8..3, 0u64..1024, 0u8..4), 1..120),
-            probes in prop::collection::vec(0u64..(64u64 << 30), 50),
+            ops in prop::collection::vec(
+                (0u8..3, 0u8..3, 0u64..64, 0u8..3, 0u64..1024, 0u8..5),
+                1..160,
+            ),
+            probes in prop::collection::vec((any::<bool>(), 0u64..(64u64 << 30)), 80),
         ) {
-            let mut m = Mem::new(1 << 12);
+            let mut m = Mem::new(1 << 13);
             let a = AddressSpace::new(&mut m).unwrap();
-            // Model: virt page start -> (phys, size, flags)
+            // Model: virt page start -> (phys, size, flags).
             let mut model: BTreeMap<u64, (u64, PageSize, Flags)> = BTreeMap::new();
+            // Regions that have a page table (2 MiB) or page directory (1 GiB)
+            // under them. Tables are never freed, so a huge page can't go there.
+            let mut pt_regions = std::collections::BTreeSet::new();
+            let mut pd_regions = std::collections::BTreeSet::new();
+            let wx = Flags { writable: true, executable: true, ..Flags::READ };
             let flag_set = [Flags::READ, Flags::READ_WRITE, Flags::READ_EXECUTE,
-                Flags { cache: Cache::Uncached, ..Flags::READ_WRITE }];
-            for (kind, slot, sz, phys_slot, fl) in ops {
+                Flags { cache: Cache::Uncached, global: true, ..Flags::READ_WRITE }, wx];
+            for (kind, half, slot, sz, phys_slot, fl) in ops {
                 let size = size_of(sz);
-                let virt = K + slot * size.bytes();
+                // half 0: user page, user flags; 1: kernel page, kernel flags;
+                // 2: kernel page with user flags (must be refused).
+                let virt = if half == 0 { 0 } else { K } + slot * size.bytes();
                 let phys = phys_slot * size.bytes() % MAX_PHYS;
-                let flags = flag_set[fl as usize];
+                let flags = Flags { user: half != 1, ..flag_set[fl as usize] };
                 let overlaps = model.iter().any(|(&v, &(_, s, _))| v < virt + size.bytes() && virt < v + s.bytes());
+                let r2m = virt & !((2 << 20) - 1);
+                let r1g = virt & !((1 << 30) - 1);
+                let rights = if flags.writable && flags.executable {
+                    Err(MapError::WriteAndExecute)
+                } else if half == 2 {
+                    Err(MapError::BadVirtual)
+                } else {
+                    Ok(())
+                };
                 match kind {
                     0 => {
-                        let r = a.map(&mut m, virt, phys, size, flags);
-                        if overlaps {
-                            // Overlap with an existing mapping must be refused
-                            // unless it lives in a separate lower-level table.
-                            if r.is_ok() {
-                                // Only possible if the existing mapping is smaller
-                                // and in a different leaf table: then it's an
-                                // overlap bug.
-                                prop_assert!(false, "mapped over an existing mapping");
-                            }
-                        } else {
-                            // May still fail if a smaller mapping's table sits
-                            // where this huge page would go; that's allowed.
-                            if r.is_ok() { model.insert(virt, (phys, size, flags)); }
-                            else { prop_assert_eq!(r, Err(MapError::AlreadyMapped)); }
+                        let expect = rights.and_then(|()| {
+                            let blocked = overlaps
+                                || (size == PageSize::Size2M && pt_regions.contains(&r2m))
+                                || (size == PageSize::Size1G && pd_regions.contains(&r1g));
+                            if blocked { Err(MapError::AlreadyMapped) } else { Ok(()) }
+                        });
+                        prop_assert_eq!(a.map(&mut m, virt, phys, size, flags), expect);
+                        if expect.is_ok() {
+                            model.insert(virt, (phys, size, flags));
+                            if size == PageSize::Size4K { pt_regions.insert(r2m); }
+                            if size != PageSize::Size1G { pd_regions.insert(r1g); }
                         }
                     }
                     1 => {
@@ -657,31 +952,33 @@ mod tests {
                                 prop_assert_eq!(r, Ok(p));
                                 model.remove(&virt);
                             }
-                            _ => prop_assert!(r.is_err()),
+                            _ => prop_assert_eq!(r, Err(MapError::NotMapped)),
                         }
                     }
                     _ => {
                         let r = a.protect(&mut m, virt, size, flags);
-                        match model.get_mut(&virt) {
-                            Some(e) if e.1 == size => { prop_assert_eq!(r, Ok(())); e.2 = flags; }
-                            _ => prop_assert!(r.is_err()),
+                        match (rights, model.get_mut(&virt)) {
+                            (Err(e), _) => prop_assert_eq!(r, Err(e)),
+                            (Ok(()), Some(e)) if e.1 == size => { prop_assert_eq!(r, Ok(())); e.2 = flags; }
+                            _ => prop_assert_eq!(r, Err(MapError::NotMapped)),
                         }
                     }
                 }
             }
-            for p in probes {
-                let virt = K + p;
+            for (user, p) in probes {
+                let virt = if user { p } else { K + p };
                 let expect = model.range(..=virt).next_back()
                     .filter(|(v, (_, s, _))| virt < **v + s.bytes())
                     .map(|(v, (ph, s, f))| Translation { phys: ph + (virt - v), size: *s, flags: *f });
                 prop_assert_eq!(a.translate(&m, virt), expect);
             }
-            // Every leaf in the tables is in the model, and nothing is W+X.
+            // Every leaf in the tables is in the model with the same frame,
+            // size and flags, and nothing is W+X.
             let mut leaves = 0;
             a.for_each_leaf(&m, |v, t| {
                 leaves += 1;
                 assert!(!(t.flags.writable && t.flags.executable));
-                assert_eq!(model.get(&v).map(|e| (e.0, e.1)), Some((t.phys, t.size)));
+                assert_eq!(model.get(&v).copied(), Some((t.phys, t.size, t.flags)));
             });
             prop_assert_eq!(leaves, model.len());
         }
