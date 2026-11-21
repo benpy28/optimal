@@ -207,7 +207,8 @@ pub(crate) fn is_special((ns, name): (Namespace, LocalName)) -> bool {
 }
 
 fn insert_sorted(v: &mut Vec<u128>, k: u128) {
-    let i = v.partition_point(|&x| x < k);
+    // Keys are unique, so the search always ends between two entries.
+    let i = v.binary_search(&k).expect_err("key is not indexed yet");
     v.insert(i, k);
 }
 
@@ -642,5 +643,109 @@ mod tests {
         );
         s.pop();
         assert_eq!(s.end_tag_target(local::B), Some(200));
+    }
+
+    fn stack_of(doc: &mut Document, names: &[LocalName]) -> OpenStack {
+        let mut s = OpenStack::default();
+        for &n in names {
+            let e = doc.create_element(Namespace::Html, n, vec![]);
+            s.push(e, Namespace::Html, n);
+        }
+        s
+    }
+
+    /// Renumbering happens exactly when a gap is used up, never sooner: the
+    /// gap above the bottom entry starts at 2^64 and each insert halves it,
+    /// so the 65th insert is the first that finds no room.
+    #[test]
+    fn renumbers_only_when_the_gap_is_used_up() {
+        let mut doc = Document::new();
+        let mut s = stack_of(&mut doc, &[local::DIV, local::P]);
+        let top_key = s.keys[1];
+        for k in 1..=70 {
+            let n = doc.create_element(Namespace::Html, local::B, vec![]);
+            s.insert(1, n, Namespace::Html, local::B);
+            let renumbered = *s.keys.last().unwrap() != top_key;
+            assert_eq!(renumbered, k >= 65, "insert {k}");
+            s.check();
+        }
+    }
+
+    /// An insert at the top spaces its key just as a push would.
+    #[test]
+    fn insert_at_the_top_is_spaced_like_a_push() {
+        let mut doc = Document::new();
+        let mut s = stack_of(&mut doc, &[local::DIV]);
+        let n = doc.create_element(Namespace::Html, local::P, vec![]);
+        s.insert(1, n, Namespace::Html, local::P);
+        assert_eq!(s.keys, [STEP, 2 * STEP]);
+        let n = doc.create_element(Namespace::Html, local::B, vec![]);
+        s.insert(0, n, Namespace::Html, local::B);
+        assert_eq!(s.keys, [STEP / 2, STEP, 2 * STEP]);
+    }
+
+    /// Inserting at the bottom over and over renumbers from the bottom too;
+    /// renumbered keys must leave room below the first entry.
+    #[test]
+    fn inserting_at_the_bottom_renumbers_with_room_below() {
+        let mut doc = Document::new();
+        let mut s = stack_of(&mut doc, &[local::DIV]);
+        let mut want = vec![s[0]];
+        for _ in 0..200 {
+            let n = doc.create_element(Namespace::Html, local::B, vec![]);
+            s.insert(0, n, Namespace::Html, local::B);
+            want.insert(0, n);
+            s.check();
+        }
+        assert_eq!(&s[..], &want[..]);
+        assert!(s.keys[0] > 0);
+    }
+
+    #[test]
+    fn clear_empties_every_index() {
+        let mut doc = Document::new();
+        let mut s = stack_of(
+            &mut doc,
+            &[local::HTML, local::BODY, local::TABLE, local::P],
+        );
+        let p = s[3];
+        s.clear();
+        assert!(s.is_empty());
+        assert!(!s.contains(p));
+        assert!(!s.has_html(local::P));
+        assert!(!s.any_in_scope(&[local::P], Scope::Default));
+        s.check();
+    }
+
+    #[test]
+    fn special_foreign_elements() {
+        for n in [
+            local::MI,
+            local::MO,
+            local::MN,
+            local::MS,
+            local::MTEXT,
+            local::ANNOTATION_XML,
+        ] {
+            assert!(is_special((Namespace::MathMl, n)));
+            assert!(!is_special((Namespace::Svg, n)));
+        }
+        for n in [local::FOREIGN_OBJECT, local::DESC, local::TITLE] {
+            assert!(is_special((Namespace::Svg, n)));
+        }
+        assert!(is_special((Namespace::Html, local::TITLE)));
+        assert!(!is_special((Namespace::Svg, local::SVG)));
+        assert!(!is_special((Namespace::MathMl, local::MATH)));
+        assert!(!is_special((Namespace::None, local::DIV)));
+    }
+
+    /// check must notice an index that disagrees with the entries.
+    #[test]
+    #[should_panic]
+    fn check_catches_a_stale_index() {
+        let mut doc = Document::new();
+        let mut s = stack_of(&mut doc, &[local::HTML, local::P]);
+        s.by_name.clear();
+        s.check();
     }
 }

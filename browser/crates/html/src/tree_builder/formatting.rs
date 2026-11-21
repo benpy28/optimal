@@ -64,7 +64,11 @@ struct Meta {
 
 /// The list of active formatting elements.
 #[derive(Debug)]
-pub(super) struct FormattingList {
+///
+/// `S` is the Noah's Ark key hasher. The parser uses a per-parser
+/// [`RandomState`]; tests also use one that makes every key collide, to check
+/// that a collision never changes a result.
+pub(super) struct FormattingList<S = RandomState> {
     entries: Vec<Afe>,
     meta: Vec<Meta>,
     /// Counts for the part of the list after each marker; `segments[0]` is
@@ -72,22 +76,20 @@ pub(super) struct FormattingList {
     segments: Vec<Segment>,
     /// The nodes of the element entries.
     nodes: HashSet<NodeId>,
-    hasher: RandomState,
+    hasher: S,
+    /// Entries looked at by Noah's Ark walks, for the tests that check a walk
+    /// stops as soon as it has seen every entry with the key.
+    #[cfg(test)]
+    walked: usize,
 }
 
 impl Default for FormattingList {
     fn default() -> Self {
-        FormattingList {
-            entries: Vec::new(),
-            meta: Vec::new(),
-            segments: vec![Segment::default()],
-            nodes: HashSet::new(),
-            hasher: RandomState::new(),
-        }
+        Self::with_hasher(RandomState::new())
     }
 }
 
-impl Deref for FormattingList {
+impl<S> Deref for FormattingList<S> {
     type Target = [Afe];
     fn deref(&self) -> &[Afe] {
         &self.entries
@@ -111,7 +113,20 @@ fn sorted_attrs(t: &TagTok) -> Vec<AttrKey<'_>> {
     v
 }
 
-impl FormattingList {
+impl<S: BuildHasher> FormattingList<S> {
+    /// An empty list whose Noah's Ark keys come from `hasher`.
+    pub(super) fn with_hasher(hasher: S) -> Self {
+        FormattingList {
+            entries: Vec::new(),
+            meta: Vec::new(),
+            segments: vec![Segment::default()],
+            nodes: HashSet::new(),
+            hasher,
+            #[cfg(test)]
+            walked: 0,
+        }
+    }
+
     /// The Noah's Ark key of a tag: a keyed hash of its name and attribute set.
     fn key(&self, tok: &TagTok) -> u64 {
         self.hasher.hash_one((tok.name, sorted_attrs(tok)))
@@ -158,6 +173,10 @@ impl FormattingList {
             for (i, e) in self.entries.iter().enumerate().rev() {
                 if seen == with_key {
                     break;
+                }
+                #[cfg(test)]
+                {
+                    self.walked += 1;
                 }
                 match e {
                     Afe::Marker => break,
@@ -418,69 +437,108 @@ mod tests {
 
         #[test]
         fn list_matches_literal_algorithm(ops in prop::collection::vec(op(), 1..120)) {
-            let mut doc = Document::new();
-            let mut list = FormattingList::default();
-            let mut model: Vec<Afe> = vec![];
-            for o in ops {
-                match o {
-                    Op::Push(n, a) => {
-                        let node = doc.create_element(Namespace::Html, NAMES[n], vec![]);
-                        list.push(node, tok(n, &a));
-                        model_push(&mut model, node, tok(n, &a));
-                    }
-                    Op::Marker => {
-                        list.push_marker();
-                        model.push(Afe::Marker);
-                    }
-                    Op::Clear => {
-                        list.clear_to_marker();
-                        while let Some(e) = model.pop() {
-                            if matches!(e, Afe::Marker) {
-                                break;
-                            }
+            check_against_model(FormattingList::default(), ops)?;
+        }
+
+        #[test]
+        fn colliding_keys_never_change_a_result(ops in prop::collection::vec(op(), 1..120)) {
+            check_against_model(FormattingList::with_hasher(Colliding), ops)?;
+        }
+    }
+
+    /// A hasher that sends every key to the same value: every entry then
+    /// collides with every other, so only the exact comparisons decide.
+    #[derive(Clone, Default)]
+    struct Colliding;
+
+    impl BuildHasher for Colliding {
+        type Hasher = ConstHasher;
+        fn build_hasher(&self) -> ConstHasher {
+            ConstHasher
+        }
+    }
+
+    struct ConstHasher;
+
+    impl std::hash::Hasher for ConstHasher {
+        fn finish(&self) -> u64 {
+            7
+        }
+        fn write(&mut self, _: &[u8]) {}
+    }
+
+    fn check_against_model<S: BuildHasher>(
+        mut list: FormattingList<S>,
+        ops: Vec<Op>,
+    ) -> Result<(), TestCaseError> {
+        let mut doc = Document::new();
+        let mut model: Vec<Afe> = vec![];
+        for o in ops {
+            match o {
+                Op::Push(n, a) => {
+                    let node = doc.create_element(Namespace::Html, NAMES[n], vec![]);
+                    list.push(node, tok(n, &a));
+                    model_push(&mut model, node, tok(n, &a));
+                }
+                Op::Marker => {
+                    list.push_marker();
+                    model.push(Afe::Marker);
+                }
+                Op::Clear => {
+                    list.clear_to_marker();
+                    while let Some(e) = model.pop() {
+                        if matches!(e, Afe::Marker) {
+                            break;
                         }
-                    }
-                    Op::Remove(i) => {
-                        // The parser only removes entries after the last marker.
-                        let c = after_marker(&model);
-                        if !c.is_empty() {
-                            let i = c[i % c.len()];
-                            list.remove(i);
-                            model.remove(i);
-                        }
-                    }
-                    Op::SetNode(i) => {
-                        let c = after_marker(&model);
-                        if !c.is_empty() {
-                            let i = c[i % c.len()];
-                            let node = doc.create_element(Namespace::Html, local::B, vec![]);
-                            list.set_node(i, node);
-                            if let Afe::El(n, _) = &mut model[i] {
-                                *n = node;
-                            }
-                        }
-                    }
-                    Op::Insert(i, n, a) => {
-                        let start = after_marker(&model).first().copied().unwrap_or(model.len());
-                        let i = start + i % (model.len() - start + 1);
-                        let node = doc.create_element(Namespace::Html, NAMES[n], vec![]);
-                        list.insert(i, node, tok(n, &a));
-                        model.insert(i, Afe::El(node, tok(n, &a)));
                     }
                 }
-                list.check();
-                prop_assert_eq!(&list[..], &model[..]);
-                for name in NAMES {
-                    prop_assert_eq!(list.last_named_after_marker(name), model_last_named(&model, name));
-                    prop_assert_eq!(list.has_name_after_marker(name), model_last_named(&model, name).is_some());
-                }
-                for e in &model {
-                    if let Afe::El(n, _) = e {
-                        prop_assert!(list.contains_node(*n));
+                Op::Remove(i) => {
+                    // The parser only removes entries after the last marker.
+                    let c = after_marker(&model);
+                    if !c.is_empty() {
+                        let i = c[i % c.len()];
+                        list.remove(i);
+                        model.remove(i);
                     }
+                }
+                Op::SetNode(i) => {
+                    let c = after_marker(&model);
+                    if !c.is_empty() {
+                        let i = c[i % c.len()];
+                        let node = doc.create_element(Namespace::Html, local::B, vec![]);
+                        list.set_node(i, node);
+                        if let Afe::El(n, _) = &mut model[i] {
+                            *n = node;
+                        }
+                    }
+                }
+                Op::Insert(i, n, a) => {
+                    let start = after_marker(&model).first().copied().unwrap_or(model.len());
+                    let i = start + i % (model.len() - start + 1);
+                    let node = doc.create_element(Namespace::Html, NAMES[n], vec![]);
+                    list.insert(i, node, tok(n, &a));
+                    model.insert(i, Afe::El(node, tok(n, &a)));
+                }
+            }
+            list.check();
+            prop_assert_eq!(&list[..], &model[..]);
+            for name in NAMES {
+                prop_assert_eq!(
+                    list.last_named_after_marker(name),
+                    model_last_named(&model, name)
+                );
+                prop_assert_eq!(
+                    list.has_name_after_marker(name),
+                    model_last_named(&model, name).is_some()
+                );
+            }
+            for e in &model {
+                if let Afe::El(n, _) = e {
+                    prop_assert!(list.contains_node(*n));
                 }
             }
         }
+        Ok(())
     }
 
     #[test]
@@ -519,6 +577,68 @@ mod tests {
         list.clear_to_marker();
         assert_eq!(list.len(), 3);
         assert_eq!(list.last_named_after_marker(local::B), Some(2));
+        list.check();
+    }
+
+    /// The Noah's Ark walk stops once it has seen every entry with the key,
+    /// so a long run of other entries below them costs nothing.
+    #[test]
+    fn noahs_ark_walk_stops_at_the_earliest_match() {
+        let mut doc = Document::new();
+        let mut list = FormattingList::default();
+        for k in 0..1000 {
+            let n = doc.create_element(Namespace::Html, local::I, vec![]);
+            list.push(n, tok(1, &[(0, k % 2), (1, k / 2 % 2), (2, k / 4 % 2)]));
+        }
+        for _ in 0..3 {
+            let n = doc.create_element(Namespace::Html, local::B, vec![]);
+            list.push(n, tok(0, &[]));
+        }
+        list.walked = 0;
+        let n = doc.create_element(Namespace::Html, local::B, vec![]);
+        list.push(n, tok(0, &[]));
+        assert_eq!(list.walked, 3, "looked at the three matching entries only");
+        // Noah's Ark keeps three of each of the eight attribute sets of i,
+        // and removed the earliest b.
+        assert_eq!(list.len(), 8 * 3 + 3);
+        list.check();
+    }
+
+    #[test]
+    fn keys_depend_on_name_and_attribute_set_only() {
+        let list = FormattingList::default();
+        let k = |t: &TagTok| list.key(t);
+        assert_eq!(k(&tok(0, &[(0, 0), (1, 1)])), k(&tok(0, &[(1, 1), (0, 0)])));
+        // A keyed 64-bit hash: distinct tags collide with odds of about 2^-64.
+        assert_ne!(k(&tok(0, &[])), k(&tok(1, &[])));
+        assert_ne!(k(&tok(0, &[(0, 0)])), k(&tok(0, &[(0, 1)])));
+        assert_ne!(k(&tok(0, &[(0, 0)])), k(&tok(0, &[])));
+    }
+
+    #[test]
+    fn same_attributes_compares_sets() {
+        assert!(same_attributes(
+            &tok(0, &[(0, 0), (1, 1)]),
+            &tok(2, &[(1, 1), (0, 0)])
+        ));
+        assert!(same_attributes(&tok(0, &[]), &tok(0, &[])));
+        assert!(!same_attributes(&tok(0, &[(0, 0)]), &tok(0, &[(0, 1)])));
+        assert!(!same_attributes(&tok(0, &[(0, 0)]), &tok(0, &[(1, 0)])));
+        assert!(!same_attributes(
+            &tok(0, &[(0, 0)]),
+            &tok(0, &[(0, 0), (1, 0)])
+        ));
+    }
+
+    /// check must notice a count that disagrees with the entries.
+    #[test]
+    #[should_panic]
+    fn check_catches_a_wrong_count() {
+        let mut doc = Document::new();
+        let mut list = FormattingList::default();
+        let n = doc.create_element(Namespace::Html, local::B, vec![]);
+        list.push(n, tok(0, &[]));
+        list.segments[0] = Segment::default();
         list.check();
     }
 }
