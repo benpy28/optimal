@@ -448,6 +448,32 @@ mod tests {
         );
         // Touching ranges are fine.
         assert!(plan_vec(&[r(MIB, 2 * MIB), r(2 * MIB, 4 * MIB)], 0).is_ok());
+        // Out of order or overlapping by less than a page: trimming to whole
+        // pages would hide it, but the map is still refused, in either list.
+        let sub_page = [r(MIB, 4 * MIB), r(2 * MIB + 0x100, 2 * MIB + 0x200)];
+        assert_eq!(plan_vec(&sub_page, 0), Err(PlanError::Unsorted));
+        let mut out = [Zone::EMPTY; 4];
+        assert_eq!(
+            plan(&[r(8 * MIB, 16 * MIB)], &sub_page, 0, &mut out),
+            Err(PlanError::Unsorted)
+        );
+        // Empty entries (firmware does list them) are skipped, wherever
+        // they sit; so is an inverted one.
+        assert_eq!(
+            plan_vec(
+                &[r(MIB, 4 * MIB), r(2 * MIB, 2 * MIB), r(4 * MIB, 8 * MIB)],
+                0
+            ),
+            plan_vec(&[r(MIB, 4 * MIB), r(4 * MIB, 8 * MIB)], 0)
+        );
+        assert!(
+            plan_vec(
+                &[r(MIB, 4 * MIB), r(3 * MIB, 2 * MIB), r(4 * MIB, 8 * MIB)],
+                0
+            )
+            .is_ok()
+        );
+        assert!(r(5, 5).is_empty() && r(6, 5).is_empty() && !r(5, 6).is_empty());
         // One page of memory spread so that 1 GiB of span needs 3 MiB of
         // metadata but only a few pages exist.
         assert_eq!(

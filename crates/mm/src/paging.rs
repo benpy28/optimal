@@ -782,6 +782,37 @@ mod tests {
         assert_eq!(Flags::from_bits(0x5001, 1, true).cache, Cache::WriteBack);
         // PAT bit alone (index 4, WP) at 2 MiB.
         assert_eq!(Flags::from_bits(0x40_1081, 2, true).cache, Cache::Uncached);
+        // PCD alone (index 2, UC-) at 4 KiB.
+        assert_eq!(Flags::from_bits(0x5011, 1, true).cache, Cache::Uncached);
+    }
+
+    #[test]
+    fn every_pat_index_reads_back_at_every_level() {
+        // Index = PAT*4 + PCD*2 + PWT, with the PAT bit at bit 7 in a 4 KiB
+        // entry and bit 12 in a 2 MiB or 1 GiB one. PAT_VALUE puts WB at 0
+        // and WC at 5; the other six (WT, UC-, UC, WP, UC-, UC) are never
+        // written, so they read back as Uncached.
+        for level in 1..=3 {
+            let pat = if level == 1 { 1 << 7 } else { 1 << 12 };
+            let huge = if level == 1 { 0 } else { 1 << 7 };
+            for index in 0u64..8 {
+                let e = PRESENT
+                    | huge
+                    | if index & 4 != 0 { pat } else { 0 }
+                    | if index & 2 != 0 { CACHE_DISABLE } else { 0 }
+                    | if index & 1 != 0 { WRITE_THROUGH } else { 0 };
+                let want = match index {
+                    0 => Cache::WriteBack,
+                    5 => Cache::WriteCombining,
+                    _ => Cache::Uncached,
+                };
+                assert_eq!(
+                    Flags::from_bits(e, level, true).cache,
+                    want,
+                    "level {level} index {index}"
+                );
+            }
+        }
     }
 
     #[test]

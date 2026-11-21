@@ -148,7 +148,9 @@ impl SlabHeader {
         }
         let c = self.class();
         let first = first_object(c);
-        if offset < first || !(offset - first).is_multiple_of(CLASSES[c]) {
+        // `first` is itself a multiple of the class size (see first_object),
+        // so an object start is just an aligned offset at or after it.
+        if offset < first || !offset.is_multiple_of(CLASSES[c]) {
             return Err(SlabError::Misaligned);
         }
         let i = (offset - first) / CLASSES[c];
@@ -211,6 +213,45 @@ mod tests {
         assert_eq!(caps, [252, 126, 63, 31, 15, 7, 3, 1]);
         // The bitmap (256 bits) covers the biggest capacity.
         assert!(caps.iter().all(|&c| c <= 256));
+    }
+
+    #[test]
+    fn full_and_empty_by_hand() {
+        // Class 7 (2048 bytes) holds one object; class 6 (1024) holds three.
+        let mut h = SlabHeader::new(PAGE, 7, SECRET);
+        assert!(h.is_empty() && !h.is_full());
+        let off = h.alloc().unwrap();
+        assert!(!h.is_empty() && h.is_full());
+        h.free(PAGE, off, SECRET).unwrap();
+        assert!(h.is_empty() && !h.is_full());
+        let mut h = SlabHeader::new(PAGE, 6, SECRET);
+        h.alloc().unwrap();
+        h.alloc().unwrap();
+        assert!(!h.is_empty() && !h.is_full());
+        h.alloc().unwrap();
+        assert!(h.is_full());
+    }
+
+    #[test]
+    fn header_validity_by_hand() {
+        let mut h = SlabHeader::new(PAGE, 7, SECRET);
+        assert!(h.valid(PAGE, SECRET));
+        assert!(!h.valid(PAGE + 4096, SECRET));
+        assert!(!h.valid(PAGE, SECRET ^ 1));
+        // A class number one past the last class is refused, even with the
+        // right magic (it would index past CLASSES).
+        h.class = CLASSES.len() as u16;
+        assert!(!h.valid(PAGE, SECRET));
+        h.class = CLASSES.len() as u16 - 1;
+        assert!(h.valid(PAGE, SECRET));
+    }
+
+    #[test]
+    fn first_object_is_a_multiple_of_its_class() {
+        // free() relies on this to check alignment with the offset alone.
+        for (c, size) in CLASSES.iter().enumerate() {
+            assert_eq!(first_object(c) % size, 0);
+        }
     }
 
     #[test]
