@@ -4,4 +4,11 @@ exclude_re = [
     # position_of: when the queried offset equals the anchor, rescanning from
     # the buffer start gives the same answer as using the anchor. Equivalent.
     "replace < with <= in Input::position_of",
+    # Script data escaped end tag open (13.2.5.24): sending a non-letter on
+    # to the end tag name state instead gives the same output, because that
+    # state's "anything else" also emits "</" plus the (empty) temporary
+    # buffer and reconsumes in the escaped state. Equivalent. The line is in
+    # the pattern so the other letter checks in Tokenizer::step stay tested;
+    # if the line moves, this stops matching and CI says so.
+    "tokenizer\\.rs:1294:22: replace match guard is_ascii_alpha\\(c\\) with true in Tokenizer::step",
 ]

@@ -104,9 +104,13 @@ jobs:
           TOKENIZER_RANDOM_ROUNDS: "1"
         run: |
           # Exit 0: every mutant caught. Exit 3: some mutants only hung until
-          # the timeout, which the tests also catch. Anything else fails.
+          # the timeout, which the tests also catch (an infinite loop is a failure). Anything else fails.
+          # A mutant can turn a loop into one that allocates forever; cap each
+          # process's address space so it fails alone instead of taking the
+          # runner down (that happened twice with no cap).
+          ulimit -v 6000000
           set +e
-          cargo mutants --workspace -j 2 --timeout 300 --shard ${{ matrix.shard }}/8
+          cargo mutants --workspace -j 2 --timeout 120 --shard ${{ matrix.shard }}/8
           code=$?
           set -e
           cat mutants.out/missed.txt || true

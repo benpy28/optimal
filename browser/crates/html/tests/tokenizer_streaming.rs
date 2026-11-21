@@ -93,6 +93,53 @@ fn whole(s: &str) -> Collect {
     tokenize_chunks(&[Wtf8::from_str(s)], InitialState::Data)
 }
 
+/// Tokenize script data after a `<script>` start tag.
+fn script(s: &str) -> Vec<T> {
+    let mut t = Tokenizer::new();
+    t.set_state(InitialState::ScriptData);
+    t.set_last_start_tag(Some("script"));
+    let mut sink = Collect::default();
+    t.feed(Wtf8::from_str(s));
+    t.end();
+    assert_eq!(t.run(&mut sink), RunResult::Done);
+    sink.tokens
+}
+
+fn chars(s: &str) -> T {
+    T::Chars(Wtf8Buf::from(s))
+}
+
+/// Hand-worked from 13.2.5.26 and 13.2.5.31: whitespace, like "/" and ">",
+/// ends the "script" word that switches into and out of the double-escaped
+/// state. Inside `<!--<script ...`, a `</script>` is text; after the
+/// matching `</script ` it ends the script again.
+#[test]
+fn whitespace_ends_the_double_escape_words() {
+    for ws in [" ", "\t", "\n", "\x0C"] {
+        // Into double-escaped: the first </script> is text, the second
+        // (after leaving with "</script>" + ws) is a real end tag.
+        let input = format!("<!--<script{ws}</script>-->");
+        assert_eq!(script(&input), vec![chars(&input)], "start word ended by {ws:?}");
+        let input = format!("<!--<script>x</script{ws}y</script>z");
+        let text = format!("<!--<script>x</script{ws}y");
+        assert_eq!(
+            script(&input),
+            vec![chars(&text), T::End(Wtf8Buf::from("script")), chars("z")],
+            "end word ended by {ws:?}"
+        );
+    }
+}
+
+/// Hand-worked from 13.2.5.24: "</" followed by a non-letter in escaped
+/// script data is text, and the escape continues.
+#[test]
+fn escaped_end_tag_open_needs_a_letter() {
+    assert_eq!(
+        script("<!--</1</script>"),
+        vec![chars("<!--</1"), T::End(Wtf8Buf::from("script"))]
+    );
+}
+
 /// Hand-worked: "a\r" + "\nb" is one CR LF pair, so one LF and no extra line.
 #[test]
 fn cr_lf_split_across_chunks_is_one_newline() {
