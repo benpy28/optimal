@@ -10,6 +10,7 @@
 //! The torture tests run this after every simulated crash.
 
 use crate::crypto::BlockKind;
+use crate::io::CopyOwner;
 use crate::device::{BLOCK_SIZE, BlockDevice};
 use crate::error::{Error, Result};
 use crate::fs::{
@@ -41,7 +42,7 @@ pub struct Report {
     pub bad_copies: u64,
     pub repairs_pending: u64,
     /// Every metadata block: (kind, pointer, copy 0, copy 1).
-    metas: Vec<(BlockKind, BlockPtr, u64, u64)>,
+    metas: Vec<(BlockKind, BlockPtr, u64, u64, CopyOwner)>,
 }
 
 /// What [`scrub_metadata`] found and fixed.
@@ -51,8 +52,11 @@ pub struct ScrubReport {
     pub blocks: u64,
     /// Copies that failed while the other was good.
     pub bad_copies: u64,
-    /// Copies rewritten from the good one (in one commit).
+    /// Bad copies repaired by moving them (in one commit).
     pub repaired: u64,
+    /// Bad copies the repair commit stopped referencing before it got to
+    /// them (so they needed no repair). `repaired + dropped = bad_copies`.
+    pub dropped: u64,
     /// Blocks with no good copy (also in `check.errors`).
     pub unreadable: u64,
     /// The full check run first.
@@ -70,9 +74,9 @@ pub fn scrub_metadata<D: BlockDevice>(fs: &mut Filesystem<D>) -> Result<ScrubRep
     let io = &mut fs.store.io;
     let mode = io.copy_mode;
     io.copy_mode = crate::io::CopyMode::Both;
-    for (kind, p, p0, p1) in &check.metas {
-        // Queues a rewrite of any bad copy from the good one.
-        if io.read_dup(*kind, p, *p0, *p1).is_err() {
+    for (kind, p, p0, p1, owner) in &check.metas {
+        // Records any bad copy, which the commit below moves.
+        if io.read_dup(*kind, p, *p0, *p1, *owner).is_err() {
             out.unreadable += 1;
         }
     }
@@ -82,9 +86,10 @@ pub fn scrub_metadata<D: BlockDevice>(fs: &mut Filesystem<D>) -> Result<ScrubRep
     out.check = check;
     if pending > 0 {
         fs.mark_dirty();
-        let r0 = fs.store.io.stats.copies_repaired;
+        let (r0, d0) = (fs.store.io.stats.copies_repaired, fs.store.io.stats.copies_dropped);
         fs.commit()?;
         out.repaired = fs.store.io.stats.copies_repaired - r0;
+        out.dropped = fs.store.io.stats.copies_dropped - d0;
     }
     Ok(out)
 }
@@ -117,7 +122,7 @@ struct Ctx {
     owners: BTreeMap<u64, (Role, u64, [u8; 16])>,
     /// Every metadata block claimed, to check both copies.
     metas: Vec<(BlockKind, BlockPtr)>,
-    metas_out: Vec<(BlockKind, BlockPtr, u64, u64)>,
+    metas_out: Vec<(BlockKind, BlockPtr, u64, u64, CopyOwner)>,
     total: u64,
 }
 
@@ -396,7 +401,8 @@ fn check_chunks<D: BlockDevice>(fs: &mut Filesystem<D>, cx: &mut Ctx, body: &Bod
         let Ok((p0, p1)) = fs.store.space.chunks.resolve(&mut fs.store.io, p.addr) else {
             continue;
         };
-        cx.metas_out.push((*kind, *p, p0, p1));
+        let id = fs.store.space.chunks.split(p.addr)?.0;
+        cx.metas_out.push((*kind, *p, p0, p1, CopyOwner::Chunk(id)));
         let (ok0, ok1) = fs.store.io.verify_copies(*kind, p, p0, p1);
         for (ok, c, at) in [(ok0, 0, p0), (ok1, 1, p1)] {
             if !ok {
@@ -405,7 +411,7 @@ fn check_chunks<D: BlockDevice>(fs: &mut Filesystem<D>, cx: &mut Ctx, body: &Bod
         }
     }
     // Chunk-table blocks: claimed physically, both copies verified.
-    for (level, p) in fs.store.space.chunks.all_node_ptrs(&mut fs.store.io)? {
+    for (level, idx, p) in fs.store.space.chunks.all_node_ptrs(&mut fs.store.io)? {
         let kind = if level == 0 {
             BlockKind::ChunkLeaf
         } else {
@@ -413,7 +419,7 @@ fn check_chunks<D: BlockDevice>(fs: &mut Filesystem<D>, cx: &mut Ctx, body: &Bod
         };
         cx.claim(p.addr, 1, Role::ChunkMap, p.birth, p.mac);
         cx.claim(p.aux, 1, Role::ChunkMap, p.birth, p.mac);
-        cx.metas_out.push((kind, p, p.addr, p.aux));
+        cx.metas_out.push((kind, p, p.addr, p.aux, CopyOwner::Table(level, idx)));
         let (ok0, ok1) = fs.store.io.verify_copies(kind, &p, p.addr, p.aux);
         for (ok, c, at) in [(ok0, 0, p.addr), (ok1, 1, p.aux)] {
             if !ok {

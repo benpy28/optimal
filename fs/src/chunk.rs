@@ -29,7 +29,7 @@ use crate::codec::{Reader, Writer};
 use crate::crypto::BlockKind;
 use crate::device::{BLOCK_SIZE, BlockDevice};
 use crate::error::{Error, Result};
-use crate::io::{Block, Io, zero_block};
+use crate::io::{Block, CopyOwner, Io, zero_block};
 use crate::ptr::BlockPtr;
 use crate::space::{SB_RESERVED_BACK, SB_RESERVED_FRONT};
 use alloc::collections::BTreeMap;
@@ -310,7 +310,7 @@ impl ChunkTable {
         } else {
             BlockKind::ChunkTable
         };
-        let b = io.read_dup(kind, p, p.addr, p.aux)?;
+        let b = io.read_dup(kind, p, p.addr, p.aux, CopyOwner::Table(level, idx))?;
         self.decode(&b[..], level, idx, p.addr)
     }
 
@@ -434,8 +434,43 @@ impl ChunkTable {
             Contents::Leaf(es) => es[(id % LEAF_ENTRIES) as usize] = e,
             Contents::Table(_) => unreachable!(),
         }
-        let mut idx = leaf_idx;
-        for level in 0..=self.depth {
+        self.dirty_up(io, 0, leaf_idx, df, dm)?;
+        self.free_total = (self.free_total as i64 + df) as u64;
+        self.mapped_total = (self.mapped_total as i64 + dm) as u64;
+        Ok(())
+    }
+
+    /// Marks node (`level`, `idx`) and its ancestors dirty, so this commit
+    /// writes them to new homes and frees their old copies into quarantine
+    /// (how a chunk-table block with a bad copy is repaired). Returns false
+    /// if the node no longer exists (its subtree was emptied and pruned).
+    pub fn redirty<D: BlockDevice>(&mut self, io: &mut Io<D>, level: u32, idx: u64) -> Result<bool> {
+        if level > self.depth || idx >= ids_at(self.depth - level) / LEAF_ENTRIES {
+            return Ok(false);
+        }
+        if level < self.depth {
+            let k = self.node(io, level + 1, idx / TABLE_FANOUT)?.kids_mut()
+                [(idx % TABLE_FANOUT) as usize];
+            if k.ptr.is_null() && !self.nodes.contains_key(&(level, idx)) {
+                return Ok(false);
+            }
+        }
+        self.dirty_up(io, level, idx, 0, 0)?;
+        Ok(true)
+    }
+
+    /// Dirties the path from (`level0`, `idx`) to the root, adding `df`
+    /// free slots and `dm` mapped chunks to every child record on the way.
+    fn dirty_up<D: BlockDevice>(
+        &mut self,
+        io: &mut Io<D>,
+        level0: u32,
+        idx: u64,
+        df: i64,
+        dm: i64,
+    ) -> Result<()> {
+        let mut idx = idx;
+        for level in level0..=self.depth {
             let was_dirty = self.node(io, level, idx)?.dirty;
             self.nodes.get_mut(&(level, idx)).unwrap().dirty = true;
             if level == self.depth {
@@ -463,8 +498,6 @@ impl ChunkTable {
             }
             idx = parent;
         }
-        self.free_total = (self.free_total as i64 + df) as u64;
-        self.mapped_total = (self.mapped_total as i64 + dm) as u64;
         Ok(())
     }
 
@@ -636,8 +669,11 @@ impl ChunkTable {
     }
 
     /// Every written node pointer with its level (for fsck).
-    pub fn all_node_ptrs<D: BlockDevice>(&mut self, io: &mut Io<D>) -> Result<Vec<(u32, BlockPtr)>> {
-        let mut out = vec![(self.depth, self.root)];
+    pub fn all_node_ptrs<D: BlockDevice>(
+        &mut self,
+        io: &mut Io<D>,
+    ) -> Result<Vec<(u32, u64, BlockPtr)>> {
+        let mut out = vec![(self.depth, 0, self.root)];
         let mut stack = vec![(self.depth, 0u64)];
         while let Some((level, idx)) = stack.pop() {
             if level == 0 {
@@ -648,7 +684,7 @@ impl ChunkTable {
                 if k.ptr.is_null() {
                     continue;
                 }
-                out.push((level - 1, k.ptr));
+                out.push((level - 1, idx * TABLE_FANOUT + j as u64, k.ptr));
                 stack.push((level - 1, idx * TABLE_FANOUT + j as u64));
             }
         }

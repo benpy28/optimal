@@ -4,7 +4,9 @@
 use crate::chunk::{ChunkTable, Entry, LEAF_ENTRIES, LOGICAL, ids_at};
 use crate::crypto::{BlockKind, Sealer, SecretKey};
 use crate::device::{BLOCK_SIZE, BlockDevice, MemDevice};
-use crate::io::{CopyMode, Io, zero_block};
+use crate::io::{CopyMode, CopyOwner, Io, zero_block};
+
+const OWN: CopyOwner = CopyOwner::Chunk(0);
 use crate::sim::{Rng, SparseDevice};
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
@@ -114,23 +116,28 @@ fn bit_flip_in_either_copy_falls_back_reports_and_repairs() {
                 flip(&mut io, bad, bit);
                 // Normal reads use copy 0 and only touch copy 1 if it fails.
                 io.copy_mode = CopyMode::Either;
-                let b = io.read_dup(BlockKind::Node, &p, 10, 20).unwrap();
+                let b = io.read_dup(BlockKind::Node, &p, 10, 20, OWN).unwrap();
                 assert_eq!(b[..], pattern(2)[..], "{name} bit {bit} bad {bad}");
                 let expect_either = (bad == 10) as u64;
                 assert_eq!(io.stats.bad_copies, expect_either, "{name} {bit} {bad}");
                 // Reading both copies always finds it.
                 io.copy_mode = CopyMode::Both;
-                let b = io.read_dup(BlockKind::Node, &p, 10, 20).unwrap();
+                let b = io.read_dup(BlockKind::Node, &p, 10, 20, OWN).unwrap();
                 assert_eq!(b[..], pattern(2)[..]);
-                assert_eq!(io.stats.bad_copies, expect_either + 1);
+                // Each bad block is counted once, however often it is read.
+                assert_eq!(io.stats.bad_copies, 1);
                 assert!(io.repair_queued(bad) && !io.repair_queued(good));
-                io.queue_repairs();
-                io.write_batch().unwrap();
-                let mut now = alloc::vec![0u8; BLOCK_SIZE];
-                io.dev.read(bad, &mut now).unwrap();
-                assert_eq!(now, orig, "{name}: repair restores the exact bytes");
+                // The repair carries the exact bytes the bad copy should
+                // hold, and which copy of what it is (the commit moves it).
+                let mut reps = io.take_repairs();
+                assert_eq!(reps.len(), 1);
+                let r = reps.remove(&bad).unwrap();
+                assert_eq!(r.good[..], orig[..], "{name}: exact bytes");
+                assert_eq!((r.owner, r.copy), (OWN, (bad == 20) as u8));
+                assert_eq!(io.pending_repairs(), 0);
+                io.dev.write(bad, &r.good[..]).unwrap();
                 let n = io.stats.bad_copies;
-                io.read_dup(BlockKind::Node, &p, 10, 20).unwrap();
+                io.read_dup(BlockKind::Node, &p, 10, 20, OWN).unwrap();
                 assert_eq!(io.stats.bad_copies, n, "healed");
             }
         }
@@ -147,13 +154,13 @@ fn dup_reads_reject_what_the_parent_did_not_commit() {
         flip(&mut io, 10, 100);
         flip(&mut io, 20, 200);
         io.copy_mode = CopyMode::Both;
-        assert!(io.read_dup(BlockKind::Node, &p, 10, 20).is_err(), "{name}");
+        assert!(io.read_dup(BlockKind::Node, &p, 10, 20, OWN).is_err(), "{name}");
         // Copies in each other's place: neither verifies (copy 1's bytes
         // are not copy 0's), so a swapped or misdirected copy is caught.
         let (mut io, p, c0, c1) = dup_fixture(mk());
         io.dev.write(10, &c1).unwrap();
         io.dev.write(20, &c0).unwrap();
-        assert!(io.read_dup(BlockKind::Node, &p, 10, 20).is_err(), "{name} swapped");
+        assert!(io.read_dup(BlockKind::Node, &p, 10, 20, OWN).is_err(), "{name} swapped");
         // A stale copy 1: an earlier version of the same logical block with
         // the same birth (a crashed attempt at this generation, replayed).
         // On plain volumes the nonce is zero, so only the parent's MAC can
@@ -167,12 +174,12 @@ fn dup_reads_reject_what_the_parent_did_not_commit() {
         io.dev.write(20, &stale).unwrap();
         flip(&mut io, 10, 5);
         io.copy_mode = CopyMode::Either;
-        assert!(io.read_dup(BlockKind::Node, &p, 10, 20).is_err(), "{name} stale copy 1");
+        assert!(io.read_dup(BlockKind::Node, &p, 10, 20, OWN).is_err(), "{name} stale copy 1");
         // With repairs off (read-only mounts) a bad copy is counted only.
         let (mut io, p, _, _) = dup_fixture(mk());
         io.repair_enabled = false;
         flip(&mut io, 10, 9);
-        io.read_dup(BlockKind::Node, &p, 10, 20).unwrap();
+        io.read_dup(BlockKind::Node, &p, 10, 20, OWN).unwrap();
         assert_eq!((io.stats.bad_copies, io.pending_repairs()), (1, 0));
         // verify_copies reports each copy without side effects.
         assert_eq!(io.verify_copies(BlockKind::Node, &p, 10, 20), (false, true));
@@ -270,7 +277,7 @@ fn chunk_table_against_model() {
                     .all_node_ptrs(&mut io)
                     .unwrap()
                     .iter()
-                    .map(|(_, p)| (p.addr, p.aux))
+                    .map(|(_, _, p)| (p.addr, p.aux))
                     .collect();
                 let freed: BTreeSet<(u64, u64)> = t.pending_frees.drain(..).collect();
                 let gone: BTreeSet<(u64, u64)> = prev_ptrs.difference(&now).copied().collect();
@@ -287,7 +294,7 @@ fn chunk_table_against_model() {
                     .all_node_ptrs(&mut io)
                     .unwrap()
                     .iter()
-                    .filter(|(_, p)| p.birth >= generation)
+                    .filter(|(_, _, p)| p.birth >= generation)
                     .count() as u64;
                 assert_eq!(u.verify_since(&mut io, generation).unwrap(), born_now);
                 t = u;
@@ -345,4 +352,47 @@ proptest::proptest! {
         io.write_batch().unwrap();
         let _ = ChunkTable::open(&mut io, total, 6, p, level);
     }
+}
+
+fn small_fs(chunk: u32) -> crate::fs::Filesystem<MemDevice> {
+    let opts = crate::fs::FormatOptions {
+        passphrase: None,
+        kdf: crate::KdfParams::INSECURE_FAST_FOR_TESTS,
+        quarantine_min_ns: 0,
+        meta_chunk_blocks: chunk,
+    };
+    let mut rng = Rng::new(21);
+    crate::fs::Filesystem::format(
+        MemDevice::new(4096),
+        &opts,
+        &mut rng,
+        alloc::boxed::Box::new(crate::fs::ZeroClock),
+    )
+    .unwrap()
+}
+
+#[test]
+fn moved_chunk_reads_back_before_the_batch_is_written() {
+    // A chunk moved at the start of a commit has its new runs only in the
+    // write batch. Anything the same commit reads from it (an uncached tree
+    // node, a bitmap) must come from the batch, not the unwritten disk.
+    let mut fs = small_fs(4);
+    let (_, root) = fs.roots_for_tests();
+    let (id, _) = fs.store.space.chunks.split(root).unwrap();
+    let before = fs
+        .store
+        .space
+        .read_meta(&mut fs.store.io, BlockKind::Node, &fs.body.fs_root)
+        .unwrap();
+    fs.store.space.relocate_chunk(&mut fs.store.io, id).unwrap();
+    let (p0, p1) = fs.resolve_metadata(root).unwrap();
+    assert!(fs.store.io.is_queued(p0) && fs.store.io.is_queued(p1));
+    let s = fs.store.io.stats.bad_copies;
+    let after = fs
+        .store
+        .space
+        .read_meta(&mut fs.store.io, BlockKind::Node, &fs.body.fs_root)
+        .unwrap();
+    assert_eq!(before[..], after[..]);
+    assert_eq!(fs.store.io.stats.bad_copies, s, "no copy looked bad");
 }

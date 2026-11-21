@@ -862,7 +862,7 @@ impl<D: BlockDevice> Filesystem<D> {
             .chunks
             .all_node_ptrs(&mut self.store.io)?
             .iter()
-            .map(|(_, p)| (p.addr, p.aux))
+            .map(|(_, _, p)| (p.addr, p.aux))
             .collect())
     }
 
@@ -1882,7 +1882,10 @@ impl<D: BlockDevice> Filesystem<D> {
 
     fn commit_inner(&mut self) -> Result<()> {
         let generation = self.txn_generation();
-        // Chunk moves first, while nothing else is queued at the old runs.
+        // Repairs and chunk moves first, while nothing else is queued.
+        if self.store.io.repair_enabled {
+            self.store.space.repair_copies(&mut self.store.io)?;
+        }
         for id in core::mem::take(&mut self.store.space.relocations) {
             self.store.space.relocate_chunk(&mut self.store.io, id)?;
         }
@@ -1941,7 +1944,6 @@ impl<D: BlockDevice> Filesystem<D> {
             body.encode_root(),
             0,
         )?;
-        self.store.io.queue_repairs();
         self.store.io.write_batch()?;
         superblock::commit(
             &mut self.store.io,

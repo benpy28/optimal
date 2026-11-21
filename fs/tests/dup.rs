@@ -106,11 +106,12 @@ fn bit_flip_in_copy1_is_found_by_recovery_and_repaired() {
         h.fs().commit().unwrap();
         let (root_l, tree_l) = h.fs().roots_for_tests();
         let target = if seed % 4 < 2 { root_l } else { tree_l };
-        let (_, p1) = h.fs().resolve_metadata(target).unwrap();
+        let (p0, p1) = h.fs().resolve_metadata(target).unwrap();
         let mut img = h.fs().device().clean_image();
         let mut r = Rng::new(seed);
         let bit = r.below(8 * BS as u64) as usize;
         img[p1 as usize * BS + bit / 8] ^= 1 << (bit % 8);
+        let damaged = img[p1 as usize * BS..(p1 as usize + 1) * BS].to_vec();
         let model = h.model.clone();
         let fs = remount(img, enc, seed);
         let st = fs.recovery_stats().expect("unclean mount runs recovery").clone();
@@ -122,11 +123,19 @@ fn bit_flip_in_copy1_is_found_by_recovery_and_repaired() {
         assert!(rep.ok(), "{:?}", rep.errors);
         assert_eq!((rep.bad_copies, rep.repairs_pending), (1, 1));
         rh.fs().commit().unwrap();
-        let stats = rh.fs().io_stats();
-        let _ = stats;
         let rep = fsck::check(rh.fs(), true).unwrap();
         assert!(rep.ok() && rep.bad_copies == 0, "{:?}", rep.errors);
         assert_eq!(rh.fs().io_stats().copies_repaired, 1);
+        // Repaired by moving copy 1's run, never in place: copy 0 stays,
+        // copy 1 is elsewhere (still in the other half), and the damaged
+        // block is untouched (quarantined for the commits that map it).
+        let (q0, q1) = rh.fs().resolve_metadata(target).unwrap();
+        assert_eq!(q0, p0, "seed {seed}");
+        assert_ne!(q1, p1, "seed {seed}: copy 1 moved");
+        let total = rh.fs().device().clean_image().len() as u64 / BS as u64;
+        assert!(q0.abs_diff(q1) >= (total - 4) / 4, "seed {seed}: {q0} {q1}");
+        let now = rh.fs().device().clean_image();
+        assert_eq!(&now[p1 as usize * BS..(p1 as usize + 1) * BS], &damaged[..]);
     }
 }
 
@@ -157,7 +166,11 @@ fn one_bad_copy_of_every_block_loses_nothing() {
         // A flipped bit could in principle land where it changes nothing?
         // No: every bit of a copy is covered by the MAC, so all are found.
         assert_eq!(sc.bad_copies, pairs.len() as u64, "seed {seed}");
-        assert_eq!(sc.repaired, pairs.len() as u64, "seed {seed}");
+        // Each is repaired, or the repair commit itself stopped using the
+        // block first (a bitmap rewritten by an earlier move) and it needed
+        // none. Never both, never neither.
+        assert_eq!(sc.repaired + sc.dropped, pairs.len() as u64, "seed {seed}");
+        assert!(sc.repaired >= pairs.len() as u64 * 3 / 4, "seed {seed}: {sc:?}");
         assert_eq!(sc.unreadable, 0);
         let rep = fsck::check(rh.fs(), true).unwrap();
         assert!(rep.ok() && rep.bad_copies == 0, "seed {seed}: {:?}", rep.errors);
@@ -167,7 +180,7 @@ fn one_bad_copy_of_every_block_loses_nothing() {
         let mut rh = Harness::from_mounted(fs, model.clone(), enc, seed);
         rh.verify(&model);
         let sc = fsck::scrub_metadata(rh.fs()).unwrap();
-        assert_eq!((sc.bad_copies, sc.repaired), (0, 0));
+        assert_eq!((sc.bad_copies, sc.repaired, sc.dropped), (0, 0, 0));
     }
 }
 

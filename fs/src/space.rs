@@ -27,7 +27,7 @@ use crate::codec::{Reader, Writer};
 use crate::crypto::BlockKind;
 use crate::device::{BLOCK_SIZE, BlockDevice};
 use crate::error::{Error, Result};
-use crate::io::{Block, Io, zero_block};
+use crate::io::{Block, CopyOwner, Io, zero_block};
 use crate::ptr::{BlockPtr, PTR_LEN};
 use crate::rangeset::RangeSet;
 use alloc::boxed::Box;
@@ -596,7 +596,8 @@ impl Space {
         p: &BlockPtr,
     ) -> Result<Block> {
         let (p0, p1) = self.chunks.resolve(io, p.addr)?;
-        io.read_dup(kind, p, p0, p1)
+        let id = self.chunks.split(p.addr)?.0;
+        io.read_dup(kind, p, p0, p1, CopyOwner::Chunk(id))
     }
 
     /// Seals metadata block `l` and queues both copies.
@@ -821,26 +822,123 @@ impl Space {
         let mut copies = Vec::new();
         for off in (0..len).filter(|&o| e.is_used(o)) {
             for p in [e.p0, e.p1] {
-                let mut b = zero_block();
-                io.read_raw(p + off, &mut b[..])?;
-                copies.push((off, p == e.p0, b));
+                copies.push((off, p == e.p0, io.read_copy(p + off)?));
             }
         }
         let (q0, q1, _) = self.alloc_chunk_runs(io, len, false)?;
         for (off, first, b) in copies {
             io.queue(if first { q0 } else { q1 } + off, b);
         }
+        // Re-read: allocating may have rewritten a bitmap and freed its old
+        // logical block, which can be in this very chunk.
+        let cur = self.chunks.entry(io, id)?;
+        debug_assert_eq!((cur.p0, cur.p1, cur.len), (e.p0, e.p1, e.len));
         self.chunks.set_entry(
             io,
             id,
             Entry {
                 p0: q0,
                 p1: q1,
-                ..e
+                ..cur
             },
         )?;
         self.free(io, e.p0, len)?;
         self.free(io, e.p1, len)
+    }
+
+    /// Repairs every bad copy recorded so far by moving it: a chunk's bad
+    /// run is rebuilt at a fresh place from its good blocks and the
+    /// recorded good bytes, the entry is changed, and the old run goes into
+    /// quarantine (older commits in the window still map it, and their
+    /// other copy is intact); a chunk-table node with a bad copy is simply
+    /// rewritten by this commit. A live block is never overwritten in place,
+    /// so a torn or misdirected repair can't damage anything a commit
+    /// references. Must run before anything else is queued in the commit.
+    pub fn repair_copies<D: BlockDevice>(&mut self, io: &mut Io<D>) -> Result<()> {
+        let mut runs: BTreeMap<(u64, u8), BTreeMap<u64, Block>> = BTreeMap::new();
+        let mut nodes = BTreeMap::new();
+        for (phys, r) in io.take_repairs() {
+            match r.owner {
+                CopyOwner::Chunk(id) => {
+                    runs.entry((id, r.copy)).or_default().insert(phys, r.good);
+                }
+                CopyOwner::Table(level, idx) => *nodes.entry((level, idx)).or_insert(0u64) += 1,
+            }
+        }
+        for ((id, copy), good) in runs {
+            self.repair_run(io, id, copy, good)?;
+        }
+        for ((level, idx), n) in nodes {
+            if self.chunks.redirty(io, level, idx)? {
+                io.stats.copies_repaired += n;
+            } else {
+                io.stats.copies_dropped += n;
+            }
+        }
+        Ok(())
+    }
+
+    fn repair_run<D: BlockDevice>(
+        &mut self,
+        io: &mut Io<D>,
+        id: u64,
+        copy: u8,
+        mut good: BTreeMap<u64, Block>,
+    ) -> Result<()> {
+        let e = if id < self.chunks.capacity() {
+            self.chunks.entry(io, id)?
+        } else {
+            Entry::default()
+        };
+        if !e.mapped() {
+            // Released since: nothing this commit references is in it.
+            io.stats.copies_dropped += good.len() as u64;
+            return Ok(());
+        }
+        let (run, other) = if copy == 0 { (e.p0, e.p1) } else { (e.p1, e.p0) };
+        let len = e.len as u64;
+        let mut fixed = 0;
+        let mut blocks = Vec::new();
+        for off in (0..len).filter(|&o| e.is_used(o)) {
+            let b = match good.remove(&(run + off)) {
+                Some(b) => {
+                    fixed += 1;
+                    b
+                }
+                None => io.read_copy(run + off)?,
+            };
+            blocks.push((off, b));
+        }
+        // Bad copies of blocks this commit no longer references (freed
+        // since they were read, for instance a bitmap the repair of an
+        // earlier run rewrote) need no repair: older commits still map them
+        // through their own tables, with the other copy good.
+        io.stats.copies_dropped += good.len() as u64;
+        if fixed == 0 {
+            // The bad blocks are no longer in use (or the chunk moved).
+            return Ok(());
+        }
+        let far = self.far_from(other);
+        let Some(q) = self.find_exact(io, far, len)? else {
+            return Err(Error::NoSpace);
+        };
+        self.set_range(io, q, len, true)?;
+        for (off, b) in blocks {
+            io.queue(q + off, b);
+        }
+        // Re-read: marking the run may have rewritten a bitmap, freeing
+        // its old logical block, which can be in this very chunk.
+        let cur = self.chunks.entry(io, id)?;
+        debug_assert_eq!((cur.p0, cur.p1, cur.len), (e.p0, e.p1, e.len));
+        let moved = if copy == 0 {
+            Entry { p0: q, ..cur }
+        } else {
+            Entry { p1: q, ..cur }
+        };
+        self.chunks.set_entry(io, id, moved)?;
+        self.free(io, run, len)?;
+        io.stats.copies_repaired += fixed;
+        Ok(())
     }
 
     /// End of the quarantined range starting exactly at `b`, if any.

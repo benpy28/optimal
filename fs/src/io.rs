@@ -26,8 +26,11 @@ pub struct IoStats {
     pub flushes: u64,
     /// Metadata copies that failed to verify while the other copy was good.
     pub bad_copies: u64,
-    /// Bad copies rewritten from the good one (at the next commit).
+    /// Bad copies repaired (moved to a fresh place by the next commit).
     pub copies_repaired: u64,
+    /// Bad copies of blocks the next commit no longer references, so not
+    /// repaired (older commits still have the good copy).
+    pub copies_dropped: u64,
 }
 
 /// Which copy of a duplicated block to read.
@@ -39,14 +42,31 @@ pub enum CopyMode {
     Both,
 }
 
+/// What a duplicated block belongs to, so a bad copy can be repaired by
+/// moving it: a metadata chunk, or a chunk-table node (level, index).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CopyOwner {
+    Chunk(u64),
+    Table(u32, u64),
+}
+
+/// A bad copy found by a read: the bytes it should hold, whose it is and
+/// which copy (0 or 1).
+#[derive(Debug, Clone)]
+pub struct Repair {
+    pub good: Block,
+    pub owner: CopyOwner,
+    pub copy: u8,
+}
+
 #[derive(Debug)]
 pub struct Io<D> {
     pub dev: D,
     pub sealer: Sealer,
     /// Sealed blocks waiting to be written in the current commit.
     batch: BTreeMap<u64, Block>,
-    /// Bad metadata copies to rewrite (identical bytes) at the next commit.
-    repairs: BTreeMap<u64, Block>,
+    /// Bad metadata copies, by physical block, to repair at the next commit.
+    repairs: BTreeMap<u64, Repair>,
     /// Physical blocks found bad since the last commit (counted once each).
     bad_seen: alloc::collections::BTreeSet<u64>,
     /// Off for read-only mounts and checks that must not write.
@@ -80,10 +100,16 @@ impl<D: BlockDevice> Io<D> {
         self.dev.read(addr, buf).map_err(Error::Io)
     }
 
-    /// Reads physical block `phys` raw (no verification).
-    fn read_copy(&mut self, phys: u64) -> Result<Block> {
+    /// Reads physical block `phys` raw (no verification): the queued
+    /// version if this commit has queued one (a chunk moved or repaired at
+    /// the start of the commit lives only in the batch until it is written),
+    /// otherwise the device's.
+    pub fn read_copy(&mut self, phys: u64) -> Result<Block> {
         if phys == 0 || phys >= self.num_blocks() {
             return Err(Error::Corrupt("block copy out of range", phys));
+        }
+        if let Some(q) = self.batch.get(&phys) {
+            return Ok(q.clone());
         }
         let mut b = zero_block();
         self.read_raw(phys, &mut b[..])?;
@@ -96,15 +122,17 @@ impl<D: BlockDevice> Io<D> {
     /// checked against the same MAC, so both are bound by the parent.
     ///
     /// A copy that fails while the other verifies is counted and, if
-    /// repairs are enabled, queued to be rewritten (with the identical
-    /// bytes it should hold) at the next commit. Fails only if no copy
-    /// that was read verifies.
+    /// repairs are enabled, recorded with `owner` so the next commit moves
+    /// that copy through the chunk table. Fails only if no copy that was
+    /// read verifies. Copy 1's bytes are never used unless the unmasked
+    /// result matches the parent's MAC.
     pub fn read_dup(
         &mut self,
         kind: BlockKind,
         ptr: &BlockPtr,
         p0: u64,
         p1: u64,
+        owner: CopyOwner,
     ) -> Result<Block> {
         let mode = self.copy_mode;
         let (a, birth, nonce, mac) = (ptr.addr, ptr.birth, ptr.nonce, ptr.mac);
@@ -129,11 +157,11 @@ impl<D: BlockDevice> Io<D> {
             (Ok((raw0, b)), Err(_)) => {
                 let mut c1 = raw0;
                 self.sealer.swap_copy(kind, a, birth, &nonce, &mut c1[..]);
-                self.note_bad_copy(p1, c1);
+                self.note_bad_copy(p1, c1, owner, 1);
                 Ok(b)
             }
             (Err(_), Ok((raw0, b))) => {
-                self.note_bad_copy(p0, raw0);
+                self.note_bad_copy(p0, raw0, owner, 0);
                 Ok(b)
             }
             (Err(e), Err(_)) => Err(e),
@@ -164,12 +192,12 @@ impl<D: BlockDevice> Io<D> {
         (ok0, ok1)
     }
 
-    fn note_bad_copy(&mut self, phys: u64, good: Block) {
+    fn note_bad_copy(&mut self, phys: u64, good: Block, owner: CopyOwner, copy: u8) {
         if self.bad_seen.insert(phys) {
             self.stats.bad_copies += 1;
         }
         if self.repair_enabled {
-            self.repairs.insert(phys, good);
+            self.repairs.insert(phys, Repair { good, owner, copy });
         }
     }
 
@@ -183,18 +211,15 @@ impl<D: BlockDevice> Io<D> {
         self.repairs.contains_key(&phys)
     }
 
-    /// Moves queued repairs into the write batch (called by commit, before
-    /// its first flush). Rewriting a live block in place is safe here: the
-    /// bytes are exactly the ones every commit referencing it expects, so a
-    /// torn repair is never worse than the damage it replaces, and the
-    /// address is in use or quarantined, so nothing new is written there.
-    pub fn queue_repairs(&mut self) {
-        let repairs = core::mem::take(&mut self.repairs);
-        self.bad_seen.clear();
-        for (phys, b) in repairs {
-            self.stats.copies_repaired += 1;
-            self.queue(phys, b);
+    /// Hands every recorded repair to the caller (the commit, which moves
+    /// each bad copy to a fresh place; a live block is never overwritten in
+    /// place). Those blocks may be counted again if read bad later.
+    pub fn take_repairs(&mut self) -> BTreeMap<u64, Repair> {
+        let r = core::mem::take(&mut self.repairs);
+        for p in r.keys() {
+            self.bad_seen.remove(p);
         }
+        r
     }
 
     pub fn discard_repairs(&mut self) {
