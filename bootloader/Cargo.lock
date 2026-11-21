@@ -116,11 +116,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
+name = "optimal-boot"
+version = "0.1.0"
+dependencies = [
+ "optimal-boot-core",
+]
+
+[[package]]
+name = "optimal-boot-conformance"
+version = "0.1.0"
+dependencies = [
+ "optimal-boot-core",
+]
+
+[[package]]
 name = "optimal-boot-core"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "sha2",
+]
+
+[[package]]
+name = "optimal-boot-sign"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "optimal-boot-core",
 ]
 
 [[package]]

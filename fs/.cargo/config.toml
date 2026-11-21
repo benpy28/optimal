@@ -1,0 +1,4 @@
+# The bare-metal kernel target has no SSE/AVX enabled, so the crypto crates
+# must use their portable backends there. (Host builds keep the SIMD ones.)
+[target.x86_64-unknown-none]
+rustflags = ['--cfg', 'poly1305_backend="soft"', '--cfg', 'chacha20_backend="soft"']

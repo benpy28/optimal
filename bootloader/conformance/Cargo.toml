@@ -1,0 +1,15 @@
+[package]
+name = "optimal-boot-conformance"
+description = "A test kernel that checks every promise of the Limine protocol handoff."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "conformance"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+optimal-boot-core = { path = "../core" }

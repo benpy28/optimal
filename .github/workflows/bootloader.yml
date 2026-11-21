@@ -35,3 +35,64 @@ jobs:
 
       - name: Core tests (release)
         run: cargo test -p optimal-boot-core --release
+
+  loader:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: bootloader
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (version pinned in bootloader/rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Lint the loader, signing tool and conformance kernel
+        run: |
+          cargo build -q --release -p optimal-boot-sign
+          target/release/optimal-boot-sign keygen /tmp/ci.secret /tmp/ci.pub
+          cargo clippy -p optimal-boot-sign -- -D warnings
+          OPTIMAL_BOOT_PUBKEYS=/tmp/ci.pub cargo clippy -p optimal-boot --target x86_64-unknown-uefi -- -D warnings
+          cargo clippy -p optimal-boot-conformance --target x86_64-unknown-none -- -D warnings
+
+  # Every case boots the conformance kernel under Optimal Boot AND under
+  # Limine (the reference): a check failing only under ours is our bug.
+  conformance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        case: [r3, r4, r5, r6, pie, entry, la57, tpm, iommu-intel, iommu-amd, smp, big, small, headless, old-cpu]
+    defaults:
+      run:
+        working-directory: bootloader
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (version pinned in bootloader/rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Install QEMU, OVMF, swtpm and image tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q qemu-system-x86 ovmf swtpm xorriso mtools dosfstools fdisk
+          # KVM where the runner offers it (emulated cases force TCG).
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm || true
+
+      - name: Fetch Limine (BSD-2-Clause, reference loader for the differential runs)
+        run: |
+          git clone -q --depth 1 --branch v11.4.1-binary https://github.com/limine-bootloader/limine.git ../build/limine
+          make -C ../build/limine >/dev/null
+
+      - name: Conformance (${{ matrix.case }})
+        run: scripts/conformance-case.sh ${{ matrix.case }}
+
+      - name: Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-${{ matrix.case }}
+          path: build/ob/*.log
+          if-no-files-found: ignore

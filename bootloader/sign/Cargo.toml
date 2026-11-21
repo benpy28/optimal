@@ -1,0 +1,10 @@
+[package]
+name = "optimal-boot-sign"
+description = "Host tool: make keys, hash files, check and sign Optimal Boot configs."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+optimal-boot-core = { path = "../core" }
+ed25519-dalek = { version = "2", default-features = false, features = ["fast"] }

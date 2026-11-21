@@ -1,0 +1,62 @@
+name: Filesystem
+
+# Builds and tortures OptimalFS (fs/): lint, the no_std kernel-target build,
+# the licence policy, and the full test suite (model-based tests, power cuts
+# at every write point, damaged-image fuzzing) at a raised scale.
+on:
+  push:
+    branches: [main]
+    paths: ["fs/**", ".github/workflows/fs*.yml"]
+  pull_request:
+    paths: ["fs/**", ".github/workflows/fs*.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: fs
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (pinned in fs/rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy (host, std)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy and build (kernel target, no_std)
+        run: |
+          cargo clippy --no-default-features --target x86_64-unknown-none -- -D warnings
+          cargo build --release --no-default-features --target x86_64-unknown-none
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: Licences, advisories and sources
+        run: cargo deny check
+
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Unit tests and decoder fuzzing
+        if: matrix.shard == 1
+        run: cargo test --lib
+      - name: Torture suite (scale 4, seeds differ per shard)
+        env:
+          OFS_TORTURE_SCALE: "4"
+        run: |
+          export OFS_SEED=$(( 1000000 * ${{ matrix.shard }} ))
+          echo "Base seed $OFS_SEED (replay a failure with OFS_SEED=<seed printed in the failure>)"
+          cargo test --tests -- --test-threads 4
