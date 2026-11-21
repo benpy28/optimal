@@ -160,7 +160,13 @@ jobs:
         # Exit code 3 means some mutants made the tests hang (for example an
         # infinite loop in a walk); a hang is a detected break, so it counts
         # as caught. Anything else non-zero, or any missed mutant, fails.
+        #
+        # Each process is capped at 3 GiB of address space: a mutant that
+        # makes a test allocate without end (an endless split pushed into a
+        # Vec, say) then fails that test instead of exhausting the runner's
+        # memory, which got the whole runner shut down once (2026-11-21).
         run: |
+          ulimit -v 3145728
           code=0
           cargo mutants -j 4 --timeout 180 || code=$?
           echo "cargo-mutants exit code $code"

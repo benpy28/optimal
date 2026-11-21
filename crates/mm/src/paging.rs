@@ -581,6 +581,9 @@ mod tests {
         let mut v = Vec::new();
         for_each_page(K + 0x3ff000, 0x3ff000, 2 << 30, true, |a, b, s| {
             assert_eq!(a - K, b);
+            // 1024 pages expected; far more means the split is broken (and
+            // stops a broken split from eating all memory).
+            assert!(v.len() < 4096, "far too many pages");
             v.push((b, s))
         });
         let count = |s| v.iter().filter(|x| x.1 == s).count();
