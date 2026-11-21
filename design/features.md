@@ -182,11 +182,16 @@ F1):
   records are encrypted under a per-day key from a hash ratchet (day d+1's
   key is HKDF(day d's key, `optimal-dash-ratchet`)); only the oldest
   retained day's key is stored, and the daily prune replaces it with the
-  next one. On B1 it is stored in one of 8 per-user TPM NV indexes that
-  first-boot sealing defines while the owner secret is unwrapped
-  ([boot.md](boot.md), which states their NV space against fTPM
-  capacity), written once a day by a kernel operation under `PolicySecret`
-  on the service key for the owning user's session only, never on the
+  next one. While in use the day keys are held in kernel-registered
+  secret memory (the agents' row of the key inventory,
+  [storage.md](storage.md)). On B1 the stored key is in one of 8 per-user
+  TPM NV indexes of 32 bytes that first-boot sealing defines while the
+  owner secret is unwrapped ([boot.md](boot.md), which states their NV
+  space against fTPM capacity; on a TPM without room install defines fewer,
+  down to 0), written once a day through the TPM broker's named "write the
+  caller's F2 NV index" operation, which the kernel performs under
+  `PolicySecret` on the service key for the owning user's session only
+  ([threat-model.md](threat-model.md)), never on the
   disk, so an image of the drive, old flash blocks included, can't decrypt
   an expired day. Retention is 1, 7, 30 or 90 days, or off. Administrators can't read
   another user's dashboard.
@@ -201,8 +206,8 @@ sends to a destination, is not shown. An app that runs its own encrypted
 DNS shows only its resolver's address. Covert channels are not shown. A
 compromised TCB service can omit records. The history is itself sensitive:
 anyone who unlocks the session can read it, which is why it is bounded,
-expiring and can be switched off. Without a TPM (B2 to B4), and for a 9th
-and later user on B1, the ratchet key
+expiring and can be switched off. Without a TPM (B2 to B4), and for a
+user on B1 with no index (a 9th and later user, or none left), the ratchet key
 is kept in the user's encrypted storage, and an SSD that keeps old blocks
 can keep an older ratchet key, from which someone with the user's key can
 decrypt expired days still in flash.

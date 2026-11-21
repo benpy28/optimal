@@ -64,7 +64,8 @@ sets the requirements it must meet.
   completing commands for 60 s; the controller is reset, no write is
   lost, no application sees an error, and the real-time gate under
   device stalls that [scheduler.md](scheduler.md) "Device stalls"
-  defines holds.
+  defines is measured and reported (this is a VM test, so the gate is
+  report-only here; it is enforced on the bare-metal reference machines).
 - **Driver restarts are invisible when nothing was lost.** When a storage
   driver is restarted ([drivers.md](drivers.md)), the block layer keeps its
   in-flight requests and resubmits them to the new instance. A controller
@@ -176,9 +177,11 @@ workload join the Linux compatibility suite (milestone 4 in
   `SIGBUS`, the same as Linux on a full file system). A metadata reserve of
   2% of the volume, minimum 256 MiB and maximum 8 GiB, guarantees deletes,
   truncates and snapshot removal always succeed on a full disk.
-- **Zero on free.** A frame that held page cache of an encrypted volume is
-  zeroed when it is freed (eviction, truncate, delete), so plaintext never
-  sits in the free lists ([scheduler.md](scheduler.md) "Frame allocator";
+- **Zero on free.** A frame that held page cache of an encrypted volume,
+  or belonged to a vault or travel identity (F3, F5), is zeroed when it is
+  freed (eviction, truncate, delete, exit), and panic lock and vault close
+  also sweep the buddy and per-CPU free lists, so plaintext never sits in
+  the free lists ([scheduler.md](scheduler.md) "Frame allocator";
   from Phase 4a, cost published with the 4a storage set; tests in
   [features.md](features.md) F4 and the class-C lock test below).
 - **Truncate versus mmap.** Truncating a mapped file unmaps the cut-off pages
@@ -597,7 +600,9 @@ only". On top of that:
   XChaCha20-Poly1305 uses that nonce directly. AES-GCM, with its 96-bit
   nonce, uses a per-mount subkey D(key, prefix) and the counter,
   zero-padded to 96 bits, as its nonce; the key is the per-file key for
-  class-B files and the volume or class key otherwise. A rewound volume gets
+  class-B files and the volume or class key otherwise. XChaCha20-Poly1305
+  volumes derive the same subkey, used only for the copy-1 key (below).
+  A rewound volume gets
   a new prefix at its next mount, so its new writes never reuse a
   (key, nonce) pair; if the counter would wrap, the file system draws a new
   prefix (and subkey) without unmounting. Prefixes come from the kernel
@@ -830,7 +835,9 @@ requires for every Linux comparison (Phase 4a included).
   with TRIM state and drive temperature recorded; the entries then run in
   table order. The real time of each entry, the preconditioning and the
   restore is budgeted in [benchmarks.md](benchmarks.md), and storage tail
-  metrics are judged against the storage tail noise ceiling there.
+  metrics are judged against the storage tail noise ceiling there (P99:
+  at most 1.5% between-boot coefficient of variation per boot; P99.9: the
+  pooled-window ceiling, one kernel's window SE at most 1% over 20 boots).
 - **The benchmark set is one table in [benchmarks.md](benchmarks.md)**, not
   repeated here. Phase 4a has static programs only (no threads or io_uring
   yet): QD1 is fio's `psync` engine, and QD32 is 32 forked static `psync`

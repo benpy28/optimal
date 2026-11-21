@@ -503,7 +503,7 @@ the sample column gives the rest.
 | Storage set: the table below | 4a, 5 |
 | Driver tier cost: per-I/O latency and throughput for the same device in tier 1, 2 and 3 | 4a |
 | IOMMU strict-invalidation cost | 4a |
-| Zero on free of encrypted-volume page-cache frames ([storage.md](storage.md)), and the free-list sweep at panic lock and vault close (F3, F4) | 4a, 5 |
+| Zero on free of encrypted-volume page-cache frames and of vault and travel identities' frames ([storage.md](storage.md)), and the free-list sweep at panic lock and vault close (F3, F4, F5) | 4a, 5 |
 | Worst CPU stall and worst real-time wake-up latency on surprise removal of a PCIe device ([scheduler.md](scheduler.md)) | 4a |
 | GPU VRAM and GTT buffer clear before first mapping (copy/clear engine), cost per MiB and per allocation | 8 |
 | Network throughput and latency (TCP and UDP, 1 and 8 streams, on a named NIC at a named link speed) | 6 |

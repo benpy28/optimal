@@ -256,7 +256,7 @@ address; a tier-3 driver sees only IOVAs in its own domain.
   controller until its reads are done, and, until `ExitBootServices`, the
   console keyboard controller only if it is not below an external-facing
   port (a keyboard on a Thunderbolt or USB4 dock can't type the PIN, and
-  the prompt says to use an internal port). Where the firmware offers
+  the prompt says to use another keyboard). Where the firmware offers
   `EDKII_IOMMU_PROTOCOL`, the loader installs its own implementation, which
   maps for a controller only the buffers its firmware driver `Map()`s;
   otherwise a controller's map is RAM only (no MMIO) and excludes the IOMMU
@@ -377,8 +377,9 @@ address; a tier-3 driver sees only IOVAs in its own domain.
   the shim contracts and the axioms of target 10
   ([verification.md](verification.md)). Tests (1c gate): QEMU
   `intel-iommu` in non-coherent mode, and QEMU `amd-iommu` rewriting live
-  device table entries under continuous DMA; 0 writes land outside the
-  domain and no transaction uses a mixed entry.
+  device table entries under continuous DMA from the test-only DMA driver
+  (below); 0 writes land outside the domain and no transaction uses a
+  mixed entry.
 - **Firmware display.** The device scanning out the firmware framebuffer,
   and the bridges on its path, keep BME so the screen stays on. Once the
   IOMMU is live, its domain maps only the framebuffer range, read-only, plus

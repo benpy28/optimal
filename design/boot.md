@@ -601,10 +601,12 @@ entry (path 2) must each stop an old signed loader.
   A floor-raise request stays pending until the next normal boot. A panic
   hibernate ([features.md](features.md) F4) is allowed with one logged-in
   session only (otherwise it is a panic power-off) and creates no object
-  4: K is wrapped under P before P is wiped. Its resume boot unseals R1 and
-  R2 with the PIN as any boot does, caps, then stretches that user's typed
-  login passphrase, unwraps P from slot 15 and K under P, and authenticates
-  the image; the PIN alone opens no part of the image.
+  4: K is wrapped under P before P is wiped. Its resume unseals nothing:
+  the loader boots the slot that made the image with no PIN prompt, the
+  boot kernel caps, asks for that user's login passphrase on the trusted
+  path, stretches it, unwraps P from slot 15 and K under P, authenticates
+  the image and hands P to the restored kernel, which unwraps its keys
+  from the P blob as at a panic unlock; no PIN is asked or accepted.
 
 ### The sealing policy, step by step
 
@@ -657,13 +659,14 @@ composition of these policies (every object, NV index and signing
 reference) is proof target 17 ([verification.md](verification.md)),
 proved per object: a session that satisfies objects 1 to 3 implies PCR 4
 matched (signed or per machine) and anti-rollback counter ≤ base + f,
-and for objects 1 and 2 also the PIN epoch and the PIN; object 4: PCR 4,
+for object 3 also the Secure Boot state through its `PolicyOR` over PCR 7
+values, and for objects 1 and 2 also the PIN epoch and the PIN; object 4: PCR 4,
 the floor and the PIN; object 5: resetCount equal, PCR 4 and 7, the capped
 PCR 8 and 9 with the boot nonce, and the PIN; the lock-screen object:
 `PolicySecret` on the service key, the PIN and the PIN epoch; the service
 key: its authValue only; every NV index, F2's included: written only
 through its stated policy. B/T at 4b (objects 1 to 3, the lock-screen
-object, the NV indexes), extended at 10 (objects 4 and 5).
+object, the service key, the NV indexes), extended at 10 (objects 4 and 5).
 
 **When PCR 7 changes.** Some updates change PCR 7: a dbx update, a db
 update (such as the 2023 CA migration), a firmware update, and a new shim
@@ -719,8 +722,8 @@ announced, and every machine reseals to the next key at its next update.
   authorisation set to an unknown value) installs, seals and unseals, and
   no lockout reset is issued.
 - **F2's NV pool.** First-boot sealing defines 8 per-user NV indexes of
-  32 bytes for F2's ratchet keys ([features.md](features.md)), written only
-  by a kernel operation under `PolicySecret` on the service key. With the
+  32 bytes for F2's ratchet keys ([features.md](features.md)), written only,
+  once a day, by a kernel operation under `PolicySecret` on the service key. With the
   other six indexes that is 14 indexes holding 304 bytes of data, plus the
   persistent SRK; install checks the free index count with
   `TPM2_GetCapability` and defines fewer F2 indexes (down to 0) on a TPM

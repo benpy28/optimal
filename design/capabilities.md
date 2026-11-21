@@ -309,7 +309,7 @@ produces them for removed devices and network file systems.
     mapping the object, `org.freedesktop.DBus.Error.AccessDenied` from the
     D-Bus proxy), one combined-approval request per identity pair is
     queued, and a retry after approval succeeds (the rule is stated in
-    [threat-model.md](threat-model.md); Phase 5 test: a socket channel
+    [threat-model.md](threat-model.md) "App identity can't be forged"; Phase 5 test: a socket channel
     refused, approved, then retried succeeds);
   - **every new grant** (network, folder, inbound port, persistent
     document, and each data-set grant above) is checked against the holder's component and every
@@ -433,7 +433,7 @@ produces them for removed devices and network file systems.
   completes or fails later; an `O_NONBLOCK` `sendto` returns `EAGAIN`).
   The generated `resolv.conf` carries `options timeout:30 attempts:1`, so
   stub resolvers wait out the hold, and the resolver dedupes retransmits
-  per identity; on refusal or timeout the lookup answers SERVFAIL
+  per identity and answers SERVFAIL within 5 s on upstream failure; on refusal or timeout the lookup answers SERVFAIL
   (`EAI_AGAIN`) and `connect` returns `ENETUNREACH`, never
   `ECONNREFUSED`. A manifest app's network declaration is shown
   at install, and the install approval is the grant. Inbound ports and
