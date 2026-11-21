@@ -81,8 +81,15 @@ jobs:
             browser/build/test-output.txt
 
   mutants:
+    # Sharded, two builds at a time per runner: four parallel mutant builds
+    # ran a hosted runner out of memory (it was shut down mid-run).
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    name: mutants (shard ${{ matrix.shard }} of 8)
     runs-on: ubuntu-24.04
-    timeout-minutes: 300
+    timeout-minutes: 340
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
@@ -99,7 +106,7 @@ jobs:
           # Exit 0: every mutant caught. Exit 3: some mutants only hung until
           # the timeout, which the tests also catch. Anything else fails.
           set +e
-          cargo mutants --workspace -j 4 --timeout 300
+          cargo mutants --workspace -j 2 --timeout 300 --shard ${{ matrix.shard }}/8
           code=$?
           set -e
           cat mutants.out/missed.txt || true
@@ -107,5 +114,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: mutants
+          name: mutants-shard-${{ matrix.shard }}
           path: browser/mutants.out/
