@@ -13,8 +13,9 @@ All integers are little-endian. A block is 4096 bytes. Block numbers are
 | N-2, N-1 | Superblock slots 3 and 2 |
 
 Slot `s` lives at block `0, 1, N-1, N-2` for `s = 0, 1, 2, 3`. Commit
-generation `g` writes slots `g % 2` and `2 + g % 2` (and, after a fallback
-mount or for a replay-value bump, then the other pair too). A volume needs
+generation `g` writes slots `g % 2` and `2 + g % 2`. After a fallback mount
+and for a replay-value bump it writes all four in two waves: slots 0 and 1,
+flush, then slots 2 and 3, flush. A volume needs
 at least 64 blocks and at most 2^45 blocks (128 PiB).
 
 ## Superblock (4096 bytes)

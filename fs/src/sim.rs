@@ -138,9 +138,26 @@ impl CrashDevice {
     /// What the platters hold after the power cut: resolves every in-flight
     /// write using the adversarial model described in the module docs.
     pub fn crash_image(&mut self) -> Vec<u8> {
+        self.crash_image_tearing(&[])
+    }
+
+    /// [`CrashDevice::crash_image`], except that every in-flight write to a
+    /// block in `tear` is torn: its last sector keeps the old content and
+    /// the rest come from any version written (so a block whose content
+    /// changed never verifies whole).
+    pub fn crash_image_tearing(&mut self, tear: &[u64]) -> Vec<u8> {
         let mut img = self.durable.clone();
         let volatile = core::mem::take(&mut self.volatile);
         for (block, versions) in volatile {
+            if tear.contains(&block) {
+                let off = block as usize * BLOCK_SIZE;
+                for s in 0..BLOCK_SIZE / SECTOR - 1 {
+                    let v = &versions[self.rng.below(versions.len() as u64) as usize];
+                    let r = s * SECTOR..(s + 1) * SECTOR;
+                    img[off + r.start..off + r.end].copy_from_slice(&v[r]);
+                }
+                continue;
+            }
             let off = block as usize * BLOCK_SIZE;
             let mut candidates: Vec<&[u8]> = Vec::with_capacity(versions.len() + 1);
             let old = self.durable[off..off + BLOCK_SIZE].to_vec();

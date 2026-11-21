@@ -105,8 +105,8 @@ see names, sizes, contents, directory structure or counts.
 
 Whole-image replay can't be detected by the disk alone. The superblock
 carries a replay value for the kernel to bind to a TPM counter.
-`bump_replay` raises it in a commit written to all four slots (each pair
-flushed) and only then may the caller advance the TPM counter. A power cut
+`bump_replay` raises it in a commit written to all four slots in two
+waves (slots 0 and 1, flush, then slots 2 and 3, flush) and only then may the caller advance the TPM counter. A power cut
 at any write point of the bump leaves the old or the new value, never a
 rolled-back one after the bump returned.
 

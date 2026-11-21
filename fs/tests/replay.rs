@@ -43,7 +43,12 @@ fn bump_is_atomic_at_every_write_point() {
             fs.device_mut().cut_at = Some(start + cut);
             let done = fs.bump_replay().is_ok();
             let mut dev = fs.into_device();
-            let img = dev.crash_image();
+            // Odd images tear every superblock write that was in flight.
+            let img = if img_no % 2 == 1 {
+                dev.crash_image_tearing(&[0, 1, 2046, 2047])
+            } else {
+                dev.crash_image()
+            };
             let fs = Filesystem::mount(
                 CrashDevice::from_image(img, cut ^ (img_no << 8)),
                 &mo,

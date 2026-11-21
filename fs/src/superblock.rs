@@ -28,6 +28,7 @@ use crate::device::{BLOCK_SIZE, BlockDevice};
 use crate::error::{Error, Result};
 use crate::io::{Io, zero_block};
 use crate::ptr::BlockPtr;
+use alloc::vec;
 use alloc::vec::Vec;
 
 pub const MAGIC: [u8; 8] = *b"OPTMLFS\x01";
@@ -506,14 +507,16 @@ pub fn commit<D: BlockDevice>(
 ) -> Result<()> {
     io.flush()?;
     let total = io.num_blocks();
-    let own = slots_for_gen(body.generation);
-    for slot in own {
-        let b = encode(header, body, slot, &mut io.sealer);
-        io.write_now(slot_addr(slot, total), &b[..])?;
-    }
-    io.flush()?;
-    if all_slots {
-        for slot in slots_for_gen(body.generation + 1) {
+    // Normal commit: its own pair. All slots: two waves, the front slots
+    // (0, 1) then the back slots (2, 3), each flushed, so a power cut
+    // tearing every write in flight still leaves a whole wave intact.
+    let waves: Vec<[u32; 2]> = if all_slots {
+        vec![[0, 1], [2, 3]]
+    } else {
+        vec![slots_for_gen(body.generation)]
+    };
+    for wave in &waves {
+        for &slot in wave {
             let b = encode(header, body, slot, &mut io.sealer);
             io.write_now(slot_addr(slot, total), &b[..])?;
         }
