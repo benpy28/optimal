@@ -82,18 +82,25 @@ ktest!(every_free_frame_is_handed_out_exactly_once, {
 
 ktest!(blocks_of_every_order_are_aligned, {
     let before = frames::free_bytes();
+    let largest = frames::largest_free_order();
     for order in 0..=optimal_mm::frames::MAX_ORDER {
         let size = PAGE_SIZE << order;
-        if let Some(b) = frames::alloc(order) {
-            assert_eq!(b % size, 0, "order {order} block {b:#x} misaligned");
-            assert!(usable(b) && usable(b + size - 1));
-            frames::free(b, order).unwrap();
-        } else {
-            // Only acceptable if the machine has no free block that big.
-            assert!(
-                before < size * 2,
-                "no order-{order} block in {before} free bytes"
-            );
+        // Exactly the orders up to the largest free block must succeed (a
+        // big enough block can always be split).
+        match frames::alloc(order) {
+            Some(b) => {
+                assert!(
+                    Some(order) <= largest,
+                    "order {order} allocated above the largest free block"
+                );
+                assert_eq!(b % size, 0, "order {order} block {b:#x} misaligned");
+                assert!(usable(b) && usable(b + size - 1));
+                frames::free(b, order).unwrap();
+            }
+            None => assert!(
+                Some(order) > largest,
+                "no order-{order} block though one is free"
+            ),
         }
     }
     assert_eq!(frames::alloc(optimal_mm::frames::MAX_ORDER + 1), None);

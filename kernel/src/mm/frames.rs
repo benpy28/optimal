@@ -229,6 +229,17 @@ pub fn check() -> Result<(), &'static str> {
     Ok(())
 }
 
+/// The largest order with a free block in any zone (tests).
+#[cfg(feature = "ktest")]
+pub fn largest_free_order() -> Option<usize> {
+    let a = FRAMES.lock();
+    (0..=optimal_mm::frames::MAX_ORDER).rev().find(|&o| {
+        a.buddies[..a.count]
+            .iter()
+            .any(|b| b.as_ref().unwrap().free_blocks(o) > 0)
+    })
+}
+
 /// The planned zones (tests and diagnostics).
 #[cfg(feature = "ktest")]
 pub fn zones() -> ([Zone; MAX_ZONES], usize) {
