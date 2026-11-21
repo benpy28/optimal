@@ -35,8 +35,21 @@ sets the requirements it must meet.
   reset can drop the drive's volatile cache, so every write that completed
   since the last successful flush is treated as **not completed**: it is
   re-issued, and any commit that depends on it waits until it and a new
-  flush complete. Applications see `EIO` only if three restarts in a row
-  fail.
+  flush complete. To re-issue it, the block layer keeps a per-device replay
+  log of completed, unflushed writes on drives with a volatile cache and no
+  power-loss protection (on others a completed write is durable and nothing
+  is kept). Page-cache writes are kept by reference: the page stays
+  write-protected until the flush completes, and a process writing to it
+  meanwhile gets a bounce copy (stable pages, below). `O_DIRECT` writes are
+  copied into the log when they complete, because the caller may reuse its
+  buffer. A completed write fully covered by a later completed write to the
+  same blocks is dropped from the log. When the log reaches 64 MiB the block
+  layer issues a flush and empties the log when it completes. After a
+  restart the log is re-sent in completion order, then flushed, then the
+  held commits go out. Applications see `EIO` only if three restarts in a
+  row fail. Tests (Phase 4a): overlapping writes to the same blocks
+  completed in both orders, then a driver kill before the flush; the disk
+  must hold the later-completed data, for page-cache and `O_DIRECT` writes.
 
 ## What durability calls promise (the Linux contract)
 
@@ -120,13 +133,47 @@ copies of them. So in stage 1:
   image's history), and it must never crash or corrupt memory, only refuse
   the volume or return `EIO`;
 - the scorecard says "encryption: confidentiality only, no tamper
-  detection, nothing protected while locked".
+  detection, nothing protected while locked", and promise 4 in
+  [threat-model.md](threat-model.md) is reported as **partial** until stage
+  2: a suspended machine has no disk key in memory (below), but its page
+  cache still holds plaintext.
 
-Per-user encryption of each home directory (a separate key per user,
-unwrapped at that user's login, with the same LUKS2-style key slots) is also
-part of stage 1, so another user's files aren't readable by them even
-before the own file system exists. The sector number is the XTS tweak, so
-the tweak mapping must be injective (target 12).
+**Passphrase KDF.** Passphrase key slots use Argon2id with at least 1 GiB of
+memory, at least 4 passes and 4 lanes, with the passes raised at install
+until unlocking takes 2 seconds on that machine (checked on the reference
+laptop in [benchmarks.md](benchmarks.md)). The floor is never lowered for a
+slow machine: unlocking takes longer instead. PBKDF2 is
+used only for the slot of the 256-bit random recovery key, whose entropy
+makes a slow KDF pointless. Test (Phase 4a): a header whose passphrase slot
+is below the floor is refused by the installer, the key-slot tools and the
+unlock path.
+
+**Suspend wipes the disk key.** On suspend, dirty pages are written back,
+the volume is frozen and the LUKS2 volume key is wiped from memory; on
+resume the kernel asks for the PIN (B1, through the post-cap TPM path in
+[boot.md](boot.md)) or the passphrase before the volume is thawed. Test
+(Phase 10): suspend, scan memory for the volume key, resume with and without
+the right secret. Home volumes (below) are frozen and their keys wiped the
+same way; each thaws when its user next unlocks their session.
+
+**Per-user home volumes (Phase 5).** Each user's home is its own volume, so
+another user's files aren't readable by them even before the own file
+system exists. The outer device carries an in-kernel volume map: a
+checksummed table, stored twice, listing extents of 1 GiB that belong to
+the system volume or to one user's home volume. Each home volume is a
+LUKS2 volume with its own volume key and key slots, unwrapped at that
+user's login (from their passphrase, plus on B1 the TPM through the
+post-cap `PolicySecret` path in [boot.md](boot.md); test: a second user
+logs in long after capping on B1), and holds an ext4 created by Optimal's
+`mkfs`. Its extents are encrypted only by that key (the system key doesn't cover them, so
+nothing is encrypted twice). Home volumes are mounted in-kernel as internal
+volumes, and grow by adding extents and resizing ext4 online
+(`resize_inode`); shrinking is offline. The map is parsed as untrusted
+input and fuzzed, and its format is documented so a Linux rescue system can
+open each volume with a `dm-linear` table. The XTS tweak is the sector
+number within each volume, so the tweak mapping must be injective per key
+(target 12). The Phase 5 storage benchmarks run on a home volume, against
+Linux ext4 on dm-crypt over `dm-linear` with the same extents.
 
 **Stage 2, own file system (default once its track is done):** encryption
 moves into the file system. Every block is encrypted and authenticated, with
@@ -135,7 +182,8 @@ tamper-evident from the superblock down. There is no separate block layer
 under it. On top of that:
 
 - **Per-user keys.** Each user's files are under their own key, wrapped by
-  their login secret (and the TPM on B1 machines). Another user, even an
+  their login secret (and on B1 by the TPM, through the same post-cap
+  `PolicySecret` path as home volumes). Another user, even an
   administrator, can't read them without that user's login.
 - **Data protection classes** (modelled on iOS's, because they're what
   makes "a locked laptop gives up nothing" true while apps keep working):
@@ -152,30 +200,62 @@ under it. On top of that:
     are written back, then clean pages are evicted from the page cache and
     zeroed, compressed-swap pages are dropped (class C never goes to swap),
     and the keys are wiped. Access while locked fails with `EACCES`.
-  The test: lock the machine, scan all of memory for class-C keys and for
-  plaintext canaries from class-C files; none may be found. Browsers
-  downloading for an hour while locked must finish without errors.
-- **Swap and hibernation** are encrypted with keys that don't survive a cold
-  boot (swap) or are sealed as described in [threat-model.md](threat-model.md)
-  (hibernation).
+    Plaintext an app copied into its own memory can't be evicted, so apps
+    holding class-C files open are frozen from lock until unlock.
+  The test: lock the machine, then scan the page cache, kernel slab,
+  bounce and DMA buffers, swap (in RAM and on disk) and the key store for
+  class-C keys and for plaintext canaries from class-C files; none may be
+  found, and the frozen apps must not have run. Browsers downloading for an
+  hour while locked must finish without errors.
+- **Swap** is encrypted with a key that doesn't survive a cold boot.
+- **Hibernation.** Class-C eviction (and in stage 1 the suspend steps
+  above) runs before the image is written, so the image holds no class-C
+  key or plaintext. The image key is a TPM sealed
+  object whose policy is the signed pre-cap PCR 8/9 policy plus
+  `TPM2_PolicyAuthValue` (the PIN), so resume unseals it only before capping
+  and only with the PIN; without a TPM it is derived from the passphrase
+  with the KDF above. Format and rollback rules are in
+  [threat-model.md](threat-model.md). Test (Phase 10): hibernate, scan the
+  image for class-C canaries, resume with a wrong PIN and after capping.
 - **Cipher choice is measured.** The format records a cipher ID per volume.
   Allowed: AES-256-GCM (fast with AES-NI and VAES) and XChaCha20-Poly1305
   (fast without AES instructions). The installer picks the faster one on
   that CPU by benchmark; both are on the scorecard.
 - **Nonces are never random under a long-lived key.** With AES-GCM, each
-  file (or extent) has its own subkey derived from the volume or class key
-  with HKDF, and each block's nonce is derived from its address and
-  generation, which copy-on-write never reuses. Each subkey has a stated
-  invocation limit (at most 2^32 blocks) after which the file is rekeyed.
-  With XChaCha20-Poly1305 the 192-bit nonce makes random nonces safe. Nonce
-  uniqueness is part of proof target 12.
+  block's nonce is derived from its address and generation, which
+  copy-on-write never reuses within one history. A crash fallback, a
+  lying-drive fallback or a replayed image can rewind the volume to an older
+  state, and the next writes would then reuse addresses and generations with
+  new plaintext. So each mount starts a **write epoch** with a fresh random
+  128-bit salt, recorded in the epoch's first commit record; every subkey is
+  derived with HKDF from the volume or class key, the file (or extent) ID
+  and the epoch salt, and each block pointer carries the epoch number whose
+  salt its subkey used. A rewound volume gets a new salt, so its new writes
+  are under keys never used before. Each subkey has a stated invocation
+  limit (at most 2^32 blocks) after which the file is rekeyed. With
+  XChaCha20-Poly1305 the 192-bit nonce makes random nonces safe. Nonce
+  uniqueness, including across crash fallback, lying-drive fallback and
+  replay, is part of proof target 12.
 - **Whole-volume replay.** Tags in parent pointers stop tampering, but an
   attacker could write back a complete older image of the volume. On B1
-  machines the superblock's commit generation is bound to a TPM NV counter,
-  bumped at most once a minute and at every clean shutdown (NV memory has
-  limited write endurance), so a replayed image older than that window is
-  refused at mount. On machines without a TPM, replay is **not detected**,
-  and the scorecard says so. Test: restore an old image and mount it.
+  machines the superblock carries a replay value bound to a TPM NV counter
+  (an ordinary counter, not `TPMA_NV_ORDERLY`, whose jump after a power
+  cut would refuse the genuine volume). The counter is bumped only at mount
+  and at resume, never per commit, to spare NV write endurance. A bump with
+  the counter at *c* writes the superblock with *c*+1, flushes, and only
+  then increments the counter. Mount accepts a superblock whose value is
+  **at least** the counter's, so a crash between the two steps is harmless,
+  and refuses a lower one: any image captured while the machine was off or
+  suspended is refused once the next mount or resume has bumped the
+  counter. The counter's increment is authorised only through the kernel
+  TPM service's post-cap `PolicySecret` path ([boot.md](boot.md)), not by
+  owner or platform auth, so root can't advance it to lock the user out. A
+  drive that lost the flushed superblock looks like a replay; the user can
+  accept the older state with the recovery key. On machines without a TPM,
+  replay is **not detected**, and the scorecard says so. Tests (file system
+  track): restore an old image and mount it; a power cut between the
+  superblock flush and the increment, and after the increment, must both
+  mount.
 - **What the own file system's design must specify** (`fs/docs/DESIGN.md`):
   the key hierarchy (volume, system, per-user and per-class keys), file-name
   encryption, the exact list of metadata left in plaintext (for example
@@ -190,17 +270,29 @@ dozens of feature flags. Writing to it wrongly corrupts someone's Linux
 install. So:
 
 - **Optimal's own ext4 volumes are read-write from Phase 4.** Optimal ships
-  its own clean-room `mkfs` and creates volumes with a fixed feature list:
-  `extent`, `64bit`, `metadata_csum`, `has_journal` (ordered data mode),
-  `flex_bg`, `dir_index`, `dir_nlink`, `extra_isize`, `huge_file`,
-  `sparse_super2`. Features not on the list (`inline_data`, `encrypt`,
-  `casefold`, `verity`, `fast_commit`, `orphan_file`) aren't written.
+  its own clean-room `mkfs` and creates volumes with a fixed feature list,
+  the ext4 default of e2fsprogs 1.47.2:
+  - COMPAT: `has_journal` (ordered data mode), `ext_attr`, `resize_inode`,
+    `dir_index`, `orphan_file`;
+  - INCOMPAT: `filetype`, `extent`, `64bit`, `flex_bg`,
+    `metadata_csum_seed`;
+  - RO_COMPAT: `sparse_super`, `large_file`, `huge_file`, `dir_nlink`,
+    `extra_isize`, `metadata_csum`, and `orphan_present` (set while the
+    orphan file has entries).
+
+  Features not on the list (among them `inline_data`, `encrypt`,
+  `casefold`, `verity`, `fast_commit`, `ea_inode`, `large_dir`, `meta_bg`,
+  `mmp`, `quota`, `project`, `sparse_super2`) aren't written. The Linux side
+  of every test makes volumes with exactly
+  `mke2fs -t ext4 -O none,has_journal,ext_attr,resize_inode,dir_index,orphan_file,filetype,extent,64bit,flex_bg,metadata_csum_seed,sparse_super,large_file,huge_file,dir_nlink,extra_isize,metadata_csum`,
+  using e2fsprogs 1.47.2 pinned by source hash in the tree.
 - **The differential gate is a Phase 4 done-when item:** random operations
   on Optimal, then Linux's `e2fsck -fn` is clean and Linux reads back the
   same tree; and the reverse (Linux writes with only listed features,
   Optimal checks and reads). During Phase 4, the crash oracle's "checker" for
   ext4 is `e2fsck -fn`, run as an external tool.
-- **Other ext4 volumes** (a dual-boot Linux install) are mounted read-only.
+- **Other ext4 volumes** (a dual-boot Linux install) are mounted read-only
+  through the tier-3 file system server (below), like all foreign media.
   If the journal needs recovery it is replayed into an in-memory overlay;
   the disk is never written. Read-write on volumes Optimal didn't create
   comes only after the differential gate has also passed on images made by
@@ -220,28 +312,38 @@ install. So:
 ## Crash-consistency testing (what "zero corruption" means)
 
 - **Crash-state model.** The block request stream is recorded below the file
-  system. A crash state is: everything completed before the last flush, plus
-  every FUA write that completed (those are mandatory), plus any subset of
-  the other unflushed writes after it, in any order, with any single write
-  torn at 512-byte granularity. **Second-order states** crash again during
+  system. A crash state is: every write that completed before the last
+  completed flush was submitted, plus every FUA write that completed (those
+  are mandatory), plus any subset of the other writes, in any order, with
+  any single write torn at 512-byte granularity. **Second-order states** crash again during
   recovery or journal replay. States are enumerated exhaustively for small
   workloads and sampled randomly for long ones.
-- **A lying-drive model** drops flushes entirely. Data loss is then
-  unavoidable, but the file system must still mount (falling back to an
-  older consistent state), and the loss must be limited to the commits since
-  the drive last really persisted.
+- **A lying-drive model** injects a drop point: flushes after it are
+  ignored, and "really persisted" means the state at the drop point. Data
+  loss is then unavoidable. The own file system must still mount (falling
+  back to its last commit before the drop point), losing only commits after
+  it. ext4 overwrites in place and has no such fallback, so for ext4 the
+  rule is: `e2fsck -fy` repairs the volume, after which only data written
+  after the drop point may be missing or changed.
 - **Oracle.** After every crash state: the file system's own checker reports
   clean; every byte that was fsynced (by the table above) is present; every
   rename is atomic; and **no stale or foreign data** is visible (a file never
   shows blocks that belonged to another file or to free space, which would
   be a confidentiality bug); and **data that was durable before is
   unchanged** by later, unrelated writes.
-- **Volume.** The nightly run reports the number of crash states checked; the
-  target is at least 10^7 per night. "7 days" in the roadmap is replaced by
-  this count, since wall-clock time isn't a coverage measure.
+- **Volume.** The nightly run reports the number of distinct crash states
+  checked; the target is at least 10^7 per night. States are deduplicated
+  by a hash of the block versions they contain, so identical disk images
+  count once. The runner is sized to fit 10^7 states in 4 hours at the
+  measured checking rate (states are copy-on-write overlays on one base
+  image, checked in parallel, one per core); if the rate drops, runners are
+  added, the target stays.
 - **Real power cuts.** Before each release: a relay-controlled power-cut rig,
-  at least 1,000 cuts on at least 3 drive models, with the same oracle. This
-  needs physical hardware and is listed as a hardware need in the roadmap.
+  at least 1,000 cuts on at least 3 drive models, with the same oracle. The
+  first run is on ext4 over LUKS2, before the first release with read-write
+  ext4 (Phase 4a); the own file system gets its own before it becomes the
+  default. This needs physical hardware and is listed as a hardware need in
+  the roadmap.
 
 ## Benchmarks (so "within 10%" and "beats ext4" mean something)
 
@@ -260,15 +362,12 @@ set and recorded; Linux ext4 with dm-crypt versus the own file system in stage
   to steady state (SNIA PTS method), with TRIM state and drive temperature
   recorded. Storage tail metrics have their own noise ceiling
   ([benchmarks.md](benchmarks.md)).
-- **Phase 4 set** (static programs, no threads or io_uring yet): fio with
-  the `psync` engine, 4k random read and overwrite at QD1, 1M sequential
-  write; fsync latency P50/P99/P99.9; a static SQLite in WAL mode; untar of
-  a source tree; metadata microbenchmarks (create, stat, unlink of 1 million
-  small files); plus an in-kernel block benchmark at QD32.
-- **Phase 5 adds** fio with io_uring at QD32, pgbench, and a git checkout and
-  `git status` on a large repository.
-
-See [benchmarks.md](benchmarks.md).
+- **The benchmark set is one table in [benchmarks.md](benchmarks.md)**, not
+  repeated here. Phase 4 has static programs only (no threads or io_uring
+  yet): QD1 is fio's `psync` engine, and QD32 is 32 forked static `psync`
+  processes, run the same way on Linux; SQLite in WAL mode and untar are
+  static binaries. An in-kernel block benchmark at QD32 is tracked against
+  Optimal's own history only, never compared to Linux.
 
 ## Tooling shipped with format version 1
 

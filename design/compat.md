@@ -87,34 +87,39 @@ against Linux" is on the benchmark list.
 ## Milestones and what each needs
 
 Each milestone has a compatibility suite that runs in CI. Its pass rate goes
-on the scorecard, measured as described below. The phase column says where
-the work lands in the [roadmap](../ROADMAP.md).
+on the scorecard, measured as described below. The phase column is the one
+**gating phase** whose done-when requires the suite's target in the
+[roadmap](../ROADMAP.md); work may start earlier where the row says so.
 
 | # | Milestone | Phase | Main pieces | Suite |
 |---|---|---|---|---|
-| 1 | ELF execution | 3 | loader, auxv, vDSO, 64- and 32-bit entry, signal frames | static glibc and static musl binaries (64 and 32 bit), static coreutils, gVisor syscall tests for the implemented calls |
-| 2 | Processes and threads | 3 to 5 | `fork`, `clone`, `wait*`, futexes including `FUTEX_LOCK_PI` and `futex_waitv`, `membarrier`, scheduling policies and affinity ([scheduler.md](scheduler.md)), `pidfd`, `prctl` basics | LTP process and thread tests, kselftest futex, glibc nptl tests, pthread stress |
-| 3 | Memory and signals | 3 to 5 | `mmap` semantics, COW, `mremap`, `madvise`, `userfaultfd` (later), per-thread signal masks, `tgkill`, `sigaltstack`, `SA_RESTART`, `signalfd` | LTP mm and signal tests, glibc and musl test suites, kselftest mm |
-| 4 | Files, `/proc` and `/sys` | 4 to 5 | VFS semantics, durability contract ([storage.md](storage.md)), `inotify`, `fanotify` (read-only uses), `/proc` and `/sys` per the contract below | LTP fs tests, xfstests subset, SQLite crash tests, BusyBox, Python, GCC and git test suites |
-| 5 | Desktop IPC and async I/O | 5 | io_uring, `AF_UNIX` with `SCM_RIGHTS` and `SCM_CREDENTIALS`, abstract sockets inside the app's network namespace, `memfd_create` with seals, `eventfd`, `timerfd`, `epoll`, pipes, pseudo-terminals | dbus-daemon tests, Wayland's test suite (protocol layer), LTP ipc tests |
+| 1 | ELF execution | 3 | loader, auxv, vDSO, 64- and 32-bit entry, signal frames | static glibc and static musl binaries (64 and 32 bit), static coreutils, the single-threaded subset of gVisor's syscall tests for the implemented calls (multi-threaded tests join milestone 2) |
+| 2 | Processes and threads | 5 (starts in 3) | `fork`, `clone`, `wait*`, futexes including `FUTEX_LOCK_PI` and `futex_waitv`, `membarrier`, scheduling policies and affinity ([scheduler.md](scheduler.md)), `pidfd`, `prctl` basics | LTP process and thread tests, kselftest futex, glibc nptl tests, pthread stress |
+| 3 | Memory and signals | 5 (starts in 3) | `mmap` semantics, COW, `mremap`, `madvise`, `userfaultfd` (later), per-thread signal masks, `tgkill`, `sigaltstack`, `SA_RESTART`, `signalfd` | LTP mm and signal tests, glibc and musl test suites, kselftest mm |
+| 4 | Files, `/proc` and `/sys` | 5 (starts in 4a) | VFS semantics, durability contract ([storage.md](storage.md)), `inotify`, `fanotify` (read-only uses), `/proc` and `/sys` per the contract below | LTP fs tests, xfstests subset, SQLite crash tests, BusyBox, Python, GCC and git test suites |
+| 5 | Desktop IPC and async I/O | 5 | io_uring, `AF_UNIX` with `SCM_RIGHTS` and `SCM_CREDENTIALS`, abstract sockets scoped per app, `memfd_create` with seals, `eventfd`, `timerfd`, `epoll`, pipes, pseudo-terminals | dbus-daemon tests, Wayland's test suite (protocol layer), LTP ipc tests |
 | 6 | Containers and sandboxes | 5 | user, mount, PID, network, UTS and IPC namespaces (unprivileged user namespaces included), `pivot_root`, bind mounts, `seccomp` with classic BPF and `RET_ERRNO`/`RET_TRAP`/`RET_USER_NOTIF`, `no_new_privs`, cgroup v2 subset (cpu, memory, pids, io) | `bwrap` running a Steam Runtime container, Chromium's and Firefox's sandbox self-tests, kselftest seccomp and namespaces, Flatpak test suite |
-| 7 | Debugging and profiling | 5 | `ptrace` (policy in [capabilities.md](capabilities.md)), `perf_event_open` (own process, user counters), core dumps (local only) | gdb test suite subset, strace's tests, rr's tests where the CPU supports it |
+| 7 | Debugging and profiling | 5 | `ptrace` (policy in [capabilities.md](capabilities.md)), `perf_event_open` (own process or one held with a debug capability, user-space counters only), core dumps (local only) | gdb test suite subset, strace's tests, rr's tests where the CPU supports it |
 | 8 | Networking | 6 | sockets (TCP, UDP, ICMP for unprivileged ping), `netlink` route and uevent basics, `getaddrinfo` paths | LTP net tests, curl and OpenSSH test suites, a browser's network tests |
-| 9 | Input and devices | 6 | evdev (`/dev/input/event*`), uevent netlink and the `/sys/class` and `/sys/dev/char` layout libudev expects, `hidraw`, `uinput`, `usbfs` for approved devices | libinput test suite, SDL gamepad tests, libusb tests |
+| 9 | Input and devices | 6 | evdev (`/dev/input/event*`), uevent netlink and the `/sys/class` and `/sys/dev/char` layout libudev expects, `hidraw` and `usbfs` for approved devices, `uinput` (input service and compositor; gamepad codes only through the virtual-gamepad portal) | libinput test suite, SDL gamepad tests, libusb tests |
 | 10 | Audio | 6 | ALSA PCM, control and timer interfaces including mmap mode; real-time scheduling for PipeWire through the rtkit portal | alsa-lib tests, PipeWire tests, underrun counts from the benchmark |
-| 11 | Graphics | 7 to 8 | DRM/KMS, GEM, render nodes, dma-buf, `sync_file`, timeline syncobj, the per-driver uAPI of the chosen GPU family, DRM master handed out by the seat service | Mesa's tests, piglit, the Vulkan Conformance Test Suite subset (pass rate published), IGT subset |
-| 12 | Wayland desktop | 7 | everything above plus the seat service, so a compositor, GTK and Qt apps and a browser run | compositor plus GTK and Qt test apps, a browser's test suite |
-| 13 | Wine and Proton | 9 | everything above, 32-bit in full, `modify_ldt`, `/dev/ntsync` (the NT synchronisation driver current Proton uses), `RLIMIT_NOFILE` of at least 524,288 by default (esync), the futex and fd-heavy patterns Proton uses | Wine's conformance tests, the published game list |
+| 11 | Graphics | 8 (starts in 7 with virtio-gpu) | DRM/KMS, GEM, render nodes, dma-buf, `sync_file`, timeline syncobj, the per-driver uAPI of the chosen GPU family, DRM master handed out by the seat service | Mesa's tests, piglit, the Vulkan Conformance Test Suite subset (pass rate published), IGT subset |
+| 12 | Wayland desktop | 7 | milestones 1 to 10, milestone 11's Phase 7 part (KMS, GEM, dma-buf and sync objects on virtio-gpu and simple framebuffers) and the seat service, so a compositor, GTK and Qt apps and a browser run | compositor plus GTK and Qt test apps, a browser's test suite |
+| 13 | Wine and Proton | 9 | everything above, 32-bit in full, Steam's child identities with their declared shared channels and the virtual-gamepad portal ([capabilities.md](capabilities.md)), `modify_ldt`, `/dev/ntsync` (the NT synchronisation driver current Proton uses), `RLIMIT_NOFILE` of at least 524,288 by default (esync), the futex and fd-heavy patterns Proton uses | Wine's conformance tests, the published game list |
 
 Anti-cheat, precisely: **kernel-level** anti-cheat (Valorant's Vanguard, some
 Call of Duty and EA titles) is a Windows kernel driver and won't run; the game
 list says so per title. **User-mode** anti-cheat with official Proton support
-(Easy Anti-Cheat, BattlEye) is a supported target; it probes `/proc`, `ptrace`
-state and kernel identity, so those must look exactly like Linux. Named test
-titles are on the game list.
+(Easy Anti-Cheat, BattlEye) is a supported target. Each named test title on
+the game list has a **probe list**: every `/proc`, `/sys`, `ptrace`-state,
+`uname` and other call its anti-cheat makes, recorded by the differential
+tracer on Linux and pinned. On Optimal each probe must return the same
+normalised result, or be an intended divergence the title is shown to
+tolerate; the probe lists are part of milestone 13's suite (Phase 9).
 
 Phase 12's app story also keeps existing formats working: Flatpak (needs
-milestone 6), AppImage (needs FUSE) and plain tarballs are compatibility
+milestone 6, started by the Flatpak launcher), AppImage (mounted read-only by
+the broker) and plain tarballs are compatibility
 targets in its done-when.
 
 ## `/proc` and `/sys`: a contract, not "basics"
@@ -130,10 +135,15 @@ sanitizers read `/proc/self/status`, glibc reads
   and addresses.
 - A file that isn't implemented doesn't exist (`ENOENT`), never a file with
   a made-up format.
-- **Privacy.** `/proc` is per app: an app sees only its own processes (the
-  equivalent of `hidepid=invisible` plus a per-app PID namespace by default),
-  so it can't read other apps' command lines, environments or memory maps.
-  Kernel pointers are hidden as in the lockdown table.
+- **Privacy.** Each app runs in its own PID namespace, whose PID 1 is a
+  minimal init (it reaps orphans and forwards termination signals, like
+  bwrap's), and `/proc` shows only processes in the viewer's PID namespace
+  and the namespaces below it. So an app can't see or read other apps'
+  command lines, environments or memory maps. System monitors and the
+  terminal's `ps`, `top` and `kill` reach other apps' processes only through
+  the **process portal**, which lists the user's processes with their
+  attested identities and signals one, with the user's grant. Kernel
+  pointers are hidden as in the lockdown table.
 
 ## Measuring compatibility honestly
 
@@ -146,9 +156,10 @@ sanitizers read `/proc/self/status`, glibc reads
   pinned list**. A `TCONF` counts as a fail unless the missing feature is on
   that phase's excused list; excused tests are shown separately and still
   count against the rate.
-- **Targets are fixed now.** Every suite must reach a 90% pass rate (and 100%
-  of its non-excused tests that touch security: capabilities, namespaces,
-  seccomp, ptrace) by the end of the phase in its milestone row. The excused
+- **Targets are fixed now.** Every suite must reach a 90% pass rate, and
+  100% of its tests that touch security (capabilities, identity, namespaces,
+  mounts, seccomp, `ptrace`, `perf_event_open`), by the end of its gating
+  phase. Security tests can never be on an excused list. The excused
   list for a phase is frozen when that phase starts and can only shrink;
   adding to it needs the owner's sign-off, recorded in the change.
 - **Differential testing.** A corpus of programs runs on Linux and Optimal
@@ -156,6 +167,10 @@ sanitizers read `/proc/self/status`, glibc reads
   errno, signal delivery) are compared. A difference is a bug or an intended
   divergence (for example a sandbox denial); each intended divergence is
   listed with the owner's sign-off, and their count is on the scorecard.
+  Every `ENOENT` on Optimal where Linux succeeded is flagged for the file
+  view list ([capabilities.md](capabilities.md)). The list starts with the
+  `/proc/<pid>/fd` reopen cap and the `EXDEV` confinement of directory fds
+  from another identity, both defined in capabilities.md.
 - **Status tables.** CI publishes a per-syscall and per-`ioctl` table:
   implemented, partial (which flags), or not yet, for 64 and 32 bit.
 - **App suites by phase.** Phase 5: coreutils, Python, GCC, git, SQLite.
