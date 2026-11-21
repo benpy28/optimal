@@ -13,6 +13,7 @@ pub mod protocol;
 pub mod rng;
 pub mod scan;
 pub mod sig;
+pub mod tcg;
 #[cfg(test)]
 pub mod testrng;
 pub mod time;

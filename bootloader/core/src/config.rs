@@ -9,6 +9,7 @@
 //! timeout 3
 //! default optimal
 //! kaslr on
+//! report-pcrs off
 //!
 //! entry optimal
 //!   title Optimal
@@ -121,6 +122,8 @@ pub struct Config<'a> {
     pub resolution: Option<(u32, u32)>,
     /// Security version number, for anti-rollback (enforced in a later stage).
     pub svn: u64,
+    /// Print the PCR values after measuring (for tests and audits).
+    pub report_pcrs: bool,
     entries: [Option<Entry<'a>>; MAX_ENTRIES],
     entry_count: usize,
 }
@@ -226,12 +229,13 @@ pub fn parse(text: &[u8]) -> Result<Config<'_>, ConfigError> {
         kaslr: true,
         resolution: None,
         svn: 0,
+        report_pcrs: false,
         entries: [None; MAX_ENTRIES],
         entry_count: 0,
     };
     let mut default_id: Option<(&str, usize)> = None;
     let mut seen_header = false;
-    let mut seen = [false; 5]; // timeout, default, kaslr, resolution, svn
+    let mut seen = [false; 6]; // timeout, default, kaslr, resolution, svn, report-pcrs
     let mut entry_seen = [false; 3]; // title, kernel, cmdline
 
     for (n, raw) in text.split('\n').enumerate() {
@@ -277,7 +281,7 @@ pub fn parse(text: &[u8]) -> Result<Config<'_>, ConfigError> {
             }
         };
         match key {
-            "timeout" | "default" | "kaslr" | "resolution" | "svn" if in_entry => {
+            "timeout" | "default" | "kaslr" | "resolution" | "svn" | "report-pcrs" if in_entry => {
                 return Err(err(line_no, ErrorKind::BadValue));
             }
             "timeout" => {
@@ -316,6 +320,10 @@ pub fn parse(text: &[u8]) -> Result<Config<'_>, ConfigError> {
             "svn" => {
                 once(&mut seen[4])?;
                 cfg.svn = number(value).map_err(|k| err(line_no, k))?;
+            }
+            "report-pcrs" => {
+                once(&mut seen[5])?;
+                cfg.report_pcrs = on_off(value).map_err(|k| err(line_no, k))?;
             }
             "entry" => {
                 if cfg.entry_count > 0 && cfg.entries[cfg.entry_count - 1].unwrap().kernel.is_none()
@@ -418,7 +426,7 @@ mod tests {
     #[test]
     fn parses_a_full_config() {
         let text = format!(
-            "# comment\noptimal-boot-config 1\ntimeout 5\ndefault second\nkaslr off\nresolution 1920x1080\nsvn 7\n\
+            "# comment\noptimal-boot-config 1\ntimeout 5\ndefault second\nkaslr off\nreport-pcrs on\nresolution 1920x1080\nsvn 7\n\
              \nentry first\n  title First one\n  kernel /boot/k1 sha512:{}\n\
              entry second\n  kernel /boot/k2 sha512:{}  \n  cmdline  quiet  loglevel=3\n  module /boot/m1 sha512:{} hello world\n  module /boot/m2 sha512:{}\n",
             h('a'),
@@ -429,6 +437,7 @@ mod tests {
         let c = parse(text.as_bytes()).unwrap();
         assert_eq!(c.timeout, 5);
         assert!(!c.kaslr);
+        assert!(c.report_pcrs);
         assert_eq!(c.resolution, Some((1920, 1080)));
         assert_eq!(c.svn, 7);
         assert_eq!(c.entry_count(), 2);
