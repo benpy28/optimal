@@ -124,6 +124,7 @@ scenario() {
             # say where it died.
             head -n 25 "$log" 2>/dev/null
             echo "[...]"
+            grep -E "KVM internal error|Suberror|emulation failure|extra data" "$log" 2>/dev/null
             tail -n 40 "$log" 2>/dev/null
         fi
     done
@@ -148,7 +149,7 @@ platform_failure() {
     grep -q "Limine" "$log" && where="inside the firmware or Limine, before the kernel ran"
     if grep -q "VM status: paused (internal-error)" "$log"; then
         echo "hypervisor internal error $where"
-    elif grep -q "^EFER=0000000000000000" "$log"; then
+    elif sed -n '/^--- hang report/,$p' "$log" | grep -q "^EFER=0000000000000000"; then
         echo "firmware crashed before entering 64-bit mode"
     fi
 }
@@ -188,7 +189,12 @@ scenario "topo-6-cores-not-pow2" boot "$ISO" bios q35 1G 6,sockets=2,cores=3,thr
 scenario "topo-2-of-8-present" boot "$ISO" bios q35 1G 2,maxcpus=8 30 kvm
 scenario "topo-dies" boot "$ISO" bios q35 1G 8,sockets=1,dies=2,cores=4,threads=1 30 kvm
 scenario "topo-64-cores" boot "$ISO" bios q35 2G 64 30 kvm
-has_uefi && scenario "topo-64-cores-uefi" boot "$ISO" uefi q35 2G 64 30 kvm
+# UEFI with 64 vCPUs runs under TCG: under KVM on the 4-core CI runners
+# (Ubuntu 24.04 OVMF, QEMU 8.2.2, host kernel 7.0) the firmware stops with a
+# KVM internal error at the same OVMF address (RIP 0x7ecffc20/24) on most
+# attempts, three in a row in run 44902042113, long before Limine runs.
+# TCG still boots the kernel with all 64 CPUs on UEFI, without the host bug.
+has_uefi && scenario "topo-64-cores-uefi" boot "$ISO" uefi q35 2G 64 30 tcg
 
 numa2=(-object memory-backend-ram,id=m0,size=1G -object memory-backend-ram,id=m1,size=1G
     -numa node,nodeid=0,cpus=0-1,memdev=m0 -numa node,nodeid=1,cpus=2-3,memdev=m1)
