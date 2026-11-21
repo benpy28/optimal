@@ -35,21 +35,23 @@ The kernel is a Cargo workspace. Tier-0 crates are the only ones allowed
 | Tier-0 crate | Contents |
 |---|---|
 | `core-boot` | entry, early CPU setup, the boot protocol, the SMP start-up trampoline |
-| `core-arch` | GDT/TSS/IDT, interrupt and syscall entry stubs, exception fixup tables, context switch, signal-frame and XSAVE save/restore, CPU feature control, MSR access, microcode loading, the APIC, I/O APIC and timer hardware |
-| `core-mm` | frame allocator, page tables, kernel heap, TLB shootdown, user-copy routines |
-| `core-io` | typed MMIO, port I/O, IRQ and DMA handles, PCI config access and MSI/MSI-X programming, the IOMMU, the raw TPM and ACPI table mappings |
+| `core-arch` | GDT/TSS/IDT, interrupt and syscall entry stubs, exception fixup tables, context switch, signal-frame and XSAVE save/restore, CPU feature control, MSR access, microcode loading, the APIC, I/O APIC and timer hardware, the text-poke shim for trace points ([verification.md](verification.md)) |
+| `core-mm` | frame allocator, page tables, kernel heap, TLB shootdown, user-copy routines, and the one API that installs user page-table entries, which takes a memory-object capability witness (proof target 4) |
+| `core-io` | typed MMIO, port I/O, IRQ and DMA handles, PCI config access and MSI/MSI-X programming (tier 3 writes the other registers on a shared MSI-X page through `mmio_write(handle, offset, width, value)`, never by trapping), the IOMMU, the raw TPM and ACPI table mappings |
 | `core-sync` | spinlocks, sleeping locks, per-CPU data, preemption and IRQ tokens |
-| `core-crypto` | the few primitives that need CPU intrinsics (AES-NI/VAES, SHA extensions, carry-less multiply), behind safe APIs |
+| `core-crypto` | the few primitives that need CPU intrinsics (AES-NI/VAES, SHA extensions, carry-less multiply), behind safe APIs; verified generated code (HACL*/libcrux-derived, fiat-crypto) wherever it exists for the algorithm and instruction set; proof target 14 |
 
 Parsing stays out of tier 0 even when the data comes from hardware: ACPI
 tables, the TPM protocol and its event log, the boot information and device
 descriptors are parsed by safe crates working on byte slices that tier 0
-hands them, so only the mapping is `unsafe`.
+hands them, so only the mapping is `unsafe`. The TPM service is such a safe
+kernel crate and the only holder of `core-io`'s raw TPM access; user space
+reaches the TPM only through the service's broker API.
 
 Everything else (scheduler policy, file systems, network stack, drivers)
 lives in crates whose root says `#![forbid(unsafe_code)]`.
 
-CI enforces, on every change, from Phase 1 (when the kernel is split into
+CI enforces, on every change, from Phase 1a (when the kernel is split into
 these crates; the Phase 0 kernel is one crate with only build, lint and boot
 tests):
 
@@ -78,10 +80,18 @@ tests):
   architecture-independent tier-0 code counts once), including tier-0
   dependencies, reported on the scorecard each build. Inside it, shim code
   (every tier-0 module with `asm!`, a target-specific `cfg` or hardware
-  access; [verification.md](verification.md)) is capped at 3,000 lines and
-  reported separately. Exceeding either cap fails CI until the cap is raised
-  by a written design change explaining why the code can't live outside the
-  core.
+  access; [verification.md](verification.md)) is capped at 3,000 lines,
+  and `core-crypto`, whose intrinsic backends are all shim by that rule, has
+  its own cap of 4,000 lines instead; both are reported separately. The
+  shim estimate per crate, checked against the actual counts on the
+  scorecard: `core-boot` 300, `core-arch` 1,100 (entry stubs, context
+  switch, XSAVE and signal frames, APIC and timer, MSRs, text poke),
+  `core-mm` 250 (CR3, `INVLPG`/`INVPCID`/`INVLPGB`, the user-copy
+  instructions), `core-io` 850 (MMIO and port access, PCI config, MSI-X,
+  VT-d and AMD-Vi register and queue programming, TPM CRB/TIS access),
+  `core-sync` 100; 2,600 in all, leaving 400 lines of headroom. Exceeding
+  any cap fails CI until the cap is raised by a written design change
+  explaining why the code can't live outside the core.
 - **Panic lints everywhere.** `unwrap_used`, `expect_used`, `panic` and
   `indexing_slicing` are denied in tier-0 crates as well as the rest (in
   tier 0 a panic is a crash), with each deliberate panic carrying an
@@ -144,13 +154,22 @@ panic means:
   it can't hold spinlocks. If the count is above 0 (the panic happened in
   core code on that thread), the core's state may be half-updated, so it is
   a kernel crash.
+- **Tier-2 watchdog.** A looping tier-2 thread is stopped without a panic:
+  a forced-preemption IPI parks it at the interrupt return if its depth
+  count is 0, and otherwise sets a park-on-core-exit flag, so it is parked
+  when its outermost core call returns and never inside the core. Core
+  calls a tier-2 thread can make never wait on driver-controlled state
+  without a timeout. A tier-2 thread holding preemption off for 10 ms is a
+  stop event for its component, not a crash. The stop sequence and its
+  fault-injection tests are in [drivers.md](drivers.md) (Phase 4a).
 - **Tier 3:** a process crash, handled like any other.
 
 ## Outside audits
 
 The unsafe core is audited by someone outside the project at the end of Phase 1
 (memory management, boot, interrupts), at the end of Phase 3 (syscall entry,
-user copy, capabilities), and at the end of Phase 4b (IOMMU, DMA and the
-driver boundary from 4a; the TPM service and loader from 4b), then again before 1.0 (Phase 11). Findings and fixes are
+user copy, capabilities), at the end of Phase 4a (the IOMMU, DMA and the
+driver boundary), at the end of Phase 4b (the TPM service, the loader and the
+core's changes since Phase 3), then again before 1.0 (Phase 11). Findings and fixes are
 published. Each audit is a done-when item of its phase; arranging one needs
 money or a volunteer, which is listed as an owner need in the roadmap.

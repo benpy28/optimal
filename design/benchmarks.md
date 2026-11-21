@@ -11,7 +11,7 @@ out and never filled in by hand.
 | Source | Used for | Not used for |
 |---|---|---|
 | **Dedicated bare-metal machines** (the reference PCs below, configured as self-hosted CI runners) | every comparison with Linux; the regression gate | — |
-| KVM on a dedicated host | trend lines between bare-metal runs | claims against Linux |
+| KVM on a dedicated host | trend lines between bare-metal runs (virtio-gpu graphics is trend-only); the Phase 1 clock-drift gate ([scheduler.md](scheduler.md)) | claims against Linux |
 | GitHub-hosted runners (shared VMs) | functional tests only: does it build, boot, pass tests | any performance number |
 | TCG (QEMU without KVM) | functional tests only | any performance number |
 
@@ -31,46 +31,79 @@ drives UEFI HTTP or PXE boot of the build under test, a power relay, and a
 serial line; results come back over serial with a per-record checksum (a
 record with a bad checksum is discarded and the run repeated), and a
 watchdog power-cycles the machine when no record arrives within the run's
-stated time limit. Only commits a maintainer has approved run on the rig; the
+stated time limit. From Phase 2 the controller also carries a GPS receiver
+and drives its PPS pulse onto each machine's UART DCD pin, the reference for
+the bare-metal clock-drift test ([scheduler.md](scheduler.md)). Only commits
+a maintainer has approved run on the rig; the
 rig sits on an isolated VLAN with no route to anything else and holds no
 secrets (no signing keys, no tokens with write access).
 
 ## The regression gate
 
 - **Locked machine state**, recorded with every result: CPU model, microcode
-  revision, firmware version, fixed energy-performance preference, turbo and
-  SMT state (the shipped default per CPU model, [scheduler.md](scheduler.md)),
-  THP mode, the isolated benchmark cores (the `isolcpus=` set in
-  [scheduler.md](scheduler.md), from Phase 2), and the exact kernel builds.
+  revision, firmware version, energy-performance preference, frequency
+  setting, SMT state (the shipped default per CPU model,
+  [scheduler.md](scheduler.md)), THP mode, the isolated cores, and the exact
+  kernel builds. Microbenchmarks (the per-change tier) run with turbo off,
+  HWP or CPPC minimum = maximum = 80% of guaranteed performance, and the
+  `isolcpus=` set from [scheduler.md](scheduler.md), on both kernels. Every
+  desktop, real-time-latency and throughput metric runs on the default boot:
+  shipped frequency defaults (same energy-performance preference on both
+  kernels) and no isolated CPUs, because that is what users run. Hardware
+  P-state control (Phase 2) is a precondition of every comparison with
+  Linux, from the Phase 4a storage set on. KASLR stays on in benchmark
+  builds (the shipped configuration); the between-boot variance it adds is
+  part of the measured noise.
 - **SMIs are counted.** Every run reads the SMI count before and after
   (`MSR_SMI_COUNT` on Intel; the SMIs-received core PMC event on AMD).
   Microbenchmark runs during which an SMI arrived are discarded and rerun,
   and the discard count is published; if more than 5% of a metric's runs are
   discarded the machine is flagged and its firmware settings are fixed.
   Tail-latency and zero-event runs keep every sample and publish the SMI
-  count, because SMIs hit both kernels and real users alike.
+  count, because SMIs hit both kernels and real users alike. The latency
+  tracer excludes SMI-overlapped sections from the 50 µs gate and publishes
+  their count ([scheduler.md](scheduler.md)).
 - **Interleaved A/B boots.** The base build and the candidate build boot
   alternately on the same machine, so drift affects both equally, and each
   boot runs several repetitions of each metric. Boot-to-boot variation
   (physical memory layout, cache colouring) is larger than run-to-run, so the
   statistics treat the boot as a random effect: the bootstrap resamples
   whole boots, then runs within each resampled boot, and SE(diff) below is
-  that hierarchical estimate.
+  that hierarchical estimate. Intervals use Student's t with (boots per
+  build − 1) degrees of freedom, or a BCa bootstrap; either needs at least
+  20 boots per build, because a cluster bootstrap over fewer boots gives
+  intervals that are too narrow.
 - **Runs per metric come from measured noise.** The number of boots and runs
   per boot for each metric is computed from its between-boot and within-boot
   variance over the last 20 base-build boots, as the smallest that gives
-  SE(diff) ≤ 0.2%, with at least 10 boots and 30 runs per build. At
-  SE(diff) = 0.2% and the strictest Holm level of a run with up to 50
-  metrics (z = 3.3), the corrected-CI branch below detects a true 2%
-  regression with at least 90% probability (a run with more metrics lowers
-  the SE target to keep that); each metric's achieved SE(diff) and power at
-  2% are published with its result.
-- **Time budget per tier.** Each change: at most 45 minutes of rig time per
-  machine. Nightly: at most 8 hours. Weekly and each release: the 24-hour
-  zero-event runs and the soak. If the budget caps a metric's runs before it
-  reaches SE(diff) ≤ 0.2%, its achieved power is published as below target.
-- **Decision rule.** A change fails the gate on a metric when the bootstrap
-  confidence interval of the difference, Holm–Bonferroni corrected for the
+  SE(diff) ≤ 0.18%, with at least 3 runs in each of at least 20 boots per
+  build. At SE(diff) = 0.18% and the strictest Holm level of a run with up
+  to 50 metrics (two-sided 0.001, t with 19 degrees of freedom = 3.88), the
+  corrected-CI branch below detects a true 2% regression with 92%
+  probability (noncentral t; 84% at 0.20%, which is why the target is
+  0.18%); a run with more metrics lowers the SE target to keep at least 90%.
+  At the noise ceilings below (between-boot CoV 0.4%, run-to-run CoV 1%),
+  20 boots of 7 runs per build give SE(diff) = 0.17%. Each metric's achieved
+  SE(diff) and power at 2% are published with its result.
+- **Machine-hours budget.** Every machine is scheduled under 168 hours a
+  week, and the plan is published. The reference desktop comes as two
+  identical units. Unit 1 (gate): the per-change tier runs per merge batch
+  (the changes merged since the last gate run; a failing batch is bisected
+  in the slack), at most 60 minutes per batch (40 boots of at most 90 s:
+  POST and netboot at most 30 s, measured and recorded, and at most 60 s of
+  runs), at most 10 batches a day = 70 h; nightly at most 8 h a day = 56 h;
+  the release input-latency P99.9 run, 13 h 20 min; total 139 h 20 min,
+  with the remaining 28 h 40 min for reruns and bisection. Unit 2 (long
+  runs): the 128-frame audio runs idle and under load, 48 h; the 64- and
+  256-frame audio runs, one size per week in alternation, 48 h; the soak,
+  24 h; release power runs, at most 12 h; total 132 h. In a release week
+  the alternating audio slot runs matched Linux at 128 frames instead.
+  The other reference machines run the release tiers only, each under the
+  same 168 h cap. If the budget caps a metric's runs before it reaches
+  SE(diff) ≤ 0.18%, its achieved power is published as below target.
+- **Decision rule.** A change fails the gate on a metric when the
+  confidence interval of the difference (t or BCa, as above),
+  Holm–Bonferroni corrected for the
   number of metrics in the run, lies entirely beyond 1% worse; or, only for
   a metric whose SE(diff) satisfies 2% ≥ 4 × SE(diff), when the median
   difference is more than 2% worse. For any other metric only the corrected
@@ -78,17 +111,22 @@ secrets (no signing keys, no tokens with write access).
   fires on noise. Either way an automatic rerun must reproduce it (its own
   median difference more than 1% worse), so tracking more metrics doesn't
   make false alarms more common.
-- **Cumulative budget.** Small regressions that each pass the gate still
-  add up, so each release is also compared with the last release: no tracked
-  metric may be more than 3% worse in total, and the geometric mean of the
-  desktop set may not be worse at all.
+- **Cumulative budget (release rule).** Small regressions that each pass
+  the gate still add up, so each release is also compared with the last
+  release: for every tracked metric the one-sided 95% upper bound of the
+  difference is at most 3% worse, and for the geometric mean of the desktop
+  set it is at most 0.5% worse. (A point-estimate "not worse at all" rule
+  would fail about half the time on two equal kernels.)
 - **Which runs gate what.** Each change: microbenchmarks (core kernel costs).
-  Nightly: tail latencies and the responsiveness set. Weekly and each
-  release: the 24-hour zero-event runs (audio underruns). Each release:
+  Nightly: tail latencies, the real-time wake-up target and the
+  responsiveness set. Weekly and each release: the 24-hour zero-event runs
+  (audio underruns). Each release:
   power, battery and the long soak. A nightly, weekly or release failure
   blocks the next release until it is fixed or the change is reverted.
 - **Noise ceiling.** Each metric must have a run-to-run coefficient of
-  variation of at most 1% on its machine; tail percentiles at most 5%, with
+  variation of at most 1% and a between-boot coefficient of variation (of
+  per-boot means) of at most 0.4% on its machine; tail percentiles at most
+  5% run-to-run, with
   at least 10^5 samples per run for a P99.9 (input latency, where the rig
   limits the event rate, follows the rule below). If the harness can't get
   under that, the harness gets fixed; the gate is never widened to fit the
@@ -98,18 +136,22 @@ secrets (no signing keys, no tokens with write access).
   second. The gate is on **P99 per run**, each run at least 10^4 events
   (about 10 minutes). **P99.9** is computed from at least 10^5 events pooled
   across at least 10 runs (about 1 hour 40 minutes per configuration), with a
-  bootstrap CI that resamples runs. Hours per gate, for 4 load conditions
-  (idle, full CPU load, background copy or compile, memory pressure) on
-  Optimal and matched Linux: nightly P99, 8 runs, about 1 hour 20 minutes;
-  each release, P99.9, about 13 hours 20 minutes.
+  bootstrap CI that resamples runs. Each ratio (loaded against idle, and
+  Optimal against matched Linux) is judged by the bootstrap CI of the ratio,
+  never by single values. Hours per gate, for 4 load conditions (idle, full
+  CPU load, background copy or compile, memory pressure) on Optimal and
+  matched Linux: nightly P99, at least 3 runs per condition per kernel,
+  24 runs, about 4 hours; each release, P99.9, 10 runs per condition per
+  kernel, about 13 hours 20 minutes.
 - **Direction and normalisation.** Every metric states whether lower or
   higher is better and what it is normalised by (per operation, per second,
   per watt). Count metrics with a zero target (underruns, dropped frames,
   lock-order reports) are pass or fail and are not part of any geometric
   mean.
-- **Zero-event targets** need at least 24 hours of runtime per configuration
-  (for audio, per buffer size), and the scorecard publishes the 95% upper
-  bound on the event rate, not just "0 seen".
+- **Zero-event targets** are stated as "0 observed in at least 24 hours per
+  configuration (for audio, per buffer size and load condition), 95% upper
+  bound on the rate at most 0.125 per hour"; the scorecard publishes the
+  upper bound, not just "0 seen".
 
 ## The Linux baseline
 
@@ -122,9 +164,18 @@ secrets (no signing keys, no tokens with write access).
   (`nosmt` on CPUs where Optimal ships SMT off, [scheduler.md](scheduler.md)),
   the same IOMMU mode (strict), the same energy-performance preference, and
   the same THP mode (`transparent_hugepage=never` until Optimal's THP lands
-  in Phase 5, then `always` with `defrag=madvise`, so neither kernel compacts
-  on fault). "Beats Linux" claims are made against
+  in Phase 5, then `always` with `defrag=defer`, so neither kernel compacts
+  on fault, [scheduler.md](scheduler.md)), the frequency settings and
+  `isolcpus` use of the locked machine state above, and usable RAM
+  equalised as measured where a test limits memory. "Beats Linux" claims are made against
   **matched**; stock is shown for context.
+- **Phase 7 graphics baseline.** Until the reference GPU's driver exists
+  (Phase 8), frame time and input-to-display latency are gated on the bare
+  metal reference desktop with llvmpipe over the firmware's simple
+  framebuffer, against Linux booted with `nomodeset` (simpledrm plus
+  llvmpipe) and the same compositor. Neither has vblank there, so both
+  compositors pace from a 60 Hz timer and frame time is the interval between
+  completed framebuffer updates.
 - **Pinned user space.** Linux runs a pinned distribution image (Debian
   stable, from a dated snapshot archive, recorded per scorecard release), so
   the kernel is the only variable. The desktop for desktop metrics is
@@ -145,18 +196,23 @@ secrets (no signing keys, no tokens with write access).
 - The **desktop set** (responsiveness table below plus app launch and idle
   power) is frozen and versioned before Phase 5. Changing it is a reviewed
   change and starts a new trend line.
-- Optimal **beats Linux** on a machine when: every desktop metric is at
-  parity or better (parity means the 95% confidence interval of the
-  difference includes zero and is no wider than ±2%), the geometric mean of the
-  desktop set is ahead, and no single desktop metric is more than 5% worse.
-  Winning "most" metrics doesn't count.
-- On server-style throughput the aim is to stay within 5% of matched Linux,
-  and the scorecard says which workloads are which.
+- Optimal **beats Linux** on a machine when every desktop metric is at
+  parity or better and the geometric mean of the desktop set is better.
+  Parity: the 95% confidence interval of the difference, Holm-corrected
+  across the desktop set, lies within ±2%. Better: that corrected interval
+  lies entirely on the better side of zero. Winning "most" metrics doesn't
+  count.
+- On server-style throughput the aim is that the worse end of each
+  corrected interval is within 5% of matched Linux, and the scorecard says
+  which workloads are which.
 
 ## Reference hardware
 
-- **Reference desktop:** recent Intel hybrid CPU (P and E cores), 8+ cores,
-  discrete GPU from the family chosen in Phase 8, NVMe.
+- **Reference desktop, two identical units** (gate and long runs, above):
+  recent Intel hybrid CPU (P and E cores), 8+ cores, NVMe, and a discrete
+  GPU whose exact model is fixed and recorded before the desktop set
+  freezes (before Phase 5), so the locked machine state doesn't change
+  afterwards; the Phase 8 GPU driver targets that model.
 - **Reference AMD desktop:** dual-CCD X3D CPU (tests the cache-die policy).
 - **Reference laptop:** mainstream, on battery, with a TPM and IOMMU.
 - **Reference old PC:** around 2012, 4 GiB, no IOMMU (tests hardware tier
@@ -166,8 +222,8 @@ secrets (no signing keys, no tokens with write access).
   online, NUMA is tested for function only (QEMU NUMA topologies, including
   a memoryless node) and every NUMA performance entry is "not yet measured".
 - **Benchmark controller host** (the rig above): one controller with a power
-  relay and serial line per machine under test, needed with the first
-  dedicated runner in Phase 2.
+  relay, a serial line and a GPS-disciplined PPS output wired to the DCD pin
+  per machine under test, needed with the first dedicated runner in Phase 2.
 - Each is listed by exact model, CPU, microcode, RAM, storage and firmware
   version on the scorecard.
 - **Input-latency rig:** a microcontroller that acts as a USB HID device and
@@ -175,7 +231,8 @@ secrets (no signing keys, no tokens with write access).
   microcontroller at 0.1 ms resolution or better, at the event rate and run
   sizes in "Input latency" above. Needed by Phase 7 (owner need).
 - The desktop is needed from Phase 1 (real-hardware boot) and as a
-  dedicated runner from Phase 2, with the controller host; the multi-node
+  dedicated runner from Phase 2, with the controller host; its second unit
+  by Phase 6 (the first 24-hour audio runs); the multi-node
   machine as soon as it can be had; the rest by Phase 5. These are owner
   needs.
 
@@ -189,14 +246,14 @@ trend line at most, never a claim.
 
 | Metric | Target (reference desktop) | From |
 |---|---|---|
-| Wake-up latency of a real-time thread with all cores saturated | P99 < 50 µs, P99.9 < 100 µs | 2 |
-| Longest preempt-off or IRQ-off section | < 50 µs (20 µs from Phase 10) | 2 |
-| Audio underruns at 128 frames, 48 kHz, under full CPU and I/O load | 0 per hour (also reported at 64 and 256 frames) | 6 |
+| Wake-up latency of a real-time thread with all cores saturated (default boot, no isolated CPUs). Load in Phase 2: a spinning thread per CPU plus IPI and timer storms; from Phase 5: hackbench, a pinned compile, fio on NVMe and memory pressure together | P99 < 50 µs, P99.9 < 100 µs | 2 (re-gated at 5 and 7, then nightly) |
+| Longest preempt-off or IRQ-off section, excluding SMI-overlapped sections (counted and published) | < 50 µs (20 µs from Phase 10) | 2 |
+| Audio underruns at 128 frames, 48 kHz, under full CPU and I/O load | 0 observed in ≥ 24 h, 95% upper bound ≤ 0.125 per hour (also reported at 64 and 256 frames) | 6 |
 | Input-to-display latency under full CPU load | P99 per run no more than 1.5 times its idle P99 (nightly gate); pooled P99.9 no more than 1.5 times its idle P99.9 (release gate); both no worse than matched Linux | 7 |
-| Frame time P99 in the frame-pacing test at 60 Hz (virtio-gpu and llvmpipe, against Linux on the same graphics stack) | ≤ refresh period + 1 ms | 7 |
+| Frame time P99 in the frame-pacing test at 60 Hz (bare metal, llvmpipe over simple framebuffer, against Linux booted `nomodeset` with simpledrm and llvmpipe; virtio-gpu trend-only) | ≤ refresh period + 1 ms | 7 |
 | Frame time P99 at 144 Hz on the reference discrete GPU | ≤ refresh period + 1 ms | 8 |
 | Foreground input latency P99 while a large copy or compile runs | ≤ 1.25 times idle | 7 |
-| Memory pressure test (`mem=8G`, 50 browser pages and a compile, [scheduler.md](scheduler.md)) | input latency P99 ≤ 1.5 times idle; frame time P99 ≤ refresh period + 2 ms; 0 OOM kills of the foreground app or the compositor; each no worse than matched Linux | 7 |
+| Memory pressure test (8 GiB usable RAM as measured, 50 browser pages and a compile, [scheduler.md](scheduler.md)) | input latency P99 ≤ 1.5 times idle; frame time P99 ≤ refresh period + 2 ms; 0 OOM kills of the foreground app or the compositor; each no worse than matched Linux | 7 |
 | Boot time, firmware handoff to kernel ready | < 300 ms (a Phase 1 done-when item) | 1 |
 | Total OS memory at an idle desktop (Phase 7 done-when) | ≤ 60% of the lightest mainstream Linux desktop on the same machine | 7 |
 | Idle CPU over the defined window (Phase 7 done-when) | ≤ matched Linux and < 0.5% | 7 |
@@ -207,11 +264,11 @@ trend line at most, never a claim.
 | Metric | Reported as | What it shows | From |
 |---|---|---|---|
 | Input-to-display latency | P50, P99, P99.9 | how quickly a key press or mouse move reaches the screen | 7 |
-| Frame time | P50, P99, variance | consistency of frame pacing, idle and under load | 7 (60 Hz, virtio-gpu and llvmpipe), 8 (144 Hz, discrete GPU) |
-| Audio underruns | per hour at 64, 128 and 256 frames (48 kHz), idle and under load | real-time scheduling quality | 6 |
+| Frame time | P50, P99, variance | consistency of frame pacing, idle and under load | 7 (60 Hz, bare metal llvmpipe over simple framebuffer), 8 (144 Hz, discrete GPU) |
+| Audio underruns | count and 95% upper bound per hour at 64, 128 and 256 frames (48 kHz), idle and under load | real-time scheduling quality | 6 |
 | Scheduling latency under saturation | P99, P99.9 wake-up latency of a real-time thread | whether interactive work cuts through a full system | 2 |
 | Foreground responsiveness during background I/O | input latency and app launch time while a large copy or compile runs | whether background work makes the desktop feel slow | 7 |
-| Memory pressure | input latency P99, frame time and OOM kills with `mem=8G`, 50 pages from a pinned offline corpus and a pinned compile ([scheduler.md](scheduler.md)); target above | the biggest real cause of stutter | 7 |
+| Memory pressure | input latency P99, frame time and OOM kills with 8 GiB usable RAM, 50 pages from a pinned offline corpus and a pinned compile ([scheduler.md](scheduler.md)); target above | the biggest real cause of stutter | 7 |
 | App launch time | cold and warm, P50/P99 | first impression speed | 5 |
 
 ## Core kernel costs
@@ -253,6 +310,7 @@ of matched Linux".
 | fio `psync`, 1M sequential write, QD1 | yes | 4a |
 | fio `psync`, 4k random read and 4k random overwrite at QD32, as 32 forked static `psync` processes (fio's default process mode, `numjobs=32`) | yes | 4a |
 | fsync latency P50, P99, P99.9 | yes | 4a |
+| fsync latency P50, P99, P99.9 of a 4 KiB file while a background writer streams 1M sequential writes | yes | 4a |
 | SQLite in WAL mode, static binary (insert and point-query mix) | yes | 4a |
 | untar of a pinned source tree, static binary | yes | 4a |
 | metadata: create, stat, unlink of 1 million small files | yes | 4a |
@@ -260,7 +318,7 @@ of matched Linux".
 | fio `io_uring`, 4k random read and overwrite at QD32 | yes | 5 |
 | pgbench | yes | 5 |
 | git checkout and `git status` on a pinned large repository | yes | 5 |
-| the whole set above, rerun on a per-user home volume ([storage.md](storage.md)) | yes (Linux: ext4 on dm-crypt over `dm-linear` with the same extents) | 5 |
+| the whole set above, rerun on a per-user home volume ([storage.md](storage.md)); each entry within 10% of the same entry on the system volume path | yes (Linux: ext4 on dm-crypt over `dm-linear` with the same extents) | 5 |
 
 Power is reported next to every throughput result (RAPL package power where
 the CPU has it), so a win bought with extra watts is visible.
@@ -310,10 +368,21 @@ is on in the image people actually download:
   disk encryption stage, side-channel mitigations) and the measured cost of
   each.
 - Microcode revision and the mitigation chosen per CPU vulnerability.
+- Named exposures per machine (boot DMA window, remote DMA exposure, SMT on
+  affected CPUs), the ATS-enabled devices and their firmware (part of the
+  trusted base), and the B2 anti-rollback scope: "holds against OS-level
+  attackers only" (against physical attackers only with owner keys).
+- The Argon2id parameters chosen on each reference machine
+  ([storage.md](storage.md)).
+- Measured bandwidth of each covert channel between apps (covert channels
+  are out of scope; the overt-channel list is tested,
+  [threat-model.md](threat-model.md)).
 - The tough-conditions and Secure Boot attack results.
 - Fuzzing hours and executions per target, and open crash bugs found by
   fuzzing.
 - Proof targets with their assurance level ([verification.md](verification.md)).
-- Lines in tier-0 crates against the cap, and the unsafe-block count.
+- Lines in tier-0 crates against the cap, the unsafe-block count, and the
+  compositor's own lines against its 60,000-line cap (Mesa listed
+  separately with its exposure).
 - Driver-interrupt maskings and driver restarts seen in the soak.
 - Open security bugs by severity.

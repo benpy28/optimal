@@ -15,10 +15,28 @@ audio keeps up under load. This file is the design that the targets in
 - **Bounded non-preemptible sections.** No section with preemption or
   interrupts disabled may last longer than **50 µs** on the reference
   desktop. A built-in tracer (always compiled in) records the longest
-  sections. When off, each trace point is a patched-out jump (a no-op until
-  the tracer is switched on); its cost when off is at most 0.5% on the
+  sections. When off, each trace point is a 5-byte no-op; switching the
+  tracer on or off rewrites trace points between exactly two precompiled
+  states (no-op and jump to the trace stub), never any other bytes. The
+  rewrite is the core's text-poke path: the target page is mapped writable
+  only at a temporary private address on the poking CPU, the first byte is
+  replaced with `int3`, every CPU is synchronised by IPI with a serialising
+  instruction, the remaining bytes are written, a second IPI round runs,
+  then the first byte is written and a third round runs (the
+  cross-modifying-code protocol of the Intel SDM Vol. 3A §8.1.3). Direct-map
+  aliases of kernel text are read-only, so kernel text is never writable at
+  two addresses. The mechanism is covered by
+  [verification.md](verification.md) target 1 and listed in the shim
+  inventory; lockdown permits only the two precompiled states. Its cost when
+  off is at most 0.5% on the
   syscall round-trip microbenchmark against a build with the tracer compiled
-  out, a Phase 3 gate ([benchmarks.md](benchmarks.md)). In virtual machines
+  out, a Phase 3 gate ([benchmarks.md](benchmarks.md)). The tracer reads the
+  SMI count (`MSR_SMI_COUNT` on Intel, the SMIs-received PMC event on AMD) at
+  the entry and exit of each section; sections an SMI overlapped are
+  firmware time, so they are reported separately with their count published
+  and excluded from the 50 µs gate. MMIO reads with interrupts off are not
+  allowed ([drivers.md](drivers.md)), so a removed device's completion
+  timeout (range A, at most 10 ms) can't stall an interrupts-off section. In virtual machines
   the host can stall a vCPU at any moment, so there the tracer only reports;
   the limit is enforced (CI fails above it) on the bare-metal reference
   machines, which run the stress suites nightly from Phase 2. The target
@@ -66,12 +84,17 @@ thread on that CPU.
   share, not 200 threads' worth.
 - **Benchmark core isolation** (Phase 2). The boot option `isolcpus=<set>`
   removes those CPUs from load balancing, from unbound kernel threads and
-  timer migration, and from the default destination of device interrupts
-  (I/O APIC and MSI destinations go to the other CPUs; interrupt remapping
-  enforces it); they run tickless when they have one thread. Only threads
-  placed there by affinity run on them. The benchmark harness uses it from
-  Phase 2, and matched Linux uses `isolcpus=domain,managed_irq,<set>
-  nohz_full=<set>` with the same set.
+  timer migration, and from the default destination of device interrupts:
+  the kernel programs every I/O APIC and MSI destination to the other CPUs
+  and rejects affinity changes that would add an isolated CPU (a Phase 2
+  test counts interrupts per CPU and requires 0 on isolated CPUs). They stop
+  their tick when they run one thread (the single-thread tick stop below,
+  Phase 2). Only threads placed there by affinity run on them. The harness
+  uses it only for the per-change microbenchmark tier; every desktop,
+  real-time-latency and throughput metric runs on the default boot with no
+  isolated CPUs ([benchmarks.md](benchmarks.md)). For that tier matched
+  Linux uses `isolcpus=domain,managed_irq,<set> nohz_full=<set>` with the
+  same set.
 - **Affinity** (`sched_setaffinity`) and `sched_yield`, `nice`,
   `getpriority`/`setpriority`, `sched_getattr`/`sched_setattr` are all
   implemented with Linux semantics (Phase 5).
@@ -124,22 +147,36 @@ thread on that CPU.
   checks, switches to that source and logs it. Timer events use the LAPIC
   TSC-deadline mode, falling back to LAPIC one-shot, then HPET, then the
   PIT. The drift test measures against an independent reference only, never
-  the calibration source: on KVM against the host's `CLOCK_MONOTONIC_RAW`
-  read over virtio-serial (under 1 ppm over 10 minutes, the Phase 1 gate),
-  and on bare metal against a PPS or NTP reference (the result is the board
+  the calibration source. On KVM (the Phase 1 gate: under 1 ppm over
+  10 minutes) QEMU runs with an explicit `tsc-frequency`, which the guest
+  reads from CPUID 0x15; once a second the kernel writes its clock reading
+  as a line on the 16550 UART (polled, no DMA), and a host-side program
+  timestamps each line's arrival with `CLOCK_MONOTONIC_RAW`; drift is the
+  slope of a least-squares fit of guest time against host time, so serial
+  latency jitter averages out. On bare metal (Phase 2, when the rig exists)
+  the controller host, disciplined by a GPS receiver, drives a PPS pulse
+  onto the UART's DCD pin; the kernel timestamps each DCD edge from the
+  modem-status interrupt and fits the same slope (the result is the board
   crystal's error, which no kernel can remove without an outside reference;
   published, and at most 50 ppm).
 - **High-resolution timers and a tickless kernel** are part of the Phase 2
   design, not Phase 10: timers are kept in per-CPU structures with
   nanosecond expiry on the timer event source above, and an idle CPU takes
-  no periodic tick. A CPU running one thread can also stop its tick (adaptive
-  tick) once Phase 10 tunes it.
-- **Frequency control before any real-hardware comparison.** In Phase 2,
-  before the first bare-metal benchmark against Linux, Optimal enables hardware
-  P-states (Intel HWP, AMD CPPC) and sets the same energy-performance
-  preference as the Linux baseline. Otherwise every comparison measures the
-  firmware's default frequency, not the kernel. Idle states beyond C1 (with
-  an idle governor) come in Phase 10, along with suspend.
+  no periodic tick. A CPU running one thread also stops its tick
+  (single-thread tick stop, Phase 2), keeping one timer for that thread's
+  slice end and RT throttle; a Phase 2 test runs one spinning thread on a
+  CPU for 10 s and requires at most 10 timer interrupts there. Phase 10
+  only tunes it.
+- **Frequency control** (Phase 2). Optimal drives hardware P-states (Intel
+  HWP, AMD CPPC) from Phase 2; it is a precondition of every comparison
+  with Linux, from the Phase 4a storage set on. Otherwise a comparison
+  measures the firmware's default frequency, not the kernel. Microbenchmarks
+  run with turbo off and HWP (or CPPC) minimum = maximum = 80% of the CPU's
+  guaranteed performance, on both kernels (Linux: `intel_pstate` or
+  `amd_pstate` active mode, `no_turbo`, and the same min/max).
+  Desktop, real-time-latency and throughput metrics run at shipped defaults,
+  with the same energy-performance preference on both kernels. Idle states
+  beyond C1 (with an idle governor) come in Phase 10, along with suspend.
 
 ## Memory management performance
 
@@ -167,8 +204,11 @@ explicit:
   that receives one switches to the kernel-only page table and leaves the
   set. A CPU leaves the set otherwise only when it loads another address
   space's CR3; translations it still holds under an unloaded PCID are covered
-  by the generation rule above. This set is exactly what
-  [verification.md](verification.md) target 1s means by "may cache".
+  by the generation rule above. [verification.md](verification.md) target 1s
+  states the property as "no CPU can use a stale translation", with two
+  obligations at each unmap: every CPU in the may-cache set has
+  acknowledged, and every other PCID slot holding that address space has a
+  generation older than the unmap, so reloading it flushes.
 - **TLB: shootdown paths.** Remote shootdowns are batched per unmap
   operation. The IPI path lands in Phase 2 and the INVLPGB path in Phase 5.
   Without INVLPGB, the initiator sends an IPI to every other CPU in the set
@@ -192,8 +232,10 @@ explicit:
 - **Huge pages** (Phase 5). Transparent huge pages for anonymous memory on
   fault where the region is aligned and large enough, plus background
   collapse; a fault never waits for compaction (if no 2 MiB frame is free it
-  maps 4 KiB and leaves the region to background collapse), the same as
-  Linux's `always` with `defrag=madvise`. Page cache huge folios for large
+  maps 4 KiB and leaves the region to background collapse), including in
+  `MADV_HUGEPAGE` regions. That matches Linux's `always` with
+  `defrag=defer` (`madvise` would compact directly in `MADV_HUGEPAGE`
+  regions), which matched Linux uses. Page cache huge folios for large
   files in Phase 10.
 - **Reclaim.** A multi-generation LRU style reclaim with refault detection
   (pages that come back soon after eviction were evicted wrongly, and the
@@ -211,7 +253,10 @@ explicit:
   latency against core count (Phase 2); 4 KiB fault cost, mmap/munmap and
   page-fault scaling across cores (Phase 3); 2 MiB fault cost (Phase 5); and a memory pressure test in
   Phase 7, when there is a desktop and a browser to run: the machine is
-  limited to 8 GiB (`mem=8G` on both kernels), a browser opens 50 pages from
+  limited to 8 GiB of usable RAM on both kernels (frames handed to the page
+  allocator, measured after boot and published; each kernel's limit option
+  is tuned until it is within 1% of 8 GiB, because `mem=` caps the top
+  physical address, not usable RAM), a browser opens 50 pages from
   a pinned offline corpus served locally, and a pinned compile runs
   alongside, measuring input latency P99, frame time and OOM kills while it
   runs, against the memory-pressure target in
@@ -224,10 +269,16 @@ driver's handler thread, which runs under the scheduler like any other thread.
 A driver's real-time threads may use at most 5% of a CPU per 100 ms window
 (the cap in [drivers.md](drivers.md)); past that they drop to the fair class
 until the window ends. So a driver over budget is slowed by the scheduler
-(it gets its share and no more) rather than by masking its interrupt, which would cause audio underruns
-or I/O timeouts. Interrupt masking is reserved for genuine storms (the
-per-class limits over 10 ms windows in [drivers.md](drivers.md)) and is
-reported on the scorecard whenever it happens.
+(it gets its share and no more) rather than by masking its interrupt,
+which would cause audio underruns or I/O timeouts. Interrupt masking is
+reserved for genuine storms (the per-class limits over 10 ms windows in
+[drivers.md](drivers.md)) and is reported on the scorecard whenever it
+happens. A looping tier-2 thread is stopped by the driver watchdog through
+the scheduler: a forced-preemption IPI, then the thread is parked only if
+its core-call depth is 0, otherwise it is flagged to park on core exit
+(core calls are bounded); a tier-2 thread that stays preempt-off for 10 ms
+is a stop event, not a crash ([drivers.md](drivers.md); Phase 4a test with
+a loop inside a core call).
 
 ## Proof and test obligations
 
@@ -241,10 +292,12 @@ reported on the scorecard whenever it happens.
   abstract clock; property tests run in QEMU. (No thread runs on two CPUs is
   guaranteed by the core's move-only `RunnableThread`, not by this check.)
 - Target 7 at level B in Phase 2 covers the scheduler's CPU accounting only
-  (the RT throttle and the driver real-time cap above); memory and interrupt
-  budgets join it in Phase 4a.
+  (the RT throttle); it is extended at 4a, when drivers exist, to the driver
+  real-time cap above and to memory and interrupt budgets.
 - Phase 2 tests: priority-inheritance chains (nested and across classes),
   capacity-aware placement on a simulated hybrid topology, tickless idle
-  (no periodic tick on an idle CPU over 10 s) and timer expiry accuracy.
+  (no periodic tick on an idle CPU over 10 s), single-thread tick stop and
+  isolated-CPU interrupt counts (above), timer expiry accuracy, and the
+  bare-metal PPS drift test.
 - The latency tracer and the stress suite run in every CI boot from Phase 2
   (report-only in VMs, enforced on bare metal, as above).

@@ -90,66 +90,133 @@ produces them for removed devices and network file systems.
   identity, or under a child identity (below) whose grants are a subset of
   its own. The hostile-process suite tries to forge an identity by every
   `clone`, `execve` and portal path (Phase 5).
-- **Where identities come from:** a signed manifest (the Optimal app format,
-  Phase 12); a Flatpak app (below); for an unpackaged program launched from
-  the desktop, an identity of **path + SHA-256 of the executable's
-  contents**, with the default profile below; for a program run from a
-  terminal, the terminal's identity. When an unpackaged program's hash
-  changes, its grants reset to the default profile, so replacing a granted
-  binary in place inherits nothing.
+- **Where identities come from:** a signed manifest (the Optimal app
+  format; the format and the launcher's manifest reader land in Phase 5);
+  a Flatpak app (below); for an unpackaged program launched from the
+  desktop, an identity of **path + SHA-256 of its launch closure**; for a
+  program run from a terminal, the terminal's identity. The launch closure
+  is everything that decides what the program does:
+  - a script started through an interpreter (`python3 app.py`, `java -jar
+    app.jar`, `wine foo.exe`, a `#!` script): the interpreter plus the
+    script's (or jar's or `.exe`'s) hash, plus the full argv for `-c` style
+    calls (`sh -c`, `python3 -c`), so two Python apps are two identities;
+  - an ELF program: the executable and its `PT_INTERP`, plus a **closure
+    record** stored with its grants: the SHA-256 of every file outside the
+    system image that it maps with `PROT_EXEC` (`$ORIGIN` libraries,
+    `LD_LIBRARY_PATH` entries, `LD_PRELOAD`, plugins), collected on its
+    first launch. Later, an executable mapping of a non-image file whose
+    hash isn't in the record succeeds only if the file's provenance is the
+    app's own identity (it is then added to the record); otherwise it fails
+    with `EACCES`;
+  - an AppImage: the AppImage file itself.
+- **Updates.** The whole install directory of a granted unpackaged app (the
+  directory holding its executable, for example `~/opt/firefox/`) is a
+  protected path. When the closure's hash changes, grants and the private
+  home (below) carry over only if every changed file's provenance is the
+  app's own identity (Firefox, Discord and Steam updating themselves);
+  any other writer makes it a new identity with the default profile and an
+  empty home, so replacing a granted binary or a library beside it
+  inherits nothing.
 - **Provenance.** Every file an app identity creates or writes carries a
   kernel-maintained provenance tag naming that identity (stored in an xattr
   namespace no app can set or remove, kept across rename and copy by the
   file manager portal; files on foreign or removable volumes count as
   unknown provenance). An executable whose provenance is an app, not the
   store or the system image, gets **no network on its first desktop launch**
-  until the user approves it in a prompt naming the app that wrote it.
+  until the user approves it in a prompt naming the app that wrote it. The
+  user service manager and D-Bus activation apply the same rule to every
+  unit and service they start. A terminal-identity process that executes a
+  file whose provenance is another app identity gets `EACCES` until the
+  user approves that file in a prompt naming the writer. "Executes" means
+  `execve` (a `#!` script included), an executable mapping, and
+  `execveat` with `AT_EXECVE_CHECK`, the Linux 6.14 call interpreters use
+  before running a script; files read only as data (a Makefile, `.envrc`,
+  npm scripts) are covered instead by the writable-grant rule under
+  direct channels below.
 - **Protected launch paths.** `~/.config/autostart`,
-  `~/.local/share/applications`, `~/.local/bin`, `~/Applications` and every
-  executable that holds grants are protected paths
-  ([threat-model.md](threat-model.md)): no folder grant includes them.
-  Desktop and autostart entries are written only through the launcher
-  portal, which asks. `~/.local/bin` is writable by the terminal identity
-  alone (so `pip install --user` and `cargo install` work), because what
-  runs from it runs as the terminal anyway.
+  `~/.local/share/applications`, `~/.local/share/dbus-1/services`,
+  `~/.config/systemd/user`, `~/.config/environment.d`,
+  `~/.config/mimeapps.list`, `~/.local/bin`, `~/Applications`, every
+  granted app's install directory and every private home are protected
+  paths ([threat-model.md](threat-model.md)): no folder grant includes
+  them. Desktop, autostart, D-Bus service, unit, environment and
+  `mimeapps.list` entries are written only through the launcher portal,
+  which asks. `~/.local/bin` is writable by the terminal identity alone (so
+  `pip install --user` and `cargo install` work), because what runs from
+  it runs as the terminal anyway.
+- **Terminals.** `TIOCSTI` returns `EPERM` (as on Linux 6.2 and later with
+  `dev.tty.legacy_tiocsti=0`) and `TIOCLINUX` is absent. The launcher gives
+  a process a fresh pty whenever it starts a different identity from a
+  terminal (`flatpak run`, `xdg-open`), and terminals ignore OSC 52
+  clipboard writes and title and report sequences written by a foreign
+  identity. These are lockdown rows with tests in Phase 5
+  ([threat-model.md](threat-model.md)).
 - **Direct channels make one principal.** Identities joined by a direct
-  channel (parent and child, D-Bus peers allowed by the proxy policy, a
-  shared Unix socket, pipe, or shared memory object) are checked as one
-  principal: the files + network rule applies to the union of their grants,
-  and a channel that would join a persistent file grant to network access
-  without the combined approval is refused (`ECONNREFUSED` on connect,
-  `EACCES` on passing the fd or mapping the object). TCB services (portals,
-  compositor, PipeWire, the D-Bus proxies) are not principals: talking to
-  one joins nobody, but app-to-app messages they relay do. The two-app collusion case is in the exfiltration suite
-  (Phase 7).
+  channel are checked as one principal: the files + network rule applies
+  to the union of the grants of every identity in the same **component**,
+  and a channel that would give a component a persistent file grant
+  together with network access without the combined approval is refused
+  (`ECONNREFUSED` on connect, `EACCES` on passing the fd or mapping the
+  object). The kernel keeps a union-find of identities per session: every
+  direct channel ever opened in the session joins its two components, a
+  new channel is checked against the union of both components, and
+  components split only at logout, so A (files) to B (nothing) to C
+  (network) is refused at the second join. The direct channels are a
+  closed list, checked in as `design/channels.toml` and tested row by row:
+  parent and child, D-Bus peers allowed by the proxy policy, a shared Unix
+  socket, pipe, pty or shared memory object, a cross-identity loopback
+  connection (the OAuth grant below included), app-to-app messages a TCB
+  service relays, a folder one identity can write and another can read,
+  and a writable grant inside the terminal's home, which joins the app to
+  the terminal (its prompt says "can run code as Terminal"). TCB services
+  (portals, compositor, PipeWire, the D-Bus proxies, the resolver, the
+  document portal) are not principals: talking to one joins nobody.
+  Covert channels (CPU and cache timing, `statfs` free space, `flock` on
+  shared read-only files) are out of scope; their measured bandwidth is
+  published on the scorecard. The exfiltration suite (Phase 7) covers two
+  colluding apps, a three-app chain, a loopback-grant relay and every row
+  of `channels.toml`, each as its own row.
 - **Apps that launch apps.** A launcher like Steam can start children under a
   **child identity** (`steam/<game id>`): the child gets its own capability
-  set and file view (by default its own data directory and the folders the
+  set and file view (by default its own private home and the folders the
   parent declares for it, never the parent's tokens or data), but stays in a
   PID namespace below the parent's, so the parent can `wait` for it, track it
   with a pidfd and signal it. The parent's manifest declares the **shared
   channels** each child gets, all mediated: read-only paths (the Steam
   library folders), named shared memory objects (the overlay) and named
   socket endpoints (the Steam client IPC socket); nothing else crosses.
-  Steam Input's virtual controllers go through the **virtual-gamepad
-  portal**, which hands out a `uinput` fd that accepts only gamepad event
-  codes (`BTN_GAMEPAD` to `BTN_THUMBR`, `BTN_TRIGGER_HAPPY*`, the `ABS_*`
-  axes, `EV_FF`); keyboard and pointer codes fail `UI_SET_*BIT` with
-  `EINVAL`. Both are tested in milestone 13. Flatpak's
-  `flatpak-spawn --sandbox` and browsers' renderer sandboxes map onto the
-  same mechanism or onto ordinary namespaces and seccomp.
-- **Flatpak apps** are started by the **Flatpak launcher**, a TCB service
-  that reads each app's `metadata` and permissions from store-owned storage
-  no app can write, never from the app's own files at run time. User
-  (`--user`) installs are installed through the store service, which shows
-  the permissions and records the user's approval at install. Each Flatpak
-  app gets a per-runtime view: `/usr` is its runtime, `/app` is the app,
-  and the rest of the view is as below.
-- **The default profile** for unpackaged desktop programs: own data
-  directory, no folder grants, outbound network (it holds no user files)
-  unless provenance withholds it, GPU render node, audio playback, and
-  portals for everything else. It is shown in Settings and can be changed
-  per program.
+  Steam ships unpackaged, so the system image carries a **signed Steam
+  manifest** for the official Steam path and closure (and a mapping of
+  Flatpak Steam's metadata onto the same grants), written as a Phase 9
+  input. Steam Input's virtual controllers go through the
+  **virtual-gamepad portal**, which hands out a `uinput` fd that accepts
+  only gamepad event codes (`BTN_GAMEPAD` to `BTN_THUMBR`,
+  `BTN_TRIGGER_HAPPY*`, the `ABS_*` axes, `EV_FF`); keyboard and pointer
+  codes fail `UI_SET_*BIT` with `EINVAL`. Its keyboard and mouse emulation
+  (desktop mode, mapped keys) goes through a **virtual keyboard and pointer**
+  the compositor provides behind its own grant: events reach only the
+  surface that has focus, never the prompt layer, and never count as the
+  secure-attention key or a prompt answer. All three are tested in
+  milestone 13 (Phase 9). Flatpak's `flatpak-spawn --sandbox` and browsers'
+  renderer sandboxes map onto the same mechanism or onto ordinary
+  namespaces and seccomp.
+- **Flatpak apps** are started by the **Flatpak launcher** (Phase 5), a TCB
+  service that reads each app's `metadata` and permissions from
+  store-owned storage no app can write, never from the app's own files at
+  run time. User (`--user`) installs are installed through the store
+  service, which shows the permissions and records the user's approval at
+  install. Each Flatpak app gets a per-runtime view: `/usr` is its
+  runtime, `/app` is the app, its private home is `~/.var/app/<app id>` as
+  on Flatpak, and the rest of the view is as below. The launcher has its
+  own conformance tests in milestone 6, alongside upstream `flatpak run`
+  tests.
+- **The default profile** for unpackaged desktop programs is outbound
+  network only (unless provenance withholds it): no file or device grants,
+  and portals for everything else. Every graphical app's base view, which
+  is not a grant, also holds its private home, the Wayland socket through
+  its security context, PipeWire playback and the GPU render node (for a
+  Flatpak app the render node only with `--device=dri`, as on Flatpak). The
+  profile is shown in Settings and can be changed per program.
 
 ## The file view
 
@@ -160,17 +227,41 @@ by a published list, so apps find everything they expect:
   links into it), or for a Flatpak app its runtime as `/usr` and the app as
   `/app`;
 - `/etc` as a generated, read-only view: `passwd` and `group` (this user and
-  system accounts only), `hosts`, `resolv.conf`, `nsswitch.conf`,
+  system accounts only), `hosts`, `resolv.conf` (naming the system
+  resolver, below), `nsswitch.conf`,
   `machine-id` (a per-app value, so apps can't use it to track the user
   across apps), `localtime`, `os-release`, `ssl/certs`, `fonts`,
   `ld.so.cache`;
-- `$HOME` containing only the app's own data directories
-  (`~/.config/<app>`, `~/.local/share/<app>`, `~/.cache/<app>` and the XDG
-  equivalents) plus any granted folders;
+- `$HOME`: the app's **private home**, persistent and writable, stored at
+  `~/.var/app/<id>` on disk (a protected path; `<id>` is the manifest or
+  Flatpak ID, or for an unpackaged program its launch path (executable,
+  script or AppImage), escaped)
+  and mounted at the user's real home path, so `$HOME`, `getpwuid` and
+  absolute paths saved in configs agree. `XDG_CONFIG_HOME`,
+  `XDG_DATA_HOME`, `XDG_STATE_HOME` and `XDG_CACHE_HOME` point inside it.
+  Apps that pick their own dotfile paths (`~/.wine`, `~/.steam`,
+  `~/.mozilla`, `~/.gitconfig`, `~/.npm`) create them there as on Linux.
+  Granted folders are bind-mounted at their real paths inside it
+  (`~/Documents`). A published read-only list of shared settings is
+  projected in: `~/.config/gtk-3.0`, `~/.config/gtk-4.0`,
+  `~/.config/fontconfig`, `~/.local/share/fonts`, `~/.icons`,
+  `~/.local/share/icons` and `~/.config/mimeapps.list`. The terminal
+  identity instead gets the real home minus the protected paths. Golden
+  first-run test (Phase 5): Wine, Steam, Firefox and git run for the first
+  time on Linux and on Optimal, and the paths each creates under `$HOME`
+  match;
 - a private `/tmp` and `/var/tmp`;
 - `$XDG_RUNTIME_DIR` with the Wayland socket (through the app's security
   context), the PipeWire socket (with the app's permissions), the session
-  bus (through the app's D-Bus proxy) and the portal sockets;
+  bus (through the app's D-Bus proxy), the portal sockets and the
+  **document portal** at `$XDG_RUNTIME_DIR/doc` (see the file chooser
+  below);
+- a generated `/.flatpak-info` holding the app's ID and permissions, and
+  `GTK_USE_PORTAL=1`, `GDK_DEBUG=portals` and
+  `QT_QPA_PLATFORMTHEME=xdgdesktopportal` in its environment, so GTK, Qt,
+  Electron and GLib use the portals for file dialogs, URI opening and
+  app-ID lookup as they do under Flatpak (every identity except the
+  terminal's, whose programs see the host as on Linux);
 - `/proc` per the contract in [compat.md](compat.md), showing only the app's
   own PID namespace and those below it;
 - a `/sys` subset: `devices/system/cpu` (online, topology, caches),
@@ -220,25 +311,53 @@ separate namespace, so a grant or revocation reaches live sockets:
   `sendto` and `sendmsg` checks the sender's identity; an identity without
   the grant gets `ENETUNREACH` immediately, and revoking the grant resets
   its live sockets (`ECONNRESET`).
-- **Inbound** on any non-loopback address (`listen`, or receiving on an
-  unconnected UDP socket) needs a separate **per-port inbound grant**,
-  declared in the manifest or requested through the network portal; the
-  default-deny firewall opens only that port, for that identity.
-- **Loopback** is shared, but a connection to a loopback port whose listener
-  belongs to another identity needs a per-port grant too (`ECONNREFUSED`
-  without it). A browser reaching a development server started from the
-  terminal needs that grant; the terminal shows a one-click request for it.
-  OAuth loopback callbacks work unchanged: when an app asks the open-URI
-  portal to open `http://127.0.0.1:<port>/…` or `http://localhost:<port>/…`
-  and that port's listener is the requesting app, the portal grants the
-  browser that port for as long as the listener lives.
+- **Inbound.** `bind` and `listen` always succeed, as on Linux. A socket
+  bound to the wildcard address receives only loopback traffic unless its
+  identity holds a **per-port inbound grant** for that port (declared in
+  the manifest or requested through the network portal); inbound packets
+  to a unicast non-loopback address without that grant are dropped by the
+  default-deny firewall, so the app sees silence, not an error.
+- **Loopback is per identity.** An app reaches loopback ports its own
+  identity listens on. Connecting to a loopback port whose listener
+  belongs to another identity needs a per-port grant (`ECONNREFUSED`
+  without it), and the connection is a direct channel, so the one-principal
+  check above applies to it. A browser reaching a development server
+  started from the terminal needs that grant; the terminal shows a
+  one-click request for it. OAuth loopback callbacks work unchanged for
+  apps that already hold outbound network: when such an app asks the
+  open-URI portal to open `http://127.0.0.1:<port>/…` or
+  `http://localhost:<port>/…` and that port's listener is the requesting
+  app, the portal grants the browser that port for as long as the listener
+  lives. For an app without outbound network the request is an ordinary
+  open-URI request (below).
+- **DNS.** `resolv.conf` names `127.0.0.53`, served by the system
+  resolver, a TCB service and not an identity's loopback port. It answers
+  only identities holding outbound network; any other identity gets
+  `ECONNREFUSED`, so DNS can't tunnel data out of an app without network.
+- **Services that send for an app.** Every TCB service that sends traffic
+  on an app's behalf checks the caller's attested grants first: the
+  resolver as above; the open-URI portal, which for a caller without
+  outbound network shows any non-`file` URI in a prompt naming both apps
+  with the full URL before handing it to the browser; the notification
+  portal, which for such a caller drops remote content (image URLs) and
+  sends any URI an action opens through the open-URI rule; and the email
+  portal, which for such a caller shows the recipients, subject and
+  attachments in the same kind of prompt before the mail client gets them.
 - Each app has its own IPC namespace (SysV IPC, POSIX message queues) and its
   own `/dev/shm`; **abstract Unix sockets are scoped per app**.
 
 Tests (Phase 6): revoke the network grant under a live TCP connection; an
-app without an inbound grant listens on every port and is unreachable from
-another machine; a cross-identity loopback connection without the grant is
-refused; the OAuth callback flow of a named app works.
+app without an inbound grant that listens on the wildcard and on a
+non-loopback address is unreachable from another machine, and with a
+per-port grant exactly that port is reachable; a cross-identity loopback
+connection without the grant is refused; an identity without network gets
+`ECONNREFUSED` from the resolver; the OAuth callback flow of a named app
+works. Exfiltration-suite rows, each its own row: an app holding
+Documents and no network sends a canary through open-URI with an `https`
+URL, through a notification, and through the email portal (Phase 5, with
+a networked test app as the URI handler), through a `<canary>.example`
+lookup (Phase 6), and through its own loopback page opened in the browser
+(Phase 7); each is refused or shown in the prompt.
 
 ## Unix permissions, uids and Linux capabilities
 
@@ -248,7 +367,9 @@ refused; the OAuth callback flow of a named app works.
 - **uids.** Each human user has a uid; each app runs under that user's uid
   inside its own view. There is a uid 0 for the system's own services, but
   it carries no special power over the kernel: being uid 0 only matters for
-  Unix permission checks on files in a view, and no app runs as uid 0.
+  Unix permission checks on files in a view, and no app runs as uid 0
+  (uid 0 inside an app's own user namespace maps to the user's uid, as on
+  Linux).
 - **Linux capabilities (`CAP_*`).** Programs that check `capget` (bwrap,
   Chromium, Flatpak) see the capabilities Linux would give them, and those
   capabilities work, but **only over objects owned by the user namespace
@@ -289,10 +410,42 @@ write to, switch to or read input from that terminal. The compositor draws
 prompts from Phase 7; the secure-attention key still opens the broker's
 terminal.
 
-- **File chooser:** the user picks files or folders in a dialog drawn by the
-  compositor; the portal hands the app fds (one use) or adds the folder to
-  its view (persistent). The network rule in
-  [threat-model.md](threat-model.md) applies to persistent grants.
+**Trusted input.** The kernel tags every input event with the device that
+produced it. The secure-attention key and prompt answers (on the broker's
+terminal, and in the compositor's prompt layer from Phase 7) are accepted
+only from keyboards parsed in the kernel (PS/2, boot-protocol USB, and
+in-kernel I2C-HID for internal laptop keyboards once it meets the parser
+promotion thresholds) or from a keyboard whose own per-device HID process
+(one process per device) passed typed-code confirmation. Bluetooth
+keyboards never count unless the user opts that keyboard in by name;
+`uinput` devices and the compositor's virtual keyboard and pointer never
+count. The polled xHCI boot-keyboard reader stops when the Phase 6 xHCI
+driver binds, and resume PIN entry uses the in-kernel paths. Attack rows:
+a compromised Bluetooth stack or HID process injects the secure-attention
+key and approves a prompt; both fail (Phase 6, extended in Phase 7 to the
+compositor path).
+
+- **File chooser:** the user picks files or folders in the portal's dialog
+  (drawn on the broker's terminal in Phase 5, by the compositor from
+  Phase 7). As with xdg-desktop-portal, the portal returns URIs that point
+  into the **document portal**, a FUSE-protocol file system served by a
+  tier-3 process and mounted at `$XDG_RUNTIME_DIR/doc` in every view. Each
+  app sees only its own entries there (`doc/<entry id>/<name>`): a one-use
+  pick lasts until the app exits, a persistent pick is recorded in
+  store-owned storage and survives reboots, and revoking it in Settings
+  revokes every OFD opened through it (`EIO`, as above). A folder picked
+  persistently is instead added to the app's view at its real path. The
+  network rule in [threat-model.md](threat-model.md) applies to persistent
+  grants. Drag and drop of `file://` URIs between apps goes through the
+  compositor, which turns each dropped file into a one-use document-portal
+  entry for the receiving app (Flatpak's file-transfer portal); DnD is a
+  row of the Phase 7 exfiltration suite.
+- **Toolkits that can't be forced** onto the portal draw their own dialogs
+  over the app's view. Wine, Java (Swing and JavaFX) and Blender are
+  intended divergences in [compat.md](compat.md) with this user-facing
+  outcome: the dialog shows the app's private home, its granted folders
+  and `$XDG_RUNTIME_DIR/doc`; to open another file the user grants a folder
+  in Settings or drags the file onto the window.
 - **Network:** outbound access, and each inbound port, is requested through
   the network portal or declared at install.
 - **Camera, microphone, screen capture, location, notifications, background
@@ -316,7 +469,8 @@ no, and inbound ports); device
 classes (GPU render node, gamepad, audio, camera); default folders (each shown
 at install and removable); D-Bus names it owns and talks to; and extra
 features (`debug own app`, `io_uring` off, FUSE, child identities and their
-shared channels for launchers). Each is shown at install.
+shared channels for launchers, virtual keyboard and pointer). Each is
+shown at install. The format and the launcher's reader land in Phase 5.
 
 Flatpak permissions map onto the same grants:
 
@@ -329,6 +483,7 @@ Flatpak permissions map onto the same grants:
 | `--device=all` | GPU, gamepads, approved `hidraw`; never keyboards, `uinput` or block devices |
 | `--socket=wayland`, `pulseaudio`, `x11` | Wayland security context, PipeWire playback (recording needs the portal), own XWayland server |
 | `--talk-name`, `--own-name` | D-Bus proxy policy |
+| `--talk-name=org.freedesktop.Flatpak` (`flatpak-spawn --host`) | never passed to the host's Flatpak service; the launcher answers `HostCommand` itself with a prompt naming the app and showing the full command line, and an approved command runs under the terminal identity over a pty and pipes, which are a direct channel between the two; every other method is refused with `org.freedesktop.DBus.Error.AccessDenied` |
 | `--socket=session-bus`, `system-bus` (unfiltered) | refused; the app runs with the filtered proxy and the user is told |
 
 ## Device nodes
@@ -338,19 +493,25 @@ every program needs (`null`, `zero`, `full`, `random`, `urandom`, `tty`,
 `ptmx`, `pts/`, `shm/`, `fd/`), plus granted classes such as `dri/renderD*`,
 `snd/`, gamepads under `input/` (only gamepads, never keyboards unless the app
 is the compositor or input service), `hidraw*` for specific devices the user
-approved, and `fuse` for apps allowed to mount FUSE file systems inside their
-view.
+approved, `uinput` only as the virtual-gamepad portal's gamepad-only fd,
+`fuse` for apps allowed to mount FUSE file systems inside their view, and
+`net/tun` for apps running rootless containers, which creates TUN and TAP
+devices only inside the caller's own network namespace (milestone 6).
 
 ## Proof and test obligations
 
 - [verification.md](verification.md) target 4 is stated over memory
   objects: a user mapping in process A reaches a frame only if A holds a
-  capability for the memory object that owns it. The sharing paths it covers
-  are a **closed list** in `design/proofs.toml`: copy-on-write after `fork`,
-  shared file mappings, SysV and POSIX shared memory, memfd, `SCM_RIGHTS`
-  passing, `ptrace` and `process_vm_*`, io_uring registered buffers,
-  dma-buf, and GPU buffer objects. Each phase that adds a path extends the
-  proof in its own done-when; a path that isn't on the list doesn't exist.
+  capability for the memory object that owns it. Every user page-table
+  entry is installed through one core-mm API that takes a memory-object
+  capability witness, and target 4 is proved over that API and the
+  capability table; a CI check fails if any other code reaches the
+  PTE-writing shim. The sharing paths that call the API are a **closed
+  list** in `design/proofs.toml`: copy-on-write after `fork`, shared file
+  mappings, SysV and POSIX shared memory, memfd, `SCM_RIGHTS` passing,
+  `ptrace` and `process_vm_*`, io_uring registered buffers, dma-buf, and
+  GPU buffer objects. Each phase that adds a path extends the proof in its
+  own done-when.
 - Target 5 covers derivation (never more rights than the parent),
   revocation (the whole subtree, and the revoked-object behaviours above),
   and OFDs and mounts: an fd or mount never carries more rights than the
@@ -360,6 +521,12 @@ view.
   ([threat-model.md](threat-model.md)) test every row of the first table, the
   file view list, the mount namespace rules, the identity rules, the
   shared-channel mediation and the setuid replacements from the attacker's
-  side. Each shared channel is gated in the phase it lands: D-Bus and kernel
-  keyrings in Phase 5, PipeWire in Phase 6, Wayland, XWayland and the
-  clipboard in Phase 7.
+  side, including the identity-forge cases: replace a library beside a
+  granted app, run two Python apps and check they get two identities,
+  plant a foreign-provenance hook or unit and try to run it as the
+  terminal or through the service manager. Each shared channel is gated in
+  the phase it lands: D-Bus, kernel keyrings, the document portal and the
+  Flatpak launcher in Phase 5, PipeWire and the resolver in Phase 6,
+  Wayland, XWayland, the clipboard and DnD in Phase 7. Each TCB service
+  named here has an A3 row in [threat-model.md](threat-model.md) with
+  10^8 protocol fuzz executions gated in its landing phase.
