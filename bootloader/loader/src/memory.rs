@@ -66,7 +66,8 @@ pub fn alloc_pages(pages: u64, typ: u32, max_address: Option<u64>) -> Option<u64
 /// Allocates pages at exactly `addr`.
 pub fn alloc_pages_at(addr: u64, pages: u64, typ: u32) -> bool {
     let mut a = addr;
-    (boot_services().allocate_pages)(efi::ALLOCATE_ADDRESS, typ, pages as usize, &mut a) == efi::SUCCESS
+    (boot_services().allocate_pages)(efi::ALLOCATE_ADDRESS, typ, pages as usize, &mut a)
+        == efi::SUCCESS
 }
 
 pub fn free_pages(addr: u64, pages: u64) {
@@ -82,7 +83,10 @@ pub struct Pages {
 impl Pages {
     pub fn new(bytes: u64, typ: u32, max_address: Option<u64>) -> Option<Pages> {
         let pages = pages_for(bytes.max(1));
-        Some(Pages { phys: alloc_pages(pages, typ, max_address)?, pages })
+        Some(Pages {
+            phys: alloc_pages(pages, typ, max_address)?,
+            pages,
+        })
     }
     pub fn len(&self) -> usize {
         (self.pages * PAGE) as usize
@@ -105,7 +109,11 @@ pub struct Arena {
 
 impl Arena {
     pub fn new(base: u64, size: u64) -> Arena {
-        Arena { base, size, used: 0 }
+        Arena {
+            base,
+            size,
+            used: 0,
+        }
     }
     pub fn alloc(&mut self, bytes: u64, align: u64) -> Option<u64> {
         let start = (self.base + self.used).checked_add(align - 1)? & !(align - 1);
@@ -117,8 +125,5 @@ impl Arena {
         // SAFETY: inside the arena's pages, which we own.
         unsafe { core::ptr::write_bytes(start as *mut u8, 0, bytes as usize) };
         Some(start)
-    }
-    pub fn reset(&mut self) {
-        self.used = 0;
     }
 }

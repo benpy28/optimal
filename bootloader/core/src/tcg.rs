@@ -10,7 +10,10 @@ fn u32_at(b: &[u8], o: usize) -> Option<u32> {
 
 /// Digest sizes declared by the Spec ID event at the start of the log:
 /// up to 8 (algorithm id, size) pairs. Returns the header event's size too.
-pub fn spec_id(log: &[u8]) -> Option<(usize, [(u16, u16); 8], usize)> {
+/// (header event size, up to 8 (algorithm id, digest size) pairs, pair count).
+pub type SpecId = (usize, [(u16, u16); 8], usize);
+
+pub fn spec_id(log: &[u8]) -> Option<SpecId> {
     // TCG_PCR_EVENT: pcr u32, type u32, digest[20], eventSize u32, event.
     let event_size = u32_at(log, 28)? as usize;
     let event = log.get(32..32 + event_size)?;

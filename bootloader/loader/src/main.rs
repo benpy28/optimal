@@ -59,5 +59,10 @@ fn panic(info: &PanicInfo) -> ! {
     if console::boot_services_active() {
         menu::wait_key(30_000);
     }
-    (console::runtime_services().reset_system)(efi::RESET_COLD, efi::LOAD_ERROR, 0, core::ptr::null())
+    (console::runtime_services().reset_system)(
+        efi::RESET_COLD,
+        efi::LOAD_ERROR,
+        0,
+        core::ptr::null(),
+    )
 }

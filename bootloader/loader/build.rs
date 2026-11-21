@@ -13,12 +13,24 @@ fn main() {
     println!("cargo:rerun-if-changed={path}");
     let text = std::fs::read_to_string(&path).expect("read OPTIMAL_BOOT_PUBKEYS");
     let mut keys = Vec::new();
-    for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
-        assert!(line.len() == 64 && line.bytes().all(|c| c.is_ascii_hexdigit()), "bad key line: {line}");
-        let bytes: Vec<u8> = (0..32).map(|i| u8::from_str_radix(&line[2 * i..2 * i + 2], 16).unwrap()).collect();
+    for line in text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+    {
+        assert!(
+            line.len() == 64 && line.bytes().all(|c| c.is_ascii_hexdigit()),
+            "bad key line: {line}"
+        );
+        let bytes: Vec<u8> = (0..32)
+            .map(|i| u8::from_str_radix(&line[2 * i..2 * i + 2], 16).unwrap())
+            .collect();
         keys.push(bytes);
     }
-    assert!(!keys.is_empty() && keys.len() <= 8, "need 1 to 8 trusted keys");
+    assert!(
+        !keys.is_empty() && keys.len() <= 8,
+        "need 1 to 8 trusted keys"
+    );
     let mut out = format!("pub static TRUSTED_KEYS: [[u8; 32]; {}] = [\n", keys.len());
     for k in &keys {
         out.push_str("    [");

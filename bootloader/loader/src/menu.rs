@@ -11,7 +11,10 @@ fn read_key() -> Option<efi::InputKey> {
     if cin.is_null() {
         return None;
     }
-    let mut k = efi::InputKey { scan_code: 0, unicode_char: 0 };
+    let mut k = efi::InputKey {
+        scan_code: 0,
+        unicode_char: 0,
+    };
     // SAFETY: con_in is the firmware's console input protocol.
     (unsafe { ((*cin).read_key_stroke)(cin, &mut k) } == efi::SUCCESS).then_some(k)
 }
@@ -43,7 +46,11 @@ pub fn choose(cfg: &Config) -> usize {
     show(sel);
     let mut left_ms = cfg.timeout as u64 * 1000;
     let mut counting = true;
-    print!("Booting \"{}\" in {} s (any key stops)", cfg.entry(sel).title, cfg.timeout);
+    print!(
+        "Booting \"{}\" in {} s (any key stops)",
+        cfg.entry(sel).title,
+        cfg.timeout
+    );
     loop {
         if let Some(k) = read_key() {
             if counting {
@@ -70,7 +77,7 @@ pub fn choose(cfg: &Config) -> usize {
                 println!();
                 return sel;
             }
-            if left_ms % 1000 == 0 && left_ms != cfg.timeout as u64 * 1000 {
+            if left_ms.is_multiple_of(1000) && left_ms != cfg.timeout as u64 * 1000 {
                 print!(" {}", left_ms / 1000);
             }
             left_ms -= 10;

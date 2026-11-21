@@ -4,29 +4,38 @@
 //! Changing between 4- and 5-level paging needs paging turned off, which in
 //! long mode means dropping to 32-bit protected mode. So the trampoline runs
 //! from a page below 4 GiB that is identity mapped in both the firmware's
-//! tables and ours, then moves to its HHDM alias, removes that identity
+//! tables and ours, then moves to its handoff alias, removes that identity
 //! mapping, and enters the kernel.
+//!
+//! The handoff alias is the one page of the final address space that is
+//! neither the kernel nor the HHDM: the trampoline page mapped read-only and
+//! executable just below the kernel's lowest virtual page. Some executable
+//! page must survive the switch to run the instructions after it, and keeping
+//! it out of the HHDM keeps the whole HHDM non-executable (W^X). It holds
+//! only this code, and its memory is bootloader-reclaimable, so it goes away
+//! when the kernel moves to its own page tables.
 
 use core::arch::global_asm;
 
 /// Data the trampoline reads; lives at the start of a page below 4 GiB.
 #[repr(C)]
 pub struct Block {
-    pub cr3: u64,           // 0x00
-    pub cr4: u64,           // 0x08
-    pub efer: u64,          // 0x10
-    pub cr0: u64,           // 0x18
-    pub pat: u64,           // 0x20
-    pub gdtr_low: [u16; 8], // 0x28: limit, base (identity)
+    pub cr3: u64,            // 0x00
+    pub cr4: u64,            // 0x08
+    pub efer: u64,           // 0x10
+    pub cr0: u64,            // 0x18
+    pub pat: u64,            // 0x20
+    pub gdtr_low: [u16; 8],  // 0x28: limit, base (identity)
     pub gdtr_high: [u16; 8], // 0x38: limit, base (HHDM)
     pub idtr_zero: [u16; 8], // 0x48
-    pub stub64: u64,        // 0x58: identity address of the 64-bit re-entry
-    pub hhdm: u64,          // 0x60
-    pub low_entry: u64,     // 0x68: HHDM address of top-level entry 0
-    pub stack_top: u64,     // 0x70
-    pub entry: u64,         // 0x78
-    pub _pad: [u64; 16],
-    pub gdt: [u64; 9],      // 0x100
+    pub stub64: u64,         // 0x58: identity address of the 64-bit re-entry
+    pub hhdm: u64,           // 0x60
+    pub low_entry: u64,      // 0x68: HHDM address of top-level entry 0
+    pub stack_top: u64,      // 0x70
+    pub entry: u64,          // 0x78
+    pub code_delta: u64,     // 0x80: handoff alias minus identity address of the code page
+    pub _pad: [u64; 15],
+    pub gdt: [u64; 9], // 0x100
 }
 
 pub const GDT: [u64; 9] = [
@@ -62,7 +71,10 @@ pub fn trampoline() -> (&'static [u8], usize) {
         let s = &ob_tramp_start as *const u8;
         let e = &ob_tramp_end as *const u8;
         let k = &ob_tramp_stub64 as *const u8;
-        (core::slice::from_raw_parts(s, e.offset_from(s) as usize), k.offset_from(s) as usize)
+        (
+            core::slice::from_raw_parts(s, e.offset_from(s) as usize),
+            k.offset_from(s) as usize,
+        )
     }
 }
 
@@ -116,10 +128,9 @@ ob_tramp_start:
 ob_tramp_stub64:
     mov edi, edi
     mov esp, esp
-    mov rax, [rdi + 0x60]
     lea rbx, [rip + 3f]
-    add rbx, rax
-    add rdi, rax
+    add rbx, [rdi + 0x80]
+    add rdi, [rdi + 0x60]
     jmp rbx
 3:
     add rsp, [rdi + 0x60]
@@ -156,8 +167,6 @@ ob_tramp_stub64:
     mov rax, [rdi + 0x78]
     push 0
     push rax
-    push 2
-    popfq
     xor eax, eax
     xor ebx, ebx
     xor ecx, ecx
@@ -173,6 +182,9 @@ ob_tramp_stub64:
     xor r13d, r13d
     xor r14d, r14d
     xor r15d, r15d
+    // Last, because every xor above sets flags: RFLAGS = 0x2 exactly.
+    push 2
+    popfq
     ret
 ob_tramp_end:
     .text

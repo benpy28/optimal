@@ -10,7 +10,11 @@ pub struct Identity;
 
 impl PhysRead for Identity {
     fn read(&self, phys: u64, buf: &mut [u8]) -> bool {
-        if phys == 0 || phys.checked_add(buf.len() as u64).is_none_or(|e| e > 1 << 52) {
+        if phys == 0
+            || phys
+                .checked_add(buf.len() as u64)
+                .is_none_or(|e| e > 1 << 52)
+        {
             return false;
         }
         // SAFETY: firmware identity-maps all memory it reports, which is where
@@ -35,7 +39,9 @@ pub fn discover(rsdp: Option<u64>) -> Platform {
     let mut p = Platform::default();
     let Some(rsdp) = rsdp else { return p };
     let mem = Identity;
-    let Some(a) = acpi::Acpi::new(&mem, rsdp) else { return p };
+    let Some(a) = acpi::Acpi::new(&mem, rsdp) else {
+        return p;
+    };
     if let Some((addr, len)) = a.find(b"APIC") {
         p.madt = Madt::parse(&mem, addr, len);
     }
@@ -51,10 +57,11 @@ pub fn discover(rsdp: Option<u64>) -> Platform {
         let flags = mem.u32(addr + 112).unwrap_or(0);
         let wide = flags & (1 << 8) != 0;
         let mut port = mem.u32(addr + 76).unwrap_or(0) as u64;
-        if len >= 220 && mem.u8(addr + 208) == Some(1) {
-            if let Some(x) = mem.u64(addr + 212).filter(|&x| x != 0) {
-                port = x;
-            }
+        if len >= 220
+            && mem.u8(addr + 208) == Some(1)
+            && let Some(x) = mem.u64(addr + 212).filter(|&x| x != 0)
+        {
+            port = x;
         }
         if port != 0 && port <= 0xffff {
             p.pm_timer = Some((port as u16, wide));
@@ -145,13 +152,13 @@ pub fn init_lapic(p: &Platform) {
     let max_lvt = (lapic.read(0x30) >> 16) & 0xff;
     let maskable = |v: u32| matches!((v >> 8) & 7, 0 | 1 | 4 | 7);
     let mut lvts: [(u32, bool); 7] = [
-        (0x320, true),          // timer
-        (0x330, max_lvt >= 5),  // thermal
-        (0x340, max_lvt >= 4),  // performance counter
-        (0x350, true),          // LINT0
-        (0x360, true),          // LINT1
-        (0x370, true),          // error
-        (0x2f0, max_lvt >= 6),  // CMCI
+        (0x320, true),         // timer
+        (0x330, max_lvt >= 5), // thermal
+        (0x340, max_lvt >= 4), // performance counter
+        (0x350, true),         // LINT0
+        (0x360, true),         // LINT1
+        (0x370, true),         // error
+        (0x2f0, max_lvt >= 6), // CMCI
     ];
     for (reg, present) in lvts.iter_mut() {
         if *present {
@@ -163,7 +170,11 @@ pub fn init_lapic(p: &Platform) {
     }
     // LINT NMI wiring from the MADT, for this processor.
     let Some(m) = &p.madt else { return };
-    let apic_id = if lapic.x2 { lapic.read(0x20) } else { lapic.read(0x20) >> 24 };
+    let apic_id = if lapic.x2 {
+        lapic.read(0x20)
+    } else {
+        lapic.read(0x20) >> 24
+    };
     let mem = Identity;
     let uid = m.uid_for_apic(&mem, apic_id);
     for nmi in m.nmis() {

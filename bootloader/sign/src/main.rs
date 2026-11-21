@@ -18,7 +18,11 @@ fn hex(b: &[u8]) -> String {
 
 fn read_key(path: &str) -> [u8; 32] {
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| die(&format!("{path}: {e}")));
-    let line = text.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with('#')).unwrap_or("");
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('#'))
+        .unwrap_or("");
     config::parse_hex::<32>(line).unwrap_or_else(|| die(&format!("{path}: not a 64-hex-digit key")))
 }
 
@@ -36,19 +40,29 @@ fn main() {
                 .and_then(|mut f| f.read_exact(&mut seed))
                 .unwrap_or_else(|e| die(&format!("/dev/urandom: {e}")));
             let key = SigningKey::from_bytes(&seed);
-            std::fs::write(&args[2], format!("{}\n", hex(&seed))).unwrap_or_else(|e| die(&e.to_string()));
-            std::fs::write(&args[3], format!("{}\n", hex(&key.verifying_key().to_bytes())))
+            std::fs::write(&args[2], format!("{}\n", hex(&seed)))
                 .unwrap_or_else(|e| die(&e.to_string()));
+            std::fs::write(
+                &args[3],
+                format!("{}\n", hex(&key.verifying_key().to_bytes())),
+            )
+            .unwrap_or_else(|e| die(&e.to_string()));
         }
         Some("hash") if args.len() == 3 => {
-            let data = std::fs::read(&args[2]).unwrap_or_else(|e| die(&format!("{}: {e}", args[2])));
+            let data =
+                std::fs::read(&args[2]).unwrap_or_else(|e| die(&format!("{}: {e}", args[2])));
             println!("{}", hex(&sig::sha512(&data)));
         }
         Some("sign") if args.len() == 4 => {
             let key = SigningKey::from_bytes(&read_key(&args[2]));
             let cfg = std::fs::read(&args[3]).unwrap_or_else(|e| die(&format!("{}: {e}", args[3])));
             if let Err(e) = config::parse(&cfg) {
-                die(&format!("{} line {}: {}", args[3], e.line, e.kind.describe()));
+                die(&format!(
+                    "{} line {}: {}",
+                    args[3],
+                    e.line,
+                    e.kind.describe()
+                ));
             }
             let s = key.sign(&sig::signed_message(&cfg));
             let mut out = sig::MAGIC.to_vec();
@@ -59,12 +73,15 @@ fn main() {
         Some("verify") if args.len() == 4 => {
             let key = read_key(&args[2]);
             let cfg = std::fs::read(&args[3]).unwrap_or_else(|e| die(&e.to_string()));
-            let s = std::fs::read(format!("{}.sig", args[3])).unwrap_or_else(|e| die(&e.to_string()));
+            let s =
+                std::fs::read(format!("{}.sig", args[3])).unwrap_or_else(|e| die(&e.to_string()));
             match sig::verify(&cfg, &s, &[key]) {
                 Ok(_) => println!("signature valid"),
                 Err(e) => die(e.describe()),
             }
         }
-        _ => die("usage: keygen <secret> <public> | hash <file> | sign <secret> <config> | verify <public> <config>"),
+        _ => die(
+            "usage: keygen <secret> <public> | hash <file> | sign <secret> <config> | verify <public> <config>",
+        ),
     }
 }

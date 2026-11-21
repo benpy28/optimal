@@ -22,7 +22,9 @@ pub struct Tpm {
 impl Tpm {
     pub fn find() -> Option<Tpm> {
         let mut p: *mut c_void = ptr::null_mut();
-        if (boot_services().locate_protocol)(&efi::TCG2_GUID, ptr::null(), &mut p) != efi::SUCCESS || p.is_null() {
+        if (boot_services().locate_protocol)(&efi::TCG2_GUID, ptr::null(), &mut p) != efi::SUCCESS
+            || p.is_null()
+        {
             return None;
         }
         let proto = p as *mut efi::Tcg2Protocol;
@@ -31,11 +33,16 @@ impl Tpm {
             ..Default::default()
         };
         // SAFETY: proto is the firmware's TCG2 protocol; cap has its size set.
-        if unsafe { ((*proto).get_capability)(proto, &mut cap) } != efi::SUCCESS || cap.tpm_present_flag == 0 {
+        if unsafe { ((*proto).get_capability)(proto, &mut cap) } != efi::SUCCESS
+            || cap.tpm_present_flag == 0
+        {
             return None;
         }
         let active = cap.active_pcr_banks;
-        Some(Tpm { proto, sha256_active: active & efi::TCG2_HASH_ALG_SHA256 != 0 })
+        Some(Tpm {
+            proto,
+            sha256_active: active & efi::TCG2_HASH_ALG_SHA256 != 0,
+        })
     }
 
     /// Hashes `data` into `pcr` and logs an EV_IPL event described by `desc`.
@@ -52,7 +59,13 @@ impl Tpm {
         ev.extend_from_slice(desc.as_bytes());
         // SAFETY: data and ev are valid for the given lengths for the call.
         let s = unsafe {
-            ((*self.proto).hash_log_extend_event)(self.proto, 0, data.as_ptr() as u64, data.len() as u64, ev.as_ptr())
+            ((*self.proto).hash_log_extend_event)(
+                self.proto,
+                0,
+                data.as_ptr() as u64,
+                data.len() as u64,
+                ev.as_ptr(),
+            )
         };
         s == efi::SUCCESS
     }
@@ -64,14 +77,27 @@ impl Tpm {
         let mut last = 0u64;
         let mut truncated = false;
         // SAFETY: valid protocol, out-pointers valid.
-        let s = unsafe { ((*self.proto).get_event_log)(self.proto, efi::TCG2_EVENT_LOG_FORMAT_TCG_2, &mut first, &mut last, &mut truncated) };
+        let s = unsafe {
+            ((*self.proto).get_event_log)(
+                self.proto,
+                efi::TCG2_EVENT_LOG_FORMAT_TCG_2,
+                &mut first,
+                &mut last,
+                &mut truncated,
+            )
+        };
         if s != efi::SUCCESS || first == 0 || last < first || last - first > 64 << 20 {
             return None;
         }
         // Read the header to learn digest sizes, then size the last event.
         // SAFETY: the firmware's log is readable from `first` through the end
         // of the last event; we read the header (at most 4 KiB) first.
-        let head = unsafe { core::slice::from_raw_parts(first as *const u8, 4096.min((last - first) as usize + 4096)) };
+        let head = unsafe {
+            core::slice::from_raw_parts(
+                first as *const u8,
+                4096.min((last - first) as usize + 4096),
+            )
+        };
         let (hlen, algs, n) = optimal_boot_core::tcg::spec_id(head)?;
         let last_size = if last == first {
             0
@@ -81,7 +107,11 @@ impl Tpm {
             let tail = unsafe { core::slice::from_raw_parts(last as *const u8, 64 * 1024) };
             optimal_boot_core::tcg::event2_size(tail, 0, &algs[..n])?
         };
-        let len = if last == first { hlen } else { (last - first) as usize + last_size };
+        let len = if last == first {
+            hlen
+        } else {
+            (last - first) as usize + last_size
+        };
         // SAFETY: [first, first + len) is the firmware's event log.
         Some(unsafe { core::slice::from_raw_parts(first as *const u8, len) }.to_vec())
     }
@@ -102,7 +132,15 @@ impl Tpm {
         cmd.extend_from_slice(&sel);
         let mut rsp = [0u8; 1024];
         // SAFETY: buffers valid for the given sizes.
-        let s = unsafe { ((*self.proto).submit_command)(self.proto, cmd.len() as u32, cmd.as_ptr(), rsp.len() as u32, rsp.as_mut_ptr()) };
+        let s = unsafe {
+            ((*self.proto).submit_command)(
+                self.proto,
+                cmd.len() as u32,
+                cmd.as_ptr(),
+                rsp.len() as u32,
+                rsp.as_mut_ptr(),
+            )
+        };
         if s != efi::SUCCESS || u32::from_be_bytes(rsp[6..10].try_into().unwrap()) != 0 {
             return None;
         }

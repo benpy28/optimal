@@ -52,7 +52,8 @@ fn protocol<T>(handle: efi::Handle, guid: &Guid) -> Option<*mut T> {
 
 impl Volume {
     pub fn open(image: efi::Handle) -> Result<Volume, FsError> {
-        let li: *mut efi::LoadedImage = protocol(image, &efi::LOADED_IMAGE_GUID).ok_or(FsError::NoVolume)?;
+        let li: *mut efi::LoadedImage =
+            protocol(image, &efi::LOADED_IMAGE_GUID).ok_or(FsError::NoVolume)?;
         // SAFETY: the firmware's loaded image protocol for our own image.
         let device = unsafe { (*li).device_handle };
         let sfs: *mut efi::SimpleFileSystem =
@@ -62,17 +63,25 @@ impl Volume {
         if unsafe { ((*sfs).open_volume)(sfs, &mut root) } != efi::SUCCESS {
             return Err(FsError::NoVolume);
         }
-        Ok(Volume { root, info: volume_info(device) })
+        Ok(Volume {
+            root,
+            info: volume_info(device),
+        })
     }
 
     /// Reads a whole file (path with '/' separators) into fresh pages, which
     /// keeps it 4 KiB aligned with pages of its own. Returns (pages, size).
     pub fn read(&self, path: &str, max: u64) -> Result<(Pages, u64), FsError> {
-        let mut name: Vec<u16> = path.bytes().map(|b| if b == b'/' { b'\\' as u16 } else { b as u16 }).collect();
+        let mut name: Vec<u16> = path
+            .bytes()
+            .map(|b| if b == b'/' { b'\\' as u16 } else { b as u16 })
+            .collect();
         name.push(0);
         let mut file = ptr::null_mut();
         // SAFETY: root is the open volume; name is NUL-terminated UCS-2.
-        let s = unsafe { ((*self.root).open)(self.root, &mut file, name.as_ptr(), efi::FILE_MODE_READ, 0) };
+        let s = unsafe {
+            ((*self.root).open)(self.root, &mut file, name.as_ptr(), efi::FILE_MODE_READ, 0)
+        };
         if s != efi::SUCCESS {
             return Err(FsError::NotFound);
         }
@@ -87,7 +96,14 @@ fn read_open(file: *mut efi::FileProtocol, max: u64) -> Result<(Pages, u64), FsE
     let mut info = [0u64; 128]; // 1 KiB, 8-byte aligned, room for the name
     let mut size = core::mem::size_of_val(&info);
     // SAFETY: file is open; info is a writable buffer of `size` bytes.
-    let s = unsafe { ((*file).get_info)(file, &efi::FILE_INFO_GUID, &mut size, info.as_mut_ptr() as *mut u8) };
+    let s = unsafe {
+        ((*file).get_info)(
+            file,
+            &efi::FILE_INFO_GUID,
+            &mut size,
+            info.as_mut_ptr() as *mut u8,
+        )
+    };
     if s != efi::SUCCESS {
         return Err(FsError::ReadFailed);
     }
@@ -137,7 +153,13 @@ fn volume_info(device: efi::Handle) -> VolumeInfo {
     for _ in 0..64 {
         // SAFETY: device path nodes are a firmware-provided list ending in an
         // end node (type 0x7f); each node's length covers its header.
-        let (typ, sub, len) = unsafe { (*node, *node.add(1), u16::from_le_bytes([*node.add(2), *node.add(3)]) as usize) };
+        let (typ, sub, len) = unsafe {
+            (
+                *node,
+                *node.add(1),
+                u16::from_le_bytes([*node.add(2), *node.add(3)]) as usize,
+            )
+        };
         if typ == 0x7f || len < 4 {
             break;
         }
@@ -173,7 +195,9 @@ fn gpt_disk_uuid(prefix: &[u8]) -> Option<[u8; 16]> {
     path.extend_from_slice(&[0x7f, 0xff, 4, 0]);
     let mut dp = path.as_ptr() as *const efi::DevicePath;
     let mut handle: efi::Handle = ptr::null_mut();
-    if (boot_services().locate_device_path)(&efi::BLOCK_IO_GUID, &mut dp, &mut handle) != efi::SUCCESS {
+    if (boot_services().locate_device_path)(&efi::BLOCK_IO_GUID, &mut dp, &mut handle)
+        != efi::SUCCESS
+    {
         return None;
     }
     let bio: *mut efi::BlockIo = protocol(handle, &efi::BLOCK_IO_GUID)?;
@@ -184,8 +208,17 @@ fn gpt_disk_uuid(prefix: &[u8]) -> Option<[u8; 16]> {
     }
     let mut buf = Pages::new(media.block_size as u64, efi::LOADER_DATA, None)?;
     // SAFETY: buf has block_size bytes, page aligned (meets any io_align).
-    let s = unsafe { ((*bio).read_blocks)(bio, media.media_id, 1, media.block_size as usize, buf.bytes().as_mut_ptr()) };
-    let out = (s == efi::SUCCESS && &buf.bytes()[0..8] == b"EFI PART").then(|| buf.bytes()[56..72].try_into().unwrap());
+    let s = unsafe {
+        ((*bio).read_blocks)(
+            bio,
+            media.media_id,
+            1,
+            media.block_size as usize,
+            buf.bytes().as_mut_ptr(),
+        )
+    };
+    let out = (s == efi::SUCCESS && &buf.bytes()[0..8] == b"EFI PART")
+        .then(|| buf.bytes()[56..72].try_into().unwrap());
     buf.free();
     out
 }

@@ -123,6 +123,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "optimal-boot-conformance"
+version = "0.1.0"
+dependencies = [
+ "optimal-boot-core",
+]
+
+[[package]]
 name = "optimal-boot-core"
 version = "0.1.0"
 dependencies = [

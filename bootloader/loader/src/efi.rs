@@ -31,21 +31,96 @@ pub fn is_error(s: Status) -> bool {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Guid(pub u32, pub u16, pub u16, pub [u8; 8]);
 
-pub const LOADED_IMAGE_GUID: Guid = Guid(0x5b1b31a1, 0x9562, 0x11d2, [0x8e, 0x3f, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b]);
-pub const SIMPLE_FILE_SYSTEM_GUID: Guid = Guid(0x964e5b22, 0x6459, 0x11d2, [0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b]);
-pub const FILE_INFO_GUID: Guid = Guid(0x09576e92, 0x6d3f, 0x11d2, [0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b]);
-pub const DEVICE_PATH_GUID: Guid = Guid(0x09576e91, 0x6d3f, 0x11d2, [0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b]);
-pub const BLOCK_IO_GUID: Guid = Guid(0x964e5b21, 0x6459, 0x11d2, [0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b]);
-pub const GOP_GUID: Guid = Guid(0x9042a9de, 0x23dc, 0x4a38, [0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a]);
-pub const EDID_ACTIVE_GUID: Guid = Guid(0xbd8c1056, 0x9f36, 0x44ec, [0x92, 0xa8, 0xa6, 0x33, 0x7f, 0x81, 0x79, 0x86]);
-pub const EDID_DISCOVERED_GUID: Guid = Guid(0x1c0c34f6, 0xd380, 0x41fa, [0xa0, 0x49, 0x8a, 0xd0, 0x6c, 0x1a, 0x66, 0xaa]);
-pub const RNG_GUID: Guid = Guid(0x3152bca5, 0xeade, 0x433d, [0x86, 0x2e, 0xc0, 0x1c, 0xdc, 0x29, 0x1f, 0x44]);
-pub const TCG2_GUID: Guid = Guid(0x607f766c, 0x7455, 0x42be, [0x93, 0x0b, 0xe4, 0xd7, 0x6d, 0xb2, 0x72, 0x0f]);
-pub const ACPI_20_TABLE_GUID: Guid = Guid(0x8868e871, 0xe4f1, 0x11d3, [0xbc, 0x22, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81]);
-pub const ACPI_10_TABLE_GUID: Guid = Guid(0xeb9d2d30, 0x2d88, 0x11d3, [0x9a, 0x16, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d]);
-pub const SMBIOS_TABLE_GUID: Guid = Guid(0xeb9d2d31, 0x2d88, 0x11d3, [0x9a, 0x16, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d]);
-pub const SMBIOS3_TABLE_GUID: Guid = Guid(0xf2fd1544, 0x9794, 0x4a2c, [0x99, 0x2e, 0xe5, 0xbb, 0xcf, 0x20, 0xe3, 0x94]);
-pub const GLOBAL_VARIABLE_GUID: Guid = Guid(0x8be4df61, 0x93ca, 0x11d2, [0xaa, 0x0d, 0x00, 0xe0, 0x98, 0x03, 0x2b, 0x8c]);
+pub const LOADED_IMAGE_GUID: Guid = Guid(
+    0x5b1b31a1,
+    0x9562,
+    0x11d2,
+    [0x8e, 0x3f, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
+);
+pub const SIMPLE_FILE_SYSTEM_GUID: Guid = Guid(
+    0x964e5b22,
+    0x6459,
+    0x11d2,
+    [0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
+);
+pub const FILE_INFO_GUID: Guid = Guid(
+    0x09576e92,
+    0x6d3f,
+    0x11d2,
+    [0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
+);
+pub const DEVICE_PATH_GUID: Guid = Guid(
+    0x09576e91,
+    0x6d3f,
+    0x11d2,
+    [0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
+);
+pub const BLOCK_IO_GUID: Guid = Guid(
+    0x964e5b21,
+    0x6459,
+    0x11d2,
+    [0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
+);
+pub const GOP_GUID: Guid = Guid(
+    0x9042a9de,
+    0x23dc,
+    0x4a38,
+    [0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a],
+);
+pub const EDID_ACTIVE_GUID: Guid = Guid(
+    0xbd8c1056,
+    0x9f36,
+    0x44ec,
+    [0x92, 0xa8, 0xa6, 0x33, 0x7f, 0x81, 0x79, 0x86],
+);
+pub const EDID_DISCOVERED_GUID: Guid = Guid(
+    0x1c0c34f6,
+    0xd380,
+    0x41fa,
+    [0xa0, 0x49, 0x8a, 0xd0, 0x6c, 0x1a, 0x66, 0xaa],
+);
+pub const RNG_GUID: Guid = Guid(
+    0x3152bca5,
+    0xeade,
+    0x433d,
+    [0x86, 0x2e, 0xc0, 0x1c, 0xdc, 0x29, 0x1f, 0x44],
+);
+pub const TCG2_GUID: Guid = Guid(
+    0x607f766c,
+    0x7455,
+    0x42be,
+    [0x93, 0x0b, 0xe4, 0xd7, 0x6d, 0xb2, 0x72, 0x0f],
+);
+pub const ACPI_20_TABLE_GUID: Guid = Guid(
+    0x8868e871,
+    0xe4f1,
+    0x11d3,
+    [0xbc, 0x22, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81],
+);
+pub const ACPI_10_TABLE_GUID: Guid = Guid(
+    0xeb9d2d30,
+    0x2d88,
+    0x11d3,
+    [0x9a, 0x16, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d],
+);
+pub const SMBIOS_TABLE_GUID: Guid = Guid(
+    0xeb9d2d31,
+    0x2d88,
+    0x11d3,
+    [0x9a, 0x16, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d],
+);
+pub const SMBIOS3_TABLE_GUID: Guid = Guid(
+    0xf2fd1544,
+    0x9794,
+    0x4a2c,
+    [0x99, 0x2e, 0xe5, 0xbb, 0xcf, 0x20, 0xe3, 0x94],
+);
+pub const GLOBAL_VARIABLE_GUID: Guid = Guid(
+    0x8be4df61,
+    0x93ca,
+    0x11d2,
+    [0xaa, 0x0d, 0x00, 0xe0, 0x98, 0x03, 0x2b, 0x8c],
+);
 
 #[repr(C)]
 pub struct TableHeader {
@@ -132,7 +207,8 @@ pub struct RuntimeServices {
     pub set_wakeup_time: *const c_void,
     pub set_virtual_address_map: *const c_void,
     pub convert_pointer: *const c_void,
-    pub get_variable: extern "efiapi" fn(*const u16, *const Guid, *mut u32, *mut usize, *mut c_void) -> Status,
+    pub get_variable:
+        extern "efiapi" fn(*const u16, *const Guid, *mut u32, *mut usize, *mut c_void) -> Status,
     pub get_next_variable_name: *const c_void,
     pub set_variable: *const c_void,
     pub get_next_high_monotonic_count: *const c_void,
@@ -172,7 +248,13 @@ pub struct BootServices {
     pub restore_tpl: *const c_void,
     pub allocate_pages: extern "efiapi" fn(u32, u32, usize, *mut u64) -> Status,
     pub free_pages: extern "efiapi" fn(u64, usize) -> Status,
-    pub get_memory_map: extern "efiapi" fn(*mut usize, *mut MemoryDescriptor, *mut usize, *mut usize, *mut u32) -> Status,
+    pub get_memory_map: extern "efiapi" fn(
+        *mut usize,
+        *mut MemoryDescriptor,
+        *mut usize,
+        *mut usize,
+        *mut u32,
+    ) -> Status,
     pub allocate_pool: extern "efiapi" fn(u32, usize, *mut *mut u8) -> Status,
     pub free_pool: extern "efiapi" fn(*mut u8) -> Status,
     pub create_event: *const c_void,
@@ -188,7 +270,8 @@ pub struct BootServices {
     pub reserved: *const c_void,
     pub register_protocol_notify: *const c_void,
     pub locate_handle: *const c_void,
-    pub locate_device_path: extern "efiapi" fn(*const Guid, *mut *const DevicePath, *mut Handle) -> Status,
+    pub locate_device_path:
+        extern "efiapi" fn(*const Guid, *mut *const DevicePath, *mut Handle) -> Status,
     pub install_configuration_table: *const c_void,
     pub load_image: *const c_void,
     pub start_image: *const c_void,
@@ -200,11 +283,13 @@ pub struct BootServices {
     pub set_watchdog_timer: extern "efiapi" fn(usize, u64, usize, *const u16) -> Status,
     pub connect_controller: *const c_void,
     pub disconnect_controller: *const c_void,
-    pub open_protocol: extern "efiapi" fn(Handle, *const Guid, *mut *mut c_void, Handle, Handle, u32) -> Status,
+    pub open_protocol:
+        extern "efiapi" fn(Handle, *const Guid, *mut *mut c_void, Handle, Handle, u32) -> Status,
     pub close_protocol: *const c_void,
     pub open_protocol_information: *const c_void,
     pub protocols_per_handle: *const c_void,
-    pub locate_handle_buffer: extern "efiapi" fn(u32, *const Guid, *const c_void, *mut usize, *mut *mut Handle) -> Status,
+    pub locate_handle_buffer:
+        extern "efiapi" fn(u32, *const Guid, *const c_void, *mut usize, *mut *mut Handle) -> Status,
     pub locate_protocol: extern "efiapi" fn(*const Guid, *const c_void, *mut *mut c_void) -> Status,
     pub install_multiple_protocol_interfaces: *const c_void,
     pub uninstall_multiple_protocol_interfaces: *const c_void,
@@ -247,7 +332,13 @@ pub struct SimpleFileSystem {
 #[repr(C)]
 pub struct FileProtocol {
     pub revision: u64,
-    pub open: extern "efiapi" fn(*mut FileProtocol, *mut *mut FileProtocol, *const u16, u64, u64) -> Status,
+    pub open: extern "efiapi" fn(
+        *mut FileProtocol,
+        *mut *mut FileProtocol,
+        *const u16,
+        u64,
+        u64,
+    ) -> Status,
     pub close: extern "efiapi" fn(*mut FileProtocol) -> Status,
     pub delete: *const c_void,
     pub read: extern "efiapi" fn(*mut FileProtocol, *mut usize, *mut u8) -> Status,
@@ -287,7 +378,8 @@ pub struct BlockIo {
 
 #[repr(C)]
 pub struct GraphicsOutput {
-    pub query_mode: extern "efiapi" fn(*mut GraphicsOutput, u32, *mut usize, *mut *const GopModeInfo) -> Status,
+    pub query_mode:
+        extern "efiapi" fn(*mut GraphicsOutput, u32, *mut usize, *mut *const GopModeInfo) -> Status,
     pub set_mode: extern "efiapi" fn(*mut GraphicsOutput, u32) -> Status,
     pub blt: *const c_void,
     pub mode: *const GopMode,
@@ -334,7 +426,10 @@ pub struct RngProtocol {
     pub get_rng: extern "efiapi" fn(*mut RngProtocol, *const Guid, usize, *mut u8) -> Status,
 }
 
-#[repr(C, packed)]
+/// EFI_TCG2_BOOT_SERVICE_CAPABILITY. Natural alignment, NOT packed: firmware
+/// (edk2) lays it out with padding, 36 bytes, and a caller passing a smaller
+/// size gets the 28-byte TrEE 1.0 layout back instead.
+#[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct Tcg2Capability {
     pub size: u8,
@@ -350,12 +445,23 @@ pub struct Tcg2Capability {
     pub active_pcr_banks: u32,
 }
 
+// The layout firmware uses (edk2 MdePkg/Include/Protocol/Tcg2Protocol.h).
+const _: () = {
+    assert!(core::mem::size_of::<Tcg2Capability>() == 36);
+    assert!(core::mem::offset_of!(Tcg2Capability, hash_algorithm_bitmap) == 8);
+    assert!(core::mem::offset_of!(Tcg2Capability, tpm_present_flag) == 16);
+    assert!(core::mem::offset_of!(Tcg2Capability, active_pcr_banks) == 32);
+};
+
 #[repr(C)]
 pub struct Tcg2Protocol {
     pub get_capability: extern "efiapi" fn(*mut Tcg2Protocol, *mut Tcg2Capability) -> Status,
-    pub get_event_log: extern "efiapi" fn(*mut Tcg2Protocol, u32, *mut u64, *mut u64, *mut bool) -> Status,
-    pub hash_log_extend_event: extern "efiapi" fn(*mut Tcg2Protocol, u64, u64, u64, *const u8) -> Status,
-    pub submit_command: extern "efiapi" fn(*mut Tcg2Protocol, u32, *const u8, u32, *mut u8) -> Status,
+    pub get_event_log:
+        extern "efiapi" fn(*mut Tcg2Protocol, u32, *mut u64, *mut u64, *mut bool) -> Status,
+    pub hash_log_extend_event:
+        extern "efiapi" fn(*mut Tcg2Protocol, u64, u64, u64, *const u8) -> Status,
+    pub submit_command:
+        extern "efiapi" fn(*mut Tcg2Protocol, u32, *const u8, u32, *mut u8) -> Status,
     pub get_active_pcr_banks: *const c_void,
     pub set_active_pcr_banks: *const c_void,
     pub get_result_of_set_active_pcr_banks: *const c_void,

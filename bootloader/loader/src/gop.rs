@@ -40,8 +40,18 @@ fn mask_info(mask: u32) -> (u8, u8) {
 
 fn format(info: &efi::GopModeInfo) -> Option<Format> {
     match info.pixel_format {
-        efi::PIXEL_RGBX => Some(Format { bpp: 32, red: (8, 0), green: (8, 8), blue: (8, 16) }),
-        efi::PIXEL_BGRX => Some(Format { bpp: 32, red: (8, 16), green: (8, 8), blue: (8, 0) }),
+        efi::PIXEL_RGBX => Some(Format {
+            bpp: 32,
+            red: (8, 0),
+            green: (8, 8),
+            blue: (8, 16),
+        }),
+        efi::PIXEL_BGRX => Some(Format {
+            bpp: 32,
+            red: (8, 16),
+            green: (8, 8),
+            blue: (8, 0),
+        }),
         efi::PIXEL_BITMASK => {
             let all = info.red_mask | info.green_mask | info.blue_mask | info.reserved_mask;
             if all == 0 {
@@ -62,7 +72,10 @@ fn format(info: &efi::GopModeInfo) -> Option<Format> {
 
 fn mode_from(number: u32, info: &efi::GopModeInfo) -> Option<Mode> {
     let f = format(info)?;
-    if info.horizontal_resolution == 0 || info.vertical_resolution == 0 || info.pixels_per_scan_line < info.horizontal_resolution {
+    if info.horizontal_resolution == 0
+        || info.vertical_resolution == 0
+        || info.pixels_per_scan_line < info.horizontal_resolution
+    {
         return None;
     }
     Some(Mode {
@@ -87,14 +100,23 @@ fn find_gop() -> Option<(*mut efi::GraphicsOutput, efi::Handle)> {
     }
     let mut count = 0usize;
     let mut handles: *mut efi::Handle = ptr::null_mut();
-    if (bs.locate_handle_buffer)(efi::LOCATE_BY_PROTOCOL, &efi::GOP_GUID, ptr::null(), &mut count, &mut handles) != efi::SUCCESS || count == 0 {
+    if (bs.locate_handle_buffer)(
+        efi::LOCATE_BY_PROTOCOL,
+        &efi::GOP_GUID,
+        ptr::null(),
+        &mut count,
+        &mut handles,
+    ) != efi::SUCCESS
+        || count == 0
+    {
         return None;
     }
     // SAFETY: the firmware returned `count` handles.
     let h = unsafe { *handles };
     (bs.free_pool)(handles as *mut u8);
     let mut p: *mut c_void = ptr::null_mut();
-    ((bs.handle_protocol)(h, &efi::GOP_GUID, &mut p) == efi::SUCCESS && !p.is_null()).then_some((p as *mut _, h))
+    ((bs.handle_protocol)(h, &efi::GOP_GUID, &mut p) == efi::SUCCESS && !p.is_null())
+        .then_some((p as *mut _, h))
 }
 
 /// Finds the display, switching mode if the config asks for a resolution
@@ -121,14 +143,20 @@ pub fn setup(want: Option<(u32, u32)>) -> Option<Display> {
         mode_from(m.mode, unsafe { &*m.info })
     };
     let target = match want {
-        Some((w, h)) => modes.iter().find(|m| m.width == w && m.height == h).copied(),
-        None if current().is_none() => modes.iter().max_by_key(|m| m.width as u64 * m.height as u64).copied(),
+        Some((w, h)) => modes
+            .iter()
+            .find(|m| m.width == w && m.height == h)
+            .copied(),
+        None if current().is_none() => modes
+            .iter()
+            .max_by_key(|m| m.width as u64 * m.height as u64)
+            .copied(),
         None => None,
     };
-    if let Some(t) = target {
-        if current().map(|c| c.number) != Some(t.number) {
-            (g.set_mode)(gop, t.number);
-        }
+    if let Some(t) = target
+        && current().map(|c| c.number) != Some(t.number)
+    {
+        (g.set_mode)(gop, t.number);
     }
     let current = current()?;
     // SAFETY: as above.
@@ -137,12 +165,15 @@ pub fn setup(want: Option<(u32, u32)>) -> Option<Display> {
     let mut edid = Vec::new();
     for guid in [efi::EDID_ACTIVE_GUID, efi::EDID_DISCOVERED_GUID] {
         let mut p: *mut c_void = ptr::null_mut();
-        if (boot_services().handle_protocol)(handle, &guid, &mut p) == efi::SUCCESS && !p.is_null() {
+        if (boot_services().handle_protocol)(handle, &guid, &mut p) == efi::SUCCESS && !p.is_null()
+        {
             // SAFETY: an EDID protocol from the firmware.
             let e = unsafe { &*(p as *const efi::EdidProtocol) };
             if !e.edid.is_null() && (128..=32768).contains(&e.size_of_edid) {
                 // SAFETY: the protocol says `size_of_edid` bytes live at `edid`.
-                edid.extend_from_slice(unsafe { core::slice::from_raw_parts(e.edid, e.size_of_edid as usize) });
+                edid.extend_from_slice(unsafe {
+                    core::slice::from_raw_parts(e.edid, e.size_of_edid as usize)
+                });
                 break;
             }
         }
@@ -150,5 +181,11 @@ pub fn setup(want: Option<(u32, u32)>) -> Option<Display> {
     if m.frame_buffer_base == 0 {
         return None;
     }
-    Some(Display { base: m.frame_buffer_base, size, current, modes, edid })
+    Some(Display {
+        base: m.frame_buffer_base,
+        size,
+        current,
+        modes,
+        edid,
+    })
 }

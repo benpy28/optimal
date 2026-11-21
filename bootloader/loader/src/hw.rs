@@ -23,7 +23,6 @@ pub struct Features {
     pub huge_1g: bool,
     pub la57: bool,
     pub pat: bool,
-    pub x2apic: bool,
     pub rdrand: bool,
     pub rdseed: bool,
     pub apic: bool,
@@ -31,7 +30,11 @@ pub struct Features {
 
 pub fn features() -> Features {
     let (_, _, c1, d1) = cpuid(1, 0);
-    let (_, b7, c7, _) = if max_leaf() >= 7 { cpuid(7, 0) } else { (0, 0, 0, 0) };
+    let (_, b7, c7, _) = if max_leaf() >= 7 {
+        cpuid(7, 0)
+    } else {
+        (0, 0, 0, 0)
+    };
     let (_, _, _, de) = if max_ext_leaf() >= 0x8000_0001 {
         cpuid(0x8000_0001, 0)
     } else {
@@ -43,7 +46,6 @@ pub fn features() -> Features {
         la57: c7 & (1 << 16) != 0,
         pat: d1 & (1 << 16) != 0,
         apic: d1 & (1 << 9) != 0,
-        x2apic: c1 & (1 << 21) != 0,
         rdrand: c1 & (1 << 30) != 0,
         rdseed: b7 & (1 << 18) != 0,
     }
@@ -97,7 +99,9 @@ pub fn rdrand() -> Option<u64> {
         let v: u64;
         let ok: u8;
         // SAFETY: only called when CPUID reports RDRAND.
-        unsafe { asm!("rdrand {v}", "setc {ok}", v = out(reg) v, ok = out(reg_byte) ok, options(nomem, nostack)) };
+        unsafe {
+            asm!("rdrand {v}", "setc {ok}", v = out(reg) v, ok = out(reg_byte) ok, options(nomem, nostack))
+        };
         if ok != 0 {
             return Some(v);
         }
@@ -110,7 +114,9 @@ pub fn rdseed() -> Option<u64> {
         let v: u64;
         let ok: u8;
         // SAFETY: only called when CPUID reports RDSEED.
-        unsafe { asm!("rdseed {v}", "setc {ok}", v = out(reg) v, ok = out(reg_byte) ok, options(nomem, nostack)) };
+        unsafe {
+            asm!("rdseed {v}", "setc {ok}", v = out(reg) v, ok = out(reg_byte) ok, options(nomem, nostack))
+        };
         if ok != 0 {
             return Some(v);
         }
@@ -122,13 +128,6 @@ pub fn rdseed() -> Option<u64> {
 pub fn cli() {
     // SAFETY: disabling interrupts is always allowed in ring 0.
     unsafe { asm!("cli", options(nomem, nostack)) };
-}
-
-pub fn halt_forever() -> ! {
-    loop {
-        // SAFETY: stops the CPU; interrupts are off so it never wakes.
-        unsafe { asm!("cli; hlt", options(nomem, nostack)) };
-    }
 }
 
 const COM1: u16 = 0x3f8;

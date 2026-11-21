@@ -7,7 +7,8 @@ log="$1"; timeout="$2"; shift 2
 DONE='OPTIMAL: kernel booted|KERNEL PANIC|OPTIMAL-BOOT: FATAL|OPTIMAL-CONFORMANCE: (PASS|FAIL)|Access Denied|Security Violation'
 rm -f "$log"
 ACCEL=()
-if [ -w /dev/kvm ]; then ACCEL=(-accel kvm); fi
+# QEMU_ACCEL=tcg forces the emulator (to test CPU features the host lacks).
+if [ "${QEMU_ACCEL:-auto}" = auto ] && [ -w /dev/kvm ]; then ACCEL=(-accel kvm); fi
 qemu-system-x86_64 "${ACCEL[@]}" -display none -serial "file:$log" -no-reboot "$@" >/dev/null 2>&1 &
 qemu=$!
 waited=0

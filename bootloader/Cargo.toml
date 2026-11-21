@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["core", "loader", "sign"]
-default-members = ["core", "loader", "sign"]
+members = ["core", "loader", "sign", "conformance"]
+default-members = ["core", "sign"]
 
 [workspace.package]
 version = "0.1.0"

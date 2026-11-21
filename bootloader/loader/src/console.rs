@@ -66,7 +66,11 @@ impl Write for Console {
                     buf[n] = b'\r' as u16;
                     n += 1;
                 }
-                buf[n] = if (c as u32) < 0x80 { c as u16 } else { b'?' as u16 };
+                buf[n] = if (c as u32) < 0x80 {
+                    c as u16
+                } else {
+                    b'?' as u16
+                };
                 n += 1;
             }
             if n > 0 {
