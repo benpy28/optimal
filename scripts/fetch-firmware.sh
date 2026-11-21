@@ -21,9 +21,11 @@ if ! command -v docker >/dev/null; then
     exit 0
 fi
 
-# fetch <name> <image> <package> <installed path, without the leading />
+# fetch <name> <image> <package> <code path> <vars path> (paths without the
+# leading /). Each firmware build gets its own matching variable store, as on
+# a real PC: some builds hang at power-on without one.
 fetch() {
-    local name="$1" image="$2" pkg="$3" path="$4"
+    local name="$1" image="$2" pkg="$3" path="$4" vars="$5"
     mkdir -p "$OUT/$name"
     if docker run --rm -v "$PWD/$OUT/$name:/out" "$image" sh -c "
         set -e
@@ -33,7 +35,8 @@ fetch() {
             dnf -q -y install $pkg
         fi
         cp /$path /out/
-    " >/dev/null 2>&1 && ls "$OUT/$name"/OVMF_CODE*.fd >/dev/null 2>&1; then
+        cp /$vars /out/OVMF_VARS.fd
+    " >/dev/null 2>&1 && ls "$OUT/$name"/OVMF_CODE*.fd "$OUT/$name/OVMF_VARS.fd" >/dev/null 2>&1; then
         echo "firmware: $name ($(basename "$path"))"
     else
         echo "WARN: could not fetch firmware $name"
@@ -42,11 +45,11 @@ fetch() {
     fi
 }
 
-fetch edk2-2019-ubuntu20.04 ubuntu:20.04 ovmf usr/share/OVMF/OVMF_CODE.fd
-fetch edk2-2022.02-ubuntu22.04 ubuntu:22.04 ovmf usr/share/OVMF/OVMF_CODE.fd
-fetch edk2-2022.11-debian12 debian:12 ovmf usr/share/OVMF/OVMF_CODE_4M.fd
-fetch edk2-2025.02-debian13 debian:13 ovmf usr/share/OVMF/OVMF_CODE_4M.fd
-fetch edk2-latest-fedora fedora:latest edk2-ovmf usr/share/edk2/ovmf/OVMF_CODE.fd
+fetch edk2-2019-ubuntu20.04 ubuntu:20.04 ovmf usr/share/OVMF/OVMF_CODE.fd usr/share/OVMF/OVMF_VARS.fd
+fetch edk2-2022.02-ubuntu22.04 ubuntu:22.04 ovmf usr/share/OVMF/OVMF_CODE.fd usr/share/OVMF/OVMF_VARS.fd
+fetch edk2-2022.11-debian12 debian:12 ovmf usr/share/OVMF/OVMF_CODE_4M.fd usr/share/OVMF/OVMF_VARS_4M.fd
+fetch edk2-2025.02-debian13 debian:13 ovmf usr/share/OVMF/OVMF_CODE_4M.fd usr/share/OVMF/OVMF_VARS_4M.fd
+fetch edk2-latest-fedora fedora:latest edk2-ovmf usr/share/edk2/ovmf/OVMF_CODE.fd usr/share/edk2/ovmf/OVMF_VARS.fd
 ls "$OUT"
 if [ "${STRICT:-0}" = 1 ] && [ "$missing" -gt 0 ]; then
     echo "ERROR: $missing firmware builds missing"
