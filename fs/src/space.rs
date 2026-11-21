@@ -30,7 +30,7 @@ use crate::io::{Io, zero_block};
 use crate::ptr::{BlockPtr, PTR_LEN};
 use crate::rangeset::RangeSet;
 use alloc::boxed::Box;
-use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -415,11 +415,10 @@ impl Space {
         }
         self.free_total = (self.free_total as i64 + delta) as u64;
         self.bmps.get_mut(&i).unwrap().dirty = true;
-        if let Some(a) = old_bmp {
-            if a != 0 {
+        if let Some(a) = old_bmp
+            && a != 0 {
                 self.free(io, a, 1)?;
             }
-        }
         Ok(())
     }
 
@@ -493,11 +492,10 @@ impl Space {
     fn quarantined_until(&self, b: u64) -> Option<u64> {
         let mut end: Option<u64> = None;
         for set in core::iter::once(&self.freed_now).chain(self.held.iter().map(|h| &h.set)) {
-            if let Some((s, e)) = set.next_range_from(b) {
-                if s == b {
+            if let Some((s, e)) = set.next_range_from(b)
+                && s == b {
                     end = Some(end.map_or(e, |x| x.max(e)));
                 }
-            }
         }
         end
     }
@@ -576,7 +574,7 @@ impl Space {
             let words = &self.bmps[&i].words;
             let bit = b - first;
             let w = words[(bit / 64) as usize];
-            if bit % 64 == 0 && w == u64::MAX {
+            if bit.is_multiple_of(64) && w == u64::MAX {
                 b += 64;
                 continue;
             }
@@ -884,6 +882,33 @@ impl Space {
         Ok(n)
     }
 
+    /// Indices of every bitmap that has been written (non-null), found by
+    /// walking only written tables, so a sparse huge map is cheap.
+    pub fn written_bitmaps<D: BlockDevice>(&mut self, io: &mut Io<D>) -> Result<Vec<u64>> {
+        let mut out = Vec::new();
+        let mut stack = vec![(self.levels, 0u64)];
+        while let Some((level, idx)) = stack.pop() {
+            let kids = self.table(io, level, idx)?.kids.clone();
+            for (j, k) in kids.iter().enumerate().rev() {
+                if k.is_null() {
+                    continue;
+                }
+                let c = idx * FANOUT + j as u64;
+                if level == 1 {
+                    out.push(c);
+                } else {
+                    stack.push((level - 1, c));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Moves the next-fit allocation cursor (tests reach far regions).
+    pub fn set_cursor(&mut self, b: u64) {
+        self.cursor = b.clamp(SB_RESERVED_FRONT, self.total - 1);
+    }
+
     /// The oldest generation whose frees are still quarantined, if any.
     pub fn oldest_held(&self) -> Option<u64> {
         self.held.front().map(|h| h.generation)
@@ -897,13 +922,4 @@ impl Space {
     pub fn held_ranges(&self) -> Vec<(u64, u64)> {
         self.held.iter().flat_map(|h| h.set.to_vec()).collect()
     }
-
-    /// Next used/free transition search for fsck: whether any block in
-    /// `[start, start+len)` is used, without loading untouched regions.
-    pub fn bitmap_is_null<D: BlockDevice>(&mut self, io: &mut Io<D>, i: u64) -> Result<bool> {
-        Ok(!self.bmps.contains_key(&i) && self.bmp_ptr(io, i)?.is_null())
-    }
 }
-
-#[allow(dead_code)]
-fn _assert_sets(_: BTreeSet<u64>) {}

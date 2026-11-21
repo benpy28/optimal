@@ -277,3 +277,60 @@ impl BlockDevice for CrashDevice {
         Ok(())
     }
 }
+
+/// A huge device that stores only blocks written with non-zero content
+/// (unwritten blocks read as zeros), for testing multi-terabyte volumes.
+#[derive(Debug, Clone, Default)]
+pub struct SparseDevice {
+    blocks: u64,
+    data: BTreeMap<u64, Vec<u8>>,
+    pub reads: u64,
+    pub writes: u64,
+}
+
+impl SparseDevice {
+    pub fn new(blocks: u64) -> Self {
+        SparseDevice {
+            blocks,
+            ..Default::default()
+        }
+    }
+    /// Blocks actually holding data.
+    pub fn stored_blocks(&self) -> usize {
+        self.data.len()
+    }
+}
+
+impl BlockDevice for SparseDevice {
+    fn num_blocks(&self) -> u64 {
+        self.blocks
+    }
+    fn read(&mut self, block: u64, buf: &mut [u8]) -> Result<(), IoError> {
+        let n = check_range(self.blocks, block, buf.len())?;
+        self.reads += n;
+        for i in 0..n {
+            let dst = &mut buf[i as usize * BLOCK_SIZE..(i as usize + 1) * BLOCK_SIZE];
+            match self.data.get(&(block + i)) {
+                Some(v) => dst.copy_from_slice(v),
+                None => dst.fill(0),
+            }
+        }
+        Ok(())
+    }
+    fn write(&mut self, block: u64, buf: &[u8]) -> Result<(), IoError> {
+        let n = check_range(self.blocks, block, buf.len())?;
+        self.writes += n;
+        for i in 0..n {
+            let src = &buf[i as usize * BLOCK_SIZE..(i as usize + 1) * BLOCK_SIZE];
+            if src.iter().all(|&x| x == 0) {
+                self.data.remove(&(block + i));
+            } else {
+                self.data.insert(block + i, src.to_vec());
+            }
+        }
+        Ok(())
+    }
+    fn flush(&mut self) -> Result<(), IoError> {
+        Ok(())
+    }
+}

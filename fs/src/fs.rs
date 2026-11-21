@@ -710,6 +710,13 @@ impl<D: BlockDevice> Filesystem<D> {
         &self.store.io.dev
     }
 
+    /// Makes the allocator continue its search at block `b` (tests use it
+    /// to put data in far regions of huge volumes).
+    #[doc(hidden)]
+    pub fn set_alloc_cursor_for_tests(&mut self, b: u64) {
+        self.store.space.set_cursor(b);
+    }
+
     #[doc(hidden)]
     pub fn next_ino_for_tests(&self) -> u64 {
         self.next_ino

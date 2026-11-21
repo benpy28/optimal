@@ -169,25 +169,30 @@ pub fn check<D: BlockDevice>(fs: &mut Filesystem<D>, verify_data: bool) -> Resul
     let total = cx.total;
     let reserved = |b: u64| b < SB_RESERVED_FRONT || b >= total - SB_RESERVED_BACK;
     let mut mismatches = 0u64;
-    let nbmps = total.div_ceil(BITS_PER_BMP);
-    for i in 0..nbmps {
+    // A never-written bitmap means "all free": nothing may live there.
+    // Only written bitmaps are compared bit by bit, so sparse multi-terabyte
+    // volumes stay fast.
+    let written = fs.store.space.written_bitmaps(&mut fs.store.io)?;
+    let written_set: BTreeSet<u64> = written.iter().copied().collect();
+    let reserved_list = [0, 1, total - 2, total - 1];
+    let in_null: Vec<u64> = cx
+        .owners
+        .keys()
+        .chain(reserved_list.iter())
+        .copied()
+        .filter(|b| !written_set.contains(&(b / BITS_PER_BMP)))
+        .take(21)
+        .collect();
+    for b in in_null {
+        mismatches += 1;
+        cx.err(format!(
+            "block {b}: space map says free (unwritten bitmap {}) but it is referenced",
+            b / BITS_PER_BMP
+        ));
+    }
+    for (n, i) in written.into_iter().enumerate() {
         let first = i * BITS_PER_BMP;
         let end = total.min(first + BITS_PER_BMP);
-        // A never-written bitmap means "all free": nothing may live there.
-        // Checked by range so sparse multi-terabyte volumes stay fast.
-        if fs.store.space.bitmap_is_null(&mut fs.store.io, i)? {
-            let clash = cx.owners.range(first..end).next().map(|(&b, _)| b);
-            let res = [0, 1, total - 2, total - 1]
-                .into_iter()
-                .find(|&b| b >= first && b < end);
-            if let Some(b) = clash.or(res) {
-                mismatches += 1;
-                cx.err(format!(
-                    "block {b}: space map says free (unwritten bitmap {i}) but it is referenced"
-                ));
-            }
-            continue;
-        }
         for b in first..end {
             let used = fs.store.space.is_used(&mut fs.store.io, b)?;
             let referenced = reserved(b) || cx.owners.contains_key(&b);
@@ -206,7 +211,7 @@ pub fn check<D: BlockDevice>(fs: &mut Filesystem<D>, verify_data: bool) -> Resul
                 }
             }
         }
-        if i % 1024 == 1023 {
+        if n % 1024 == 1023 {
             fs.store.space.evict_clean();
         }
     }
