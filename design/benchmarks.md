@@ -121,14 +121,15 @@ and verified-image state is the shipped one.
   Nightly boots accumulate in rolling windows: each night adds boots and
   the gate judges the last N nights (N = 5 for the nightly block, N = 4 for
   the extended block's tail metrics, below). A window spans up to N nightly
-  builds, so each night also runs a change-point test inside it: the newest
-  2 nights' candidate boots against the older nights' (3, or 2 for N = 4),
-  by the same cluster bootstrap, a hit being a one-sided 95% bound beyond
-  2% worse; a hit starts bisection of the
-  newest 2 builds at once, without waiting for the window to fill. A
-  window failure is bisected by binary search over its builds, at most 3
-  steps, each step booting the middle build 20 times against the last
-  passing build, from the bisection budget below. Once the offending
+  builds, so each night also runs a change-point test: the newest 20
+  candidate boots against the 20 before them (for the extended block's
+  tails these span 8 nights), by the same cluster bootstrap, a hit being a
+  one-sided 95% bound beyond 2% worse; a hit starts bisection of the
+  builds in the newer 20 boots at once, without waiting for the window to
+  fill. A window failure is bisected by binary search over its builds, at
+  most 3 steps, each step booting the middle build 20 times against 20
+  boots of the last passing build (topped up to 20 where it has fewer),
+  from the bisection budget below. Once the offending
   change is reverted, the boots of the builds that carried it leave the
   window. The extended block's non-tail metrics (core-count sweeps,
   schbench and hackbench means, fork+exec) are trend lines nightly and are
@@ -161,8 +162,8 @@ and verified-image state is the shipped one.
     automatically within 24 h of the failure; if bisection can't finish in
     24 h the whole batch is reverted and its changes re-queued one per
     batch): 40 boots of at most 90 s (POST and netboot at most 30 s,
-    measured and recorded, plus the 60 s list above), at most 10 batches a
-    day, 70 h. Nightly, 7 h 55 min a day, 55 h 25 min: the nightly block,
+    measured and recorded, plus the 60 s list above), at most 9 batches a
+    day, 63 h. Nightly, 7 h 55 min a day, 55 h 25 min: the nightly block,
     16 boots of 22.5 min (8 candidate, 4 matched LTS, 4 matched stable;
     each boot runs input latency idle, under full CPU load and during a
     background copy or compile, 5,000 events each, about 5 min, with frame
@@ -172,11 +173,12 @@ and verified-image state is the shipped one.
     candidate, 5 last release: core-count sweeps, schbench, hackbench, the
     cyclictest equivalent, timer and interrupt latency tails, fork+exec at
     10^4 and 10^5 fds), 1 h 55 min. Latency-tracer stress boots, 1 h a
-    day, 7 h. Total 132 h 25 min. The remaining 35 h 35 min: the
-    **bisection budget**, 26 h (one 3-step nightly search of 20 boots of
-    22.5 min per step, 22 h 30 min, and 3 h 30 min of per-change steps of
+    day, 7 h. Total 125 h 25 min. The remaining 42 h 35 min: the
+    **bisection budget**, 33 h 30 min (one 3-step nightly search of 20
+    boots of 22.5 min per step plus at most 20 top-up boots of the last
+    passing build, 80 boots, 30 h, and 3 h 30 min of per-change steps of
     40 boots of 90 s); A/A runs, 2 h 8 min a week on average (8 h 30 min a
-    cycle, below); automatic reruns, 7 h 27 min. Phase done-when gates and,
+    cycle, below); automatic reruns, 6 h 57 min. Phase done-when gates and,
     until unit 2 arrives, the release tier use bisection budget a week
     leaves unused, and wait for it.
   - Unit 2 (long runs and release tier), per release cycle (672 h). Audio:
@@ -216,32 +218,44 @@ and verified-image state is the shipped one.
   make false alarms more common.
 - **Cumulative budget (release rule).** Small regressions that each pass
   the gate still add up, so each release is also compared with the last
-  release (the release block on unit 2): for every tracked metric the
-  one-sided 95% upper bound of the difference is at most its margin worse,
-  and for the geometric mean of the desktop set's non-tail metrics at most
-  0.5% worse. Two equal kernels pass a one-sided bound with probability
-  Φ(margin / SE − 1.645), so each margin sets an SE target for 95%: a
-  non-tail metric's margin is 3% (SE(diff) ≤ 0.91%); the geometric mean
-  needs SE ≤ 0.15% (95.4%), and the release block's boots are budgeted for
-  it, with boots added from the rerun slot when the achieved SE is higher;
-  a tail metric's margin is also 3%, with the same SE target. No margin
-  ever grows with SE: when a metric's achieved SE is above its target,
-  boots are added from the rerun slot until it is met, and if the budget
-  runs out first the entry is published as "below target power" and is
-  judged at the same margin. Each metric's pass probability at a true 0%
-  difference and power at 2% are published. (A point-estimate "not worse
-  at all" rule would fail about half the time on two equal kernels.)
+  release (the release block on unit 2) over the release metric list: k =
+  150 tracked metrics at most, the geometric mean of the desktop set's
+  non-tail metrics among them (the list is published; a longer one is a
+  reviewed change that recomputes the numbers here). A metric fails when
+  a one-sided Holm test at family-wise 5% over the k shows it worse and
+  its estimated difference is beyond its margin, and the failure stands
+  only after a confirmatory rerun of the runs holding it, on 20 fresh
+  boots per build, from the rerun slot (the release waits for it), shows
+  the estimate beyond the margin again. So two equal kernels fail the release with at most 5%.
+  Margins, fixed now: 3% for a non-tail metric (SE(diff) target 0.91%),
+  0.5% for the geometric mean (SE target 0.15%), 5% for a P99 and 8% for
+  a P99.9. At the non-tail target the strictest Holm step (t with 19
+  degrees of freedom at one-sided 0.05/150, 4.06) needs an estimate
+  beyond 3.7%, so a true 5% regression fails with 92% and is confirmed
+  with 91%; at the tail noise ceilings the Holm step needs less than the
+  margin. These are the SE targets the release block's boots were
+  budgeted for, so unit 2's budget is unchanged. No margin ever grows
+  with SE: when a metric's achieved SE is above its target, boots are
+  added from the rerun slot until it is met, and if the budget runs out
+  first the entry is published as "below target power" and is judged at
+  the same margin. Each metric's power at twice its margin is published.
 - **A/A runs** check the statistics instead of assuming them. Each release
   cycle the gates run with the candidate identical to the base: the
   per-change tier (40 boots, unit 1), the nightly block's tail rule with
   matched LTS against itself (20 extra LTS boots, unit 1), and the release
   rule with the last release against itself on the release block and the
-  storage boots (unit 2). The false-fail rate per metric (over the run's
-  metrics and, per metric, over the last 12 cycles) is published. A rate
-  above 5% for the release rule and the nightly tail rule, or above the
-  Holm level for the per-change tier, is a harness failure: the harness
-  is fixed and the A/A run repeated before the next scorecard release,
-  which waits for it.
+  storage boots (unit 2); the change-point test runs on the nightly A/A's
+  40 LTS boots (the window's 20 and the 20 extra). The false-fail count
+  per cycle and each metric's false-fail rate over the last 12 cycles are
+  published against the rule's design rate (its own per-metric false-fail
+  probability: 5% for a one-sided 95% bound such as the change-point
+  test, 5%/k for a metric under a family-wise Holm rule over k, the Holm
+  level for the per-change tier). The harness has
+  failed only when the one-sided 95% lower bound of a metric's pooled
+  12-cycle false-fail rate exceeds the design rate, or a cycle's count of
+  false-failing metrics exceeds the 99th percentile of Binomial(k, design
+  rate) for its k metrics; then the harness is fixed and the A/A run
+  repeated before the next scorecard release, which waits for it.
 - **Which runs gate what.** Each change: the per-change metric list.
   Nightly (rolling windows): the nightly block (input latency and its
   ratios, frame time, the real-time wake-up target, app launch) and the
@@ -256,13 +270,16 @@ and verified-image state is the shipped one.
 - **Noise ceiling.** Each metric must have a run-to-run coefficient of
   variation of at most 1% and a between-boot coefficient of variation (of
   per-boot means) of at most 0.4% on its machine. A tail metric at P99 or
-  below has a per-boot value with at most 5% between-boot coefficient of
-  variation (for storage tails this is the **storage tail noise ceiling**); a P99.9 has no per-boot ceiling
-  (a few thousand events per boot leave it set by its 5 largest samples)
-  and is judged only on the pooled window, with at least 10^5 pooled
-  events. If the harness can't get
-  under that, the harness gets fixed; the gate is never widened to fit the
-  noise.
+  below has a per-boot value with at most 1.5% between-boot coefficient of
+  variation (for storage tails this is the **storage tail noise
+  ceiling**), so SE(diff) is at most 0.47% at 20 boots against 20. A P99.9
+  has no per-boot ceiling (a few thousand events per boot leave it set by
+  its 5 largest samples) and is judged only on the pooled window, with at
+  least 10^5 pooled events and a pooled-window ceiling: the cluster-
+  bootstrap SE of one kernel's window value at most 1% over 20 boots. If
+  the harness can't get under that, the harness (or the events per boot)
+  gets fixed; the gate is never widened to fit the noise, and tail
+  margins are never changed to fit it.
 - **Input latency.** The rig sends one event every 50 to 70 ms (uniformly
   random, so events don't lock to the refresh phase), about 16.7 events per
   second, so a 5,000-event run takes 5 minutes. It follows the tail rule:
@@ -296,7 +313,9 @@ and verified-image state is the shipped one.
   the same THP mode (`transparent_hugepage=never` until Optimal's THP lands
   in Phase 5, then `always` with `defrag=defer`, so neither kernel compacts
   on fault, [scheduler.md](scheduler.md)), the frequency settings and
-  `isolcpus` use of the locked machine state above, and usable RAM
+  `isolcpus` use of the locked machine state above (for Linux
+  `isolcpus=domain,managed_irq` without `nohz_full`, whose run is
+  published as context only, [scheduler.md](scheduler.md)), and usable RAM
   equalised as measured where a test limits memory; in the memory-pressure
   test, zram of the same size and compressor as Optimal's compressed swap,
   `lru_gen` enabled, the same swappiness and systemd-oomd with the same
@@ -336,16 +355,21 @@ and verified-image state is the shipped one.
   change and starts a new trend line.
 - Optimal **beats Linux** on a machine when every desktop metric is at
   parity or better against both matched kernels and the geometric mean of
-  the desktop set's non-tail metrics is better. Parity: the 95% confidence
-  interval of the difference, Holm-corrected across the desktop set, lies
-  within ± the metric's parity margin. Two equal kernels pass that with
-  95% probability only if margin ≥ (c + 1.96) × SE, where c is the
-  strictest Holm critical value of the set (3.17 for 10 metrics at 20
-  boots), so a non-tail metric's margin is 2% and its SE target 2% / (c +
-  1.96), 0.39% for 10 metrics; a tail metric's margin is also 2%, with
-  the same SE target, boots added or the entry marked "below target power"
-  as in the release rule. Better: that corrected interval lies entirely on
-  the better side of zero. Winning "most" metrics doesn't count.
+  the desktop set's non-tail metrics is better. Parity: the simultaneous 95%
+  confidence interval of the difference, Bonferroni-corrected across the
+  desktop set's 18 metrics (count metrics excluded), lies within ± the
+  metric's parity margin. Two equal kernels pass that with 95% probability
+  only if margin ≥ (c + 1.96) × SE, where c is the Bonferroni critical
+  value (two-sided 0.05/18: 3.43 for t with 19 degrees of freedom, 2.99
+  for the tail bootstraps). A non-tail metric's margin is 2% (SE target
+  2% / 5.39 = 0.37%); tail margins are fixed now at 5% for a P99 and 8%
+  for a P99.9, which the tail noise ceilings meet (2.3% and 7.0% needed at
+  20 boots against 20); boots added or the entry marked "below target
+  power" as in the release rule. Better: that corrected interval lies
+  entirely on the better side of zero. A tail metric is called better than
+  Linux only when it is better in that sense; at parity it is published as
+  "within ±5%" (±8% for a P99.9), never as better. Winning "most" metrics
+  doesn't count.
 - On server-style throughput the aim is that the worse end of each
   corrected interval is within 5% of matched Linux, and the scorecard says
   which workloads are which.
@@ -407,35 +431,41 @@ the entries of the same gate, meets it (the release rule and parity keep
 their own bounds, above). Intervals are t over per-boot means for
 non-tail metrics and BCa cluster bootstraps over boots for tail metrics.
 Every threshold relative to Linux must hold against both matched LTS and
-matched stable. "No worse than matched Linux" means the bound of
-Optimal/Linux is at most 1.02 (one-sided; SE target 2% / 3.29 = 0.61%,
-boots added or the entry marked "below target power" as in the release
-rule), because two equal kernels can't show a bound at or below exactly 1. A count target (OOM
+matched stable. "No worse than matched Linux" is judged by the release
+rule's form over the gate's j comparisons (each entry against each
+matched kernel): an entry fails when a one-sided Holm test at
+family-wise 5% over the j shows Optimal worse and the estimate of
+Optimal/Linux is above 1.02, and the failure stands only after a
+confirmatory rerun on fresh boots shows it above 1.02 again. The SE
+target is 2% divided by the strictest Holm critical value (t with 19
+degrees of freedom at one-sided 0.05/j; 0.73% for j = 8), boots added or
+the entry marked "below target power" as in the release rule. Such a
+gate is published as "not shown worse than 2%", never as parity. A count target (OOM
 kills, underruns) is zero observed over every boot of the run, with the
 zero-event rule for rates. Every gate uses at least 20 boots per kernel;
 the sample column gives the rest.
 
 | Metric | Target (reference desktop) | Sample per kernel | From |
 |---|---|---|---|
-| Wake-up latency of a real-time thread with all cores saturated (default boot, no isolated CPUs). Load in Phase 2: a spinning thread per CPU plus IPI and timer storms; at 4a also storage load (the latency gate of [storage.md](storage.md)); from Phase 5: hackbench, a pinned compile, fio on NVMe and memory pressure together | P99 < 50 µs, P99.9 < 100 µs | 20 boots, 4 min at 1 kHz each (2.4 × 10^5 wake-ups per boot) | 2 (re-gated at 4a, 5 and 7, then nightly) |
+| Wake-up latency of a real-time thread with all cores saturated (default boot, no isolated CPUs). Load in Phase 2: a spinning thread per CPU plus IPI and timer storms; at 4a also storage load and device stalls (the real-time gate under device stalls, [scheduler.md](scheduler.md) "Device stalls"); from Phase 5: hackbench, a pinned compile, fio on NVMe and memory pressure together | P99 < 50 µs, P99.9 < 100 µs | 20 boots, 4 min at 1 kHz each (2.4 × 10^5 wake-ups per boot) | 2 (re-gated at 4a, 5 and 7, then nightly) |
 | Longest preempt-off or IRQ-off section, excluding SMI-overlapped sections (counted and published) | < 50 µs (20 µs from Phase 10): no section above it in any stress boot | every stress boot (at least 20 per gate) | 2 |
 | Audio underruns at 128 frames, 48 kHz, under full CPU and I/O load | 0 observed in ≥ 24 h, 95% upper bound ≤ 0.125 per hour (also reported at 64 and 256 frames, under load) | 24 h per buffer size and load condition | 6 |
 | Input-to-display latency under full CPU load | P99 no more than 1.5 times its idle P99 (nightly gate); P99.9 no more than 1.5 times its idle P99.9 (release gate); both no worse than matched Linux | one nightly window: 40 boots Optimal, 20 per Linux kernel, 5,000 events per condition per boot | 7 |
 | Frame time P99 in the frame-pacing test at 60 Hz (bare metal, llvmpipe over simple framebuffer, against Linux booted `nomodeset` with simpledrm and llvmpipe; virtio-gpu trend-only) | ≤ refresh period + 1 ms | 20 boots, 5 min (18,000 frames) per boot | 7 |
 | Frame time P99 at 144 Hz on the reference discrete GPU | ≤ refresh period + 1 ms | 20 boots, 5 min (43,200 frames) per boot | 8 |
 | Foreground input latency P99 while a large copy or compile runs | ≤ 1.25 times idle | one nightly window, as above | 7 |
-| Memory pressure test (8 GiB usable RAM as measured, 50 browser pages and a compile, [scheduler.md](scheduler.md)) | input latency P99 ≤ 1.5 times idle; frame time P99 ≤ refresh period + 2 ms; 0 OOM kills of the foreground app or the compositor; each no worse than matched Linux | 20 memory-pressure boots | 7 |
+| Memory pressure test (8 GiB usable RAM as measured, 50 browser pages and a compile, [scheduler.md](scheduler.md)) | the compile finishes; input latency P99 ≤ 1.5 times idle; frame time P99 ≤ refresh period + 2 ms; 0 OOM kills of the foreground app or the compositor; each, and the compile's wall time and the count of background-app kills (both published), no worse than matched Linux | 20 memory-pressure boots | 7 |
 | Boot time, firmware handoff to kernel ready | mean < 300 ms (a Phase 1 done-when item) | 20 boots | 1 |
 | Total OS memory at an idle desktop (Phase 7 done-when) | ≤ 60% of the lightest mainstream Linux desktop on the same machine | 20 boots per OS | 7 |
 | Idle CPU over the defined window (Phase 7 done-when) | < 0.5% and no worse than matched Linux | 20 boots, one window each | 7 |
-| Latency tracer cost when off, on the syscall round-trip microbenchmark | ≤ 0.5% against a build with the tracer compiled out, both with the fixed code layout | 40 boots per build, 7 runs each (SE ≤ 0.15%) | 3 |
+| Latency tracer cost when off, on the `getppid` round trip, kernel-thread context switch, 4 KiB anonymous fault and slab allocate/free (futex ping-pong from 5) | each ≤ 0.5% against a build with the tracer compiled out, both with the fixed code layout | 40 boots per build, 7 runs each (SE ≤ 0.15%) | 3 |
 | Storage set entries compared against Linux | each within 10% of matched Linux | 20 boots, at least 3 runs per entry per boot | 4a, 5 |
 | Context switch and fork+exec against Linux (Core kernel costs) | each within 10% of matched Linux | 20 boots, 7 runs per boot | 5 |
 | Storage set on a per-user home volume | each entry within 10% of the same entry on the system volume path | 20 boots, 3 runs per entry per boot | 5 |
 | Large TCP download over the named NIC | ≥ 95% of Linux's measured goodput on the same link | 20 boots, 3 downloads of 60 s per boot | 6 |
 | Games from the game list, average and 1% low frame rate | each within 15% of Linux | 20 boots, 3 runs of a pinned 60 s scene per title per boot (at least 5 titles) | 8 |
 | Battery life, each of the three workloads | no worse than matched Linux | 20 runs per workload, each the mean discharge power over 1 h at fixed brightness | 10 |
-| Panic lock (F4 in [features.md](features.md)): chord to keys wiped, writeback bound 0, with 8 GiB of page cache of encrypted volumes | ≤ 200 ms, each step's time published | 20 boots, 10 chords each | 5 |
+| Panic lock (F4 in [features.md](features.md)): chord to keys wiped, not counting writeback (step 4, published on its own), at the shipped 1 s writeback bound, with 8 GiB of page cache of encrypted volumes; dumps taken at the "panic complete" event | ≤ 200 ms, each step's time published, step 6 included | 20 boots, 10 chords each | 5 |
 | VPN-only guard on (F6): large TCP download through the tunnel | ≥ 99% of the same with the guard off | 20 boots, 3 downloads of 60 s per boot | 6 |
 | Game mode overlay (F8), 144 Hz direct scanout on the reference discrete GPU | CPU cost ≤ 0.5%; input-to-display P99 and frame time P99 no worse than overlay off; per-frame agreement with the input-latency rig within 0.5 ms at P99 | 20 boots per condition, 5 min per boot | 8 |
 | Focus boost ×4 (F9): 60 Hz frame-pacing app in focus while a pinned compile runs | frame time P99 ≤ refresh period + 1 ms; compile wall time ≤ 1.5 times its time with the boost off | 20 boots per condition | 10 |
@@ -473,6 +503,7 @@ the sample column gives the rest.
 | Storage set: the table below | 4a, 5 |
 | Driver tier cost: per-I/O latency and throughput for the same device in tier 1, 2 and 3 | 4a |
 | IOMMU strict-invalidation cost | 4a |
+| Zero on free of encrypted-volume page-cache frames ([storage.md](storage.md)), and the free-list sweep at panic lock and vault close (F3, F4) | 4a, 5 |
 | Worst CPU stall and worst real-time wake-up latency on surprise removal of a PCIe device ([scheduler.md](scheduler.md)) | 4a |
 | GPU VRAM and GTT buffer clear before first mapping (copy/clear engine), cost per MiB and per allocation | 8 |
 | Network throughput and latency (TCP and UDP, 1 and 8 streams, on a named NIC at a named link speed) | 6 |
@@ -573,7 +604,9 @@ is on in the image people actually download:
   each.
 - Microcode revision and the mitigation chosen per CPU vulnerability.
 - Named exposures per machine (boot DMA window, pre-loader secret DMA
-  window on D2 boots, S3 resume DMA window, remote DMA exposure, SMT on
+  window on D2 and PMR-only boots, its keyboard-path form for a USB or
+  PCIe `ConIn` without `EDKII_IOMMU_PROTOCOL`, pre-loader DMA write window
+  without firmware pre-boot DMA protection, S3 resume DMA window, remote DMA exposure, SMT on
   affected CPUs, "out-of-band remote management: on"), the ATS-enabled devices and their firmware (part of the
   trusted base), the B2 anti-rollback scope: "holds against OS-level
   attackers only" (against physical attackers only with owner keys), and
@@ -583,8 +616,10 @@ is on in the image people actually download:
 - The boot-time cost of `MemoryOverwriteRequestControl` per reference
   machine, set only while a panic mode is enabled (F4,
   [boot.md](boot.md)).
-- Disk encryption stage per machine, and "stage 2: new installs only"
-  until the per-user stage 1 to stage 2 migration lands
+- Disk encryption stage per machine, "stage 2: new installs only"
+  until the per-user stage 1 to stage 2 migration lands, "Linux rescue
+  unavailable while re-encryption runs" during a volume-key change, and
+  the TPM NV counter increment latency per reference TPM
   ([storage.md](storage.md)).
 - Residual risks the threat model accepts, each with its test result: a
   compromised Bluetooth stack (input accepted only from paired HID
@@ -593,16 +628,25 @@ is on in the image people actually download:
   the published hammering PoC), and machines with fewer than 4 CPUs, where
   hot-removable device handlers can't be kept off real-time CPUs
   ([scheduler.md](scheduler.md)).
-- **Prompts per typical day:** every prompt of every kind (install
-  approvals, first-use, device and DNS-fallback prompts included) in the
-  pinned typical-day script: Firefox (browse, download a file), Steam, a
-  chat app, an editor, a media player, an AppImage, a cargo project, a
-  video call, joining a new Wi-Fi network, and plugging in a new mouse, a
-  headset and a gamepad; at each prompt level ("Always ask", "Only when
-  suspicious", "Almost never"). Target at most 5 at the default "Only when
-  suspicious"; the measured count is published, counted by the
-  threat-model test ([threat-model.md](threat-model.md),
-  [capabilities.md](capabilities.md)), from Phase 7.
+- **Prompts per typical day** (the one typical-day script; other files
+  cite it): every prompt the user did not start (first-use, device,
+  combined-approval and DNS-fallback prompts included), at each prompt
+  level ("Always ask", "Only when suspicious", "Almost never"). Install
+  confirmations (the user clicked Install) are counted and published
+  separately. The pinned steps, with the expected prompt count at the
+  default "Only when suspicious": install and run Firefox, browse and
+  download a file (0); install Steam, a chat app, an editor and a media
+  player and open a file in each (0; 5 install confirmations in all);
+  launch a downloaded AppImage from the desktop (1, floor); build and run
+  a cargo project in the terminal (0); a video call in the chat app (2:
+  microphone and camera, each a combined approval with network); join a
+  new Wi-Fi network from Settings (0, user-started); plug in a new mouse
+  (0, pointer-only), a headset (1, its consumer-control interface,
+  suspicious-list entry 4) and a gamepad (0). Expected 4; target at most
+  5, counting every prompt the user did not start. The measured counts
+  are published, counted by the threat-model test
+  ([threat-model.md](threat-model.md), [capabilities.md](capabilities.md)),
+  from Phase 7.
 - The Argon2id parameters chosen on each reference machine, and the
   recovery-key LUKS2 slot's PBKDF2 iteration count (exempt from the
   Argon2id floor: its input is high-entropy, [storage.md](storage.md)).
@@ -625,13 +669,15 @@ is on in the image people actually download:
   encrypted DNS on (target 0, F6); the tamper alert's scope per boot tier
   (F7); the panic-lock residuals (frozen apps' memory including tmpfs,
   shm, memfd and the pipe, socket and tty buffers they hold, names of open
-  files, DMA-pinned pages until their timeout, DRAM remanence and cold
-  boot, F4); the hidden vault's limits in the words of its Settings
+  files, encrypted-volume pages DMA-pinned other than through GPUVM or
+  `io_uring` fixed buffers, DRAM remanence and cold boot; tasks not frozen
+  within 500 ms are killed, F4); the hidden vault's limits in the words of its Settings
   text (defeats one-time inspection of a powered-off disk; not two images
   over time, a compromised running system, forced unlock of the outer
   volume while the hidden one is open, TRIM-pattern analysis if the
   no-TRIM rule is broken, or the SSD's own flash), with the distinguisher
-  result and the two-image result (F3); travel mode's limits and residual
+  result, stated as "no distinguisher in the k = 23 test suite beats 55%",
+  and the two-image result (F3); travel mode's limits and residual
   count for converted folders (F5); and **unpatched time**: a staged
   security fix takes effect only at a restart the user chooses, so the row
   gives the time from each security release to its availability to the

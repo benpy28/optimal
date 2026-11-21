@@ -55,35 +55,53 @@ recovery key.
 [core.md](core.md) (its own tier-0 cap of 3,000 lines, unsafe inventory,
 lints, exact toolchain pin), its harnesses run in the proofs job, its floor
 code is in proof target 16's scope, and all of its cryptography (Ed25519,
-SHA-256, SHA-512, HMAC-SHA-1 for TOTP) is `core-crypto` under proof target
-14 ([verification.md](verification.md)); its current `ed25519-dalek` and
+SHA-256, SHA-512, HMAC-SHA-1 for TOTP, and for salted TPM sessions ECDH
+P-256, KDFe/KDFa and AES-128-CFB, with CAVP and Wycheproof vectors) is
+`core-crypto` under proof target 14 ([verification.md](verification.md)),
+inside the 3,000-line cap; its current `ed25519-dalek` and
 `sha2` dependencies are replaced before Phase 4b.
 
-**DMA before the kernel.** Before it reads the PIN, sends any TPM command
-that returns a secret, or checks and measures anything, Optimal Boot
-installs a deny-all IOMMU: every context entry (Intel) or device table
-entry (AMD) blocks, with one exception list, the same as in
+**DMA before the kernel.** Before anything else, Optimal Boot installs a
+deny-all IOMMU: every context entry (Intel) or device table entry (AMD)
+blocks, with one exception list, the same as in
 [drivers.md](drivers.md): identity maps for the ranges the firmware's
 RMRR/IVMD entries declare, a read-only map of the firmware framebuffer for
-the device scanning it out, and, until `ExitBootServices`, the boot disk
-controller and the console keyboard controller, so firmware's own drivers
-keep working. Those two get an identity map of all memory except the pages
-the loader allocates for the PIN and every value it unseals. TPM access
-through CRB or TIS is MMIO and needs no DMA. Then it reads the config,
-kernel and modules, removes their pages from both controllers' maps (with
-an IOTLB invalidation) and only then checks and measures them, so no
-device can change an image after its check. Then it unseals object 3,
-shows the code, reads the PIN through `ConIn` and does the remaining
-firmware I/O (loader-state writes, the platform-hierarchy disable). It
+the device scanning it out, and, while firmware drivers still need them,
+the boot disk controller and the console keyboard controller. Where
+firmware offers `EDKII_IOMMU_PROTOCOL`, the loader installs its own
+implementation, which maps for each controller only the buffers its
+driver `Map()`s. Otherwise each exception maps RAM only (no MMIO), minus
+the loader image and one excluded pool from which every other page the
+loader owns is allocated: the IOMMU tables, the stack it switches to, its heap and
+page tables, the hand-off pages, the kernel's destination and the pages
+for the PIN and every value it unseals. TPM access through CRB or TIS is
+MMIO and needs no DMA. The order is fixed: (1) every disk read the boot
+needs (config, kernel, modules, the header block) lands in staging
+buffers outside the pool; (2) the boot disk controller's exception is
+removed and the IOTLB invalidated; (3) each image is copied into the pool
+and only then checked and measured there; (4) only then object 3 is
+unsealed, the code shown, the PIN read through `ConIn` and the remaining
+firmware I/O done (loader-state writes, the platform-hierarchy disable).
+The keyboard controller keeps an exception only if it is not below an
+external-facing port (the rule in [drivers.md](drivers.md)); a keyboard
+that is can't type at the loader prompt, which says to use another one.
+The firmware's own keystroke buffers stay reachable by that controller, so
+a USB or PCIe `ConIn` keyboard without `EDKII_IOMMU_PROTOCOL` shows the
+named "pre-loader secret DMA window (keyboard path)". The table builder is
+a pure crate shared with the kernel, and proof target 10 extends to it at
+4b (B/T): only the listed exceptions are mapped, no pool page is in any
+device's map, each IOTLB invalidation completes before the step after it,
+and the tables are re-armed after `ExitBootServices`. It
 builds the tables in the translation mode (legacy or scalable) the kernel
 will use, chosen from the
 IOMMU's capabilities by the rule in [drivers.md](drivers.md). If firmware
 already enabled the IOMMU, it follows the kernel's takeover rules: on AMD
 it rewrites the inherited device table's entries in place (the table stays
-reserved) and invalidates each one; on Intel it keeps the inherited
+reserved) through the blocking intermediates in
+[drivers.md](drivers.md), never V=0 on a live device; on Intel it keeps the inherited
 translation mode and loads its root table with SRTP while translation
-stays on. Then it calls `ExitBootServices`, drops the two controller
-exceptions, and before handing over it re-reads the IOMMU state (Intel
+stays on. Then it calls `ExitBootServices`, drops the keyboard
+exception, and before handing over it re-reads the IOMMU state (Intel
 GSTS.TES and the root-table address, AMD IommuEn and the device-table base)
 and re-arms its tables if a firmware
 `ExitBootServices` handler turned them off (EDK2's `IntelVTdDxe` does by
@@ -94,11 +112,14 @@ framebuffer outside them, and with the loader's PIN and unsealed-value
 pages inside; the hand-off names the covered ranges, and the kernel
 allocates only inside them until its tables are live. A USB keyboard's
 firmware transfer buffers lie outside the PMRs, so a PMR-only boot that
-reads the PIN shows the named "pre-loader secret DMA window"; so does a
+reads the PIN shows the named "pre-loader secret DMA window (keyboard
+path)"; so does a
 boot with no usable IOMMU, which is D2. The kernel
-takes these tables over at its own IOMMU setup. D1 requires DMA to be
-blocked before the kernel takes over, either by the firmware's pre-boot
-DMA protection or by this step, and the kernel checks at entry (from the
+takes these tables over at its own IOMMU setup. D1 requires the
+firmware's pre-boot DMA protection: without it a DMA device can patch
+firmware-verified code (shim, Optimal Boot) before this step runs, so this
+step alone shows the named "pre-loader DMA write window". The kernel also
+checks at entry (from the
 PMR base and limit registers or the live tables) that every page it and
 the loader occupy is covered. A machine that fails that check, or has
 neither protection (any machine under Limine without the firmware
@@ -109,11 +130,16 @@ by a device's own BME. Tests (Phase 4b): on QEMU's `intel-iommu` with OVMF
 built with `IntelVTdDxe`, the hostile-device emulator (the vfio-user device
 server in [drivers.md](drivers.md)) DMAs into the kernel image between
 `ExitBootServices` and the kernel's IOMMU setup, and every write is
-blocked; the same on QEMU's `amd-iommu`; a PMR setup that leaves a hole
-under the kernel image is reported as a boot DMA window; the emulator, and
-on the reference laptop a PCIe FPGA DMA reader, scan memory from power-on
-to the kernel's IOMMU setup for a PIN canary, the TOTP key and M, and find
-0.
+blocked; the same on QEMU's `amd-iommu`; the emulator posing as the boot
+disk controller writes the IOMMU tables and the loader text while its
+exception is live and after it is dropped, and 0 writes land; a PMR setup
+that leaves a hole under the kernel image is reported as a boot DMA
+window; the emulator, and on the reference laptop a PCIe FPGA DMA reader
+(once as a third device, once posing as the boot disk controller), scan
+memory from power-on to the kernel's IOMMU setup for a PIN canary, the
+TOTP key and M, and find 0; on firmware without pre-boot DMA protection
+an FPGA write into the loader image lands and is reported as the
+pre-loader DMA write window.
 
 ## Interim chain: Limine (until Optimal Boot replaces it)
 
@@ -327,12 +353,16 @@ entry (path 2) must each stop an old signed loader.
   unwraps the volume key from the header block with the recovery key,
   checks the volume tags and caps; no LUKS2 key slot is read on this or any
   other boot path. After capping it replays that boot's PCR 4 and PCR 7
-  log, picks the PCR 4 variant, creates the service key, the mark key and
-  objects 1 to 3 (`TPM2_Create` needs no matching PCRs), then defines the
-  anti-rollback counter and its base, the storage replay counter and its
-  base, the PIN-epoch index and the time index with the owner secret the
-  recovery key unwraps (their policies name the service key and the mark
-  key, so these come first). It writes the blobs and the volume key
+  log, picks the PCR 4 variant, and works in this order, since policies
+  compare against NV values and names that exist only once written: (1)
+  the service key and the mark key (the NV policies name them); (2) with
+  the owner secret the recovery key unwraps, it defines, increments or
+  writes, and locks every NV index: the anti-rollback counter and its base,
+  the storage replay counter and its base, the PIN-epoch index, the time
+  index and F2's 8 per-user indexes (TPM ownership, below); (3) it reads
+  back their values and their names (which change once `TPMA_NV_WRITTEN`
+  is set); (4) only then it creates objects 1 to 3 and the lock-screen PIN
+  object (`TPM2_Create` needs no matching PCRs). It writes the blobs and the volume key
   wrapped under the TPM key-slot key into the header block; it writes no
   LUKS2 key slot. Each new object is checked by
   running its policy steps in a trial session (`TPM_SE_TRIAL`) and
@@ -349,14 +379,16 @@ entry (path 2) must each stop an old signed loader.
   then seals the same way. Tests (Phase 4b): install from USB through shim,
   signed by a test CA enrolled in db standing in for Microsoft's, onto a
   disk that then boots by path 2, and the reverse; both seal at the first
-  boot and unseal at the second with no recovery prompt. A 4a volume seals
+  boot and unseal at the second with no recovery prompt, also on a swtpm
+  whose counters were pre-incremented to a random value. A 4a volume seals
   at its first 4b boot and the boot after needs only the PIN.
 - **The Optimal header block** (format, parser, passphrase and
   recovery-key wraps from Phase 4a; the TPM fields from 4b). This is the
   only part of the data volume read before capping, and no Optimal boot
   path ever reads a LUKS2 key slot. It sits at a fixed offset: the last
   16 KiB before the LUKS2 data offset, which is fixed at 16 MiB. The LUKS2
-  key-slot area is sized to end before it, and the system volume's header
+  key-slot area ends before it (`config.keyslots_size` = 16 MiB − 48 KiB,
+  on the allow-list in [storage.md](storage.md)), and the system volume's header
   sits ahead of the per-user volume map ([storage.md](storage.md)). Stage 2
   keeps the same 16 KiB at the same offset, outside the file system's
   allocatable space, in exactly this format. It has two 8 KiB copies, each
@@ -365,11 +397,18 @@ entry (path 2) must each stop an old signed loader.
   valid copy with the higher version among those whose PIN epoch equals
   the PIN-epoch index, uses the other if that copy's objects fail a policy
   step (never after a wrong PIN), and writes the other, so a power cut
-  leaves one intact. Each copy has 512 bytes of fixed fields: the
+  leaves one intact. Only one operation that writes the other copy is
+  pending at a time: a PIN change waits until a pending floor raise or
+  PCR 7 reseal has completed at its next boot, and a raise or reseal waits
+  for a PIN change to finish; a hibernation blob is added to the pending
+  copy when there is one. Tests (Phase 4b): a PIN change requested during
+  a pending raise runs after the raising boot, and a power cut at every
+  write of either still boots without the recovery key; proof target 16
+  models the rule. Each copy has 512 bytes of fixed fields: the
   parameters of the PIN's KDF; for each LUKS2 key slot Optimal writes
   (passphrase, recovery key) its KDF parameters and write generation
-  ([storage.md](storage.md)); the names of the SRK and of the base,
-  replay-base and PIN-epoch NV indexes; the PIN epoch its objects were
+  ([storage.md](storage.md)); the names of the SRK and of the
+  anti-rollback counter, base, replay-base and PIN-epoch NV indexes; the PIN epoch its objects were
   sealed at; and the current and pending volume tag sets (Volume identity,
   below). Then come 15 fixed slots of 512 bytes: the sealed blobs (objects
   1 to 4 below, the service key and the mark key), the volume key wrapped
@@ -377,16 +416,22 @@ entry (path 2) must each stop an old signed loader.
   key), the AEAD ciphertexts of S and of the hibernation image key, the
   owner secret and (together with S) the lockout secret wrapped under the
   recovery key, the lockout secret wrapped under S, and F4's panic-hibernate
-  key wrapped under the passphrase ([features.md](features.md)). No
+  key wrapped under the logged-in user's stretched login passphrase
+  ([features.md](features.md)). No
   file-system generation or slot number lives here, so in stage 2 these
   bytes are identical whichever superblock slot is newest, and first-boot
   sealing, a floor raise or a hibernation blob rewrites them without a
-  file-system commit. Its parser is fuzzed to the in-kernel thresholds in
-  [drivers.md](drivers.md) from Phase 4a and is proof target 15 (B/T,
-  Phase 4b).
-- **Capping.** The kernel extends a separator into PCRs 8 and 9
-  unconditionally, whatever the unseal result (passphrase fallback
-  included). It does so before it parses any byte of the data volume beyond
+  file-system commit. Its parser, the kernel's and the loader's own, is
+  fuzzed to the in-kernel thresholds in [drivers.md](drivers.md) from
+  Phase 4a and is proof target 15 (B/T, Phase 4b), together with the
+  PIN-epoch index's read authorisation (`TPMA_NV_AUTHREAD` with an empty
+  authValue: the value is not secret, only its writes are guarded). A copy
+  whose CRC fails is not used; if neither copy is usable, the boot shows
+  the Linux rescue instructions ([storage.md](storage.md)).
+- **Capping.** The kernel extends a separator into PCRs 8 and 9, and a
+  fresh random 256-bit boot nonce into PCR 9, so capped values differ on
+  every boot. It does so unconditionally, whatever the unseal result
+  (passphrase fallback included). It does so before it parses any byte of the data volume beyond
   the Optimal header block, and before user space starts. The LUKS2 JSON
   and the volume map are parsed only after capping. Everything that needs
   the pre-cap PCRs happens before then: unsealing objects 1 to 4, a pending
@@ -429,9 +474,8 @@ entry (path 2) must each stop an old signed loader.
   differences (key slots, tokens, segments) on the trusted path. If the JSON
   passes the allow-list and the user confirms, it writes new tags in the
   order above and reboots; otherwise it refuses the volume.
-- **The sealed objects.** Every floor raise covers objects 1 to 3; a
-  predicted PCR 7 reseal covers objects 1 and 2 (object 3 binds no PCR 7),
-  and, where PCR 4 is bound per machine, a new loader's PCR 4 reseal covers
+- **The sealed objects.** Every floor raise and every predicted PCR 7
+  reseal covers objects 1 to 3, and, where PCR 4 is bound per machine, a new loader's PCR 4 reseal covers
   1 to 3. Objects 4 and 5 exist only
   between a hibernate or suspend and the next resume, when neither reseal
   runs. Every object that carries the PIN step (step 5 below) seals only a
@@ -449,11 +493,14 @@ entry (path 2) must each stop an old signed loader.
   2. *Service-key secret* R2: steps 1 to 5. S is AEAD-encrypted under
      HKDF(R2 ‖ PIN half 2) in the header block. It is unsealed only after
      the volume tag matches.
-  3. *Anti-phishing TOTP key and mark secret M* (below): steps 1, 2 and 4,
-     plus step 3's PCR 4 where PCR 4 is bound per machine, never PCR 7. It
-     has no PIN, because the code is shown before the PIN is typed.
-  4. *Hibernation key* (Phase 10): created at hibernate, after capping,
-     sealing R4 with steps 1 to 5 at the current floor and with the PCR 7
+  3. *Anti-phishing TOTP key and mark secret M* (below): steps 1 to 4,
+     step 3 binding PCR 7 through a `PolicyOR` over its accepted values,
+     so a boot with Secure Boot off, or with PCR 7 changed outside
+     Optimal, shows no code. It has no PIN, because the code is shown
+     before the PIN is typed.
+  4. *Hibernation key* (Phase 10): created at hibernate, after capping and
+     before S, the volume key and the PIN half are wiped (the order in
+     [storage.md](storage.md)), sealing R4 with steps 1 to 5 at the current floor and with the PCR 7
      branches objects 1 to 3 carry at that moment (a pending `PolicyOR`
      included). The image key is AEAD-encrypted under HKDF(R4 ‖ PIN half
      2); blob and ciphertext go into the header block. Resume from
@@ -466,12 +513,14 @@ entry (path 2) must each stop an old signed loader.
      capping, sealing R5. Its policy is `TPM2_PolicyCounterTimer` with
      resetCount (offset 16 of `TPMS_TIME_INFO`, `TPM_EO_EQ`) equal to its
      value at suspend, `TPM2_PolicyPCR` over PCR 4 and 7 and this boot's
-     capped PCR 8 and 9, and `TPM2_PolicyAuthValue`. An S3 resume leaves
-     resetCount unchanged (PCR 8 and 9 survive through
-     `TPM2_Shutdown(STATE)`); any reboot or TPM reset changes it, so a cold
-     boot into another OS that replays the published PCR 8 and 9 events
-     can't use the object. The blob and the keys encrypted under it stay in
-     RAM only.
+     capped PCR 8 and 9 (boot nonce included), and `TPM2_PolicyAuthValue`;
+     it is DA-protected (no `noDA`). An S3 resume leaves resetCount and the
+     PCRs unchanged (they survive through `TPM2_Shutdown(STATE)`). A TPM
+     Reset changes resetCount; a hard reset after `TPM2_Shutdown(STATE)` is
+     a TPM Restart that keeps resetCount but resets the PCRs, and no later
+     boot, genuine or replaying the published PCR 8 and 9 events, extends
+     the same nonce, so neither can use the object. The blob and the keys
+     encrypted under it stay in RAM only.
   The blobs are loaded under the storage root key (SRK), a persistent
   primary object created at install with owner authorisation.
 - **TPM use after capping.** At the first boot from disk, the kernel's TPM
@@ -481,32 +530,35 @@ entry (path 2) must each stop an old signed loader.
   before capping and after the volume tag matches, the kernel unseals R2
   with the PIN, decrypts S and loads the service key. S stays only in
   kernel memory. S is also wrapped under the recovery key, so a
-  recovery-key boot keeps the service key; only a TPM clear loses it. Four
+  recovery-key boot keeps the service key; only a TPM clear loses it. Five
   things are used after capping, each with `TPM2_PolicySecret` against the
   service key in its policy, so only the kernel of a boot that passed the
   pre-cap check can use them, at any time later: per-user home-volume keys;
   the storage replay NV counter, whose value is counter − its own
   write-once base, defined like the anti-rollback base
   ([storage.md](storage.md)); the PIN-epoch index (Changing credentials,
-  below); and the lock-screen PIN object. A substituted volume fails the
+  below); F2's 8 per-user NV indexes; and the lock-screen PIN object. A substituted volume fails the
   tag check, so it never gets S and its init can't bump the replay
   counter. The replay counter's and the PIN-epoch index's write policy is
   `TPM2_PolicyCommandCode(TPM2_NV_Increment)` plus that `PolicySecret`, so
   the kernel can bump them after capping while root, the owner and the
   platform can't. The lock-screen PIN object (without `noDA`) has that
   `PolicySecret` plus `TPM2_PolicyAuthValue` with the PIN's stretched
-  authorisation half, so the lock screen checks a typed PIN through the TPM
-  and every wrong guess counts against the dictionary-attack counter; after
-  10 failed unlocks it accepts only the passphrase. Its blob lives in the
-  system volume. Without a TPM the lock screen uses persistent exponential
-  back-off on disk instead ([features.md](features.md) F4; test in Phase
-  6: a scripted USB HID guesser makes at most 32 guesses before
-  passphrase-only).
+  authorisation half and a `TPM2_PolicyNV` on the PIN-epoch index
+  (`TPM_EO_EQ`), so an old blob never accepts an old PIN after a PIN
+  change. The lock screen checks a typed PIN through the TPM and every
+  wrong guess counts against the dictionary-attack counter; after exactly
+  10 failures it accepts only the passphrase. Its blob lives in the
+  system volume; it is created at 4b first-boot sealing. Without a TPM the
+  lock screen takes the passphrase only, with persistent exponential
+  back-off on disk ([features.md](features.md) F4). Test (Phase 6): a
+  scripted USB HID guesser's 11th guess is refused and failedTries rises
+  by exactly 10.
 - **Resume from suspend.** At suspend the kernel closes open vaults (F3)
   and reseals unsealed travel folders (F5), then creates object 5, encrypts
-  the volume key, S and (stage 2) every per-user, class and per-file key
-  under it, and wipes them and R5 (the key inventory in
-  [storage.md](storage.md)). From the panic-lock state (F4) nothing is left
+  under HKDF(R5 ‖ PIN half 2) every key the key inventory in
+  [storage.md](storage.md) marks wrapped at suspend (the agents' secret
+  memory included), and wipes them and R5. From the panic-lock state (F4) nothing is left
   to wrap and resume asks for the passphrase only. On an S3 wake the
   waking vector clears Bus Master Enable on every bridge and root port and
   re-arms the IOMMU tables before any device or interrupt is re-enabled.
@@ -529,7 +581,8 @@ entry (path 2) must each stop an old signed loader.
   own canary set, which has no class C); with the swtpm state dumped as
   well as RAM, recovering the keys still needs the Argon2id PIN search;
   reboot, replay the published PCR 8 and 9 events and try the unseal
-  (must fail); resume after a TPM reset reaches recovery; a USB keyboard
+  (must fail); suspend, hard reset and a genuine boot: object 5 refuses;
+  resume after a TPM reset reaches recovery; a USB keyboard
   plugged in while suspended can't type at the resume prompt; with the
   xHCI controller reset across S3, the same keyboard types the PIN; a PCIe
   FPGA attached while suspended can't write kernel memory from the waking
@@ -545,7 +598,13 @@ entry (path 2) must each stop an old signed loader.
   generator ([core.md](core.md)) into a reserved hand-over page named in
   the image header. The restored kernel reads the page, wipes it, erases
   the image blob from both header-block copies and flushes before thawing.
-  A floor-raise request stays pending until the next normal boot.
+  A floor-raise request stays pending until the next normal boot. A panic
+  hibernate ([features.md](features.md) F4) is allowed with one logged-in
+  session only (otherwise it is a panic power-off) and creates no object
+  4: K is wrapped under P before P is wiped. Its resume boot unseals R1 and
+  R2 with the PIN as any boot does, caps, then stretches that user's typed
+  login passphrase, unwraps P from slot 15 and K under P, and authenticates
+  the image; the PIN alone opens no part of the image.
 
 ### The sealing policy, step by step
 
@@ -595,26 +654,31 @@ machines step 3 carries that check and the `-pm` references keep PCR
 8/9-only signatures from reaching any other machine. The loader's own SVN
 in PCR 8 covers old loaders whose hash was approved before. The
 composition of these policies (every object, NV index and signing
-reference) is proof target 17 (B/T, Phase 4b,
-[verification.md](verification.md)):
-every session that satisfies one implies PCR 4 matched (signed or per
-machine), counter ≤ base + f, the PIN epoch for objects 1 and 2, and the
-PIN authValue for objects 1, 2, 4 and 5.
+reference) is proof target 17 ([verification.md](verification.md)),
+proved per object: a session that satisfies objects 1 to 3 implies PCR 4
+matched (signed or per machine) and anti-rollback counter ≤ base + f,
+and for objects 1 and 2 also the PIN epoch and the PIN; object 4: PCR 4,
+the floor and the PIN; object 5: resetCount equal, PCR 4 and 7, the capped
+PCR 8 and 9 with the boot nonce, and the PIN; the lock-screen object:
+`PolicySecret` on the service key, the PIN and the PIN epoch; the service
+key: its authValue only; every NV index, F2's included: written only
+through its stated policy. B/T at 4b (objects 1 to 3, the lock-screen
+object, the NV indexes), extended at 10 (objects 4 and 5).
 
 **When PCR 7 changes.** Some updates change PCR 7: a dbx update, a db
 update (such as the 2023 CA migration), a firmware update, and a new shim
 or SbatLevel (shim measures SbatLevel into PCR 7 and applies new SBAT
 levels itself at boot). When the OS itself applies one of these, it first
 predicts the new PCR 7 from the event log and the update. It then reseals
-objects 1 and 2 with a `PolicyOR` of the old and new values (object 3
-binds no PCR 7). It checks each new object by comparing a trial-session
+objects 1 to 3 with a `PolicyOR` of the old and new values. It checks each new object by comparing a trial-session
 policy digest with the object's authPolicy, because the system is up and
 PCR 8 and 9 are capped, so a real test-unseal is impossible. It writes them
 into the other header-block copy and only then applies the update. The
 next boot unseals them before capping, which is the real test, and after
 that boot succeeds the old values are dropped. Changes made outside
-Optimal (firmware setup, another OS) can't be predicted: the next boot still
-shows the anti-phishing code, the disk secret doesn't unseal, the user
+Optimal (firmware setup, another OS) can't be predicted: the next boot
+shows no anti-phishing code and says what the PCR 7 event log shows
+changed, the disk secret doesn't unseal, the user
 types the recovery key, and that boot reseals after capping (first-boot
 sealing, above). Where PCR 4 is bound per machine, the same predicted
 reseal adds a new loader's PCR 4 to objects 1 to 3 before its trial boot.
@@ -640,9 +704,34 @@ announced, and every machine reseals to the next key at its next update.
   authorisation empty. If so, the loader disables that hierarchy
   (`TPM2_HierarchyControl`) before `ExitBootServices`, so nothing after it
   can clear the TPM through the platform hierarchy.
+- **A TPM another OS already provisioned** (Windows in a dual boot): the
+  installer reads `TPMA_PERMANENT` and finds ownerAuthSet or
+  lockoutAuthSet. It never changes an authorisation it doesn't hold. With
+  the lockout authorisation unknown, Optimal works without it: no lockout
+  reset after a good boot and no change to the dictionary-attack
+  parameters, so the budget is the TPM's existing maxTries and
+  recoveryTime (read with `TPM2_GetCapability` and shown at install), and
+  wrong PINs and unclean shutdowns since that OS's last reset count
+  against it. With the owner authorisation unknown, nothing can be defined,
+  so the only way on is a TPM clear the installer explains first (the
+  other OS's TPM-bound keys, BitLocker's included, then need their own
+  recovery). Test (Phase 4b): a swtpm provisioned Windows-style (lockout
+  authorisation set to an unknown value) installs, seals and unseals, and
+  no lockout reset is issued.
+- **F2's NV pool.** First-boot sealing defines 8 per-user NV indexes of
+  32 bytes for F2's ratchet keys ([features.md](features.md)), written only
+  by a kernel operation under `PolicySecret` on the service key. With the
+  other six indexes that is 14 indexes holding 304 bytes of data, plus the
+  persistent SRK; install checks the free index count with
+  `TPM2_GetCapability` and defines fewer F2 indexes (down to 0) on a TPM
+  without room, and the counts on the reference fTPMs are published. A user
+  with no index (a 9th user, or none left) gets F2's B2 to B4 limit.
 - **The floor never goes below the loader's built-in minimum.** Each
-  loader has a minimum config SVN built in (the SVN of the newest
-  security-fix release when it was built), and older loaders are retired
+  loader has a minimum config SVN built in, lagging one security release
+  (the SVN of the security-fix release before the newest one when it was
+  built), and is installed only after a completed floor raise at or above
+  that minimum, so a fallback slot and the recovery copies always meet it.
+  Older loaders are retired
   through SBAT generations (path 1) or dbx entries (path 2), which live in
   firmware and survive a TPM clear. On every boot the floor is at least
   that minimum.
@@ -650,13 +739,13 @@ announced, and every machine reseals to the next key at its next update.
   firmware setup. That wipes the counter, the base and every sealed
   object, and the records the loader could check are attacker-writable
   (loader state is a runtime-writable UEFI variable, and the loader can't
-  check the header block's tag), so the floor after a clear can't come from
-  them. If the TPM's SRK name differs from the one recorded in the loader
-  state or the header block, or the counter or base is missing, or object
-  3 doesn't unseal so no code can be shown (an attacker can rewrite both
-  records and redefine counter and base with the same attributes, hence
-  the same names), the loader treats the TPM as cleared: the floor is
-  max(its built-in minimum, the
+  check the header block's tag), so the floor can't come from them alone.
+  Whenever the anti-rollback counter and its base exist (read at their
+  handles; a name that differs from the header block's record is reported
+  as tampering but changes nothing), the floor is max(its built-in
+  minimum, the highest SVN among the configs on the ESP, counter − base).
+  The loader treats the TPM as cleared only when the SRK, the counter or
+  the base is missing: the floor is then max(its built-in minimum, the
   highest SVN among the configs present on the ESP), it boots the newest
   image at or above that floor, and it says the TPM was cleared and that no
   anti-phishing code can be shown. If nothing on the ESP reaches its
@@ -664,9 +753,12 @@ announced, and every machine reseals to the next key at its next update.
   media. An image above the minimum but below the old floor can then boot,
   but every sealed object is gone with the clear, so it opens nothing
   without the recovery key. The recovery-key boot that follows takes
-  ownership again, recreates the SRK, defines counter and base at that
-  floor, the replay counter and its base, the PIN-epoch index and the time
-  index, creates a new service key and reseals (first-boot sealing).
+  ownership again, recreates the SRK, creates a new service key and the
+  mark key, defines counter and base at that floor, the replay counter and
+  its base, the PIN-epoch index, the time index and F2's pool, and reseals
+  (first-boot sealing, in its order). A recovery boot never redefines a
+  counter that exists, except at a PCR 4 variant change (above), which
+  keeps the floor it read from that counter before capping.
   Before the new replay value is accepted, it shows the volume's last
   authenticated commit time and generation ([storage.md](storage.md)) and
   the user confirms on the trusted path that this is the latest state. The
@@ -676,7 +768,10 @@ announced, and every machine reseals to the next key at its next update.
   name into the loader state and the header block, delete the newer slots and
   both recovery copies and write an old signed recovery image: the loader
   refuses everything below its built-in minimum, warns and shows no code;
-  with a newer image left on the ESP it boots that image instead.
+  with a newer image left on the ESP it boots that image instead. Root,
+  with no clear, writes a wrong SRK name into the loader state, corrupts
+  object 3's slot and deletes the newer configs: the floor stays
+  counter − base, and no image below it boots.
 - **Lockout parameters:** maxTries 32, recoveryTime 7,200 s (one attempt
   recovered every 2 hours of TPM power-on time), lockoutRecovery 86,400 s.
   After every successful pre-cap unseal of object 1 the kernel, still
@@ -803,9 +898,9 @@ announced, and every machine reseals to the next key at its next update.
   above the PIN prompt with the UTC time it used. The user checks it
   against their phone. Another signed chain (an old loader, a signed tool
   faking the prompt) can't unseal the key, so its prompt shows no correct
-  code. Object 3 binds the signed PCR 4/8/9 policy and the floor but not
-  PCR 7, so a dbx, db or firmware update made outside Optimal still shows
-  the code, which is when the recovery key is asked.
+  code. Object 3 also binds PCR 7, so a dbx, db or firmware update made
+  outside Optimal shows no code either; the loader names the change, and
+  the boot after the recovery-key boot shows the code again.
 - **Time for the code.** The RTC may keep local time (Windows dual boot)
   and drifts while off (about 50 s a month at 20 ppm). At every shutdown
   the kernel, whose clock is NTS-disciplined, records in the loader state
@@ -823,29 +918,36 @@ announced, and every machine reseals to the next key at its next update.
   only a chain that can show a correct code can move the mark, on
   signed-variant and per-machine machines alike.
 - **No code.** The loader says why when it can't show a code: the first
-  boot from disk, a TPM clear, or a key that no longer unseals. Typing the
+  boot from disk, a TPM clear, a PCR 7 change, or a key that no longer
+  unseals. Typing the
   recovery key without a code is safe only in a case the user caused
   (a fresh install, a clear or firmware reset they made); the prompt says
   so. After that boot the kernel generates a new TOTP key and M, seals
   them and shows the QR code once (re-enrolment). Re-enrolment for a lost
   phone is in Settings, on the trusted path, and needs the PIN.
 - **What a correct code proves.** It proves the TPM saw the approved
-  loader and kernel at or above the floor, not that the firmware is
-  unchanged: with firmware setup unprotected, someone who turns Secure Boot
-  off can load a firmware driver (measured in PCR 2, which nothing binds)
-  that logs keys while the genuine loader shows a correct code. So the
-  loader decodes the PCR 7 event log and, if Secure Boot is off or PK, KEK
-  or db differs from what the kernel recorded in the loader state at the
-  last good boot, shows that above the code and says not to type the
-  recovery key unless the user made that change. A firmware setup password
-  closes the gap, and the scorecard says so. The optional tamper alert (F7
+  loader and kernel at or above the floor with the PCR 7 state (Secure
+  Boot on, the same PK, KEK, db and dbx) Optimal last sealed to, not that
+  the firmware itself (PCRs 0 to 5) is unchanged. Someone who turns Secure
+  Boot off to load a key-logging firmware driver therefore gets no code
+  shown. The loader also decodes the PCR 7 event log and, if Secure Boot
+  is off or PK, KEK or db differs from what the kernel recorded in the
+  loader state at the last good boot, says so and not to type the
+  recovery key unless the user made that change; such a driver could fake
+  that log, so only the missing code is relied on. A firmware setup
+  password keeps firmware changes out, and the scorecard says so. The optional tamper alert (F7
   in [features.md](features.md)) extends this comparison to PCRs 0 to 5,
   with an S-authenticated record checked after unlock.
 - **Where the PIN or passphrase is typed.** Once Optimal Boot lands (Phase
   4b), it reads it through the UEFI text input protocol (`ConIn`, which
   works with USB keyboards through firmware) before `ExitBootServices`, and
   hands it to the kernel in a dedicated page the kernel zeroes after use;
-  the loader wipes its own copies before handing over. With Limine or on
+  the loader wipes its own copies before handing over. It also hands over
+  the EFI device path behind `ConIn`, and the kernel's reader trusts that
+  device as the one that typed the unlock secret; if no path is known, the
+  reader asks for a code shown on screen to be typed after hand-over.
+  Unencrypted installs use the keyboard that types the login password.
+  Test (Phase 5): the `usb-kbd` test reruns on a B1 swtpm boot. With Limine or on
   BIOS there's no TPM unlock at all, and the kernel asks for the
   **passphrase** on the framebuffer console from Phase 4a. Input comes from
   PS/2, serial, or a USB keyboard through a polled xHCI boot-protocol
@@ -864,11 +966,23 @@ announced, and every machine reseals to the next key at its next update.
 
 ### Tests (Phase 4b gate, QEMU with swtpm)
 
+**Stand-ins at 4b.** The desktop, the update client (Phase 7) and the
+prompt VT (Phase 5) come later, so the 4b gate uses: a pre-desktop kernel
+console as the trusted path (the prompt VT grows from it at 5), from which
+credential changes, the re-tag, the confirmation after a clear,
+re-enrolment and the lock-screen PIN object's check run; a signed test
+health agent that marks a slot or loader good; and a minimal signed
+slot/loader stager that does `BootNext` re-arming, the `BootOrder` flip,
+floor-raise stage 1 and config-key rotation step 1. The tests that use
+the stager or the health agent rerun with the update client at 7; the HID
+guesser test stays at 6.
+
 - **Unseal and tamper.** A normal boot unseals. A kernel update, a rollback
   to a release at or above the floor, an OS-applied dbx update, and an SBAT
   bump with a new shim all unseal with no recovery prompt. A dbx change
-  made outside the OS shows the correct anti-phishing code, asks for the
-  recovery key, and the boot after it needs only the PIN. Each of these
+  made outside the OS shows no anti-phishing code and names the PCR 7
+  change, asks for the recovery key, and the boot after it needs only the
+  PIN. Each of these
   fails to unseal: a tampered loader, config, command line, kernel, module
   or system-image root hash; an **older signed Optimal Boot**; a **signed
   EFI tool that replays the published PCR 8 and 9 events**; an image below
@@ -923,8 +1037,8 @@ announced, and every machine reseals to the next key at its next update.
   code the reference TOTP implementation gives for true UTC. A TPM clear
   shows no code and names the clear; the recovery-key boot after it
   re-enrols, and the next boot shows a correct code. With Secure Boot
-  turned off in the OVMF setup, the loader shows the Secure Boot warning
-  above the code.
+  turned off in the OVMF setup, the loader shows no code and the Secure
+  Boot warning.
 - **Lockout.** 64 power cuts at random points after the PIN unseal, plus
   10 kernel panics: failedTries is at most 1 at every boot, read with
   `TPM2_GetCapability`, and no boot asks for the recovery key. 32 wrong
@@ -956,7 +1070,11 @@ announced, and every machine reseals to the next key at its next update.
   both loader copies carry the new generation, and an attempt to apply it
   earlier is refused. Power is cut at every step of a config-key rotation
   (each dual-signed config, the loader update, the floor raise), and the
-  machine boots each time without the recovery key.
+  machine boots each time without the recovery key. A loader update
+  staged while a floor raise is pending waits for the raise, and a power
+  cut at each step of that sequence still boots without the recovery key;
+  a loader whose built-in minimum is above the completed floor is not
+  installed.
 - **Slots.** Power is cut during every loader-state write and the loader
   boots a valid slot each time; flipping one bit in the active slot's image
   makes the read fail, the kernel sets "slot bad", and the next boot runs
@@ -1050,17 +1168,28 @@ announced, and every machine reseals to the next key at its next update.
   and witness keys built into it, and refuses the config otherwise (Phase
   4b). The witness set and threshold change through a signed loader
   update whose own config carries a checkpoint cosigned under the old set,
-  or, when fewer than 2 old witnesses remain, through an emergency
-  witness-set change signed by the offline root (2 of 3, its keys built
-  into the loader) and itself logged. The log and the 4 witnesses, run by
+  or through an emergency witness-set change signed by the offline root
+  (2 of 3, its keys built into the loader) and logged, which also needs a
+  cosignature by at least 1 old witness, or else 30 days in the public log
+  plus a trusted-path notice before the update client applies it. Each
+  witness set has a monotonic version, built into the loader that carries
+  it, so the floor raise that ships a new set retires loaders with the
+  old one. The log and the 4 witnesses, run by
   parties other than the release signers, are provided by the owner and
   are a 4b entry condition. The update client checks the same before
-  installing. So a release signed in secret (stolen key, coercion) can't be
-  installed or booted without being visible. Tests (Phase 4b): an unlogged
+  installing, and before any reseal it checks that the new loader's hash
+  and every disk policy it reseals to are logged. So a release signed in
+  secret (stolen key, coercion) can't be installed by the update client or
+  booted by a current loader without being logged. Firmware doesn't check
+  the log and the TPM accepts a disk-policy signature whether logged or
+  not, so a secretly signed loader placed with physical access is not
+  covered at boot: it is caught only by the update client's check before
+  resealing. Tests (Phase 4b): an unlogged
   but validly signed release is refused by both; with one witness removed
   a release still boots; the witness set is rotated with one old witness
-  dead; an emergency change signed by the root with 3 old witnesses dead
-  is accepted.
+  dead; an emergency change signed by the root and cosigned by the one
+  live old witness is accepted; a root-signed change with no old-witness
+  cosignature while 2 or more old witnesses are alive is refused.
 - **When updates apply.** Staging never restarts the machine: the slot
   switch, loader trial boots and floor raises happen only at a restart the
   user chose, and each release's changelog is in its signed metadata (F14
@@ -1158,8 +1287,8 @@ announced, and every machine reseals to the next key at its next update.
 | Microcode on every CPU | 2 |
 | Verified system image format and block checks; A/B slot layout; B4 static A/B Limine entries; passphrase prompt with PS/2, serial and the polled USB boot keyboard reader; the Optimal header block format, parser and fuzzing with its passphrase and recovery-key wraps (no boot path reads a LUKS2 key slot) | 4a |
 | `MemoryOverwriteRequestControl` only while a panic mode is enabled, boot cost measured | 5 |
-| Lock-screen PIN object and its HID-guesser test; TLS time check from the time floor with the RTC-reset test | 6 |
-| TPM driver, measured boot (entry conditions: Optimal Boot's measured boot and boot counting, Secure Boot path 2 on the reference laptop, and the transparency log with 4 witnesses at threshold 2 running, owner-provided), the emergency witness-set change, shim revocation tracking and the documented way back, path 1 through a test CA in db, config-signing key (Ed25519) and its rotation, the loader under core.md's rules with `core-crypto`, the loader's pre-boot IOMMU installed before the PIN and any unseal, with re-arm, PMR coverage check and the FPGA canary scan, PCR 4 variants and the `-pm` references, first-boot sealing after capping with trial-digest checks, the header block's TPM fields and 15 slots (proof target 15 at B/T), the sealing policy with the PIN epoch, proof target 17, capping and per-copy volume tags with pending sets and the recovery-key re-tag, sealed objects 1 to 3 sealing only R, the service key and its recovery-key wrap, salted HMAC sessions for every secret-carrying command, TPM ownership, platform-hierarchy disable, the built-in minimum SVN and clear detection (any boot with no code included), counter, base, replay counter and its base, PIN-epoch index and time index, lockout reset and `TPM2_Shutdown` on every path, stretched PIN and fTPM passphrase rule, PIN, passphrase and recovery-key changes, PIN entry in the loader, anti-phishing TOTP with RTC correction and re-enrolment, per-slot configs, loader state, two loader copies with `BootNext` trial boots, slot-bad fallback, local health check, two-stage floor raise with the real unseal before the increment, revocation ordering, recovery image copies with signed PCR 8/9, slots by partition type GUID on the boot disk, the loader's transparency check, proof target 16, all tests above; outside audit of the TPM service, loader and core at the end of 4b | 4b |
+| Lock-screen HID-guesser test; TLS time check from the time floor with the RTC-reset test | 6 |
+| TPM driver, measured boot (entry conditions: Optimal Boot's measured boot and boot counting, Secure Boot path 2 on the reference laptop, and the transparency log with 4 witnesses at threshold 2 running, owner-provided), the emergency witness-set change, shim revocation tracking and the documented way back, path 1 through a test CA in db, config-signing key (Ed25519) and its rotation, the loader under core.md's rules with `core-crypto` (TPM session crypto included), the loader's pre-boot IOMMU installed first, with the excluded pool or `EDKII_IOMMU_PROTOCOL` implementation, every disk read and the disk exception dropped before the PIN and any unseal, re-arm, PMR coverage check, target 10 extended to the table builder, the hostile boot-disk tests and the FPGA canary scan, PCR 4 variants and the `-pm` references, first-boot sealing after capping in its order (keys, NV indexes, read-back, objects) with trial-digest checks, the boot nonce at capping, the lock-screen PIN object, F2's NV pool, dual boot with an already-provisioned TPM, the one-pending-operation rule, the 4b stand-ins (kernel console as trusted path, test health agent, slot/loader stager), the header block's TPM fields and 15 slots (proof target 15 at B/T), the sealing policy with the PIN epoch, proof target 17, capping and per-copy volume tags with pending sets and the recovery-key re-tag, sealed objects 1 to 3 sealing only R, the service key and its recovery-key wrap, salted HMAC sessions for every secret-carrying command, TPM ownership, platform-hierarchy disable, the built-in minimum SVN and clear detection (any boot with no code included), counter, base, replay counter and its base, PIN-epoch index and time index, lockout reset and `TPM2_Shutdown` on every path, stretched PIN and fTPM passphrase rule, PIN, passphrase and recovery-key changes, PIN entry in the loader, anti-phishing TOTP with RTC correction and re-enrolment, per-slot configs, loader state, two loader copies with `BootNext` trial boots, slot-bad fallback, local health check, two-stage floor raise with the real unseal before the increment, revocation ordering, recovery image copies with signed PCR 8/9, slots by partition type GUID on the boot disk, the loader's transparency check, proof target 16, all tests above; outside audit of the TPM service, loader and core at the end of 4b | 4b |
 | Signed update client with TUF metadata and transparency inclusion proofs | 7 |
 | Secure Boot path 2 on 3 real PCs and path 1 submitted for review | bootloader track, finishing before Phase 7 |
 | Microcode after resume; the resume object (object 5) and resume PIN input with keyboard identity across re-enumeration; S3 waking-vector IOMMU re-arm and its FPGA test; the hibernation key (object 4), the hand-over page and the resume-slot rule | 10 |

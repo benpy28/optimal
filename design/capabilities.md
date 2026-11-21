@@ -140,11 +140,19 @@ produces them for removed devices and network file systems.
   dashboard logs) lives inside the open hidden volume and is never written
   to the system settings store.
 - **Updates.** The install directory of every program launched from the
-  desktop is a protected path: the directory holding its executable (for
-  example `~/opt/firefox/`), or for a script the script's directory tree;
-  when that directory is the home root, an XDG user directory (Downloads,
-  Desktop, Documents and so on) or a removable volume, only the closure
-  files themselves. When the closure hash changes, the lineage carries over
+  desktop is protected against other app identities: the directory holding
+  its executable (for example `~/opt/firefox/`), or for a script the
+  script's directory tree; when that directory is the home root, an XDG
+  user directory (Downloads, Desktop, Documents and so on) or a removable
+  volume, only the closure files themselves. No other app identity's grant
+  includes it, but it stays visible and writable to the terminal identity
+  (a terminal write gives the file terminal provenance, so the rules below
+  decide the lineage). A directory whose files all have terminal
+  provenance is never protected; only its closure hashes are recorded.
+  Tests (Phase 5): desktop-launch `./target/debug/x`, then 10 `cargo
+  build` runs give 0 `EACCES`; `rm -rf ~/opt/app` from the terminal works;
+  `pip install --upgrade` of a terminal-installed app gives exactly 1
+  prompt. When the closure hash changes, the lineage carries over
   only if every changed file's provenance is (a) the identity itself
   (Firefox, Discord and Steam updating themselves), (b) for a child
   identity, its declared parent, for paths the parent's manifest shares
@@ -166,8 +174,14 @@ produces them for removed devices and network file systems.
   definition): a file is tagged downloaded when (a) any identity writes it
   into a download folder (the XDG Downloads folder, a browser's download
   directory), (b) it arrives through a portal from a networked identity, or
-  (c) it is written by a process that has read from a non-loopback socket
-  since its last `execve` (a per-process taint, sticky until `execve`).
+  (c) it is written by a tainted process. A process is tainted when it
+  has read from a non-loopback socket since its last `execve`, and within
+  an identity the taint spreads across `fork` and to every process that
+  reads from a tainted one through a pipe, Unix socket or shared memory;
+  for a non-terminal app identity it is identity-wide (Chromium's network
+  process taints its browser process). Tests (Phase 7): Chromium "Save
+  as" to `~/Documents`, `curl … | tar x` and a cloned repository's binary
+  each prompt once on a double-click.
   Files an identity writes inside its own install directory or closure keep
   its provenance and are not tagged (update rule (a) below). **Removable**
   is set on files read from removable or foreign volumes. Copies keep the
@@ -220,7 +234,8 @@ produces them for removed devices and network file systems.
   `~/.local/share/applications`, `~/.local/share/dbus-1/services`,
   `~/.config/systemd/user`, `~/.config/environment.d`,
   `~/.config/mimeapps.list`, `~/.local/bin`, `~/Applications`, every
-  desktop-launched program's install directory, every private home and the
+  desktop-launched program's install directory (against other app
+  identities only, above), every private home and the
   projected shared settings (below) are protected paths
   ([threat-model.md](threat-model.md)): no folder grant includes them.
   Autostart entries are written only through the **Background portal**
@@ -250,9 +265,11 @@ produces them for removed devices and network file systems.
   kernel-set attribute. When a terminal-identity process `execve`s such a
   path, the kernel runs the system image's **launch relay** in its place:
   the relay asks the launcher to start the app under its own identity on a
-  fresh pty, passing argv, the environment variables on a published
-  allowlist (locale, `TERM`, `EDITOR`, `VISUAL`, `PAGER` and the like) and
-  the cwd; path arguments and the cwd become one-use
+  fresh pty, passing argv, the typed environment minus a published
+  denylist (`LD_*`, `*PRELOAD`, `PYTHONPATH` and similar), the cwd, and the
+  caller's rlimits, nice value, CPU affinity and cgroup; when the
+  `execve`ing process is traced, the app starts stopped and the tracer
+  gets a debug capability on it through the debugger portal. Path arguments and the cwd become one-use
   document-portal entries for the app, and argv is rewritten to their
   paths (Flatpak's `@@` file forwarding). It relays stdio between its own
   fds and that pty (with the escape filter above), forwards signals, waits
@@ -262,7 +279,8 @@ produces them for removed devices and network file systems.
   and the stdio relay are not prompts, and the relay's edge lasts the
   app's process lifetime and doesn't join components. Tests: (Phase 5) a
   registered test app run from the shell and from the launcher sees the
-  same home, and its exit status and signals pass through; (Phase 7)
+  same home, and its exit status and signals pass through; `gdb`,
+  `strace -f` and `taskset` on a registered app act on the app; (Phase 7)
   `code .`, `EDITOR="code --wait" git commit` and a pipe into an app each
   work with 0 prompts.
 - **Direct channels make one principal.** Data moves between identities
@@ -278,7 +296,8 @@ produces them for removed devices and network file systems.
   identity is itself plus every identity with a path of edges to it, and
   the component's **data set** is the union of its members' persistent
   file grants and their camera, microphone, screen capture and screenshot,
-  location and background clipboard-read grants. The data + network rule
+  location, background clipboard-read, USB-portal raw device, `hidraw`,
+  serial and screen-reader (AT-SPI) grants. The data + network rule
   applies to components: an identity holding network may have a non-empty
   component data set only under a **combined approval**, a prompt that
   names each source in that data set and every networked identity it would
@@ -286,8 +305,12 @@ produces them for removed devices and network file systems.
   two points:
   - **opening a channel** A → B checks every networked identity reachable
     from B, B included; without a covering approval the channel is refused
-    (`ECONNREFUSED` on connect, `EACCES` on passing the fd or mapping the
-    object, `org.freedesktop.DBus.Error.AccessDenied` from the D-Bus proxy);
+    at once (`ECONNREFUSED` on connect, `EACCES` on passing the fd or
+    mapping the object, `org.freedesktop.DBus.Error.AccessDenied` from the
+    D-Bus proxy), one combined-approval request per identity pair is
+    queued, and a retry after approval succeeds (the rule is stated in
+    [threat-model.md](threat-model.md); Phase 5 test: a socket channel
+    refused, approved, then retried succeeds);
   - **every new grant** (network, folder, inbound port, persistent
     document, and each data-set grant above) is checked against the holder's component and every
     networked identity downstream of it before it is made. A writable
@@ -313,7 +336,8 @@ produces them for removed devices and network file systems.
   projected shared settings are written only by the settings portal, so
   they join nobody. TCB services (portals, the launcher and launch relay,
   compositor, PipeWire, the D-Bus proxies, the resolver, the document
-  portal, the SSH agent, GPG agent and secret service) are not principals:
+  portal, the SSH agent, GPG agent and secret service, the per-app
+  accessibility proxy and the input method) are not principals:
   talking to one joins nobody, and each enforces its own rule
   (channels.toml lists every one). Covert channels (CPU and cache timing,
   `statfs` free space, `flock` on shared read-only files) are out of scope;
@@ -336,12 +360,21 @@ produces them for removed devices and network file systems.
   PID namespace below the parent's, so the parent can `wait` for it, track it
   with a pidfd and signal it. The parent's manifest declares the **shared
   channels** each child gets, all mediated: read-only paths (the Steam
-  library folders), named shared memory objects (the overlay) and named
-  socket endpoints (the Steam client IPC socket); nothing else crosses.
+  library folders), writable per-child paths (`compatdata/<appid>` and
+  `shadercache/<appid>`), named shared memory objects (the overlay), named
+  socket endpoints (the Steam client IPC socket) and a read-write edge
+  between Steam and each child's save paths (Steam Cloud), a declared
+  graph edge; nothing else crosses.
   Steam ships unpackaged, so the system image carries a **signed Steam
   manifest** for the official Steam path and closure (and a mapping of
   Flatpak Steam's metadata onto the same grants), written as a Phase 9
-  input. Steam Input's virtual controllers go through the
+  input. When a Steam process `execve`s a program with `SteamAppId` in its
+  environment or under an appmanifest install directory, the kernel hands
+  the exec to the launcher, which maps the two through that manifest to
+  the child identity (so
+  Proton's shared `proton` and `wine64` binaries run as the game's child)
+  and builds its view. Phase 9 test: a Proton title and a Cloud-synced
+  native title each round-trip their saves. Steam Input's virtual controllers go through the
   **virtual-gamepad portal**, which hands out a `uinput` fd that accepts
   only gamepad event codes (`BTN_GAMEPAD` to `BTN_THUMBR`,
   `BTN_TRIGGER_HAPPY*`, the `ABS_*` axes, `EV_FF`); keyboard and pointer
@@ -395,9 +428,12 @@ produces them for removed devices and network file systems.
   are made synchronously from the level policy the broker pushes into the
   kernel and the resolver, so the call itself succeeds and no app sees a
   failure when no human is needed (granted silently and logged). When a
-  human is needed, the lookup or `connect` waits up to 30 s for the
-  decision (an `O_NONBLOCK` connect returns `EINPROGRESS` and completes or
-  fails later); on refusal or timeout the lookup answers SERVFAIL
+  human is needed, the lookup, `connect` or `sendto` waits up to 30 s for
+  the decision (an `O_NONBLOCK` connect returns `EINPROGRESS` and
+  completes or fails later; an `O_NONBLOCK` `sendto` returns `EAGAIN`).
+  The generated `resolv.conf` carries `options timeout:30 attempts:1`, so
+  stub resolvers wait out the hold, and the resolver dedupes retransmits
+  per identity; on refusal or timeout the lookup answers SERVFAIL
   (`EAI_AGAIN`) and `connect` returns `ENETUNREACH`, never
   `ECONNREFUSED`. A manifest app's network declaration is shown
   at install, and the install approval is the grant. Inbound ports and
@@ -411,7 +447,8 @@ produces them for removed devices and network file systems.
   (Phase 5 on the loopback-only stack with a fake upstream; Phase 6 against
   the real network): `curl https://<name>` from a new identity raises
   exactly 1 request, prompts at "Always ask" and succeeds on its first run
-  once approved within 30 s; at the default level a network-only first use
+  when approved at 2 s and at 25 s, through glibc, musl, Go and Chromium's
+  built-in resolver; at the default level a network-only first use
   gives 0 failures and 0 prompts; a refused identity's lookup gets
   `EAI_AGAIN` and its `connect` `ENETUNREACH`.
 
@@ -426,7 +463,7 @@ by a published list, so apps find everything they expect:
   `/app`;
 - `/etc` as a generated, read-only view: `passwd` and `group` (this user and
   system accounts only), `hosts`, `resolv.conf` (naming the system
-  resolver, below), `nsswitch.conf`,
+  resolver, with `options timeout:30 attempts:1`, below), `nsswitch.conf`,
   `machine-id` (a per-app value, so apps can't use it to track the user
   across apps), `localtime`, `os-release`, `ssl/certs`, `fonts`,
   `ld.so.cache`;
@@ -451,8 +488,9 @@ by a published list, so apps find everything they expect:
   `~/.icons`, `~/.local/share/icons` and `~/.config/mimeapps.list`; these
   are protected paths in the real home, written only by the settings
   portal (the launcher portal for `mimeapps.list`). The terminal identity
-  instead gets the real home minus the protected paths. Golden first-run
-  test: git, Python and Wine (`wineboot --init` with no display) in
+  instead gets the real home minus the protected paths, install
+  directories included in its view (above). Golden first-run
+  test: git, Python and new-WoW64 Wine (`wineboot --init` with no display) in
   Phase 5, Firefox and Steam (whose first run downloads its client and
   opens an X11 window) in Phase 7 run for the first time on Linux and on
   Optimal, and the paths each creates under `$HOME` match;
@@ -550,7 +588,11 @@ separate namespace, so a grant or revocation reaches live sockets:
   from an identity with no recorded answer is the first-use event above
   (decided before any query leaves the machine); an identity whose answer
   is a refusal gets SERVFAIL (`EAI_AGAIN`), never `ECONNREFUSED`, so DNS
-  can't tunnel data out of an app without network. The resolver lands in
+  can't tunnel data out of an app without network. The kernel stamps the
+  sender's identity on every loopback datagram and TCP connection to the
+  resolver (an Optimal control message), which is how the resolver tells
+  who asks. It does its own upstream retries and answers SERVFAIL within
+  5 s when the upstream fails. The resolver lands in
   Phase 5, forwarding to a fake upstream on the loopback-only stack until
   the full stack arrives in Phase 6.
 - **Services that send for an app.** Every TCB service that sends traffic
@@ -627,8 +669,9 @@ the browser (Phase 7); each is refused or shown in the prompt.
   `EPERM`, `ENETUNREACH` or `ENOENT` immediately. Prompts never happen inside
   a system call, because a syscall that blocks on a human would hang or time
   out real programs; apps ask through portals, which are asynchronous. The
-  one exception is the first-use network request (above): a lookup or
-  `connect` waits at most 30 s, and only when a human must decide.
+  one exception is the first-use network request (above): a lookup,
+  `connect` or `sendto` waits at most 30 s, and only when a human must
+  decide.
 
 ## Granting access: portals
 
@@ -650,9 +693,12 @@ in-kernel I2C-HID for internal laptop keyboards once it meets the parser
 promotion thresholds) or from a keyboard whose own per-device HID process
 (one process per device) passed typed-code confirmation. Before Phase 6
 (no device authorization yet) the prompt terminal accepts USB input only
-from the port and device that typed the unlock passphrase this boot
-(Phase 5 test: a `usb-kbd` hot-added after unlock can't open or answer a
-prompt). Bluetooth keyboards and 2.4 GHz receivers never count unless the
+from the device that typed the unlock secret this boot: the loader records
+the EFI device path behind `ConIn` and hands it over, and the kernel's
+reader trusts that device; if no path is known, the reader asks for a
+typed code after hand-over. Unencrypted installs use the keyboard that
+types the login password. Phase 5 test, also run on a B1 swtpm boot: a
+`usb-kbd` hot-added after unlock can't open or answer a prompt. Bluetooth keyboards and 2.4 GHz receivers never count unless the
 user opts that keyboard in by name;
 `uinput` devices and the compositor's virtual keyboard and pointer never
 count, and neither do events produced by the user's key remapping, which
@@ -672,6 +718,13 @@ the tier-2 transport holds. Attack rows: a compromised Bluetooth stack or
 HID process injects the secure-attention key and approves a prompt, and a
 compromised Bluetooth stack injects keys into a focused terminal; all fail
 (Phase 6, the first extended in Phase 7 to the compositor path).
+The user's own transfers (a file-chooser pick, a cross-identity drop, a
+paste) count only when driven from a confirmed device: a keyboard that
+may answer prompts, or a pointer the user confirmed by clicking a target
+the prompt layer shows when that pointer is first used for one; from any
+other device the transfer is refused. Exfiltration row (Phase 7): a
+BadUSB mouse drags `~/Documents` into a networked app and pastes the
+clipboard into it; nothing arrives.
 
 - **File chooser:** the user picks files or folders in the portal's dialog
   (drawn on the broker's terminal in Phase 5, by the compositor from
@@ -706,10 +759,14 @@ compromised Bluetooth stack injects keys into a focused terminal; all fail
   interface), USB devices:** the portal decides once per the prompt level,
   the answer is remembered and can be changed in Settings, and the app gets
   a capability (often an fd, such as a PipeWire stream). Camera,
-  microphone, screen capture and screenshot, location and background
-  clipboard-read grants are in the component's data set (above), so with
+  microphone, screen capture and screenshot, location, background
+  clipboard-read, USB-portal raw device, `hidraw`, serial and
+  screen-reader grants are in the component's data set (above), so with
   network in the component they need the combined approval at every
-  level. Screenshots, screen casting, remote desktop and input capture are
+  level. A screen reader reaches other apps' text only through the
+  per-app accessibility proxy (Flatpak's `--a11y-own-name` model), and
+  the input method, which sees every keystroke, is a TCB service, never an
+  app ([`channels.toml`](channels.toml) rows). Screenshots, screen casting, remote desktop and input capture are
   in the floor below. The USB portal refuses raw access to audio (class
   0x01) and video (class 0x0E) interfaces; those devices are reached only
   through PipeWire, where F1's indicators and kill switches apply. Trusted indicators for the camera,
@@ -724,8 +781,8 @@ TCB setting stored by the broker and changed only on the trusted path (the
 prompt terminal, later the compositor's prompt layer); no app can change
 it. A **prompt** here is a dialog the user
 didn't open: an install review page, a file chooser pick and drag and
-drop are the user's own actions and aren't prompts (the prompt budget
-below still counts install approvals).
+drop are the user's own actions and aren't prompts (install
+confirmations are counted and published separately, below).
 - *Always ask:* every new grant prompts.
 - *Only when suspicious:* a request prompts if it is on the closed
   **suspicious list**, or in the floor; any other grant is given silently.
@@ -746,9 +803,10 @@ seen.
    casting, remote desktop, input capture, the virtual keyboard and pointer
    (inbound in 6, the rest in 7);
 4. a new USB device of network or storage class, or a new HID interface
-   without keyboard/keypad or system-control usages (mice, gamepads,
-   consumer-control-only headset buttons, FIDO keys; [drivers.md](drivers.md)
-   "Device authorization") (6);
+   without keyboard/keypad or system-control usages other than a
+   pointer-only or gamepad interface (consumer-control-only headset
+   buttons, FIDO keys; [drivers.md](drivers.md) "Device authorization")
+   (6);
 5. a device presenting a different class than it did last time (6);
 6. any grant requested while the screen is locked, or requested before any
    user input to the identity's own surfaces (5).
@@ -770,18 +828,16 @@ prompt, listed in Settings and revocable there. Tests: at "Only when
 suspicious" each entry prompts and a request outside the list doesn't; at
 "Almost never" each floor case still prompts, with microphone + network,
 camera + network, location + network, background clipboard + network and
-screenshot + network each prompting exactly once (Phase 7) and a
-hot-added PCIe device and Thunderbolt tunnel each prompting (Phase 6); an
+screenshot + network and screen reader + network each prompting exactly
+once (Phase 7), USB storage + network, serial GPS + network, a hot-added
+PCIe device and a Thunderbolt tunnel each prompting (Phase 6); an
 app's attempt to change the level (D-Bus, settings files, input
 injection) fails (5, with the entries in their phases above). Prompt
-budget (Phase 7): a pinned typical-day script at the default level
-(the one pinned in the scorecard row "prompts per typical day" in
-[benchmarks.md](benchmarks.md): Firefox with browsing and one download,
-Steam, a chat app, an editor, a media player, an AppImage, a cargo
-project, a video call, a new Wi-Fi network, plugging in a new mouse, a
-headset and a gamepad) counts every prompt kind, install approvals
-included; the target is at most 5 at the default level, and the measured
-count is published in that row.
+budget (Phase 7): the one typical-day script, its expected count per step
+and the target (at most 5 prompts per typical day at the default level,
+counting every prompt the user did not start; install confirmations
+counted and published separately) are in [benchmarks.md](benchmarks.md),
+row "prompts per typical day".
 
 **Settings before Phase 12.** Until the Settings app lands, every
 "Settings" screen named in this file is a trusted-path **settings
@@ -881,8 +937,9 @@ connect; Tailscale keeps its tunnel while roaming between two networks.
   loopback-only stack and the resolver in Phase 5, PipeWire, the
   notification, email, print and VPN portals and full sockets in Phase 6,
   Wayland, XWayland, the clipboard, DnD, the camera, location and
-  screenshot portals and the remote-control portals in Phase 7. Each TCB service named here (the
-  launcher and launch relay, broker and portals, the SSH agent, GPG agent
-  and secret service included) has an A3 row in
+  screenshot portals, the remote-control portals, the accessibility proxy
+  and the input method in Phase 7. Each TCB service named here (the
+  launcher and launch relay, broker and portals, the SSH agent, GPG agent,
+  secret service, resolver and input method included) has an A3 row in
   [threat-model.md](threat-model.md) with 10^8 protocol fuzz executions
   gated in its landing phase.

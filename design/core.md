@@ -15,8 +15,9 @@ because every new component would reopen the question.
 
 Consequences:
 
-- `unsafe fn`, raw pointers, physical addresses and raw page-table entries
-  never appear in a tier-0 crate's public API. They are `pub(crate)` or
+- `unsafe fn`, raw pointers, physical addresses, raw page-table entries and
+  the vendored `vstd` types (`PPtr`, `PAtomicU64`, `PCell`, sound only
+  under Verus's permission checks) never appear in a tier-0 crate's public API. They are `pub(crate)` or
   behind sealed traits.
 - **The core never relies on `Drop` for safety.** If a guard's destructor
   doesn't run (it was leaked), the result may be a resource leak, never
@@ -44,7 +45,7 @@ The kernel is a Cargo workspace. Tier-0 crates are the only ones allowed
 | `core-mm` | frame allocator, page tables, kernel heap, TLB shootdown, user-copy routines, the memory-access backend (the only code that turns a physical address into a reference, through the direct map; [verification.md](verification.md)), and the one API that installs user page-table entries, which takes a memory-object capability witness (proof target 4) |
 | `core-io` | typed MMIO, port I/O, IRQ and DMA handles, PCI config access and MSI/MSI-X programming (tier 3 writes the other registers on a shared MSI-X page through `mmio_write(handle, offset, width, value)`, never by trapping), the IOMMU, the raw TPM and ACPI table mappings |
 | `core-sync` | spinlocks, sleeping locks, per-CPU data, preemption and IRQ tokens |
-| `core-crypto` | all cipher, hash, MAC, KDF, signature and random-generator code in the kernel and the loader, behind safe APIs: AES-XTS, AES-GCM and GHASH, ChaCha20-Poly1305 and XChaCha20-Poly1305, SHA-1 (TOTP only), SHA-256, SHA-512, BLAKE2b, HMAC, HKDF, PBKDF2, Argon2id, Ed25519 verification and the kernel generator (below), each with an intrinsic backend (AES-NI/VAES, SHA extensions, carry-less multiply, AVX2/AVX-512) where one exists and a constant-time portable backend for CPUs without; verified generated code (HACL*/libcrux-derived, fiat-crypto) wherever it exists for the algorithm and instruction set; no other crate implements a primitive; proof target 14 |
+| `core-crypto` | all cipher, hash, MAC, KDF, signature and random-generator code in the kernel and the loader, behind safe APIs: AES-XTS, AES-GCM and GHASH, ChaCha20-Poly1305 and XChaCha20-Poly1305, SHA-1 (TOTP only), SHA-256, SHA-512, BLAKE2b, BLAKE3 (keyed, `derive_key`, XOF; the own file system's KDF), HMAC, HKDF, PBKDF2, Argon2id, Ed25519 verification, the TPM session crypto (ECDH P-256, KDFa and KDFe, AES-128-CFB) and the kernel generator (below), each with an intrinsic backend (AES-NI/VAES, SHA extensions, carry-less multiply, AVX2/AVX-512) where one exists and a constant-time portable backend for CPUs without; verified generated code (HACL*/libcrux-derived, fiat-crypto) wherever it exists for the algorithm and instruction set; no other crate implements a primitive; proof target 14 |
 
 Parsing stays out of tier 0 even when the data comes from hardware: ACPI
 tables, the TPM protocol and its event log, the boot information and device
@@ -90,12 +91,14 @@ tests):
   (every tier-0 module with `asm!`, a target-specific `cfg` or hardware
   access; [verification.md](verification.md)) is capped at 3,000 lines,
   and `core-crypto`, whose intrinsic backends are all shim by that rule, has
-  its own cap of 6,000 lines instead; both are reported separately. The
+  its own cap of 7,500 lines instead; both are reported separately. The
   `core-crypto` estimate: AES with AES-NI, VAES and bitsliced portable
   backends 1,100; XTS, GCM and GHASH 700; ChaCha20, Poly1305 and XChaCha
-  900; SHA-1, SHA-256 and SHA-512 550; BLAKE2b 250; HMAC, HKDF and PBKDF2
-  150; Argon2id 350; Ed25519 verification over fiat-crypto field
-  arithmetic 1,300; the generator 250; 5,550 in all. The kernel shim
+  900; SHA-1, SHA-256 and SHA-512 550; BLAKE2b 250; BLAKE3 with portable
+  and AVX2 backends 600; HMAC, HKDF and PBKDF2 150; Argon2id 350; Ed25519
+  verification over fiat-crypto field arithmetic 1,300; ECDH P-256 over
+  fiat-crypto field arithmetic 1,000; KDFa, KDFe and AES-CFB 100; the
+  generator 250; 7,250 in all. The kernel shim
   estimate per crate, checked against the actual counts on the
   scorecard: `core-boot` 300, `core-arch` 1,120 (entry stubs, context
   switch, XSAVE and signal frames, APIC and timer, MSRs, `RDSEED`/`RDRAND`,
@@ -129,13 +132,18 @@ tests):
   for each `unsafe` it contains) gate every change. Kernel crates may not
   depend on crates with `build.rs` scripts or procedural macros unless the
   crate is vendored and audited, because both run arbitrary code at build
-  time. Verus's `verus_builtin` and `builtin_macros` crates and the exec
-  subset of `vstd` the shipping kernel uses (`atomic`, `simple_pptr`,
-  `cell`) are vendored, pinned and audited on this rule; their ghost code
-  erases in non-Verus builds, and a CI check fails if any shipping
-  `cargo tree` contains `vstd` other than as that subset at its pinned hash
-  ([verification.md](verification.md)). The subset counts as a tier-0
-  dependency: inventoried and inside the 15,000-line cap.
+  time. Verus's `verus_builtin` crate, the exec subset of `vstd` the
+  shipping kernel uses (`atomic`, `simple_pptr`, `cell`) and the whole
+  procedural-macro chain (`builtin_macros`, `verus_syn`, `proc-macro2`,
+  `quote`) are vendored, pinned by hash and audited on this rule; their
+  ghost code erases in non-Verus builds. The `vstd` subset counts as a
+  tier-0 dependency (inventoried and inside the 15,000-line cap); only
+  verified crates may depend on it, and it is byte-identical to the pinned
+  Verus `vstd` (CI checks in [verification.md](verification.md)).
+  Build-time-only procedural-macro crates emit code but never ship, so they
+  are outside the tier-0 count and cap; in exchange, CI expands each
+  verified crate in an erased build and fails if any ghost or tracked item
+  is left, which tests the erasure axiom.
 
 ## The bootloader workspace
 
@@ -145,8 +153,9 @@ rule above applies to it from Phase 1a, with its own numbers: tier-0 crates
 pre-boot IOMMU deny-all programming and its TPM access) are the only ones
 allowed `unsafe`, capped at 3,000 lines, of which shim code is at most
 1,500; the pure crates (`optimal-boot-core`: config, signatures, ELF,
-memory map, KASLR) are `#![forbid(unsafe_code)]`. `core-crypto` is shared
-and counted once, in the kernel's caps. The same lints, unsafe inventory,
+memory map, KASLR) are `#![forbid(unsafe_code)]`. `core-crypto` and the
+kernel's pure IOMMU-table crate (which builds the loader's pre-boot tables,
+proof target 10) are shared and counted once, in the kernel's caps. The same lints, unsafe inventory,
 dependency rules and toolchain pin apply, its harnesses run in the proofs
 job, and its floor code is in proof target 16's scope. Configs are signed
 with Ed25519 (RFC 8032, verified by `core-crypto`). The whole loader's

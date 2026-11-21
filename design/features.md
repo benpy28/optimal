@@ -13,8 +13,9 @@ Three rules hold for all of them:
 
 - **Options are TCB settings where they weaken or strengthen security.**
   Turning a security or privacy option off, or loosening one, happens only
-  on the trusted path (the prompt terminal in Phase 5, the compositor's
-  prompt layer from Phase 7), like the prompt level
+  on the trusted path (the pre-desktop kernel console in 4b, the prompt
+  terminal from Phase 5, the compositor's prompt layer from Phase 7), like
+  the prompt level
   ([capabilities.md](capabilities.md)). No app can change one through a
   portal, a settings file or injected input. Turning a protection on is
   allowed from any input.
@@ -181,10 +182,13 @@ F1):
   records are encrypted under a per-day key from a hash ratchet (day d+1's
   key is HKDF(day d's key, `optimal-dash-ratchet`)); only the oldest
   retained day's key is stored, and the daily prune replaces it with the
-  next one. On B1 it is stored in a per-user TPM NV index (authValue
-  derived from the user's key, one write a day), never on the disk, so
-  an image of the drive, old flash blocks included, can't decrypt an
-  expired day. Retention is 1, 7, 30 or 90 days, or off. Administrators can't read
+  next one. On B1 it is stored in one of 8 per-user TPM NV indexes that
+  first-boot sealing defines while the owner secret is unwrapped
+  ([boot.md](boot.md), which states their NV space against fTPM
+  capacity), written once a day by a kernel operation under `PolicySecret`
+  on the service key for the owning user's session only, never on the
+  disk, so an image of the drive, old flash blocks included, can't decrypt
+  an expired day. Retention is 1, 7, 30 or 90 days, or off. Administrators can't read
   another user's dashboard.
 - *Revoke.* One click revokes the grant through the broker, with the
   revocation semantics of [capabilities.md](capabilities.md): open files
@@ -197,7 +201,8 @@ sends to a destination, is not shown. An app that runs its own encrypted
 DNS shows only its resolver's address. Covert channels are not shown. A
 compromised TCB service can omit records. The history is itself sensitive:
 anyone who unlocks the session can read it, which is why it is bounded,
-expiring and can be switched off. Without a TPM (B2 to B4) the ratchet key
+expiring and can be switched off. Without a TPM (B2 to B4), and for a 9th
+and later user on B1, the ratchet key
 is kept in the user's encrypted storage, and an SSD that keeps old blocks
 can keep an older ratchet key, from which someone with the user's key can
 decrypt expired days still in flash.
@@ -295,8 +300,14 @@ on a fixed region that nothing else writes, trims or snapshots:
   identities' views. Suspend, hibernation and panic lock close every open
   vault first: vault identities' processes are killed and the vault keys
   wiped, never wrapped (the key inventory in [storage.md](storage.md));
-  Settings says so on the vault page. Kernel crash dumps already exclude
-  user pages.
+  Settings says so on the vault page. Every frame that held vault page
+  cache or belonged to a vault identity is zeroed when freed, and every
+  close runs unmap-evict-zero on the vault's page cache and sweeps the
+  buddy and per-CPU free lists. At close the TCB intermediaries
+  (clipboard, document-portal entries, notifications, the input method
+  and PipeWire buffers) drop every entry a vault identity owns; TCB
+  services are never killed, their open descriptions in the vault are
+  revoked. Kernel crash dumps already exclude user pages.
 
 **What it does not protect against** (also the Settings text and the
 scorecard row). It defeats **one-time inspection of a powered-off disk**
@@ -313,9 +324,10 @@ with a tool that trims; an SSD's own flash, which may keep earlier
 versions of rewritten blocks; an outer volume that is plainly never used,
 or whose timestamps show it unused while the vault was opened; data the
 user copies or sends out of the vault; and coercion: deniability is a
-claim the adversary may not believe. It rests on the assumption, listed in
-`axioms.md`, that XTS ciphertext and unused AEAD slots are
-indistinguishable from CSPRNG output. Opening the outer volume alone can
+claim the adversary may not believe. It rests on a written lemma in
+`axioms.md`, resting on target 14, that XTS ciphertext and unused AEAD
+slots are indistinguishable from CSPRNG output; what is measured is only
+that no distinguisher in the 23-test suite of test (a) beats 55%. Opening the outer volume alone can
 overwrite the hidden volume. The existence and size of a vault are visible
 to anyone with the disk.
 
@@ -330,10 +342,10 @@ without, each 2 GiB, made by the vault tool on QEMU guests (each image
 scored, then deleted); every outer filled to 30% by the same scripted
 workload; every hidden one also used by a vault workload (a text editor,
 an image viewer that makes thumbnails, a terminal with shell history, a
-browser download); each machine powered off and imaged once. Each
-distinguisher of the suite, given each image and its outer passphrase
-(slot entropy, the NIST SP 800-22 suite over every region the outer
-reports free, the outer's metadata and timestamps, the volume map, the
+browser download); each machine powered off and imaged once. Each of the
+k = 23 distinguishers of the suite, given each image and its outer
+passphrase (slot entropy, the 15 NIST SP 800-22 tests over every region
+the outer reports free, the outer's metadata and timestamps, the volume map, the
 system and home volumes decrypted with their keys, the system settings
 store and its identity databases (lineage, closure, grants, first-use
 answers, silent-grant log, provenance timestamps, known devices), swap,
@@ -354,7 +366,9 @@ the hidden ranges and the outer reports `ENOSPC` when full. (f) Suspend,
 hibernation and a panic lock with a hidden vault open each close it
 first: a guest memory dump taken in the suspended (and panic-locked)
 state and the hibernation image hold 0 hits for the outer and hidden
-vault keys and the vault workload's canaries, and a canary page of a vault
+vault keys, the vault workload's canaries, a killed vault app's
+anonymous-memory canary and canaries placed in the clipboard, a
+notification and a document-portal path, and a canary page of a vault
 identity is never found in disk swap.
 
 ### F4. Panic lock
@@ -396,31 +410,44 @@ fails closed and the in-kernel input paths in
 - *Order.* (1) The agents' wipe message. (2) User space is frozen (every
   identity's group) except the lock screen, the compositor (from Phase
   7) and the tier-3 HID processes of known keyboards (from Phase 6); each of these runs from the read-only
-  system image and keeps no state on an encrypted volume. (3) Processes of
+  system image and keeps no state on an encrypted volume. Tasks not frozen
+  within 500 ms are killed. (3) Processes of
   vault identities are killed and open vaults closed (F3); unsealed travel
-  folders are resealed (F5) and processes holding open file descriptions
-  in them are killed. (4) Writeback: dirty `MAP_SHARED` pages of encrypted
-  volumes are written back with no time limit; other dirty pages for at
-  most the bound (1 s by default, a setting from 0 to 10 s), after which
-  those still dirty are dropped and their files keep the writeback error
-  (errseq). While panic lock is enabled, dirty pages of encrypted volumes
-  are capped at the bound times the device's measured write bandwidth, so
-  writeback fits the bound. The volumes are then frozen. (5) The keys are
-  wiped. (6) Every PTE mapping a page-cache page of an encrypted volume is
-  unmapped (through the reverse map, with a TLB shootdown), and the pages
-  are evicted and zeroed; frozen apps refault them from disk after unlock.
+  folders are resealed (F5) and non-TCB processes holding open file
+  descriptions in them are killed; TCB services are never killed, their
+  descriptions are revoked and the intermediaries drop vault and travel
+  entries (F3). (4) Writeback: while panic lock is enabled, dirty pages of
+  encrypted volumes, `MAP_SHARED` pages included (counted through
+  write-protect throttling), are capped at max(bound, 1 s) times the
+  device's measured write bandwidth, the bound being 1 s by default, a
+  setting from 0 to 10 s. Writeback stops at the bound plus 2 s; any page
+  still dirty is encrypted in place under P (a fresh key that goes into
+  the P-wrapped blobs with its volume's key) and written back after
+  unlock. The volumes are then frozen. (5) The keys are wiped. (6) Every
+  PTE mapping a page-cache page of an encrypted volume is unmapped
+  (through the reverse map, with a TLB shootdown), and the pages, except
+  those encrypted in step 4, are evicted and zeroed; frozen apps refault them from disk after unlock.
+  Long-term DMA pins of those pages are revoked: the GPU core's invalidate
+  callback unmaps them from GPUVM and io_uring fixed buffers are
+  unregistered. Frames that held encrypted-volume page cache are zeroed
+  whenever they are freed, and the panic sweeps the buddy and per-CPU free
+  lists; the cost of both is published ([benchmarks.md](benchmarks.md)).
   The dentry and inode caches of those volumes, which hold file names, are
   evicted except dentries pinned by open files and working directories.
-  Then the lock screen takes over.
+  The kernel then emits a "panic complete" event and the lock screen takes
+  over.
 - *What is wiped* (each key's row in the key inventory,
   [storage.md](storage.md)). The volume key and S, every home-volume, vault
   (outer and hidden) and travel key and (stage 2) every per-user, class
-  and per-file key, with their expanded AES key schedules and the vector
+  and per-file key; every key derived from these and every key schedule,
+  each sharing its parent's fate; the vector
   registers of every CPU (an IPI to each); the secrets held after capping
   (each R, the TOTP key and M, both stretched-PIN halves,
   [boot.md](boot.md)); the agents' secret memory; the tagged slabs (pipe,
   socket and tty buffers, keyrings) not owned by a frozen app; and on D2
-  machines the bounce region ([drivers.md](drivers.md)).
+  machines the free bounce slots and completed bounce buffers, while live
+  rings, device contexts and the NVMe Host Memory Buffer stay
+  ([drivers.md](drivers.md)).
 - *How it unlocks without the TPM.* PCRs 8 and 9 are capped, so the TPM
   can't release anything again before a reboot. At login the kernel draws
   a random 256-bit panic key P and keeps a blob of P wrapped under the
@@ -447,10 +474,16 @@ fails closed and the in-kernel input paths in
   TCG MOR variable) at boot where the firmware supports it, so a forced
   reset in the middle makes the firmware clear memory before anything else
   boots; the boot-time cost of MOR is measured per reference machine and
-  published. *Panic hibernate* (Phase 10) uses the hibernation path with
-  the image key wrapped under P, and P wrapped under the stretched
-  passphrase in the 15th header-block slot ([boot.md](boot.md)), so resume
-  needs the PIN at boot and the full passphrase for the image.
+  published. *Panic hibernate* (Phase 10) is offered only while exactly
+  one session is logged in (otherwise the panic powers off, and Settings
+  says so). It draws the image key K and wraps it under P before step 5
+  wipes P; P stays wrapped under that user's stretched login passphrase
+  in the 15th header-block slot ([boot.md](boot.md)). No TPM object holds
+  K, so resume needs no PIN: the loader boots the slot that made the image
+  without unsealing anything, the boot kernel asks for the passphrase on
+  the trusted path, unwraps P from slot 15 and K under P, authenticates
+  the image and hands P over, and the restored kernel unwraps its keys
+  from the P blob as at a normal panic unlock.
 
 **What it does not protect against.** Plaintext already in app memory: in
 freeze mode the frozen apps' memory, including their tmpfs, shared-memory
@@ -458,16 +491,17 @@ and memfd pages, the pipe, socket and tty buffers they hold, their
 compressed swap pages, their kernel keyrings and their GPU buffers
 (including what was on screen), stays, because the apps are to resume.
 The names of files frozen apps hold open, or use as working directories,
-stay in their pinned dentries. Pages pinned for DMA stay until their pin's
-timeout. DRAM keeps its contents for seconds to minutes after power-off
+stay in their pinned dentries. Encrypted-volume pages pinned for DMA by a
+path other than GPUVM and io_uring fixed buffers stay mapped (a named
+residual). DRAM keeps its contents for seconds to minutes after power-off
 (longer when chilled), so a cold-boot attack that moves the memory soon
 after a panic power-off can still find what the zeroing didn't reach, and
 in freeze mode finds the apps' memory; memory encryption (AMD SME, Intel
 TME), where it is on, defeats moving the modules, not an attack on the
 running machine. The swap key is kept at panic (key inventory in
 [storage.md](storage.md)), because swap holds the frozen apps' memory.
-Non-mapped writes still dirty after the writeback bound
-can be lost. Someone who already controls the running system before the
+Tasks that don't freeze within 500 ms are killed and lose unsaved work.
+Someone who already controls the running system before the
 chord (malware, a compromised kernel) is not stopped.
 
 **Phase.** Freeze and power-off modes in Phase 5: needs per-user home keys,
@@ -484,11 +518,14 @@ secret memory); 8 GiB of page cache is filled from encrypted files with
 canary plaintext; a frozen test app maps a canary file `MAP_SHARED` and
 runs an executable from the home volume; a canary file name not held open
 goes into the dentry cache, and another canary-named file is held open; a
-canary goes into a tmpfs file and into a test app's memory. The chord is
+canary goes into a tmpfs file and into a test app's memory; canary files
+are read and then evicted under memory pressure before the chord; a
+canary file is registered as an io_uring fixed buffer. The chord is
 sent through the polled readers (QEMU `sendkey` on PS/2 and on `usb-kbd`),
-and 2 s later guest memory is dumped (`dump-guest-memory`) and scanned: 0
-hits for every key canary and its AES key schedule, the page-cache and
-mapped-file canaries and the not-held-open file name; the held-open file
+and at the kernel's "panic complete" event guest memory is dumped
+(`dump-guest-memory`) and scanned: 0 hits for every key canary and its
+AES key schedule, the page-cache, evicted, fixed-buffer and mapped-file
+canaries and the not-held-open file name; the held-open file
 name, the tmpfs canary and the app's canary are found and published as
 the freeze-mode residuals. The PIN is refused at the lock screen in 20 of
 20 tries; the passphrase unlocks with the guest's free memory exhausted
@@ -498,17 +535,22 @@ database in WAL mode and an LMDB environment, each with a writer running,
 pass `PRAGMA integrity_check` and `mdb_stat` checks after each of 100
 panics. A lid close while panic-locked resumes with the passphrase only. In
 power-off mode, a dump at the kernel's last instruction before power-off
-(`-no-shutdown`) holds 0 hits for the app canary as well. Each step's time
-is published; time from chord to keys wiped with the writeback bound at 0
-is at most 200 ms on the reference desktop with 8 GiB of page cache
-(scorecard row). Phase 6 adds the chord injected through `uinput` and a
+(`-no-shutdown`) holds 0 hits for the app canary as well. On a D2 guest a
+panic and unlock complete with NVMe I/O intact and the unlock typed on a
+USB keyboard on xHCI. Each step's time is published, step 6 included;
+time from chord to keys wiped, not counting writeback (step 4, published
+on its own), is at most 200 ms at the shipped 1 s bound on the reference
+desktop with 8 GiB of page cache (scorecard row). Phase 6 adds the chord injected through `uinput` and a
 Bluetooth test keyboard, Phase 7 through the compositor's virtual
-keyboard: none triggers a lock. Phase 10 adds: after panic hibernate the
-image holds no key canary and resume without the full passphrase is
-refused; a VRAM canary reads back as zero after panic power-off on the
+keyboard: none triggers a lock. Phase 8 adds a GPU userptr canary,
+gone from the dump. Phase 10 adds: after panic hibernate the
+image holds no key canary, resume without the full passphrase is
+refused and resume with it needs no PIN; with two sessions logged in,
+panic hibernate powers off instead; a VRAM canary reads back as zero after panic power-off on the
 reference desktop. Phase 12 adds an open hidden vault and an unsealed
-travel folder: 0 hits for their keys and the travel canaries, and their
-processes are gone.
+travel folder: 0 hits for their keys, the travel canaries, a killed vault
+app's anonymous-memory canary and canaries in the clipboard, a
+notification and a document-portal path, and their processes are gone.
 
 ### F5. Travel mode
 
@@ -535,8 +577,11 @@ from the device until it is brought back.
   those apps first and the user confirms), revokes any open file
   description left in it (`EIO`), unmounts it from every view, unmaps,
   evicts and zeroes its page cache, evicts its dentries, and wipes its
-  key. Suspend and panic lock (F4) also reseal it, without asking: they
-  kill the processes holding open file descriptions in it; Settings says
+  key. Frames of its page cache and of the stopped processes are zeroed
+  when freed, and the TCB intermediaries drop entries from it as at a
+  vault close (F3). Suspend and panic lock (F4) also reseal it, without
+  asking: they kill the non-TCB processes holding open file descriptions
+  in it (a TCB service's descriptions are revoked instead); Settings says
   so where travel folders are marked. Resume and unlock then need the
   travel passphrase to bring it back. "Leave the key at home" exports the
   wrapped key and overwrites its header slot with random bytes.
@@ -730,8 +775,8 @@ files on the ESP and the Secure Boot variables it reads itself, which an
 attacker controlling firmware can hide, and Settings says so.
 
 **Phase.** Phase 4b. Needs the TPM driver, event-log replay, S and capping
-(4b); shown on the console in 4b and as a trusted-path notification from
-Phase 7.
+(4b); shown on the pre-desktop kernel console (the 4b trusted path) and
+as a trusted-path notification from Phase 7.
 
 **Test (Phase 4b, QEMU with OVMF and swtpm).** Six changes, each made between
 two boots, 20 runs each: another OVMF build (PCR 0), a changed UEFI boot
@@ -1063,8 +1108,10 @@ stops and crash reports in [drivers.md](drivers.md) and
 - *No new keyboards.* In safe mode every USB keyboard path, the polled
   reader included, accepts input only from known keyboards and from the
   one that typed the unlock passphrase this boot (the identity rule in
-  [drivers.md](drivers.md), "Device authorization"); any other keyboard
-  is ignored and logged.
+  [drivers.md](drivers.md), "Device authorization"; on B1, the device at
+  the EFI device path the loader recorded behind `ConIn`, or, with no
+  path, the keyboard that types the code the kernel's reader shows after
+  hand-over); any other keyboard is ignored and logged.
 - *What failed.* The kernel keeps a boot health record of the last 8 boots
   on the system volume: the outcome (marked good, crashed with the
   component and reason from the crash report header, hung, or the health

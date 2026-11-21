@@ -40,7 +40,9 @@ gamed. Security rules that shape the ABI are in
   writes the `IRET` frame through a writable alias and runs `IRET` from the
   espfix stack, so the leaked bits carry nothing. It lands with
   `modify_ldt` in milestone 3 (Phase 5), because the Phase 5 Wine
-  first-run test needs `modify_ldt`; A3 row test (Phase 5): a 16-bit-SS
+  first-run test needs `modify_ldt` (that test pins a new-WoW64 Wine
+  build, `--enable-archs=i386,x86_64`, so it needs no i386 userland
+  before Phase 7); A3 row test (Phase 5): a 16-bit-SS
   `IRET` leak program recovers 0 bits of any kernel address. x32 (the ILP32 ABI on 64-bit) is not supported; it is
   almost unused and Linux distributions have dropped it.
 - **Kernel identity.** `uname` reports the newest Linux release whose
@@ -53,6 +55,10 @@ gamed. Security rules that shape the ABI are in
   reported version's checklist isn't fully met. Before any
   checklist above glibc's minimum is met, Optimal reports `3.2.0-optimal`
   (glibc's minimum supported kernel), and programs fall back through `ENOSYS`.
+  Programs pick code paths by this version (containers/storage uses
+  native rootless overlay only from 5.13), so the reported version is
+  published per phase and the differential baseline's Linux reports the
+  same version.
 - **Unknown means ENOSYS.** Every syscall number not implemented returns
   `-ENOSYS`, never a kill or `SIGSYS` (seccomp aside). Every unsupported
   `ioctl` returns `-ENOTTY`. Unsupported flags behave exactly as on Linux
@@ -144,7 +150,7 @@ on the scorecard, measured as described below. The phase column is the one
 | 10 | Audio | 6 | ALSA PCM, control and timer interfaces including mmap mode; real-time scheduling for PipeWire through the rtkit portal | alsa-lib tests, PipeWire tests, underrun counts from the benchmark |
 | 11 | Graphics | 8 (starts in 7 with virtio-gpu) | DRM/KMS, GEM, render nodes, dma-buf, `sync_file`, timeline syncobj, the per-driver uAPI of the chosen GPU family, DRM master handed out by the seat service | Mesa's tests, piglit, the pinned Vulkan Conformance Test Suite subset, IGT subset (each at the 90% target below) |
 | 12 | Wayland desktop | 7 | milestones 1 to 10, milestone 11's Phase 7 part (KMS, GEM, dma-buf and sync objects on virtio-gpu and simple framebuffers) and the seat service, so a compositor, GTK and Qt apps and a browser run | compositor plus GTK and Qt test apps, a browser's test suite |
-| 13 | Wine and Proton | 9 | everything above, 32-bit in full (the i386 userland from Phase 7), Steam's child identities with their declared shared channels and the virtual-gamepad portal ([capabilities.md](capabilities.md)), `/dev/ntsync` (the NT synchronisation driver current Proton uses), `RLIMIT_NOFILE` soft 1024 and hard 524,288 by default (soft stays at 1024 so `select()` users keep working; Proton raises its own soft limit for esync), the futex and fd-heavy patterns Proton uses | Wine's conformance tests, the published game list |
+| 13 | Wine and Proton | 9 | everything above, 32-bit in full (the i386 userland from Phase 7), Steam's child identities (mapped from `SteamAppId` and the appmanifest install directory) with their declared shared channels, writable `compatdata/<appid>` and `shadercache/<appid>` and the Steam-to-save-path edge, and the virtual-gamepad portal ([capabilities.md](capabilities.md)), `/dev/ntsync` (the NT synchronisation driver current Proton uses), `RLIMIT_NOFILE` soft 1024 and hard 524,288 by default (soft stays at 1024 so `select()` users keep working; Proton raises its own soft limit for esync), the futex and fd-heavy patterns Proton uses | Wine's conformance tests, the published game list, a Proton title and a Cloud-synced native title round-tripping their saves |
 
 Anti-cheat, precisely: **kernel-level** anti-cheat (Valorant's Vanguard, some
 Call of Duty and EA titles) is a Windows kernel driver and won't run; the game
@@ -182,11 +188,13 @@ sanitizers read `/proc/self/status`, glibc reads
   other apps' processes through the **process portal**, which lists the
   user's processes with their attested identities and signals one, with
   the user's grant. Unmodified `ps`, `top` and `kill` run as the terminal
-  identity and read `/proc` directly, so the terminal's view has a
-  portal-backed `/proc`: it lists every process of the user's session,
-  showing for other identities' processes only `stat`, `statm`, `status`,
-  `comm` and `cmdline` (`environ`, `maps`, `mem`, `fd` and the rest are
-  absent), and `kill(2)` from the terminal reaches them with `SIGTERM`,
+  identity and read `/proc` directly, so the terminal sits in the
+  session's root PID namespace (every app's namespace is below it, so
+  each process has a PID there) and its view has a portal-backed `/proc`:
+  it lists every process of the user's session, showing for other
+  identities' processes only `stat`, `statm`, `status`, `comm` and a
+  `cmdline` holding argv[0] alone (`environ`, `maps`, `mem`, `fd` and the
+  rest are absent), and `kill(2)` from the terminal reaches them with `SIGTERM`,
   `SIGINT`, `SIGKILL`, `SIGSTOP` and `SIGCONT` only; other signals need
   the process portal's grant (`EPERM` without it). Golden test
   (Phase 5): `ps aux`, `top -b -n1` and `kill` against another app's
@@ -256,14 +264,17 @@ sanitizers read `/proc/self/status`, glibc reads
   from another identity, `TIOCSTI` returning `EPERM` and `TIOCLINUX`
   absent, wildcard sockets receiving only loopback without an inbound
   grant, no network in the default profile until the first-use request is
-  answered (a name lookup or `connect` that needs a human waits up to 30 s,
+  answered (a name lookup, `connect` or `sendto` that needs a human waits up to 30 s,
   then gets `EAI_AGAIN` or `ENETUNREACH` if refused), the per-app private
   home, `SO_PEERCRED` giving pid 0 for a peer
   in another app's PID namespace (as Linux does for a pid outside the
-  receiver's namespace), the terminal's portal-backed `/proc` and its
-  limited signals to other identities (above), a registered app run from a
+  receiver's namespace), the terminal's portal-backed `/proc` (argv[0]
+  only for other identities) and its limited signals to other identities
+  (above), a registered app run from a
   shell running under its own identity behind the launch relay (path
-  arguments and cwd rewritten to one-use document-portal paths), autostart
+  arguments and cwd rewritten to one-use document-portal paths, the
+  environment passed minus the `LD_*`, `*PRELOAD` and `PYTHONPATH`
+  denylist), autostart
   and desktop entries written inside a private home becoming Background
   and launcher portal requests (nothing appears until approved; Phase 5
   test, and Steam's shortcuts in milestone 13), the Flatpak portal's

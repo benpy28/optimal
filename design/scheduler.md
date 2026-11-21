@@ -28,9 +28,10 @@ audio keeps up under load. This file is the design that the targets in
   two addresses. The mechanism is covered by
   [verification.md](verification.md) target 1 and listed in the shim
   inventory; lockdown permits only the two precompiled states. Its cost when
-  off is at most 0.5% on the
-  syscall round-trip microbenchmark against a build with the tracer compiled
-  out, both built with the fixed code alignment of
+  off is at most 0.5% on each of the `getppid` round trip, the
+  kernel-thread context switch, the 4 KiB anonymous fault and slab
+  allocate/free (futex ping-pong added at Phase 5, when it lands), against
+  a build with the tracer compiled out, both built with the fixed code alignment of
   [benchmarks.md](benchmarks.md) so the gate measures the trace points, not
   link layout, a Phase 3 gate. The tracer reads the
   SMI count (`MSR_SMI_COUNT` on Intel, the SMIs-received PMC event on AMD) at
@@ -41,22 +42,37 @@ audio keeps up under load. This file is the design that the targets in
 - **Device stalls.** A CPU waiting on a non-posted MMIO read takes no
   interrupt until the read completes, whatever the interrupt flag says, so
   a surprise-removed device stalls that CPU for its whole Completion
-  Timeout. Three rules bound it ([drivers.md](drivers.md)): Completion
+  Timeout. These rules bound it ([drivers.md](drivers.md)): Completion
   Timeout defaults to the 1 to 10 ms range, and is set to 50 to 100 µs
   only on devices measured safe with ASPM L1 substates off (a 24-hour soak
-  with 0 spurious timeouts gates each one); no MMIO read happens in
-  any non-preemptible section (spinlock held, preemption or interrupts
-  off), so hard-IRQ handlers only write; and handler threads of
+  with 0 spurious timeouts gates each one); no read of a PCIe endpoint BAR
+  or of ECAM happens in any non-preemptible section (spinlock held,
+  preemption or interrupts off; LAPIC, I/O APIC, HPET and IOMMU registers
+  are not PCIe reads and are exempt), so hard-IRQ handlers only write; a
+  wait for IPI acknowledgement (TLB shootdown, text poke) spins with
+  preemption off for at most 50 µs, then becomes a preemptible wait and is
+  reported with the late CPU; the NMI watchdog reports a stall while a
+  device-gone event is outstanding (the all-ones read and its Vendor ID
+  confirm read, up to 20 ms) as a device stall, not a stuck CPU; and
+  handler threads of
   hot-removable devices (behind a hotplug-capable or Thunderbolt/USB4 port)
   are affine to one "removable-device core" (the highest-numbered
   non-isolated core, with its SMT sibling; on hybrid CPUs an E-core), on
   which the real-time class never places a thread while any other CPU can
   take it, so audio, input and other real-time threads don't share a CPU
   with a stall (on machines with fewer than 4 CPUs this is off, and the
-  scorecard says so). Test (Phase 4a): the
-  surprise-removal latency test pulls a QEMU NVMe device behind a hotplug
-  root port during reads, with the real-time wake-up load running, and
-  publishes the worst CPU stall and the worst real-time wake-up latency.
+  scorecard says so). **The real-time gate under device stalls** (the one
+  definition; [drivers.md](drivers.md) and [storage.md](storage.md) cite
+  it): the wake-up target of [benchmarks.md](benchmarks.md) (P99 < 50 µs,
+  P99.9 < 100 µs) holds for real-time threads on every CPU except the
+  removable-device core while a device stalls. Test (Phase 4a): the
+  surprise-removal latency test pulls an NVMe device during reads, with the
+  real-time wake-up load, TLB shootdowns and a tracer toggle running, and
+  publishes the worst CPU stall and the worst real-time wake-up latency;
+  the gate is enforced on the bare-metal reference machines with a
+  hot-pluggable NVMe or Thunderbolt device and reported only in VMs (QEMU
+  behind a hotplug root port, and the stall tests of
+  [storage.md](storage.md)), as for the 50 µs limit.
 - **Where the 50 µs limit is enforced.** In virtual machines the host can
   stall a vCPU at any moment, so there the tracer only reports; the limit
   is enforced (CI fails above it) on the bare-metal reference machines, in
@@ -123,8 +139,9 @@ thread on that CPU.
   uses it only for the per-change microbenchmark tier; every desktop,
   real-time-latency and throughput metric runs on the default boot with no
   isolated CPUs ([benchmarks.md](benchmarks.md)). For that tier matched
-  Linux uses `isolcpus=domain,managed_irq,<set> nohz_full=<set>` with the
-  same set.
+  Linux uses `isolcpus=domain,managed_irq,<set>` with the
+  same set, without `nohz_full` (which adds context tracking to every
+  kernel entry and exit); a `nohz_full` run is published as context only.
 - **Affinity** (`sched_setaffinity`) and `sched_yield`, `nice`,
   `getpriority`/`setpriority`, `sched_getattr`/`sched_setattr` are all
   implemented with Linux semantics (Phase 5).
@@ -202,10 +219,15 @@ thread on that CPU.
   non-isolated CPUs), so a tick-stopped CPU arms only timers its own
   thread asked for and, from Phase 5, the `cpu.max` quota-expiry timer of
   its thread's group (one per period while the group has a quota, which
-  the bound counts). A Phase 2 test runs one spinning thread on a CPU for
-  10 s, logs every interrupt there by source, and requires at most 10
-  timer interrupts (with a `cpu.max` quota from Phase 5: at most 10 plus
-  one per quota period). Phase 10 only tunes it.
+  the bound counts). When that thread is real-time or has a CPU-time limit
+  (`RLIMIT_RTTIME`, `RLIMIT_CPU`, the 95% RT throttle, the driver
+  real-time cap below), the CPU also arms one budget-expiry timer at the
+  earliest of those limits, which the bound counts too. A Phase 2 test runs
+  one spinning thread on a CPU for 10 s, logs every interrupt there by
+  source, and requires at most 10 timer interrupts (plus one per quota or
+  budget period where one applies); a second Phase 2 test holds a lone
+  `SCHED_FIFO` spinner on a tick-stopped CPU to at most 950 ms per 1 s
+  period, ±1 ms. Phase 10 only tunes it.
 - **Frequency control** (Phase 2). Optimal drives hardware P-states (Intel
   HWP, AMD CPPC) from Phase 2; it is a precondition of every comparison
   with Linux, from the Phase 4a storage set on. Otherwise a comparison
@@ -224,7 +246,12 @@ explicit:
 
 - **Frame allocator.** Buddy allocator per NUMA node with per-CPU caches of
   free frames, so most allocations take no lock. 4 KiB, 2 MiB and 1 GiB
-  frames.
+  frames. A frame that held page cache of an encrypted volume, or was
+  allocated to a vault or travel identity, carries a flag set at
+  allocation and is zeroed when freed; panic lock and vault close also
+  sweep the buddy and per-CPU free lists ([storage.md](storage.md) "Zero on
+  free", [features.md](features.md) F3 and F4; their canary tests gate
+  it at 4a, 5 and 12; cost published in [benchmarks.md](benchmarks.md)).
 - **TLB: PCID allocation** (Phase 3, with user address spaces). PCID is used
   whenever the CPU has it (essential to keep page-table isolation cheap).
   Each CPU keeps 6 dynamic PCID slots, each holding an address-space id and
@@ -324,8 +351,9 @@ explicit:
   is tuned until it is within 1% of 8 GiB, because `mem=` caps the top
   physical address, not usable RAM), a browser opens 50 pages from
   a pinned offline corpus served locally, and a pinned compile runs
-  alongside, measuring input latency P99, frame time and OOM kills while it
-  runs, against the memory-pressure target in
+  alongside and must finish, measuring input latency P99, frame time, OOM
+  kills, the compile's wall time and the count of background-app kills,
+  against the memory-pressure target in
   [benchmarks.md](benchmarks.md).
 
 ## Driver budgets and real-time work

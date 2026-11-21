@@ -42,7 +42,7 @@ id = "unix-socket"
 what = "a path-bound or passed Unix socket connected across identities"
 direction = "both"
 created = "open"
-refusal = "ECONNREFUSED on connect, EACCES on passing the fd"
+refusal = "ECONNREFUSED on connect, EACCES on passing the fd; one combined-approval request per identity pair is queued and a retry after approval succeeds (threat-model.md)"
 phase = 5
 test = "exfil/unix-socket"
 
@@ -157,7 +157,7 @@ test = "exfil/wayland-x11-relay"
 
 [[channel]]
 id = "steam-child-shared"
-what = "a launcher's manifest-declared shared channels to a child identity: read-only paths (parent to child), named shared memory and socket endpoints (both)"
+what = "a launcher's manifest-declared shared channels to a child identity (Steam: mapped from SteamAppId and the appmanifest install directory by the signed Steam manifest): read-only paths (parent to child), writable compatdata/<appid> and shadercache/<appid>, named shared memory and socket endpoints, and a read-write edge between Steam and each child's save paths (both)"
 direction = "both"
 created = "open"
 refusal = "EACCES; nothing undeclared crosses"
@@ -169,25 +169,31 @@ test = "milestone13/shared-channels"
 
 [[user_transfer]]
 id = "file-chooser-pick"
-rule = "one-use or persistent document-portal entry for the picking app only; a persistent pick is a grant (grant checks below)"
+rule = "one-use or persistent document-portal entry for the picking app only; a persistent pick is a grant (grant checks below); counts only when driven from a confirmed device (a prompt-capable keyboard, or a pointer confirmed by a click on a target the prompt layer shows)"
 phase = 5
 test = "exfil/file-chooser"
 
 [[user_transfer]]
 id = "launch-relay-typed"
-rule = "a command line the user typed in the terminal: argv, allowlisted env, cwd and path arguments (one-use document-portal entries) and the stdio relay go to the registered app for that run; the edge lasts the app's process lifetime and joins no components"
+rule = "a command line the user typed in the terminal: argv, env minus the denylist, rlimits, nice, affinity and cgroup, cwd and path arguments (one-use document-portal entries) and the stdio relay go to the registered app for that run; the edge lasts the app's process lifetime and joins no components"
 phase = 5
 test = "exfil/launch-relay-stdin"
 
 [[user_transfer]]
 id = "drag-and-drop"
-rule = "each dropped file becomes a one-use document-portal entry for the receiving app"
+rule = "each dropped file becomes a one-use document-portal entry for the receiving app; a cross-identity drop counts only from a confirmed device (as file-chooser-pick)"
 phase = 7
 test = "exfil/drag-and-drop"
 
 [[user_transfer]]
+id = "badusb-pointer"
+rule = "an unconfirmed pointer (a BadUSB mouse) drags ~/Documents into a networked app and pastes the clipboard into it; nothing arrives"
+phase = 7
+test = "exfil/badusb-mouse"
+
+[[user_transfer]]
 id = "clipboard"
-rule = "the compositor gives clipboard contents only to the focused surface on a paste; background reads only under the background-clipboard portal's grant, which is in the data set"
+rule = "the compositor gives clipboard contents only to the focused surface on a paste driven from a confirmed device (as file-chooser-pick); background reads only under the background-clipboard portal's grant, which is in the data set"
 phase = 7
 test = "exfil/clipboard"
 
@@ -224,21 +230,28 @@ covert = ["CPU and cache timing", "statfs free space", "flock on shared read-onl
 # Every new grant is checked against the holder's component and every
 # networked identity downstream of it before it is made. A component's data
 # set = persistent file grants + camera, microphone, screen capture and
-# screenshot, location and background clipboard-read grants; data set +
+# screenshot, location, background clipboard-read, USB-portal raw device,
+# hidraw, serial and screen-reader (AT-SPI) grants; data set +
 # network is in the floor (capabilities.md, "Direct channels make one
 # principal").
 
 [[grant_check]]
 id = "network"
-rule = "first non-loopback connect or send, or first resolver lookup, raises one request per identity; silent decisions synchronous; a human decision waits up to 30 s, then SERVFAIL (EAI_AGAIN) or ENETUNREACH; floor when the component's data set is non-empty"
+rule = "first non-loopback connect or send, or first resolver lookup, raises one request per identity; silent decisions synchronous; a human decision waits up to 30 s (resolv.conf options timeout:30 attempts:1; an O_NONBLOCK sendto gets EAGAIN), then SERVFAIL (EAI_AGAIN) or ENETUNREACH; floor when the component's data set is non-empty"
 phase = 5
 test = "exfil/grant-network"
 
 [[grant_check]]
 id = "data-set"
-rule = "camera, microphone, screen capture, screenshot, location and background clipboard-read grants join the data set; with network in the component, the combined approval naming each source, at every level"
+rule = "camera, microphone, screen capture, screenshot, location, background clipboard-read and screen-reader grants join the data set; with network in the component, the combined approval naming each source, at every level"
 phase = 7
 test = "floor/data-set-network"
+
+[[grant_check]]
+id = "device-data-set"
+rule = "USB-portal raw device, hidraw and serial grants join the data set; USB storage + network and serial GPS + network each need the combined approval"
+phase = 6
+test = "floor/device-data-set-network"
 
 [[grant_check]]
 id = "folder"
@@ -274,12 +287,12 @@ test = "exfil/grant-after-join"
 
 [[tcb_service]]
 id = "resolver"
-rule = "queries upstream only for identities holding outbound network; a lookup with no recorded answer is the first-use event; refused identities get SERVFAIL (EAI_AGAIN), never ECONNREFUSED; fake upstream on the loopback-only stack until Phase 6"
+rule = "queries upstream only for identities holding outbound network; the asker is the kernel-stamped sender identity on each loopback datagram or TCP connection; a lookup with no recorded answer is the first-use event; retransmits deduped per identity; SERVFAIL within 5 s on upstream failure; refused identities get SERVFAIL (EAI_AGAIN), never ECONNREFUSED; fake upstream on the loopback-only stack until Phase 6"
 phase = 5
 
 [[tcb_service]]
 id = "launcher"
-rule = "spawns with identity; launch relay (argv, env allowlist, cwd, path arguments as one-use document-portal entries) for registered apps run from a terminal; turns private-home autostart and desktop files into portal requests"
+rule = "spawns with identity; launch relay (argv, env minus the denylist, rlimits, nice, affinity, cgroup, cwd, path arguments as one-use document-portal entries; a traced exec starts the app stopped and hands the tracer a debug capability through the debugger portal) for registered apps run from a terminal; maps Steam's execs to child identities through the signed Steam manifest; turns private-home autostart and desktop files into portal requests"
 phase = 5
 
 [[tcb_service]]
@@ -290,6 +303,16 @@ phase = 5
 [[tcb_service]]
 id = "compositor"
 rule = "draws prompts; clipboard and DnD only on user action; virtual keyboard and pointer reach only the focused surface"
+phase = 7
+
+[[tcb_service]]
+id = "a11y-proxy"
+rule = "per-app AT-SPI proxy (Flatpak --a11y-own-name model): an app exposes only its own accessible tree; reading other apps' text needs the screen-reader grant, which is in the data set"
+phase = 7
+
+[[tcb_service]]
+id = "input-method"
+rule = "IBus/Fcitx-style input method run as one TCB service, never an app; sees keystrokes for the focused surface and commits text only to it; size budget and 10^8 protocol fuzz row in threat-model.md"
 phase = 7
 
 [[tcb_service]]
@@ -533,7 +556,8 @@ test = "portal/realtime"
 id = "usb"
 interface = "org.freedesktop.portal.Usb"
 sends = "no"
-rule = "access to an approved USB device; raw access to audio (class 0x01) and video (class 0x0E) interfaces refused (PipeWire only); HID interfaces with keyboard/keypad or system-control usages are in the floor, other HID on the suspicious list (drivers.md, Device authorization)"
+rule = "access to an approved USB device, hidraw node or serial port; raw access to audio (class 0x01) and video (class 0x0E) interfaces refused (PipeWire only); HID interfaces with keyboard/keypad or system-control usages are in the floor, other HID except pointer-only and gamepad interfaces on the suspicious list (drivers.md, Device authorization)"
+data_set = true
 prompt = "level"
 phase = 6
 test = "portal/usb"
@@ -628,6 +652,16 @@ rule = "only for the VPN identity designated on the trusted path; sets addresses
 prompt = "user-action"
 phase = 6
 test = "portal/vpn"
+
+[[portal]]
+id = "screen-reader"
+interface = "org.a11y.Bus (through the a11y-proxy)"
+sends = "no"
+rule = "a screen reader reads other apps' accessible text"
+data_set = true
+prompt = "level"
+phase = 7
+test = "portal/screen-reader"
 
 [[portal]]
 id = "global-shortcuts"
