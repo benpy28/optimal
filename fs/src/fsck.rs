@@ -68,15 +68,16 @@ pub fn scrub_metadata<D: BlockDevice>(fs: &mut Filesystem<D>) -> Result<ScrubRep
         ..Default::default()
     };
     let io = &mut fs.store.io;
-    let (mode, before) = (io.copy_mode, io.stats.bad_copies);
+    let mode = io.copy_mode;
     io.copy_mode = crate::io::CopyMode::Both;
     for (kind, p, p0, p1) in &check.metas {
+        // Queues a rewrite of any bad copy from the good one.
         if io.read_dup(*kind, p, *p0, *p1).is_err() {
             out.unreadable += 1;
         }
     }
     io.copy_mode = mode;
-    out.bad_copies = io.stats.bad_copies - before;
+    out.bad_copies = check.bad_copies;
     let pending = io.pending_repairs() as u64;
     out.check = check;
     if pending > 0 {

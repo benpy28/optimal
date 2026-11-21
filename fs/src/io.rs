@@ -47,6 +47,8 @@ pub struct Io<D> {
     batch: BTreeMap<u64, Block>,
     /// Bad metadata copies to rewrite (identical bytes) at the next commit.
     repairs: BTreeMap<u64, Block>,
+    /// Physical blocks found bad since the last commit (counted once each).
+    bad_seen: alloc::collections::BTreeSet<u64>,
     /// Off for read-only mounts and checks that must not write.
     pub repair_enabled: bool,
     /// How duplicated blocks are read ([`CopyMode::Both`] during recovery).
@@ -61,6 +63,7 @@ impl<D: BlockDevice> Io<D> {
             sealer,
             batch: BTreeMap::new(),
             repairs: BTreeMap::new(),
+            bad_seen: alloc::collections::BTreeSet::new(),
             repair_enabled: true,
             copy_mode: CopyMode::Either,
             stats: IoStats::default(),
@@ -162,7 +165,9 @@ impl<D: BlockDevice> Io<D> {
     }
 
     fn note_bad_copy(&mut self, phys: u64, good: Block) {
-        self.stats.bad_copies += 1;
+        if self.bad_seen.insert(phys) {
+            self.stats.bad_copies += 1;
+        }
         if self.repair_enabled {
             self.repairs.insert(phys, good);
         }
@@ -185,6 +190,7 @@ impl<D: BlockDevice> Io<D> {
     /// address is in use or quarantined, so nothing new is written there.
     pub fn queue_repairs(&mut self) {
         let repairs = core::mem::take(&mut self.repairs);
+        self.bad_seen.clear();
         for (phys, b) in repairs {
             self.stats.copies_repaired += 1;
             self.queue(phys, b);
@@ -193,6 +199,7 @@ impl<D: BlockDevice> Io<D> {
 
     pub fn discard_repairs(&mut self) {
         self.repairs.clear();
+        self.bad_seen.clear();
     }
 
     /// Seals `data` as (`kind`, `addr`, `birth`) and queues copy 0 at

@@ -833,9 +833,37 @@ impl<D: BlockDevice> Filesystem<D> {
         self.store.space.chunks.all_entries(&mut self.store.io)
     }
 
+    /// The volume's metadata chunk size in blocks.
+    pub fn metadata_chunk_blocks(&self) -> u64 {
+        self.store.space.chunks.chunk_blocks()
+    }
+
+    /// The logical address of slot `off` of metadata chunk `id`.
+    pub fn metadata_address(&self, id: u64, off: u64) -> u64 {
+        self.store.space.chunks.join(id, off)
+    }
+
+    #[doc(hidden)]
+    pub fn commit_forced_for_tests(&mut self) -> Result<()> {
+        self.commit_forced()
+    }
+
     /// Physical blocks of copies 0 and 1 of logical metadata block `l`.
     pub fn resolve_metadata(&mut self, l: u64) -> Result<(u64, u64)> {
         self.store.space.chunks.resolve(&mut self.store.io, l)
+    }
+
+    /// Both copies of every chunk-table block (tests damage them).
+    #[doc(hidden)]
+    pub fn chunk_table_blocks_for_tests(&mut self) -> Result<Vec<(u64, u64)>> {
+        Ok(self
+            .store
+            .space
+            .chunks
+            .all_node_ptrs(&mut self.store.io)?
+            .iter()
+            .map(|(_, p)| (p.addr, p.aux))
+            .collect())
     }
 
     /// The committed root block and filesystem-tree root pointers (tests
@@ -1827,7 +1855,9 @@ impl<D: BlockDevice> Filesystem<D> {
         if self.poisoned {
             return Err(Error::Poisoned);
         }
-        if !self.txn_dirty {
+        // Queued repairs of bad metadata copies are written by the next
+        // commit even when nothing else changed.
+        if !self.txn_dirty && self.store.io.pending_repairs() == 0 {
             return Ok(());
         }
         self.check_writable()?;
