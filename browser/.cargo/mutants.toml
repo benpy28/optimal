@@ -1,0 +1,7 @@
+# Mutants that cannot change behaviour, each with the reason. Everything else
+# that survives fails the CI job.
+exclude_re = [
+    # position_of: when the queried offset equals the anchor, rescanning from
+    # the buffer start gives the same answer as using the anchor. Equivalent.
+    "replace < with <= in Input::position_of",
+]
