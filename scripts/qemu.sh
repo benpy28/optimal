@@ -17,6 +17,38 @@ clean_log() {
     sed 's/\x1b\[[0-9;=?]*[A-Za-z]//g' "$1" 2>/dev/null | tr -d '\r'
 }
 
+# hang_report <monitor socket> <log>: ask QEMU where the CPU is, and save a
+# screenshot as <log>.ppm (uploaded with the failure logs).
+hang_report() {
+    python3 - "$1" "$2" <<'PY'
+import socket, sys, time
+sock, log = sys.argv[1], sys.argv[2]
+s = socket.socket(socket.AF_UNIX)
+s.connect(sock)
+s.settimeout(2)
+def cmd(c):
+    s.sendall(c.encode() + b"\n")
+    time.sleep(1)
+    out = b""
+    try:
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            out += chunk
+    except socket.timeout:
+        pass
+    return out.decode(errors="replace")
+cmd("")
+for c in ("info status", "info registers", "screendump " + log + ".ppm"):
+    out = cmd(c).replace("\r", "")
+    # Keep what QEMU printed, minus its line-editing noise.
+    lines = [l for l in out.split("\n") if l.strip() and "\x1b" not in l and not l.startswith("(qemu)")]
+    print("$ " + c)
+    print("\n".join(lines[:40]))
+PY
+}
+
 # Optional knobs, set by the caller before run_qemu (all default to empty):
 #   QEMU_EXTRA=(...)   extra QEMU arguments (CPU model, NUMA layout, ...)
 #   QEMU_ACCEL=(...)   replaces the accelerator, e.g. (-accel tcg) for a slow CPU
@@ -65,17 +97,24 @@ run_qemu() {
     rm -f "$log"
     "${QEMU_WRAP[@]}" qemu-system-x86_64 "${QEMU_ACCEL[@]}" -M "$machine" -m "$mem" -smp "$smp" \
         -cdrom "$iso" -display none -serial "file:$log" -no-reboot "${fw_args[@]}" \
+        -monitor "unix:$log.mon,server,nowait" -d guest_errors,cpu_reset \
         "${QEMU_EXTRA[@]}" >"$log.qemu" 2>&1 &
     local qemu=$!
-    local waited=0
+    local waited=0 done=no
     while kill -0 "$qemu" 2>/dev/null && [ "$waited" -lt $((timeout * 10)) ]; do
         if clean_log "$log" | grep -qaE "$DONE_PATTERN"; then
             sleep 0.5 # let the rest of the report land
+            done=yes
             break
         fi
         sleep 0.1
         waited=$((waited + 1))
     done
+    if [ "$done" = no ] && kill -0 "$qemu" 2>/dev/null; then
+        # Hung or silent: record where the CPU is and what the screen shows,
+        # so a failure comes with evidence (firmware, bootloader or kernel?).
+        hang_report "$log.mon" "$log" >"$log.hang" 2>&1
+    fi
     kill "$qemu" 2>/dev/null
     wait "$qemu" 2>/dev/null
     # Firmware and Limine draw text with terminal escape codes, one character
@@ -85,6 +124,9 @@ run_qemu() {
     if [ -s "$log.qemu" ]; then
         { echo "--- qemu stderr ---"; cat "$log.qemu"; } >>"$log"
     fi
-    rm -f "$log.qemu" "$log.vars"
+    if [ -s "$log.hang" ]; then
+        { echo "--- hang report (no finish line within ${timeout}s) ---"; cat "$log.hang"; } >>"$log"
+    fi
+    rm -f "$log.qemu" "$log.vars" "$log.mon" "$log.hang"
     return 0
 }
