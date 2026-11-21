@@ -7,6 +7,8 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 mod arch;
 mod backtrace;
 mod boot;
@@ -60,6 +62,7 @@ extern "C" fn kmain_on_own_tables() -> ! {
     mm::paging::finish_switch();
     let info = bootinfo::get();
     let reclaimed = mm::frames::reclaim_bootloader_memory(info);
+    mm::heap::init(mm::paging::random_u64());
     let l = mm::paging::layout();
     crate::println!(
         "paging: own tables on; kernel W^X by section, direct map {}, {} pages; {} KiB of bootloader memory reclaimed",

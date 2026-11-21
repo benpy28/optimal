@@ -162,6 +162,12 @@ impl Random {
     }
 }
 
+/// A random number for secrets (heap header magic and the like): RDRAND
+/// when the CPU has it, else timestamp jitter (weak, as reported at boot).
+pub fn random_u64() -> u64 {
+    Random::new().next()
+}
+
 /// SplitMix64 finaliser.
 fn mix(mut z: u64) -> u64 {
     z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -401,6 +407,50 @@ pub fn finish_switch() {
     // SAFETY: reloading the same CR3 we are running on, plus a global flush.
     unsafe { cpu::load_page_tables(l.root) };
     frames::move_direct_map(l.direct_map);
+}
+
+/// Map one 4 KiB page in the kernel's tables (later kernel mappings and
+/// tests). The caller flushes nothing: a new mapping has no stale entry.
+#[cfg_attr(
+    not(feature = "ktest"),
+    expect(
+        dead_code,
+        reason = "first user outside tests is 1c (ACPI and APIC mappings)"
+    )
+)]
+pub fn map_kernel_page(
+    virt: u64,
+    phys: u64,
+    flags: Flags,
+) -> Result<(), optimal_mm::paging::MapError> {
+    let guard = KERNEL_SPACE.lock();
+    let space = guard.as_ref().expect("kernel page tables not built yet");
+    space.map(
+        &mut KernelTables,
+        virt,
+        phys,
+        PageSize::Size4K,
+        Flags {
+            global: true,
+            ..flags
+        },
+    )
+}
+
+/// Unmap one 4 KiB kernel page and flush it from this CPU's TLB.
+#[cfg_attr(
+    not(feature = "ktest"),
+    expect(
+        dead_code,
+        reason = "first user outside tests is 1c (ACPI and APIC mappings)"
+    )
+)]
+pub fn unmap_kernel_page(virt: u64) -> Result<u64, optimal_mm::paging::MapError> {
+    let guard = KERNEL_SPACE.lock();
+    let space = guard.as_ref().expect("kernel page tables not built yet");
+    let r = space.unmap(&mut KernelTables, virt, PageSize::Size4K);
+    cpu::flush_page(virt);
+    r
 }
 
 /// Look up a kernel virtual address in the kernel's tables.

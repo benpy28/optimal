@@ -2,6 +2,9 @@
 //! and kernel stacks build on this.
 
 pub mod frames;
+pub mod heap;
+#[cfg(feature = "ktest")]
+mod heap_tests;
 pub mod paging;
 #[cfg(feature = "ktest")]
 mod paging_tests;

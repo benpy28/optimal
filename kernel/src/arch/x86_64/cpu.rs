@@ -212,6 +212,12 @@ pub unsafe fn load_page_tables(root: u64) {
     }
 }
 
+/// Flush the TLB entry for one page on this CPU.
+pub fn flush_page(virt: u64) {
+    // SAFETY: invlpg only drops a cached translation.
+    unsafe { asm!("invlpg [{}]", in(reg) virt, options(nostack, preserves_flags)) };
+}
+
 /// A hardware random number (RDRAND), or None if the CPU has no RDRAND or
 /// it kept failing (the SDM suggests 10 retries).
 pub fn rdrand() -> Option<u64> {

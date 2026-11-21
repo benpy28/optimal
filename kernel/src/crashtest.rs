@@ -85,6 +85,31 @@ pub fn run(name: &str) {
                 // Kernel code must not be writable.
                 asm!("mov byte ptr [{}], 0xc3", in(reg) recurse as *const () as u64);
             }
+            "heap_double_free" => {
+                let layout = core::alloc::Layout::from_size_align(64, 8).unwrap();
+                // black_box: the compiler may otherwise drop an unused
+                // allocation and its frees altogether.
+                let p = core::hint::black_box(alloc::alloc::alloc(layout));
+                alloc::alloc::dealloc(p, layout);
+                alloc::alloc::dealloc(core::hint::black_box(p), layout);
+            }
+            "heap_bad_pointer" => {
+                // Free a pointer into the middle of an object.
+                let layout = core::alloc::Layout::from_size_align(64, 8).unwrap();
+                let p = core::hint::black_box(alloc::alloc::alloc(layout));
+                alloc::alloc::dealloc(core::hint::black_box(p.add(8)), layout);
+            }
+            "heap_wild_pointer" => {
+                // Free a pointer the heap never handed out (kernel data).
+                static NOT_HEAP: [u8; 64] = [0; 64];
+                let layout = core::alloc::Layout::from_size_align(64, 8).unwrap();
+                alloc::alloc::dealloc(&raw const NOT_HEAP as *mut u8, layout);
+            }
+            "execute_heap" => {
+                // Heap memory is no-execute.
+                let code = alloc::boxed::Box::new([0xc3u8; 16]);
+                asm!("call {}", in(reg) code.as_ptr(), clobber_abi("C"));
+            }
             "execute_direct_map" => {
                 // The direct map is no-execute: put a `ret` in a fresh frame
                 // and call it through the direct map.

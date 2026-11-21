@@ -25,6 +25,31 @@ pub fn phys_to_virt(phys: u64) -> u64 {
     phys + DIRECT_MAP.load(Ordering::Relaxed)
 }
 
+pub fn virt_to_phys(virt: u64) -> u64 {
+    virt.wrapping_sub(DIRECT_MAP.load(Ordering::Relaxed))
+}
+
+/// Is `virt` (seen through the direct map) the start of an allocated
+/// single-frame block? The heap checks this before reading a slab header,
+/// so a wild pointer can never make it read unmapped memory.
+pub fn is_allocated_frame(virt: u64) -> bool {
+    let phys = virt_to_phys(virt);
+    if !phys.is_multiple_of(PAGE_SIZE) {
+        return false;
+    }
+    let a = FRAMES.lock();
+    match zones::zone_of(&a.zones[..a.count], phys) {
+        Some(i) => {
+            a.buddies[i]
+                .as_ref()
+                .unwrap()
+                .allocated_order(phys / PAGE_SIZE)
+                == Some(0)
+        }
+        None => false,
+    }
+}
+
 struct Allocator {
     zones: [Zone; MAX_ZONES],
     buddies: [Option<Buddy<'static>>; MAX_ZONES],
@@ -162,6 +187,10 @@ impl Allocator {
 /// Allocate 2^order contiguous frames, aligned to their size. Returns the
 /// physical address of the first. Lowest zone first.
 pub fn alloc(order: usize) -> Option<u64> {
+    #[cfg(feature = "ktest")]
+    if fault::should_fail() {
+        return None;
+    }
     let mut a = FRAMES.lock();
     let count = a.count;
     a.buddies[..count]
@@ -172,10 +201,6 @@ pub fn alloc(order: usize) -> Option<u64> {
 
 /// Free a block from `alloc(order)`. A bad free (double free, wrong order,
 /// not a block start, unknown memory) is refused and changes nothing.
-#[cfg_attr(
-    not(feature = "ktest"),
-    expect(dead_code, reason = "first user outside tests is the heap (1b2d)")
-)]
 pub fn free(phys: u64, order: usize) -> Result<(), FreeError> {
     if !phys.is_multiple_of(PAGE_SIZE) {
         return Err(FreeError::NotAllocated);
@@ -209,4 +234,26 @@ pub fn check() -> Result<(), &'static str> {
 pub fn zones() -> ([Zone; MAX_ZONES], usize) {
     let a = FRAMES.lock();
     (a.zones, a.count)
+}
+
+/// Fault injection for kernel tests: make every Nth frame allocation fail.
+/// Only in test builds; a normal kernel has no such hook.
+#[cfg(feature = "ktest")]
+pub mod fault {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static EVERY: AtomicU64 = AtomicU64::new(0);
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+
+    /// Fail every `n`th allocation from now on (1 = all of them); 0 turns
+    /// injection off.
+    pub fn fail_every(n: u64) {
+        COUNT.store(0, Ordering::SeqCst);
+        EVERY.store(n, Ordering::SeqCst);
+    }
+
+    pub(super) fn should_fail() -> bool {
+        let n = EVERY.load(Ordering::SeqCst);
+        n != 0 && (COUNT.fetch_add(1, Ordering::SeqCst) + 1).is_multiple_of(n)
+    }
 }
