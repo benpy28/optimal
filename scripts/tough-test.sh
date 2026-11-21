@@ -179,6 +179,9 @@ for code in build/firmware/*/OVMF_CODE*.fd; do
     [ -f "$code" ] || continue
     ver="$(basename "$(dirname "$code")")"
     scenario "fw-ovmf-$ver" boot "$ISO" "ovmf=$code" q35 512M 2 30 kvm
+    # Same firmware on an emulated CPU (different CPUID, no KVM): firmware
+    # bugs often depend on exactly what the CPU reports.
+    scenario "fw-ovmf-$ver-tcg-qemu64" boot "$ISO" "ovmf=$code" q35 512M 2 40 tcg -- -cpu qemu64
 done
 
 # ---------------------------------------------------------------------------
