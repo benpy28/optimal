@@ -2,10 +2,14 @@
 target = "x86_64-unknown-none"
 
 [target.x86_64-unknown-none]
+# The kernel is a static position-independent executable, so Limine can load
+# it at a random address (KASLR) and apply its relocations.
 rustflags = [
-  "-C", "relocation-model=static",
-  "-C", "code-model=kernel",
+  "-C", "relocation-model=pie",
   "-C", "force-frame-pointers=yes",
   "-C", "link-arg=-Tlinker.ld",
   "-C", "link-arg=--no-dynamic-linker",
+  "-C", "link-arg=-pie",
+  "-C", "link-arg=-z", "-C", "link-arg=text",
+  "-C", "link-arg=-z", "-C", "link-arg=max-page-size=0x1000",
 ]
