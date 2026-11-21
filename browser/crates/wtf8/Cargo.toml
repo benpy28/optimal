@@ -1,0 +1,14 @@
+[package]
+name = "optimal-wtf8"
+version = "0.1.0"
+description = "WTF-8 strings: UTF-8 that can also hold lone surrogates, so web text round-trips exactly"
+edition.workspace = true
+publish = false
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+proptest = "1"

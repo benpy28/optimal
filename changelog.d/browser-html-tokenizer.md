@@ -1,0 +1,1 @@
+Browser engine track started in `browser/`: the `optimal-wtf8` web string crate and the `optimal-html` WHATWG tokenizer (streaming, all 52 parse error codes with exact positions), passing all 7046 html5lib-tests tokenizer tests, with its own CI workflow (conformance, deep property tests, mutation testing).

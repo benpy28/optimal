@@ -1,0 +1,327 @@
+{
+  "reason_by_group": {
+    "pi-eof-column": "The end-of-file error in the processing instruction data state is detected when EOF is consumed, which is one column past the last character (as in every other eof-in-* test in the suite, e.g. '<?a' -> col 4 and '<!--' tests). The suite records column 4, the column after the target, for every input of the form '<?X X' or '<?X X?'. Spec: 'Processing instruction data state', EOF entry. Remove these entries when upstream fixes the data; the harness fails if an entry no longer matches the suite."
+  },
+  "errata": [
+    {
+      "file": "test3.test",
+      "description": "<?a a",
+      "input": "<?a a",
+      "suite_errors": [
+        {
+          "code": "eof-in-processing-instruction",
+          "line": 1,
+          "col": 4
+        }
+      ],
+      "corrected_errors": [
+        {
+          "code": "eof-in-processing-instruction",
+          "line": 1,
+          "col": 6
+        }
+      ],
+      "group": "pi-eof-column"
+    },
+    {
+      "file": "test3.test",
+      "description": "<?b b",
+      "input": "<?b b",
+      "suite_errors": [
+        {
+          "code": "eof-in-processing-instruction",
+          "line": 1,
+          "col": 4
+        }
+      ],
+      "corrected_errors": [
+        {
+          "code": "eof-in-processing-instruction",
+          "line": 1,
+          "col": 6
+        }
+      ],
+      "group": "pi-eof-column"
+    },
+    {
+      "file": "test3.test",
+      "description": "<?y y",
+      "input": "<?y y",
+      "suite_errors": [
+        {
+          "code": "eof-in-processing-instruction",
+          "line": 1,
+          "col": 4
+        }
+      ],
+      "corrected_errors": [
+        {
+          "code": "eof-in-processing-instruction",
+          "line": 1,
+          "col": 6
+        }
+      ],
+      "group": "pi-eof-column"
+    },
+    {
+      "file": "test3.test",
+      "description": "<?z z",
+      "input": "<?z z",
+      "suite_errors": [
+        {
+          "code": "eof-in-processing-instruction",
+          "line": 1,
+          "col": 4
+        }
+      ],
+      "corrected_errors": [
+        {
+          "code": "eof-in-processing-instruction",
+          "line": 1,
+          "col": 6
+        }
+      ],
+      "group": "pi-eof-column"
+    },
+    {
+      "file": "test3.test",
+      "description": "<?A A",
+      "input": "<?A A",
+      "suite_errors": [
+        {
+          "code": "eof-in-processing-instruction",
+          "line": 1,
+          "col": 4
+        }
+      ],
+      "corrected_errors": [
+        {
+          "code": "eof-in-processing-instruction",
+          "line": 1,
+          "col": 6
+        }
+      ],
+      "group": "pi-eof-column"
+    },
+    {
+      "file": "test3.test",
+      "description": "<?B B",
+      "input": "<?B B",
+      "suite_errors": [
+        {
+          "code": "eof-in-processing-instruction",
+          "line": 1,
+          "col": 4
+        }
+      ],
+      "corrected_errors": [
+        {
+          "code": "eof-in-processing-instruction",
+          "line": 1,
+          "col": 6
+        }
+      ],
+      "group": "pi-eof-column"
+    },
+    {
+      "file": "test3.test",
+      "description": "<?Y Y",
+      "input": "<?Y Y",
+      "suite_errors": [
+        {
+          "code": "eof-in-processing-instruction",
+          "line": 1,
+          "col": 4
+        }
+      ],
+      "corrected_errors": [
+        {
+          "code": "eof-in-processing-instruction",
+          "line": 1,
+          "col": 6
+        }
+      ],
+      "group": "pi-eof-column"
+    },
+    {
+      "file": "test3.test",
+      "description": "<?Z Z?",
+      "input": "<?Z Z?",
+      "suite_errors": [
+        {
+          "code": "eof-in-processing-instruction",
+          "line": 1,
+          "col": 4
+        }
+      ],
+      "corrected_errors": [
+        {
+          "code": "eof-in-processing-instruction",
+          "line": 1,
+          "col": 7
+        }
+      ],
+      "group": "pi-eof-column"
+    },
+    {
+      "file": "test3.test",
+      "description": "<?a a?",
+      "input": "<?a a",
+      "suite_errors": [
+        {
+          "code": "eof-in-processing-instruction",
+          "line": 1,
+          "col": 4
+        }
+      ],
+      "corrected_errors": [
+        {
+          "code": "eof-in-processing-instruction",
+          "line": 1,
+          "col": 6
+        }
+      ],
+      "group": "pi-eof-column"
+    },
+    {
+      "file": "test3.test",
+      "description": "<?b b?",
+      "input": "<?b b",
+      "suite_errors": [
+        {
+          "code": "eof-in-processing-instruction",
+          "line": 1,
+          "col": 4
+        }
+      ],
+      "corrected_errors": [
+        {
+          "code": "eof-in-processing-instruction",
+          "line": 1,
+          "col": 6
+        }
+      ],
+      "group": "pi-eof-column"
+    },
+    {
+      "file": "test3.test",
+      "description": "<?y y?",
+      "input": "<?y y",
+      "suite_errors": [
+        {
+          "code": "eof-in-processing-instruction",
+          "line": 1,
+          "col": 4
+        }
+      ],
+      "corrected_errors": [
+        {
+          "code": "eof-in-processing-instruction",
+          "line": 1,
+          "col": 6
+        }
+      ],
+      "group": "pi-eof-column"
+    },
+    {
+      "file": "test3.test",
+      "description": "<?z z?",
+      "input": "<?z z",
+      "suite_errors": [
+        {
+          "code": "eof-in-processing-instruction",
+          "line": 1,
+          "col": 4
+        }
+      ],
+      "corrected_errors": [
+        {
+          "code": "eof-in-processing-instruction",
+          "line": 1,
+          "col": 6
+        }
+      ],
+      "group": "pi-eof-column"
+    },
+    {
+      "file": "test3.test",
+      "description": "<?A A?",
+      "input": "<?A A",
+      "suite_errors": [
+        {
+          "code": "eof-in-processing-instruction",
+          "line": 1,
+          "col": 4
+        }
+      ],
+      "corrected_errors": [
+        {
+          "code": "eof-in-processing-instruction",
+          "line": 1,
+          "col": 6
+        }
+      ],
+      "group": "pi-eof-column"
+    },
+    {
+      "file": "test3.test",
+      "description": "<?B B?",
+      "input": "<?B B",
+      "suite_errors": [
+        {
+          "code": "eof-in-processing-instruction",
+          "line": 1,
+          "col": 4
+        }
+      ],
+      "corrected_errors": [
+        {
+          "code": "eof-in-processing-instruction",
+          "line": 1,
+          "col": 6
+        }
+      ],
+      "group": "pi-eof-column"
+    },
+    {
+      "file": "test3.test",
+      "description": "<?Y Y?",
+      "input": "<?Y Y",
+      "suite_errors": [
+        {
+          "code": "eof-in-processing-instruction",
+          "line": 1,
+          "col": 4
+        }
+      ],
+      "corrected_errors": [
+        {
+          "code": "eof-in-processing-instruction",
+          "line": 1,
+          "col": 6
+        }
+      ],
+      "group": "pi-eof-column"
+    },
+    {
+      "file": "test3.test",
+      "description": "<?Z Z?",
+      "input": "<?Z Z",
+      "suite_errors": [
+        {
+          "code": "eof-in-processing-instruction",
+          "line": 1,
+          "col": 4
+        }
+      ],
+      "corrected_errors": [
+        {
+          "code": "eof-in-processing-instruction",
+          "line": 1,
+          "col": 6
+        }
+      ],
+      "group": "pi-eof-column"
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+[package]
+name = "optimal-html"
+version = "0.1.0"
+description = "WHATWG HTML parser (tokenizer and tree builder) for the Optimal browser engine"
+edition.workspace = true
+publish = false
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+optimal-wtf8 = { path = "../wtf8" }
+
+[dev-dependencies]
+serde_json = "1"
+proptest = "1"
