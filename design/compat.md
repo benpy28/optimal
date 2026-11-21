@@ -19,11 +19,14 @@ gamed. Security rules that shape the ABI are in
   `ioctl` declares its 32-bit layout when it is written; an `ioctl` without
   one fails CI. x32 (the ILP32 ABI on 64-bit) is not supported; it is
   almost unused and Linux distributions have dropped it.
-- **Kernel identity.** `uname` reports a fixed Linux release matching the
-  feature set actually implemented, in the form `6.6.0-optimal-<build>`.
-  The number moves only when the implemented features match a newer Linux.
-  Programs that check features (glibc, Mesa, liburing, Steam) then behave
-  correctly.
+- **Kernel identity.** `uname` reports the newest Linux release whose
+  feature checklist Optimal fully implements, as `<x.y>.0-optimal-<build>`.
+  Each Linux release we might report has a checklist in `design/kernel-versions.md`
+  (created in Phase 3): the syscalls, flags and interfaces glibc, Mesa,
+  liburing, Steam and systemd-style tools probe for. CI runs the probes and
+  fails if the reported version's checklist isn't fully met. Before any
+  checklist above glibc's minimum is met, Optimal reports `3.2.0-optimal`
+  (glibc's minimum supported kernel), and programs fall back through `ENOSYS`.
 - **Unknown means ENOSYS.** Every syscall number not implemented returns
   `-ENOSYS`, never a kill or `SIGSYS` (seccomp aside). Every unsupported
   `ioctl` returns `-ENOTTY`, every unsupported flag `-EINVAL`, as Linux
@@ -36,12 +39,29 @@ gamed. Security rules that shape the ABI are in
   never designed process-wide and then retrofitted.
 - **glibc is the base libc** of the system image, for binary compatibility
   with third-party programs (symbol versions, NSS). musl programs are
-  supported and tested too.
-- **io_uring is supported**, because high-performance programs and games'
-  asset loaders increasingly use it. Every io_uring operation goes through
-  the same checked handler as its system call (same capability checks), it
-  is fuzzed like syscalls, and an app's manifest can turn it off. It is not
-  a way around the sandbox.
+  supported and tested too. glibc is LGPL; `libstdc++` and `libgcc_s` are GPL
+  with the GCC Runtime Library Exception. Almost every third-party C and C++
+  binary needs them, so they ship as unmodified shared libraries (allowed by
+  the licence rules in the roadmap).
+- **The base system's shell and tools are permissively licensed:** `/bin/sh`
+  is dash (BSD), the core utilities are uutils (MIT), and other base tools
+  are chosen the same way. bash and GNU tools aren't in the OS image (they
+  are GPL), but users can install them from the store like any app. The
+  Phase 5 suite runs the most common shell scripts (build systems, installers,
+  `configure` scripts) against dash and uutils, and reports what breaks.
+- **Desktop plumbing is ours or permissive:** the seat service implements the
+  `org.freedesktop.login1` Session and Seat interfaces that compositors use
+  (`TakeDevice`, `PauseDevice`) and the libseat protocol; device events come
+  from our own udev-compatible daemon (the `libudev` ABI and the
+  `/run/udev` database layout); the user service manager is ours and
+  implements D-Bus activation and the `systemd --user` unit subset that
+  PipeWire and the portals need; the D-Bus broker is dbus-broker
+  (Apache-2.0). Each has a conformance test in milestones 9 and 12.
+- **io_uring is supported** (milestone 5, Phase 5), because high-performance
+  programs and game asset loaders use it. Every io_uring operation goes
+  through the same checked handler as its system call (same capability
+  checks, same network rule), it is fuzzed like syscalls, and an app's
+  manifest can turn it off. It is not a way around the sandbox.
 - **eBPF is not available to apps.** Classic BPF is supported for seccomp and
   socket filters. See the lockdown table.
 - **No loadable kernel modules** (`init_module` returns `ENOSYS`). Drivers
@@ -76,7 +96,7 @@ the work lands in the [roadmap](../ROADMAP.md).
 | 2 | Processes and threads | 3 to 5 | `fork`, `clone`, `wait*`, futexes including `FUTEX_LOCK_PI` and `futex_waitv`, `membarrier`, scheduling policies and affinity ([scheduler.md](scheduler.md)), `pidfd`, `prctl` basics | LTP process and thread tests, kselftest futex, glibc nptl tests, pthread stress |
 | 3 | Memory and signals | 3 to 5 | `mmap` semantics, COW, `mremap`, `madvise`, `userfaultfd` (later), per-thread signal masks, `tgkill`, `sigaltstack`, `SA_RESTART`, `signalfd` | LTP mm and signal tests, glibc and musl test suites, kselftest mm |
 | 4 | Files, `/proc` and `/sys` | 4 to 5 | VFS semantics, durability contract ([storage.md](storage.md)), `inotify`, `fanotify` (read-only uses), `/proc` and `/sys` per the contract below | LTP fs tests, xfstests subset, SQLite crash tests, BusyBox, Python, GCC and git test suites |
-| 5 | Desktop IPC | 5 | `AF_UNIX` with `SCM_RIGHTS` and `SCM_CREDENTIALS`, abstract sockets inside the app's network namespace, `memfd_create` with seals, `eventfd`, `timerfd`, `epoll`, pipes, pseudo-terminals | dbus-daemon tests, Wayland's test suite (protocol layer), LTP ipc tests |
+| 5 | Desktop IPC and async I/O | 5 | io_uring, `AF_UNIX` with `SCM_RIGHTS` and `SCM_CREDENTIALS`, abstract sockets inside the app's network namespace, `memfd_create` with seals, `eventfd`, `timerfd`, `epoll`, pipes, pseudo-terminals | dbus-daemon tests, Wayland's test suite (protocol layer), LTP ipc tests |
 | 6 | Containers and sandboxes | 5 | user, mount, PID, network, UTS and IPC namespaces (unprivileged user namespaces included), `pivot_root`, bind mounts, `seccomp` with classic BPF and `RET_ERRNO`/`RET_TRAP`/`RET_USER_NOTIF`, `no_new_privs`, cgroup v2 subset (cpu, memory, pids, io) | `bwrap` running a Steam Runtime container, Chromium's and Firefox's sandbox self-tests, kselftest seccomp and namespaces, Flatpak test suite |
 | 7 | Debugging and profiling | 5 | `ptrace` (policy in [capabilities.md](capabilities.md)), `perf_event_open` (own process, user counters), core dumps (local only) | gdb test suite subset, strace's tests, rr's tests where the CPU supports it |
 | 8 | Networking | 6 | sockets (TCP, UDP, ICMP for unprivileged ping), `netlink` route and uevent basics, `getaddrinfo` paths | LTP net tests, curl and OpenSSH test suites, a browser's network tests |
@@ -84,7 +104,7 @@ the work lands in the [roadmap](../ROADMAP.md).
 | 10 | Audio | 6 | ALSA PCM, control and timer interfaces including mmap mode; real-time scheduling for PipeWire through the rtkit portal | alsa-lib tests, PipeWire tests, underrun counts from the benchmark |
 | 11 | Graphics | 7 to 8 | DRM/KMS, GEM, render nodes, dma-buf, `sync_file`, timeline syncobj, the per-driver uAPI of the chosen GPU family, DRM master handed out by the seat service | Mesa's tests, piglit, the Vulkan Conformance Test Suite subset (pass rate published), IGT subset |
 | 12 | Wayland desktop | 7 | everything above plus the seat service, so a compositor, GTK and Qt apps and a browser run | compositor plus GTK and Qt test apps, a browser's test suite |
-| 13 | Wine and Proton | 9 | everything above, 32-bit in full, `modify_ldt`, the futex and fd-heavy patterns Proton uses | Wine's conformance tests, the published game list |
+| 13 | Wine and Proton | 9 | everything above, 32-bit in full, `modify_ldt`, `/dev/ntsync` (the NT synchronisation driver current Proton uses), `RLIMIT_NOFILE` of at least 524,288 by default (esync), the futex and fd-heavy patterns Proton uses | Wine's conformance tests, the published game list |
 
 Anti-cheat, precisely: **kernel-level** anti-cheat (Valorant's Vanguard, some
 Call of Duty and EA titles) is a Windows kernel driver and won't run; the game
@@ -122,13 +142,20 @@ sanitizers read `/proc/self/status`, glibc reads
   version or list is a reviewed change and resets the trend line.
 - **Results are reported by outcome**, never as one blended percentage:
   pass, fail, broken, and "not configured" (LTP's `TCONF`, a test that skips
-  because a feature is missing). A `TCONF` counts as a **fail** unless the
-  missing feature is in the documented list of features Optimal doesn't
-  implement yet, with the milestone that will add it.
+  because a feature is missing). Pass rates are computed over the **full
+  pinned list**. A `TCONF` counts as a fail unless the missing feature is on
+  that phase's excused list; excused tests are shown separately and still
+  count against the rate.
+- **Targets are fixed now.** Every suite must reach a 90% pass rate (and 100%
+  of its non-excused tests that touch security: capabilities, namespaces,
+  seccomp, ptrace) by the end of the phase in its milestone row. The excused
+  list for a phase is frozen when that phase starts and can only shrink;
+  adding to it needs the owner's sign-off, recorded in the change.
 - **Differential testing.** A corpus of programs runs on Linux and Optimal
   under a syscall tracer; normalised traces (calls, arguments, results,
-  errno, signal delivery) are compared. A difference is a bug or a
-  documented, intended divergence (for example a sandbox denial).
+  errno, signal delivery) are compared. A difference is a bug or an intended
+  divergence (for example a sandbox denial); each intended divergence is
+  listed with the owner's sign-off, and their count is on the scorecard.
 - **Status tables.** CI publishes a per-syscall and per-`ioctl` table:
   implemented, partial (which flags), or not yet, for 64 and 32 bit.
 - **App suites by phase.** Phase 5: coreutils, Python, GCC, git, SQLite.

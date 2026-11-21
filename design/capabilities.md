@@ -42,7 +42,7 @@ derivation as follows:
 | `mmap` of a file or memfd | derives a mapping capability on the file's memory object, rights capped by the fd's rights |
 | `fork`'s copy-on-write memory | both processes hold a read capability on the shared, copy-on-write memory object until one writes; a write gives that process its own private object |
 | SysV and POSIX shared memory | named shared memory objects, reached through the IPC namespace and the same permission check as files |
-| `ptrace`, `process_vm_readv/writev`, `/proc/pid/mem` | need a **debug** capability on the target, which by default only the parent within the same app gets (like Yama scope 1), and never across apps without a user prompt |
+| `ptrace`, `process_vm_readv/writev`, `/proc/pid/mem` | need a **debug** capability on the target. Within one app this follows Yama scope 1 exactly: a process may debug its descendants, and any process that named it with `prctl(PR_SET_PTRACER)` (how Crashpad and Breakpad crash reporters work). An app's manifest can ask for "debug own app", which lets any of its processes debug any other process of the same app identity (Wine's `wineserver` needs this). Across apps, only through the debugger portal, which asks the user *before* the attach and hands the debugger a capability; the `ptrace` call itself never prompts |
 
 **Revocation of Linux objects** (what an app sees when a grant is withdrawn,
 for example the user revoking an app's access to a folder): the next operation
@@ -51,72 +51,146 @@ reused); a revoked file mapping delivers `SIGBUS` on next access; a revoked
 socket returns `ECONNRESET`. Programs already handle all of these, because
 Linux produces them for removed devices and network file systems.
 
-## App identity and the file view
+## App identity
 
-- **App identity** is fixed when an app is launched, from its signed manifest
-  (below), and is inherited across `fork` and `execve`. A process can't change
-  its own app identity. Launching another app goes through the app launcher
-  portal, which starts it under its own identity.
-- **Each app has its own file view**: a mount namespace built at launch from
-  its manifest. It contains the system image (read-only), its own data
-  directory, a private `/tmp`, the device nodes it is allowed, and nothing
-  else. The user's files appear only when granted (below). Paths that aren't
-  in the view don't exist (`ENOENT`), which programs handle better than
-  `EACCES` for things they didn't need.
-- **Unix permissions still apply, inside the view.** Every file check is
-  first the normal Linux discretionary check (uid, gid, mode, ACLs) and then
-  the capability check. Both must pass. This keeps multi-user permissions
-  and programs that check `access()` working.
+- **App identity** is fixed when an app is launched and inherited across
+  `fork` and `execve`. A process can't change its own identity. The kernel
+  attests it: any process can learn a peer's app identity from a pidfd
+  (`SO_PEERPIDFD` on a Unix socket, then an Optimal `pidfd` query), which is
+  race-free, unlike reading `/proc` by pid. Portals, the compositor and the
+  D-Bus proxies use this; it's what the "verified identity" on every prompt
+  is.
+- **Where identities come from:** a signed manifest (the Optimal app format,
+  Phase 12); a Flatpak app's ID and its `metadata` permissions (mapped
+  below); for an unpackaged program launched from the desktop, an identity
+  derived from its install location, with the default profile below; for a
+  program run from a terminal, the terminal's identity.
+- **Apps that launch apps.** A launcher like Steam can start children under a
+  **child identity** (`steam/<game id>`): the child gets its own capability
+  set and file view (by default its own data directory and the folders the
+  parent declares for it, never the parent's tokens or data), but stays in the
+  parent's PID namespace subtree, so the parent can `wait` for it, track it
+  with a pidfd and signal it. Flatpak's `flatpak-spawn --sandbox` and
+  browsers' renderer sandboxes map onto the same mechanism or onto ordinary
+  namespaces and seccomp.
+- **The default profile** for unpackaged desktop programs: own data
+  directory, no folder grants, network allowed (it holds no user files),
+  GPU render node, audio playback, and portals for everything else. It is
+  shown in Settings and can be changed per program.
+
+## The file view
+
+Each app has its own mount namespace, built at launch. Its contents are fixed
+by a published list (tested against the Phase 5 and Phase 7 app suites), so
+apps find everything they expect:
+
+- the system image read-only (`/usr`, and `/bin`, `/lib`, `/lib64`, `/sbin` as
+  links into it);
+- `/etc` as a generated, read-only view: `passwd` and `group` (this user and
+  system accounts only), `hosts`, `resolv.conf`, `nsswitch.conf`,
+  `machine-id` (a per-app value, so apps can't use it to track the user
+  across apps), `localtime`, `os-release`, `ssl/certs`, `fonts`,
+  `ld.so.cache`;
+- `$HOME` containing only the app's own data directories
+  (`~/.config/<app>`, `~/.local/share/<app>`, `~/.cache/<app>` and the XDG
+  equivalents) plus any granted folders;
+- a private `/tmp` and `/var/tmp`;
+- `$XDG_RUNTIME_DIR` with the Wayland socket (through the app's security
+  context), the PipeWire socket (with the app's permissions), the session
+  bus (through the app's D-Bus proxy) and the portal sockets;
+- `/proc` per the contract in [compat.md](compat.md), showing only the app's
+  own processes;
+- a `/sys` subset: `devices/system/cpu` (online, topology, caches),
+  `class/drm` and `dev/char` entries for devices the app was granted, and
+  what libdrm, the Vulkan loader and libudev need for those, nothing else;
+- the device nodes below.
+
+Paths that aren't in the view don't exist (`ENOENT`).
+
+**Networking.** Apps with network access share the host's network stack,
+including loopback, so a browser reaches a development server on
+`localhost` and OAuth loopback callbacks work. Apps without network access
+get their own network namespace with only a loopback of their own.
+Abstract Unix sockets are scoped per app.
+
+## Unix permissions, uids and Linux capabilities
+
+- **Unix permissions still apply, inside the view.** Every file check is the
+  normal Linux discretionary check (uid, gid, mode, ACLs) and then the
+  capability check. Both must pass.
 - **uids.** Each human user has a uid; each app runs under that user's uid
-  inside its own view. Apps can't see other users' files because those
-  aren't in their view and are under other users' keys.
-- **setuid binaries.** The setuid bit has no effect on Optimal (like a
-  `nosuid` mount everywhere). Tools that relied on it (`sudo`, `passwd`,
-  `ping`, `bwrap`'s setuid mode) talk to the broker instead, or, for `bwrap`
-  and browsers' sandboxes, use unprivileged user namespaces, which Optimal
-  supports ([compat.md](compat.md)). `sudo` is replaced by an
-  administrator-action portal that asks the user.
+  inside its own view. There is a uid 0 for the system's own services, but
+  it carries no special power over the kernel: being uid 0 only matters for
+  Unix permission checks on files in a view, and no app runs as uid 0.
+- **Linux capabilities (`CAP_*`).** Programs that check `capget` (bwrap,
+  Chromium, Flatpak) see the capabilities Linux would give them, and those
+  capabilities work, but **only over objects owned by the user namespace
+  they're in**: `CAP_SYS_ADMIN` inside an unprivileged user namespace lets a
+  process mount inside that namespace's mount namespace, set its hostname,
+  and so on, exactly as Linux scopes them, and never grants anything outside
+  it. Outside any user namespace an app holds no `CAP_*` at all. File
+  capabilities (`security.capability` xattrs) are ignored, like setuid.
+- **setuid binaries.** The setuid bit has no effect (like `nosuid`
+  everywhere). Each tool that depended on it has a named replacement, each
+  with a test:
+
+  | Tool | Replacement |
+  |---|---|
+  | `sudo`, `pkexec` | the administrator-action portal, which asks the user |
+  | `passwd`, `chsh` | the accounts portal |
+  | `ping` | unprivileged ICMP sockets |
+  | `bwrap` setuid mode | unprivileged user namespaces |
+  | `newuidmap`, `newgidmap` (rootless containers) | the broker writes the uid map for ranges allocated to the user |
+  | `fusermount3` (AppImage, FUSE) | the broker mounts FUSE inside the calling app's view if it holds the FUSE grant |
+  | `flatpak-system-helper` (via polkit) | the store service, which installs Flatpak apps system-wide after an administrator prompt |
+
 - **Denials never hang.** A call the app isn't allowed returns `EACCES`,
-  `EPERM` or `ENOENT` immediately. Permission prompts never happen inside a
-  system call, because a syscall that blocks on a human would hang or time
-  out real programs.
+  `EPERM`, `ENETUNREACH` or `ENOENT` immediately. Prompts never happen inside
+  a system call, because a syscall that blocks on a human would hang or time
+  out real programs. Apps ask through portals, which are asynchronous.
 
 ## Granting access: portals
 
-Prompts and grants go through **portals**, user-space services in the TCB that
+Prompts and grants go through **portals**: user-space services in the TCB that
 speak the xdg-desktop-portal D-Bus interfaces, so Flatpak-aware apps work
-unchanged:
+unchanged. The broker and portals land in Phase 5 (with prompts on the text
+console until the compositor exists); the compositor draws them from Phase 7.
 
 - **File chooser:** the user picks files or folders in a dialog drawn by the
-  compositor; the portal hands the app fds (or bind-mounts the folder into its
-  view). The app never sees the rest of the tree.
+  compositor; the portal hands the app fds (one use) or adds the folder to
+  its view (persistent). The network rule in
+  [threat-model.md](threat-model.md) applies to persistent grants.
+- **Network:** requested through the network portal or declared at install.
 - **Camera, microphone, screen capture, location, notifications, background
-  running, network for apps with file grants:** the portal asks once, the
-  user's answer is remembered and can be changed in Settings, and the app gets
-  a capability (often an fd, such as a PipeWire stream).
-- **Prompts can't be faked.** Only the compositor can draw portal prompts, in
-  a layer apps can't draw over or capture, with the app's verified identity
-  shown.
-- Apps that don't use portals still work for everything in their own view;
-  they just can't reach user files beyond what was granted at install.
+  running, real-time scheduling (the rtkit interface):** the portal asks
+  once, the answer is remembered and can be changed in Settings, and the app
+  gets a capability (often an fd, such as a PipeWire stream).
+- **Prompts can't be faked.** Only the compositor draws portal prompts, in a
+  layer apps can't draw over, capture or cover, showing the app's attested
+  identity. The borrowed compositor used from Phase 7 is patched to do this
+  (the patches are kept in the tree and the prompt-spoofing tests run
+  against it); the own compositor does it by design.
 
-## The app manifest
+## The app manifest and Flatpak permissions
 
-Every app ships a signed manifest (part of the one app format in Phase 12;
-for unpackaged programs launched from a terminal, a default profile below):
+A manifest lists: identity (name, publisher key); network (yes or no); device
+classes (GPU render node, gamepad, audio, camera); default folders (each shown
+at install and removable); D-Bus names it owns and talks to; and extra
+features (`debug own app`, `io_uring` off, FUSE, child identities for
+launchers). Each is shown at install.
 
-- identity (name, publisher key),
-- requested static grants: device classes (GPU render node, gamepad, audio),
-  network (yes/no), the folders it wants by default (each shown to the user
-  at install and individually removable),
-- system calls or features it needs beyond the default set (for example
-  `ptrace` for a debugger, `io_uring`), each shown at install.
+Flatpak permissions map onto the same grants:
 
-**Programs run from a terminal** inherit the terminal's app identity and view.
-The terminal itself is an app; by default it gets the user's home directory
-(people use terminals to work on their files) but no other app's data
-directories, and that grant is shown and can be narrowed. This is the one
-place a broad home grant exists, and it is explicit.
+| Flatpak permission | Optimal grant |
+|---|---|
+| `--share=network` | network |
+| `--filesystem=home` or `host` | home minus protected paths, persistent, so it needs the combined files + network approval if the app also has network |
+| `--filesystem=xdg-documents` and similar | that folder, persistent |
+| `--device=dri` | GPU render node |
+| `--device=all` | GPU, gamepads, approved `hidraw`; never keyboards, `uinput` or block devices |
+| `--socket=wayland`, `pulseaudio`, `x11` | Wayland security context, PipeWire playback (recording needs the portal), own XWayland server |
+| `--talk-name`, `--own-name` | D-Bus proxy policy |
+| `--socket=session-bus`, `system-bus` (unfiltered) | refused; the app runs with the filtered proxy and the user is told |
 
 ## Device nodes
 
@@ -132,12 +206,15 @@ view.
 
 - [verification.md](verification.md) target 4 is stated over memory
   objects: a user mapping in process A reaches a frame only if A holds a
-  capability for the memory object that owns it. Every sharing path in the
-  table above creates such a capability, so the property covers Linux
-  sharing (copy-on-write, page cache, shared memory, memfd, ptrace) instead
-  of silently excluding it.
+  capability for the memory object that owns it. The sharing paths it covers
+  are a **closed list** in `design/proofs.toml`: copy-on-write after `fork`,
+  shared file mappings, SysV and POSIX shared memory, memfd, `SCM_RIGHTS`
+  passing, `ptrace` and `process_vm_*`, io_uring registered buffers,
+  dma-buf, and GPU buffer objects. Each phase that adds a path extends the
+  proof in its own done-when; a path that isn't on the list doesn't exist.
 - Target 5 covers derivation (never more rights than the parent) and
   revocation (the whole subtree, and the revoked-object behaviours above).
-- The hostile-process suite ([threat-model.md](threat-model.md)) tests each
-  row of the first table from the attacker side: a process tries to gain
-  each kind of access without the capability and must fail.
+- The hostile-process and exfiltration suites
+  ([threat-model.md](threat-model.md)) test every row of the first table, the
+  file view list, the shared-channel mediation and the setuid replacements
+  from the attacker's side.

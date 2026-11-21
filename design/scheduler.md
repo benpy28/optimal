@@ -15,8 +15,11 @@ audio keeps up under load. This file is the design that the targets in
 - **Bounded non-preemptible sections.** No section with preemption or
   interrupts disabled may last longer than **50 µs** on the reference
   desktop. A built-in tracer (always compiled in, near-zero cost when off)
-  records the longest sections; CI fails if any exceeds the limit during the
-  stress suites. The target tightens to 20 µs in Phase 10.
+  records the longest sections. In virtual machines the host can stall a
+  vCPU at any moment, so there the tracer only reports; the limit is
+  enforced (CI fails above it) on the bare-metal reference machines, which
+  run the stress suites nightly from Phase 2. The target tightens to 20 µs
+  in Phase 10.
 - **Interrupt handlers are threaded.** Hard-IRQ handlers live in the core and
   only acknowledge the device and wake the driver's handler thread, which is
   an ordinary schedulable thread with its own priority. Audio, input and
@@ -85,7 +88,9 @@ thread on that CPU.
 - **SMT and side channels.** On CPUs affected by L1TF/MDS-class bugs, core
   scheduling keeps threads of different apps (and the kernel's sensitive
   work) off sibling hyperthreads at the same time
-  ([threat-model.md](threat-model.md)). The cost is measured and published.
+  ([threat-model.md](threat-model.md)). Core scheduling and its leak test
+  land in Phase 3, when there are user processes to separate; the cost is
+  measured and published.
 
 ## Time and idle
 
@@ -94,8 +99,8 @@ thread on that CPU.
   nanosecond expiry using the TSC deadline timer, and an idle CPU takes no
   periodic tick. A CPU running one thread can also stop its tick (adaptive
   tick) once Phase 10 tunes it.
-- **Frequency control before any real-hardware comparison.** Before the
-  first bare-metal benchmark against Linux, Optimal enables hardware
+- **Frequency control before any real-hardware comparison.** In Phase 2,
+  before the first bare-metal benchmark against Linux, Optimal enables hardware
   P-states (Intel HWP, AMD CPPC) and sets the same energy-performance
   preference as the Linux baseline. Otherwise every comparison measures the
   firmware's default frequency, not the kernel. Idle states beyond C1 (with
@@ -132,26 +137,36 @@ explicit:
   background app first, never the compositor or the foreground app.
 - **Benchmarks** (added to [benchmarks.md](benchmarks.md)): 4 KiB and 2 MiB
   fault cost, mmap/munmap and page-fault scaling across cores, TLB shootdown
-  latency against core count, and a memory pressure test (a browser with 50
-  tabs plus a compile in 8 GiB of RAM) measuring input latency P99 and
-  frame time while it runs.
+  latency against core count (Phase 2), and a memory pressure test in
+  Phase 7, when there is a desktop and a browser to run: the machine is
+  limited to 8 GiB (`mem=8G` on both kernels), a browser opens 50 pages from
+  a pinned offline corpus served locally, and a pinned compile runs
+  alongside, measuring input latency P99 and frame time while it runs.
 
 ## Driver budgets and real-time work
 
 Driver CPU and interrupt budgets ([drivers.md](drivers.md)) are charged to the
 driver's handler thread, which runs under the scheduler like any other thread.
-So a driver over budget is slowed by the scheduler (it gets its share and no
-more) rather than by masking its interrupt, which would cause audio underruns
-or I/O timeouts. Interrupt masking is reserved for genuine storms (rate far
-above anything the device class can legitimately produce) and is reported on
-the scorecard whenever it happens.
+A driver's real-time threads may use at most 5% of a CPU per 100 ms window
+(the cap in [drivers.md](drivers.md)); past that they drop to the fair class
+until the window ends. So a driver over budget is slowed by the scheduler
+(it gets its share and no more) rather than by masking its interrupt, which would cause audio underruns
+or I/O timeouts. Interrupt masking is reserved for genuine storms (the
+per-class limits over 10 ms windows in [drivers.md](drivers.md)) and is
+reported on the scorecard whenever it happens.
 
 ## Proof and test obligations
 
 - [verification.md](verification.md) target 8 covers: every runnable thread
-  is on exactly one run queue; no thread runs on two CPUs; a higher class
+  is on exactly one run queue; a higher class
   always runs before a lower one on the same CPU; RT throttling never lets RT
   use more than its budget; priority inheritance chains are acyclic and
   restore priorities when released. Checked with loom-style model checking
-  of the run queue code on the host, plus property tests in QEMU.
-- The latency tracer and the stress suite run in every CI boot from Phase 2.
+  of the run queue code on the host, plus property tests in QEMU. (No thread
+  runs on two CPUs is guaranteed by the core's move-only `RunnableThread`,
+  not by this proof.)
+- Phase 2 tests: priority-inheritance chains (nested and across classes),
+  capacity-aware placement on a simulated hybrid topology, tickless idle
+  (no periodic tick on an idle CPU over 10 s) and timer expiry accuracy.
+- The latency tracer and the stress suite run in every CI boot from Phase 2
+  (report-only in VMs, enforced on bare metal, as above).

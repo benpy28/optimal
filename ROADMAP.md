@@ -39,7 +39,7 @@ These are decided now because they are expensive to change later.
 - **First target: x86_64.** ARM64 comes once the core is stable. Code that depends on the architecture lives in its own module from day one.
 - **Licence: our own code only, never GPL.**
   - Kernel, bootloader and every component we write: clean-room code from specs (Intel/AMD manuals, ACPI, PCI, NVMe, xHCI and USB specs, the Linux man pages and uAPI docs for the syscall interface). We never copy, translate or read for reference the code of Linux, BSD or other kernels. Dependencies must be MIT, Apache-2.0, BSD, Zlib or similar, checked by `cargo-deny` in CI.
-  - Borrowed programs shipped in the OS until ours replace them: permissive licences preferred; weak copyleft (LGPL, MPL) allowed as separate, unmodified programs (Wine, a browser); GPL programs are not shipped.
+  - Borrowed programs shipped in the OS until ours replace them: permissive licences preferred; weak copyleft (LGPL, MPL) allowed as separate, unmodified programs (Wine, a browser); GPL programs are not shipped, with one exception: shared libraries under the GCC Runtime Library Exception (glibc is LGPL; libstdc++ and libgcc_s are GPL with that exception), which every Linux program links against ([design/compat.md](design/compat.md)). The base system uses dash as `/bin/sh` and uutils for coreutils; bash and other GPL programs are third-party apps the user can install from the store, never part of the image.
   - Firmware: redistributable vendor binaries (CPU microcode, GPU and Wi-Fi firmware) are allowed as data, each listed with its licence and hash ([design/drivers.md](design/drivers.md)).
   - Test tools: GPL test suites and checkers (LTP, xfstests, kselftest, `e2fsck`) may be run as external test oracles, never linked, vendored or shipped.
   - The repo has no licence file yet, which means all rights are reserved until the owner picks one.
@@ -75,7 +75,8 @@ attack path with its defence and its test are in
 - **Tough but realistic conditions** (from Phase 1): every change also boots on deliberately awkward machines: CPUs from Core 2 to current Xeon/EPYC with security features missing, 5-level paging, odd core topologies, NUMA (including a node with no memory), odd and split memory, no HPET, no ACPI, old and new OVMF builds, a host fighting for CPU, and Secure Boot attacks (unsigned bootloader, wrong key, tampered kernel, tampered config, old signed image), which must be refused. Fault injection joins as each piece lands: failed allocations, quirky ACPI tables, timer jitter, spurious interrupts, hostile DMA devices, then disk power cuts and I/O errors.
 - **Public scorecard from the first bootable build:** performance against a pinned, matched Linux baseline, measured on dedicated bare-metal machines (shared CI VMs are too noisy and are used for functional tests only); committed provisional targets that can only tighten; and a security scorecard per hardware tier that counts only what is on in the shipped image. See [design/benchmarks.md](design/benchmarks.md).
 - **Formal verification in CI:** every proof target runs on every change, with time budgets and tracked bounds ([design/verification.md](design/verification.md)).
-- **Fuzzing:** syscalls from Phase 3, the driver boundary, device-side driver fuzzing and filesystems from Phase 4, the network stack and USB from Phase 6.
+- **Fuzzing:** syscalls from Phase 3, the driver boundary, device-side driver fuzzing and filesystems from Phase 4, the network stack, Wi-Fi, Bluetooth and USB from Phase 6.
+- **What runs today and what lands later.** Each item above is marked on the scorecard as running now or "lands in Phase N"; nothing is described as running before its job exists.
 - **Real hardware:** from Phase 1, each milestone is also checked on at least one real PC booted from USB.
 
 ## Phases
@@ -86,6 +87,8 @@ that depends on a phase doesn't ship until that phase's done-when passes.
 Work that doesn't depend on it (the built-by-us tracks, proofs, fuzzing,
 security items) runs in parallel and is never held back by a later, unrelated
 phase. In particular, no security item waits for GPUs or games.
+Phases 1 and 4 have lettered parts; "Phase 4" on its own means both 4a and
+4b, so an item due "at the end of Phase 4" is due when 4b closes.
 
 ### Phase 0: It boots (done in CI)
 - Rust kernel loaded by Limine, writes to the serial port, paints the screen and reports usable memory.
@@ -95,64 +98,74 @@ phase. In particular, no security item waits for GPUs or games.
 ### Phase 1: The core
 - **1a, CPU setup:** GDT, TSS, IDT, and handlers for every CPU exception with a clear crash report (registers and a stack trace); a double-fault handler on its own IST stack so stack overflows are reported.
 - **1b, memory:** physical frame allocator (NUMA-aware), our own page tables for the kernel, a fallible kernel heap, guard pages; the kernel built position-independent so the bootloader can randomise it (KASLR); first proofs (targets 1 and 2) and Miri on the core's host tests.
-- **1c, ACPI, interrupts, IOMMU and time:** ACPI tables, an AML interpreter (safe Rust, fuzzed), local APIC and I/O APIC, the IOMMU in deny-all mode with interrupt remapping and every device's bus mastering off until assigned, an accurate clock (TSC calibrated against HPET or the ACPI timer), a timer interrupt, microcode loaded on the boot CPU before mitigations are chosen.
+- **1c, ACPI, interrupts, IOMMU and time:** ACPI tables, AML hosting staged as in [design/drivers.md](design/drivers.md) (safe Rust, fuzzed, confined), minimal PCI enumeration (enough to find and program the IOMMU), local APIC and I/O APIC, the IOMMU in deny-all mode with interrupt remapping and every device's bus mastering cleared in the defined order (USB handover first, the IOMMU's own function exempt) and kept off until assigned, an accurate clock (TSC calibrated against HPET or the ACPI timer), a timer interrupt, microcode loaded on the boot CPU before mitigations are chosen.
 - **1d, console:** a framebuffer text console so the kernel can talk without serial (with a font we make or that is permissively licensed).
 - The kernel becomes a workspace with tier-0 crates and enforced lint rules, the unsafe inventory and the core size cap ([design/core.md](design/core.md)).
 - Security baseline: no-execute, write-xor-execute kernel mappings, SMEP, SMAP, UMIP, guard pages, KASLR; the shipped image uses the hash-pinned, enrolled boot chain.
 - In-kernel test runner in CI, plus the tough-conditions run and Secure Boot attack tests.
 - First scorecard entries: boot time, timer accuracy, kernel memory, and the security table.
-- Done when: every exception type is triggered on purpose in tests and reported correctly; the allocator and page tables pass their tests and proofs (targets 1, 2 and 10 at level B); every tough-conditions scenario passes; the KASLR test measures at least 9 bits of entropy over 100 boots; a hostile QEMU device's DMA and interrupt writes outside its domain are blocked and logged; the timer keeps accurate time over a 10-minute run (drift under 1 part per million against the host clock); and the outside audit of the Phase 1 core is done with its findings fixed.
+- Where it runs today: CI covers QEMU boots, the in-kernel tests and proofs as each lands; real-hardware and bare-metal items are reported "not yet measured" until the owner's machines are online.
+- Done when: every exception type is triggered on purpose in tests and reported correctly; the allocator and page tables pass their tests and proofs (targets 1, 2 and 10 at level B); every tough-conditions scenario passes; the KASLR tests in [design/boot.md](design/boot.md) pass (10^6 host draws pass the chi-square test with an SP 800-90B estimate of at least 9 bits, and 100 QEMU boots give at least 80 distinct bases); boot time from firmware handoff to kernel ready is under 300 ms on the reference desktop; a hostile QEMU device's DMA and interrupt writes outside its domain are blocked and logged; the timer keeps accurate time over a 10-minute run (drift under 1 part per million against the host clock); and the outside audit of the Phase 1 core is done with its findings fixed.
 
 ### Phase 2: Many cores and a scheduler
 - Start every CPU core (SMP), with per-core data, microcode on every core, and the typed locking and per-CPU rules in [design/core.md](design/core.md), checked by a lock-order checker.
-- The scheduler in [design/scheduler.md](design/scheduler.md): fully preemptible kernel, real-time, fair (EEVDF) and idle classes, threaded interrupt handlers, priority inheritance for kernel locks, topology and capacity-aware placement for hybrid CPUs, core scheduling where SMT leaks, high-resolution timers and a tickless idle.
+- The scheduler in [design/scheduler.md](design/scheduler.md): fully preemptible kernel, real-time, fair (EEVDF) and idle classes, threaded interrupt handlers, priority inheritance for kernel locks, topology and capacity-aware placement for hybrid CPUs, high-resolution timers and a tickless idle.
 - Kernel threads, sleeping, wake-ups and timers.
 - The benchmark harness lands here, with Optimal compared against **itself** only (there is no user space yet to compare with Linux fairly), plus the first dedicated bare-metal runner.
-- Proofs: targets 7, 8 and 11 (loom).
-- Done when: all cores run stress tests for an hour with no crash, deadlock or lock-order report; the latency tracer finds no non-preemptible section over 50 µs; real-time wake-up latency under saturation meets its provisional target ([design/benchmarks.md](design/benchmarks.md)) on the reference desktop.
+- Frequency control: hardware P-states (Intel HWP, AMD CPPC) with a fixed energy-performance preference, before the first bare-metal comparison.
+- Proofs: target 7 at level B; targets 8, 11 and 1s (TLB shootdown) at level M; target 3's interrupt re-entry at level M.
+- Done when: all cores run stress tests for an hour with no crash, deadlock or lock-order report; the latency tracer finds no non-preemptible section over 50 µs on the bare-metal runner (report-only in VMs); the priority-inheritance chain, capacity-aware placement, tickless idle and timer accuracy tests in [design/scheduler.md](design/scheduler.md) pass; real-time wake-up latency under saturation meets its provisional target ([design/benchmarks.md](design/benchmarks.md)) on the reference desktop.
 
 ### Phase 3: User space
 - Ring 3, processes and threads with the Linux task model, their own address spaces, ELF loading (static, static-PIE and dynamic), the full auxiliary vector and a vDSO, system calls, per-thread signals with XSAVE-sized frames, 64-bit **and 32-bit** entry paths ([design/compat.md](design/compat.md)).
 - Virtual memory features programs need: `mmap`, copy-on-write `fork`, demand paging, PCID, page-table isolation where the CPU needs it.
-- The capability system with derivation and revocation, Linux fds as capabilities, per-app file views and the lockdown table ([design/capabilities.md](design/capabilities.md)).
-- Syscall entry hardened against Spectre-style attacks, including index masking. Syscall fuzzing starts.
-- Proofs: targets 4, 5 and 6; Verus starts.
-- Done when: static glibc and static musl programs (64 and 32 bit) and the milestone 1 suite run unchanged; the hostile-process suite and the lockdown test pass with every attempt refused; published Spectre and Meltdown proof-of-concepts fail to leak; an unknown-syscall sweep returns `ENOSYS` for every unimplemented number; proofs 4 to 6 run at their stated levels; and the outside audit of syscall entry, user copy and capabilities is done.
+- A minimal virtual filesystem layer, an initramfs unpacked into a RAM filesystem, and mount namespaces, so per-app file views exist from the start.
+- The capability system with derivation and revocation, Linux fds as capabilities, kernel-attested app identity, per-app file views, the default app profile and the lockdown table ([design/capabilities.md](design/capabilities.md)).
+- Syscall entry hardened against Spectre-style attacks, including index masking; core scheduling where SMT leaks. Syscall fuzzing starts.
+- Proofs: targets 4 (for the sharing paths that exist in Phase 3), 5 and 6; Verus starts.
+- Done when: static glibc and static musl programs (64 and 32 bit) and the milestone 1 suite run unchanged; the hostile-process suite and the lockdown test pass with every attempt refused; published Spectre and Meltdown proof-of-concepts, and the cross-hyperthread leak test with core scheduling on, recover zero bytes over 10^6 attempts; an unknown-syscall sweep returns `ENOSYS` for every unimplemented number; proofs 4 to 6 run at their stated levels; and the outside audit of syscall entry, user copy and capabilities is done.
 
-### Phase 4: Storage, files and the trusted boot chain
-- PCI enumeration with AER/DPC and hotplug, then NVMe and AHCI drivers on the driver framework: trust tiers, the message interface, budgets, fault containment and restart, suspend/resume callbacks, device-side fuzzing ([design/drivers.md](design/drivers.md)).
+### Phase 4a: Storage and files
+- PCI enumeration with AER/DPC and hotplug, then NVMe and AHCI drivers on the driver framework: trust tiers, the message interface, budgets, fault containment and restart, suspend/resume callbacks, device-side fuzzing ([design/drivers.md](design/drivers.md)). virtio-blk runs in tier 2; NVMe and AHCI start in tier 1 and must meet the promotion thresholds for in-kernel parsers before this phase closes.
 - The block layer with flush/FUA and completion ordering, the durability contract, the page cache with stable pages and copy-on-write space reservation ([design/storage.md](design/storage.md)).
-- A virtual filesystem layer, a RAM filesystem, and ext4 **read-only** with journal replay into memory (read-write only on a published feature list after the differential gate).
-- Disk encryption stage 1 (AES-XTS), with a passphrase and recovery key; the TPM 2.0 driver, measured boot (with Optimal Boot), the signed TPM policy and PIN, which together make TPM unlocking available as soon as Optimal Boot's measured boot lands ([design/boot.md](design/boot.md)).
+- The full virtual filesystem layer, ext4 read-only on any volume, and ext4 **read-write on volumes Optimal created** with its own mkfs and the fixed feature list in [design/storage.md](design/storage.md), after the differential `e2fsck` gate passes.
+- Disk encryption stage 1 (LUKS2, AES-XTS) with a passphrase and recovery key.
 - The read-only, hash-tree-verified system image format with A/B slots.
-- Filesystem testing: the crash-state model and oracle in [design/storage.md](design/storage.md), property tests against a reference model, image fuzzing, long randomised workloads, all running forever in the nightly soak.
+- Filesystem testing: the crash-state model and oracle in [design/storage.md](design/storage.md), property tests against a reference model, image fuzzing (including LUKS2 headers), long randomised workloads, all running forever in the nightly soak.
 - Proofs: targets 9 and 12.
-- Done when: the kernel boots from a real NVMe drive with its disk encrypted; the 24-hour file stress test and at least 10^7 crash states per night pass the oracle; every durability-contract crash test passes; killing the NVMe driver under load recovers within 500 ms with no corruption (if NVMe has moved to tier 2; otherwise the same test on AHCI); the TPM tamper tests and rollback tests in [design/boot.md](design/boot.md) pass under swtpm; a flipped block in the system image is caught; device-side fuzzing of the storage drivers has run 24 hours clean; the storage benchmark set is within 10% of matched Linux on aged filesystems with encryption on; and the outside audit of the IOMMU, DMA, driver boundary and TPM code is done.
+- Done when: the kernel boots from a real NVMe drive with its disk encrypted; the 24-hour file stress test and at least 10^7 crash states per night pass the oracle; every durability-contract crash test passes; the differential `e2fsck` gate is clean; killing the virtio-blk driver (tier 2) under load recovers within 500 ms with in-flight requests resubmitted and no corruption; NVMe and AHCI meet the promotion thresholds; a flipped block in the system image is caught; device-side fuzzing of the storage drivers has run 24 hours clean; and the Phase 4 storage benchmark subset is within 10% of matched Linux on aged ext4 with encryption on.
+
+### Phase 4b: The trusted boot chain
+- Entry condition: Optimal Boot's measured boot and boot counting have landed (bootloader track).
+- The TPM 2.0 driver, the signed TPM policy, PIN and recovery, TPM ownership and the anti-rollback counter, with parameter encryption ([design/boot.md](design/boot.md)).
+- Done when: the TPM tamper tests and rollback tests in [design/boot.md](design/boot.md) pass under swtpm and on the reference laptop; and the outside audit of the IOMMU, DMA, driver boundary and TPM code is done.
 
 ### Phase 5: Running real Linux programs
 - Compatibility milestones 2 to 7 in [design/compat.md](design/compat.md): dynamic linking, threads, PI futexes and `futex_waitv`, `/proc` and `/sys` per the contract, desktop IPC, namespaces, seccomp and cgroups, `ptrace` and `perf_event_open`.
-- Scheduling ABI (policies, affinity, cgroup CPU control), pressure information, compressed swap, user-space shadow stacks.
+- Scheduling ABI (policies, affinity, cgroup CPU control), pressure information, compressed swap, user-space shadow stacks, io_uring (milestone 5).
+- The permission broker and portals, with prompts on the text console until the compositor can draw them in Phase 7 ([design/capabilities.md](design/capabilities.md)); setuid replaced by brokers.
 - Run BusyBox, a shell, then real tools like Python, GCC, git and SQLite.
 - First benchmarks against Linux with identical binaries on both.
-- Done when: each milestone's suite reaches its published target pass rate with results reported by outcome (target 90% for the pinned LTP syscall list, with undocumented skips counted as failures); a Steam Runtime container runs under `bwrap`; Chromium's sandbox self-test passes; and context-switch, wake-up and messaging benchmarks are within 10% of matched Linux on the reference desktop.
+- Done when: each milestone's suite reaches its published target pass rate with results reported by outcome (target 90% for the pinned LTP syscall list, with undocumented skips counted as failures); a Steam Runtime container runs under `bwrap`; Chromium's sandbox self-test passes; the A7 (malicious app) rows of the attack table in [design/threat-model.md](design/threat-model.md) pass; and context-switch, wake-up and messaging benchmarks are within 10% of matched Linux on the reference desktop.
 
 ### Phase 6: Input, USB, networking and audio
 - xHCI USB with USB authorisation, keyboards, mice and storage. PS/2 as a fallback.
-- Network drivers (virtio, Intel and Realtek first), Wi-Fi in tier 3, and a TCP/IP stack; network fuzzing starts.
+- Network drivers (virtio, Intel and Realtek first), Wi-Fi in tier 3 (an in-kernel tier-2 build on machines without an IOMMU), Bluetooth, and a TCP/IP stack; network, Wi-Fi and Bluetooth fuzzing start. Network-facing services (DHCP, DNS, time) run sandboxed.
+- The Thunderbolt/USB4 connection manager in tier 2, with external devices needing approval.
 - Audio: HD Audio and USB Audio Class 2 drivers, the ALSA interface, PipeWire with real-time scheduling through a portal.
 - Laptop basics: embedded controller, battery, backlight, I2C-HID touchpads, lid and power buttons.
 - Default-deny inbound firewall and no listening services.
 - Compatibility milestones 8, 9 and 10.
-- Done when: the PC can be used with USB devices only; an emulated keyboard that types immediately gets no keystroke accepted; a large download over a named NIC reaches at least 95% of the link's measured TCP goodput on Linux; a port scan of a fresh boot finds 0 open ports; the network stack has 10^9 fuzz executions and USB descriptor fuzzing 24 hours with no open crash; and audio has 0 underruns per hour at 128 frames under load.
+- Done when: the PC can be used with USB devices only; an emulated keyboard that types immediately gets no keystroke accepted; a large download over a named NIC reaches at least 95% of the link's measured TCP goodput on Linux; a port scan of a fresh boot finds 0 open ports over IPv4 and IPv6; the Phase 6 exfiltration tests in [design/threat-model.md](design/threat-model.md) pass; the network stack has 10^9 fuzz executions and USB descriptor fuzzing 24 hours with no open crash; Wi-Fi and Bluetooth frame fuzzing has run 24 hours with no open crash; and audio has 0 underruns at 128 frames under load over a 24-hour run per buffer size, with the 95% upper bound on the rate published.
 
 ### Phase 7: Graphics and a desktop
 - Kernel modesetting interface (DRM/KMS, GEM, dma-buf, sync objects), starting with virtio-gpu and simple framebuffers.
-- Run a Wayland compositor (part of the trusted base) and Mesa's software renderer on top, with portals and the seat service.
-- Done when: a Wayland desktop session runs with a terminal and a browser, **with the browser's own sandbox on**; the sandbox-escape and prompt-spoofing suites pass; and input-to-display latency and frame time meet their provisional targets.
+- Run a borrowed Wayland compositor, patched to draw portal prompts and enforce `wp_security_context_v1` (part of the trusted base), and Mesa's software renderer (llvmpipe) on top, with portals and the seat service.
+- Done when: a Wayland desktop session runs with a terminal and a browser, **with the browser's own sandbox on**; the sandbox-escape, prompt-spoofing and full exfiltration suites pass; input-to-display latency, 60 Hz frame time (virtio-gpu and llvmpipe, against Linux on the same stack), foreground responsiveness during I/O and the memory-pressure test meet their provisional targets; and total OS memory and idle CPU are measured against theirs.
 
 ### Phase 8: Real GPU drivers
 - The hardest part of any new kernel. Start with one family (AMD or Intel) and work towards accelerated 3D through Mesa, split into a small tier-1 GPU core and tier-3 management, under the written clean-room process ([design/drivers.md](design/drivers.md)).
-- Done when: Mesa runs hardware-accelerated OpenGL and Vulkan on one GPU family with published Vulkan CTS and piglit pass rates; the cross-process GPU buffer isolation test passes; a hung engine recovers within 2 seconds without losing the session; and 5 benchmark games run within 15% of Linux.
+- Done when: Mesa runs hardware-accelerated OpenGL and Vulkan on one GPU family with published Vulkan CTS and piglit pass rates; the cross-process GPU buffer isolation test passes and proof target 13 (GPU address-space isolation) runs at level B; 144 Hz frame time meets its target on the reference discrete GPU; a hung engine recovers within 2 seconds without losing the session; and 5 benchmark games run within 15% of Linux.
 
 ### Phase 9: Games and Windows apps
 - Run Steam, Wine and Proton on the Linux syscall layer (milestone 13). Fix what breaks, one game at a time, from a published test list.
@@ -195,7 +208,7 @@ keeps things working.
 
 | Piece | Starts after | Replaces | Done when |
 |---|---|---|---|
-| Bootloader (Optimal Boot) | Phase 1 | Limine | Boots Optimal on UEFI across the full CI boot matrix and on 3 real PCs; signed config, measured boot and the tamper tests pass; Secure Boot paths per [design/boot.md](design/boot.md) (owner keys working on 3 PCs, MOK on 1, shim submitted for review); parsers fuzzed. BIOS support is a later, separate item |
+| Bootloader (Optimal Boot) | Phase 1 | Limine | Boots Optimal on UEFI across the full CI boot matrix and on 3 real PCs; signed config, measured boot and the tamper tests pass; Secure Boot paths per [design/boot.md](design/boot.md) (owner keys working on 3 PCs, shim submitted for review); parsers fuzzed. BIOS support is a later, separate item |
 | Filesystem | Phase 4 | ext4 as the default | Copy-on-write with authenticated encryption, checksums and snapshots (a user feature; OS rollback uses the A/B image); at least 10^7 crash states per night pass the oracle in [design/storage.md](design/storage.md), plus 1,000 real power cuts on 3 drive models; fsck, scrub and rescue tools ship with format v1; beats matched ext4 on the aged storage benchmark set |
 | Compositor | Phase 7 | Borrowed Wayland compositor | Speaks the Wayland protocol so existing apps run; tear-free, variable refresh rate, and input-to-display latency P99 and P99.9 lower than the best of KWin, Mutter and Sway on the reference desktop in the benchmark harness |
 | Desktop | Compositor | Borrowed desktop shell | Panel, launcher, notifications, built-in tiling and gaming mode, all within the total OS memory target in [design/benchmarks.md](design/benchmarks.md) |
@@ -225,7 +238,7 @@ Honest notes:
 
 Some things can't be done from CI and need Ben:
 
-- **Real hardware:** booting each milestone from USB on a real PC; the reference machines in [design/benchmarks.md](design/benchmarks.md), set up as dedicated runners for the performance gate (the desktop by Phase 2, the rest by Phase 5); a relay power-cut rig and 3 drive models for the filesystem track.
+- **Real hardware:** booting each milestone from USB on a real PC; the reference machines in [design/benchmarks.md](design/benchmarks.md), set up as dedicated runners for the performance gate (the desktop by Phase 2, the rest by Phase 5); a relay power-cut rig and 3 drive models for the filesystem track; an input-latency rig (USB HID microcontroller and photodiode) by Phase 7.
 - **Signing keys:** hardware tokens for the offline root key (2 of 3) before the first public release.
 - **Outside audits** at the end of Phases 1, 3 and 4 and before 1.0 (volunteers or funding).
 - **Accounts:** shim review submission and Microsoft signing, and repository settings.

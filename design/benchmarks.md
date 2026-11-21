@@ -31,13 +31,32 @@ the roadmap as an owner need.
   SMT state, isolated benchmark cores, and the exact kernel builds.
 - **Interleaved A/B runs.** The base build and the candidate build alternate
   on the same machine, at least 30 runs each, so drift affects both equally.
-- **Decision rule.** A change fails the gate when the bootstrap 95%
-  confidence interval of the median difference lies entirely beyond 3% worse
-  on any tracked metric, and an automatic rerun reproduces it.
+- **Decision rule.** A change fails the gate on a metric when the median
+  difference is more than 2% worse, or the bootstrap 95% confidence interval
+  lies entirely beyond 1% worse, and an automatic rerun reproduces it. The
+  confidence level is corrected for the number of metrics in the run
+  (Holm–Bonferroni), so tracking more metrics doesn't make false alarms
+  more common.
+- **Cumulative budget.** Small regressions that each pass the gate still
+  add up, so each release is also compared with the last release: no tracked
+  metric may be more than 3% worse in total, and the geometric mean of the
+  desktop set may not be worse at all.
+- **Which runs gate what.** Each change: microbenchmarks (core kernel costs).
+  Nightly: tail latencies and the responsiveness set. Each release: power,
+  battery and the long soak. A nightly or release failure blocks the next
+  release until it is fixed or the change is reverted.
 - **Noise ceiling.** Each metric must have a run-to-run coefficient of
-  variation of at most 1% on its machine (tails: enough samples per run for
-  a stable P99.9, at least 10^5). If the harness can't get under that, the
-  harness gets fixed; the gate is never widened to fit the noise.
+  variation of at most 1% on its machine; tail percentiles at most 5%, with
+  at least 10^5 samples per run for a P99.9. If the harness can't get under
+  that, the harness gets fixed; the gate is never widened to fit the noise.
+- **Direction and normalisation.** Every metric states whether lower or
+  higher is better and what it is normalised by (per operation, per second,
+  per watt). Count metrics with a zero target (underruns, dropped frames,
+  lock-order reports) are pass or fail and are not part of any geometric
+  mean.
+- **Zero-event targets** need at least 24 hours of runtime per configuration
+  (for audio, per buffer size), and the scorecard publishes the 95% upper
+  bound on the event rate, not just "0 seen".
 
 ## The Linux baseline
 
@@ -49,6 +68,9 @@ the roadmap as an owner need.
   side-channel mitigations Optimal uses on that CPU, the same IOMMU mode
   (strict), and the same energy-performance preference. "Beats Linux" claims
   are made against **matched**; stock is shown for context.
+- **Matching idle states.** Until Optimal has deep idle states (Phase 10),
+  the scorecard adds a third Linux column limited to C1 (`idle=halt`), so a
+  power or latency difference that comes only from C-states is visible.
 - **Inside a VM,** Linux's paravirtual features that Optimal doesn't have
   (kvm-clock, paravirtual spinlocks, paravirtual TLB flush and EOI, haltpoll)
   are switched off for the matched column, or Optimal implements them; the
@@ -60,7 +82,8 @@ the roadmap as an owner need.
   power) is frozen and versioned before Phase 5. Changing it is a reviewed
   change and starts a new trend line.
 - Optimal **beats Linux** on a machine when: every desktop metric is at
-  parity or better within its confidence interval, the geometric mean of the
+  parity or better (parity means the 95% confidence interval of the
+  difference includes zero and is no wider than ±2%), the geometric mean of the
   desktop set is ahead, and no single desktop metric is more than 5% worse.
   Winning "most" metrics doesn't count.
 - On server-style throughput the aim is to stay within 5% of matched Linux,
@@ -73,9 +96,13 @@ the roadmap as an owner need.
 - **Reference AMD desktop:** dual-CCD X3D CPU (tests the cache-die policy).
 - **Reference laptop:** mainstream, on battery, with a TPM and IOMMU.
 - **Reference old PC:** around 2012, 4 GiB, no IOMMU (tests hardware tier
-  S3 and "runs on almost anything").
+  D2 and "runs on almost anything").
 - Each is listed by exact model, CPU, microcode, RAM, storage and firmware
   version on the scorecard.
+- **Input-latency rig:** a microcontroller that acts as a USB HID device and
+  sends input, plus a photodiode on the screen, timestamped by the same
+  microcontroller at 0.1 ms resolution or better; each result uses at least
+  10^4 events. Needed by Phase 7 (owner need).
 - The desktop is needed from Phase 1 (real-hardware boot) and as a
   dedicated runner from Phase 2; the rest by Phase 5. These are owner needs.
 
@@ -90,20 +117,23 @@ seeing the results. They can only be made stricter.
 | Longest preempt-off or IRQ-off section | < 50 µs (20 µs from Phase 10) | 2 |
 | Audio underruns at 128 frames, 48 kHz, under full CPU and I/O load | 0 per hour (also reported at 64 and 256 frames) | 6 |
 | Input-to-display latency, P99.9 under full CPU load | no more than 1.5 times its idle P99.9, and no worse than matched Linux | 7 |
-| Frame time P99 in the frame-pacing test at 60 and 144 Hz | ≤ refresh period + 1 ms | 7 |
-| Foreground input latency P99 while a large copy or compile runs | ≤ 1.25 times idle | 4 |
-| Boot time, firmware handoff to kernel ready | < 300 ms | 1 |
+| Frame time P99 in the frame-pacing test at 60 Hz (virtio-gpu and llvmpipe, against Linux on the same graphics stack) | ≤ refresh period + 1 ms | 7 |
+| Frame time P99 at 144 Hz on the reference discrete GPU | ≤ refresh period + 1 ms | 8 |
+| Foreground input latency P99 while a large copy or compile runs | ≤ 1.25 times idle | 7 |
+| Boot time, firmware handoff to kernel ready | < 300 ms (a Phase 1 done-when item) | 1 |
+| Total OS memory at an idle desktop | ≤ 60% of the lightest mainstream Linux desktop on the same machine | 7 |
+| Idle CPU over the defined window | ≤ matched Linux and < 0.5% | 7 |
 
 ## Responsiveness (the main event)
 
 | Metric | Reported as | What it shows | From |
 |---|---|---|---|
 | Input-to-display latency | P50, P99, P99.9 | how quickly a key press or mouse move reaches the screen | 7 |
-| Frame time | P50, P99, variance | consistency of frame pacing, idle and under load | 7 |
+| Frame time | P50, P99, variance | consistency of frame pacing, idle and under load | 7 (60 Hz, virtio-gpu and llvmpipe), 8 (144 Hz, discrete GPU) |
 | Audio underruns | per hour at 64, 128 and 256 frames (48 kHz), idle and under load | real-time scheduling quality | 6 |
 | Scheduling latency under saturation | P99, P99.9 wake-up latency of a real-time thread | whether interactive work cuts through a full system | 2 |
-| Foreground responsiveness during background I/O | input latency and app launch time while a large copy or compile runs | whether background work makes the desktop feel slow | 4 |
-| Memory pressure | input latency P99 and frame time while a 50-tab browser and a compile overcommit 8 GiB | the biggest real cause of stutter | 5 |
+| Foreground responsiveness during background I/O | input latency and app launch time while a large copy or compile runs | whether background work makes the desktop feel slow | 7 |
+| Memory pressure | input latency P99 and frame time with `mem=8G`, 50 pages from a pinned offline corpus and a pinned compile ([scheduler.md](scheduler.md)) | the biggest real cause of stutter | 7 |
 | App launch time | cold and warm, P50/P99 | first impression speed | 5 |
 
 ## Core kernel costs
@@ -119,7 +149,7 @@ seeing the results. They can only be made stricter.
 | TLB shootdown latency against core count | 2 |
 | Memory allocation (kernel and user) | 1 (kernel), 3 (user) |
 | Cross-NUMA-node memory latency and bandwidth | 2 |
-| Storage set (see [storage.md](storage.md)): fio 4k random read QD1/QD32, 4k random overwrite QD32, 1M sequential write QD8, fsync P50/P99/P99.9, SQLite WAL, pgbench, git checkout and status, untar, metadata microbenchmarks; on aged file systems with encryption on for both | 4 |
+| Storage set (see [storage.md](storage.md)): the Phase 4 subset (fio 4k random read QD1/QD32, 4k random overwrite QD32, 1M sequential write QD8, fsync P50/P99/P99.9, metadata microbenchmarks) on aged ext4 with encryption on for both; the full set (adding SQLite WAL, pgbench, git checkout and status, untar) from Phase 5 | 4, 5 |
 | Driver tier cost: per-I/O latency and throughput for the same device in tier 1, 2 and 3 | 4 |
 | IOMMU strict-invalidation cost | 4 |
 | Network throughput and latency (TCP and UDP, 1 and 8 streams, on a named NIC at a named link speed) | 6 |
@@ -143,6 +173,8 @@ the CPU has it), so a win bought with extra watts is visible.
    without swapping, at that same moment.
 
 Reclaimable caches are reported separately and never counted as "used".
+Memory is reported from Phase 3 (kernel only) and in full from Phase 7, when
+there is a desktop to measure.
 Measured on each reference machine and on the CI VM. Targets: total OS memory
 at an idle desktop at most 60% of the lightest mainstream Linux desktop
 measured on the same machine, tightened as data comes in.
@@ -151,7 +183,7 @@ measured on the same machine, tightened as data comes in.
 
 - **Idle CPU:** percentage of CPU time not idle, averaged over a 10-minute
   window starting 5 minutes after the desktop is ready, no input, network
-  connected. Target: at most matched Linux's, and below 0.5%.
+  connected. Target: at most matched Linux's, and below 0.5%, from Phase 7.
 - **Wake-ups per second** over the same window.
 - **Idle power** over the same window at fixed screen brightness.
 - **Battery life** on the reference laptop at fixed brightness for three
