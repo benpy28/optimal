@@ -209,7 +209,18 @@ scenario "fw-pc-no-smbus-no-sata" boot "$ISO" bios pc,smbus=off,sata=off 256M 1 
 for code in build/firmware/*/OVMF_CODE*.fd; do
     [ -f "$code" ] || continue
     ver="$(basename "$(dirname "$code")")"
-    scenario "fw-ovmf-$ver" boot "$ISO" "ovmf=$code" q35 512M 2 30 kvm
+    case "$ver" in
+        edk2-2022.11-debian12)
+            # Evidence (CI, 2026-11-21): with KVM and `-cpu host` this build
+            # crashes in its own 32-bit PEI phase (CR0=0x33, EFER=0, EIP=0x1369,
+            # wild addresses) before any bootloader runs, on every attempt,
+            # while the same firmware and ISO pass under TCG. So it is a
+            # firmware/host-CPU incompatibility, not ours: under KVM it runs
+            # with a plain qemu64 CPU model instead.
+            scenario "fw-ovmf-$ver-kvm-qemu64" boot "$ISO" "ovmf=$code" q35 512M 2 30 kvm -- -cpu qemu64 ;;
+        *)
+            scenario "fw-ovmf-$ver" boot "$ISO" "ovmf=$code" q35 512M 2 30 kvm ;;
+    esac
     # Same firmware on an emulated CPU (different CPUID, no KVM): firmware
     # bugs often depend on exactly what the CPU reports.
     scenario "fw-ovmf-$ver-tcg-qemu64" boot "$ISO" "ovmf=$code" q35 512M 2 40 tcg -- -cpu qemu64
