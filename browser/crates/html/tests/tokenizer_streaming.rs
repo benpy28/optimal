@@ -119,7 +119,11 @@ fn whitespace_ends_the_double_escape_words() {
         // Into double-escaped: the first </script> is text, the second
         // (after leaving with "</script>" + ws) is a real end tag.
         let input = format!("<!--<script{ws}</script>-->");
-        assert_eq!(script(&input), vec![chars(&input)], "start word ended by {ws:?}");
+        assert_eq!(
+            script(&input),
+            vec![chars(&input)],
+            "start word ended by {ws:?}"
+        );
         let input = format!("<!--<script>x</script{ws}y</script>z");
         let text = format!("<!--<script>x</script{ws}y");
         assert_eq!(
