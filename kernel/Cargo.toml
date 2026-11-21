@@ -1,0 +1,17 @@
+[package]
+name = "optimal-kernel"
+version = "0.0.1"
+edition = "2024"
+publish = false
+
+[dependencies]
+# Rust bindings for the Limine boot protocol (MIT OR Apache-2.0).
+limine = "0.5"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = 3
+debug = true

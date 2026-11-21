@@ -1,0 +1,58 @@
+name: Kernel
+
+# Builds the Optimal kernel, packs it into a bootable ISO, and boots that ISO in
+# QEMU (BIOS and UEFI). The run fails if the kernel doesn't print its boot line.
+# The ISO is attached to each run under Artifacts, ready to flash to a USB stick.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-boot:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable KVM so QEMU runs at full speed
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Install QEMU, xorriso and UEFI firmware
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 xorriso ovmf
+
+      - name: Install Rust (version pinned in kernel/rust-toolchain.toml)
+        working-directory: kernel
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Lint
+        working-directory: kernel
+        run: |
+          rustup component add clippy rustfmt
+          cargo fmt --check
+          cargo clippy --release -- -D warnings
+
+      - name: Build kernel and ISO
+        run: ./scripts/build-iso.sh
+
+      - name: Boot test matrix in QEMU (64 virtual PCs, each booted 3 times)
+        env:
+          REPEAT: "3"
+        run: ./scripts/boot-test.sh
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: optimal-iso
+          path: |
+            build/optimal.iso
+            build/boot-logs/
+          retention-days: 14
