@@ -205,6 +205,34 @@ mod tests {
     }
 
     #[test]
+    fn static_names_have_small_indices() {
+        assert_eq!(static_name_count(), STATIC_NAMES.len());
+        assert!(
+            static_name_count() > 100,
+            "the HTML tag names alone are more"
+        );
+        assert_eq!(
+            local::DIV.index(),
+            STATIC_NAMES.iter().position(|&s| s == "div").unwrap()
+        );
+        assert!(local::ANNOTATION_XML.index() < static_name_count());
+    }
+
+    #[test]
+    fn namespace_urls() {
+        assert_eq!(Namespace::None.url(), "");
+        assert_eq!(Namespace::Html.url(), "http://www.w3.org/1999/xhtml");
+        assert_eq!(
+            Namespace::MathMl.url(),
+            "http://www.w3.org/1998/Math/MathML"
+        );
+        assert_eq!(Namespace::Svg.url(), "http://www.w3.org/2000/svg");
+        assert_eq!(Namespace::XLink.url(), "http://www.w3.org/1999/xlink");
+        assert_eq!(Namespace::Xml.url(), "http://www.w3.org/XML/1998/namespace");
+        assert_eq!(Namespace::Xmlns.url(), "http://www.w3.org/2000/xmlns/");
+    }
+
+    #[test]
     fn dynamic_names_intern_once() {
         let mut i = Interner::new();
         let a = i.intern_str("my-element");
@@ -215,6 +243,10 @@ mod tests {
         assert_eq!(i.text(a), "my-element");
         assert_eq!(i.get(Wtf8::from_str("other")), Some(c));
         assert_eq!(i.get(Wtf8::from_str("missing")), None);
+        // Each new name gets the next index after the static ones.
+        assert_eq!(a.index(), static_name_count());
+        assert_eq!(c.index(), static_name_count() + 1);
+        assert_eq!(i.text(c), "other");
         // Case matters: names are already lowercased where HTML requires it.
         assert_ne!(i.intern_str("DIV"), local::DIV);
     }

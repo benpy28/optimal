@@ -59,6 +59,125 @@ fn refuses_foreign_reference_child() {
     d.insert_before(a, b, Some(c));
 }
 
+#[test]
+fn element_queries_by_hand() {
+    let mut d = Document::new();
+    let names = &mut d.names;
+    let id_attr = Attribute {
+        namespace: Namespace::None,
+        prefix: None,
+        local: local::ID,
+        value: Wtf8Buf::from("x"),
+    };
+    let xlink_href = Attribute {
+        namespace: Namespace::XLink,
+        prefix: Some(names.intern_str("xlink")),
+        local: names.intern_str("href"),
+        value: Wtf8Buf::from("#a"),
+    };
+    let href = d.names.intern_str("href");
+    let div = d.create_element(Namespace::Html, local::DIV, vec![xlink_href, id_attr]);
+    let svg_div = d.create_element(Namespace::Svg, local::DIV, vec![]);
+    let e = d.element(div).unwrap();
+    assert!(e.is_html(local::DIV));
+    assert!(!e.is_html(local::SPAN));
+    assert!(!d.element(svg_div).unwrap().is_html(local::DIV));
+    assert!(!d.element(svg_div).unwrap().is_html(local::SPAN));
+    assert_eq!(e.attribute(local::ID), Some(Wtf8::from_str("x")));
+    // Only attributes with no namespace count.
+    assert_eq!(e.attribute(href), None);
+    assert_eq!(e.attribute(local::CLASS), None);
+
+    // element_mut reaches the same element; text nodes are not elements.
+    d.element_mut(div).unwrap().attributes.pop();
+    assert_eq!(d.element(div).unwrap().attribute(local::ID), None);
+    let t = text(&mut d, "t");
+    assert!(d.element(t).is_none() && d.element_mut(t).is_none());
+
+    // has_element_child looks for elements, not just any child.
+    let host = d.create_element(Namespace::Html, local::DIV, vec![]);
+    d.append(host, t);
+    assert!(!d.has_element_child(host));
+    d.append(host, svg_div);
+    assert!(d.has_element_child(host));
+    assert_eq!(d.name_text(local::DIV), "div");
+    assert_eq!(d.name_text(href), "href");
+    // Root, div, svg div, text, host: and no template fragments.
+    assert_eq!(d.node_count(), 5);
+}
+
+#[test]
+fn links_by_hand() {
+    let mut d = Document::new();
+    let p = d.create_element(Namespace::Html, local::P, vec![]);
+    let a = text(&mut d, "a");
+    let b = text(&mut d, "b");
+    d.append(p, a);
+    d.append(p, b);
+    assert_eq!(d.first_child(p), Some(a));
+    assert_eq!(d.last_child(p), Some(b));
+    assert_eq!(d.prev_sibling(b), Some(a));
+    assert_eq!(d.prev_sibling(a), None);
+    assert_eq!(d.next_sibling(a), Some(b));
+    assert_eq!(d.next_sibling(b), None);
+    assert_eq!((a.index(), b.index()), (2, 3));
+}
+
+/// check_invariants must notice each kind of broken link. The tree is broken
+/// on purpose through the private fields.
+#[test]
+fn invariant_check_catches_bad_links() {
+    fn tree() -> (Document, NodeId, NodeId, NodeId) {
+        let mut d = Document::new();
+        let p = d.create_element(Namespace::Html, local::P, vec![]);
+        let a = text(&mut d, "a");
+        let b = text(&mut d, "b");
+        d.append(p, a);
+        d.append(p, b);
+        d.check_invariants();
+        (d, p, a, b)
+    }
+    type Break = fn(&mut Document, NodeId, NodeId, NodeId);
+    let breaks: [(&str, Break); 5] = [
+        ("child's parent link", |d, _, a, _| {
+            d.nodes[a.index()].parent = None
+        }),
+        ("prev link", |d, _, _, b| {
+            d.nodes[b.index()].prev_sibling = None
+        }),
+        ("last child link", |d, p, a, _| {
+            d.nodes[p.index()].last_child = Some(a)
+        }),
+        ("detached", |d, _, _, b| {
+            d.remove(b);
+            d.nodes[b.index()].next_sibling = Some(b);
+        }),
+        ("cycle", |d, p, a, _| d.nodes[p.index()].parent = Some(a)),
+    ];
+    for (what, f) in breaks {
+        let (mut d, p, a, b) = tree();
+        f(&mut d, p, a, b);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| d.check_invariants()));
+        assert!(r.is_err(), "missed a broken {what}");
+    }
+}
+
+#[test]
+fn moving_children_to_the_same_parent_keeps_them() {
+    let mut d = Document::new();
+    let p = d.create_element(Namespace::Html, local::P, vec![]);
+    let q = d.create_element(Namespace::Html, local::P, vec![]);
+    let a = text(&mut d, "a");
+    let b = text(&mut d, "b");
+    d.append(p, a);
+    d.append(p, b);
+    d.move_children(p, p);
+    assert_eq!(d.children(p).collect::<Vec<_>>(), vec![a, b]);
+    d.move_children(p, q);
+    assert_eq!(d.children(q).collect::<Vec<_>>(), vec![a, b]);
+    assert_eq!(d.first_child(p), None);
+}
+
 #[derive(Debug, Clone)]
 enum Op {
     Create,
@@ -162,8 +281,17 @@ proptest! {
         for (i, list) in kids.iter().enumerate() {
             let got: Vec<NodeId> = d.children(ids[i]).collect();
             let want: Vec<NodeId> = list.iter().map(|&k| ids[k]).collect();
-            prop_assert_eq!(got, want);
+            prop_assert_eq!(d.first_child(ids[i]), want.first().copied());
+            prop_assert_eq!(d.last_child(ids[i]), want.last().copied());
+            prop_assert_eq!(d.has_element_child(ids[i]), !want.is_empty());
+            for (k, &w) in want.iter().enumerate() {
+                prop_assert_eq!(d.prev_sibling(w), k.checked_sub(1).map(|j| want[j]));
+                prop_assert_eq!(d.next_sibling(w), want.get(k + 1).copied());
+            }
+            prop_assert_eq!(&got, &want);
             prop_assert_eq!(d.parent(ids[i]), parent[i].map(|p| ids[p]));
+            prop_assert_eq!(ids[i].index(), i);
         }
+        prop_assert_eq!(d.node_count(), ids.len());
     }
 }

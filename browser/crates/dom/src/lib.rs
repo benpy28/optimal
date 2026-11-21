@@ -391,17 +391,18 @@ impl Document {
     pub fn check_invariants(&self) {
         for (i, n) in self.nodes.iter().enumerate() {
             let id = NodeId(i as u32);
+            // The prev-link check also rules out a sibling cycle, so this
+            // walk always ends: if the walk first came back to a node, that
+            // node's prev link would have to name two different nodes (or
+            // be None, for the first child).
             let mut prev = None;
             let mut c = n.first_child;
-            let mut count = 0usize;
             while let Some(x) = c {
                 let xn = &self.nodes[x.index()];
                 assert_eq!(xn.parent, Some(id), "child's parent link");
                 assert_eq!(xn.prev_sibling, prev, "prev link");
                 prev = Some(x);
                 c = xn.next_sibling;
-                count += 1;
-                assert!(count <= self.nodes.len(), "sibling cycle");
             }
             assert_eq!(n.last_child, prev, "last child link");
             if n.parent.is_none() {
