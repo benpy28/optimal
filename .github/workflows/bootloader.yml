@@ -54,6 +54,7 @@ jobs:
           cargo clippy -p optimal-boot-sign -- -D warnings
           OPTIMAL_BOOT_PUBKEYS=/tmp/ci.pub cargo clippy -p optimal-boot --target x86_64-unknown-uefi -- -D warnings
           cargo clippy -p optimal-boot-conformance --target x86_64-unknown-none -- -D warnings
+          cargo clippy -p optimal-boot-quirk --target x86_64-unknown-uefi -- -D warnings
 
   # Every case boots the conformance kernel under Optimal Boot AND under
   # Limine (the reference): a check failing only under ours is our bug.
@@ -63,7 +64,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        case: [r3, r4, r5, r6, pie, entry, la57, tpm, iommu-intel, iommu-amd, smp, big, small, headless, old-cpu]
+        case: [r3, r4, r5, r6, pie, entry, la57, tpm, iommu-intel, iommu-amd, smp, big, small, headless, old-cpu,
+               quirk-r3, quirk, quirk-x2apic, quirk-apic-off, quirk-iommu-intel, quirk-iommu-amd]
     defaults:
       run:
         working-directory: bootloader
@@ -95,4 +97,40 @@ jobs:
         with:
           name: conformance-${{ matrix.case }}
           path: build/ob/*.log
+          if-no-files-found: ignore
+
+  # The firmware-quirk injector must refuse bad input rather than run a
+  # weaker test, and every deliberate break of the loader's machine-state
+  # code must be caught by a quirk case.
+  quirk-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: bootloader
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (version pinned in bootloader/rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Install QEMU, OVMF and image tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q qemu-system-x86 ovmf xorriso mtools dosfstools fdisk
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm || true
+
+      - name: Injector refusals
+        run: scripts/quirk-refusals.sh
+
+      - name: Loader mutants (each must be killed)
+        run: scripts/loader-mutants.sh
+
+      - name: Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quirk-tests
+          path: build/ob/*.out
           if-no-files-found: ignore

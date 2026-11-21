@@ -133,7 +133,10 @@ impl Lapic {
 /// Base revision 5 local APIC state: enabled, SVR = 0x1FF, TPR = 0, LVT
 /// entries masked, and LINT pins wired as NMIs where the MADT says so.
 pub fn init_lapic(p: &Platform) {
-    if !hw::features().apic {
+    // CPUID.1:EDX.APIC mirrors IA32_APIC_BASE.EN, so firmware that left the
+    // APIC globally disabled makes CPUID say there is none. A MADT means
+    // the hardware is there (and IA32_APIC_BASE with it), so trust either.
+    if !hw::features().apic && p.madt.is_none() {
         return;
     }
     // SAFETY: IA32_APIC_BASE exists on every CPU with an APIC.
@@ -142,6 +145,14 @@ pub fn init_lapic(p: &Platform) {
         apic_base |= 1 << 11;
         // SAFETY: setting the global enable bit is always valid.
         unsafe { hw::wrmsr(IA32_APIC_BASE, apic_base) };
+        // Some CPUs (P6-era, and QEMU's emulated APIC) cannot re-enable a
+        // globally disabled APIC before a reset. Then it is not available,
+        // and its registers must not be touched.
+        // SAFETY: as above.
+        apic_base = unsafe { hw::rdmsr(IA32_APIC_BASE) };
+        if apic_base & (1 << 11) == 0 {
+            return;
+        }
     }
     let lapic = Lapic {
         x2: apic_base & (1 << 10) != 0,
