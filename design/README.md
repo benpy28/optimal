@@ -54,7 +54,7 @@ One line each: what was chosen, why, and what was rejected.
 - KASLR entropy is tested on 10^6 host draws plus distinct bases in 100 boots, because 100 samples can't show 9 bits; rejected: a boot-count-only test. (Round 3: at least 2^16 slots, 90B at least 9 bits, at least 95 distinct bases.)
 - Secure Boot has two paths, a Microsoft-signed shim or owner keys; rejected: MOK-only, because shim is the thing MOK depends on.
 - PCR 7 is bound at install and resealed through a PolicyOR, because it can't be predicted in CI; rejected: signing PCR 7 values.
-- Phase 4 gets read-write ext4 only on volumes our own mkfs created, with a fixed feature list and a differential `e2fsck` gate; rejected: read-only until the own file system, or read-write on any ext4.
+- Phase 4a gets read-write ext4 only on volumes our own mkfs created, with a fixed feature list and a differential `e2fsck` gate; rejected: read-only until the own file system, or read-write on any ext4.
 - Phase 4 splits into 4a (storage) and 4b (trusted chain, entered once Optimal Boot measures), so storage isn't blocked by the bootloader track; rejected: one phase gated on both.
 - The terminal gets home minus protected paths and no network by default; rejected: whole home with network.
 - Gate rule is 2% point estimate or 1% CI bound, Holm–Bonferroni corrected, plus a 3% per-release budget; rejected: the round-1 "CI entirely beyond 3%" rule, which let steady 2% losses through.

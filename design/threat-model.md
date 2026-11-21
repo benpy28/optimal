@@ -22,15 +22,17 @@ makes.
    escrow, no remote access, no account required. Updates can change code,
    so update signing is part of the trusted base and has its own defences
    ([boot.md](boot.md)).
-4. **A stolen or lost device** that is powered off gives up no user data. A
-   locked or suspended one gives up no data in the protected classes
-   ([storage.md](storage.md)), whose keys are evicted by default. Until
-   disk encryption stage 2, the scorecard shows this part as "partial".
+4. **A stolen or lost device** that is powered off or suspended gives up no
+   user data without the PIN or passphrase: at suspend every disk, user,
+   class and per-file key is wrapped into the resume object and wiped, and
+   that object needs an Argon2id PIN search even with the TPM's secrets
+   extracted ([storage.md](storage.md)). A locked one gives up no data in
+   the protected classes, whose keys are evicted on lock. Until disk
+   encryption stage 2, the scorecard shows the locked part as "partial".
 
 What it does **not** promise: that an app the user granted access to a file
 won't misuse that file. Grants are explicit and narrow so the damage is
-bounded: apps start with no file or device grants, and the default profile
-includes outbound network only.
+bounded: apps start with no file, device or network grants.
 
 ## Attackers
 
@@ -46,14 +48,21 @@ includes outbound network only.
 
 Out of scope, said out loud: chip decapping, a malicious CPU or firmware
 vendor, and cold-boot attacks on DRAM of a running, unlocked machine.
-(Memory encryption, AMD SME and Intel TME, is enabled where present, and the
-scorecard says whether it is on.) Firmware TPMs (AMD fTPM, Intel PTT) are
+(Memory encryption, AMD SME and Intel TME, is enabled where present from
+Phase 11 at the latest, and the scorecard says whether it is on; test in
+the table below.) Rowhammer from an app or a web page (A2, A3) is in scope;
+its defences are under "Side channels". Firmware TPMs (AMD fTPM, Intel PTT) are
 weaker than discrete ones against physical attack (faulTPM showed AMD's can be
 broken in hours), and an active bus interposer can defeat any TPM's sealing.
 So the PIN is never the only secret: it is stretched with Argon2id (memory
 min(1 GiB, RAM/4) but at least 64 MiB, at least 4 passes, passes raised to
-reach about 2 s on the machine; the same rule for every passphrase and KDF,
-[storage.md](storage.md)) and mixed into the disk key ([boot.md](boot.md)).
+reach about 2 s on the machine; the same rule for every passphrase-derived
+key, while the TPM keyslot, whose input is a high-entropy TPM-released
+secret, uses PBKDF2 at its minimum iterations and is listed in the floor
+test, [storage.md](storage.md)) and mixed into every sealed key: each sealed
+TPM object (disk secret, service-key secret S, resume object, hibernation
+key) seals only a random R, and the real key material is AEAD-encrypted
+under HKDF(R ‖ stretched-PIN half 2) ([boot.md](boot.md)).
 An encrypted install needs at least 256 MiB of RAM. A PIN is allowed
 only with a discrete TPM; on fTPM machines install requires a passphrase
 estimated at 60 bits or more instead. Against those attacks disk protection
@@ -72,14 +81,18 @@ core".
 - Every device with ATS enabled, and its firmware: its translated requests
   bypass the IOMMU. Each is listed here per machine and on the scorecard
   ([drivers.md](drivers.md)).
-- The bootloader ([boot.md](boot.md)) and the recovery image.
+- The bootloader ([boot.md](boot.md)) and the recovery image. `bootloader/`
+  falls under [core.md](core.md)'s rules (its own unsafe cap, a TCB budget in the table below,
+  an exact toolchain pin) and the proofs job: its floor code is in proof
+  target 16's scope, and its crypto (Ed25519 config signatures, SHA-256) is
+  in target 14 ([verification.md](verification.md)).
 - The unsafe kernel core (tier 0), every in-kernel safe-Rust component (tiers
   1 and 2 in [drivers.md](drivers.md)), and every dependency of theirs. This
   includes the TPM service, which lives in the kernel: the kernel alone holds
   raw TPM access, and user space reaches the TPM only through the TPM broker
   API, a capability-gated kernel interface that exposes named operations
-  (unwrap a user key, bump the replay counter, seal a hibernation image key),
-  never raw TPM commands.
+  (unwrap a user key), never raw TPM commands. Sealing the hibernation key
+  and bumping the replay counter are kernel-internal and not in the API.
 - **User-space TCB**, each process with a size budget in the table below.
 - Release and policy signing keys.
 
@@ -97,7 +110,8 @@ change that exceeds one.
 | User service manager (D-Bus activation, `systemd --user` subset) | ours | 10,000 lines |
 | Seat and input service | ours | 8,000 lines |
 | udev-compatible daemon | ours | 6,000 lines |
-| Lock screen | ours | 4,000 lines |
+| Lock screen (on the prompt virtual terminal from Phase 5, in the compositor's prompt layer from Phase 7) | ours | 4,000 lines |
+| SSH agent, GPG agent, secret service (permissively licensed, our own; OpenPGP through a pinned MIT/Apache crate counted in the ledger) | ours | 4,000, 8,000 and 6,000 lines |
 | Store service and Flatpak launcher | ours | 15,000 and 5,000 lines |
 | Document portal file system (tier 3, FUSE protocol) | ours | 6,000 lines |
 | Storage service, log service | ours | 8,000 and 3,000 lines |
@@ -107,6 +121,7 @@ change that exceeds one.
 | Compositor, with XWayland servers' host side | upstream, pinned, patched | 60,000 lines of compositor code |
 | Mesa driver loaded into the compositor | upstream, pinned | measured size; only the present GPU's driver is installed. Exposure: it imports app buffers (dma-buf, shm) for compositing; it never compiles app shaders or runs app command streams, which go to the app's own Mesa and the kernel GPU driver |
 | Audio server permission layer | PipeWire, pinned | measured size |
+| Bootloader (Optimal Boot, all stages) | ours | 15,000 lines, of which at most 3,000 are `unsafe` tier-0 code ([core.md](core.md)); the `core-crypto` crate it shares with the kernel (cap 6,000 lines) is counted once, in the kernel's ledger |
 | Recovery image | ours, plus the release kernel | 10,000 lines beyond the kernel; image at most 64 MiB |
 
 Not trusted: every app, every tier-3 driver, every network peer, every
@@ -127,7 +142,7 @@ measured).
 | **B1** | UEFI Secure Boot on, trusting Optimal (path 1 or 2 in [boot.md](boot.md)), TPM 2.0 | verified and measured boot; TPM + PIN unlock; tamper refuses to unseal |
 | **B2** | Secure Boot on and trusting Optimal, no TPM | verified boot; passphrase-only unlock; no measurement, so an attacker who can get firmware to run their signed code isn't detected by the disk unlock. Anti-rollback holds against OS-level attackers only (against a physical attacker only with owner keys enrolled), and the scorecard says so |
 | **B3** | UEFI with Secure Boot off, or not trusting Optimal (with or without a TPM) | **no verified boot**: the boot chain checks its own signatures but anyone can replace it. TPM sealing is not offered (it would seal to an unverified chain). Passphrase-only unlock |
-| **B4** | Legacy BIOS | as B3 |
+| **B4** | Legacy BIOS | as B3. Until Optimal Boot's BIOS stage lands (bootloader track), B4 boots through static A/B Limine entries with a manual fallback, and the scorecard says "B4: no automatic rollback, no floor" |
 
 Until Optimal Boot path 1 or 2 works on a given PC, that PC is B3, and the
 scorecard says "verified boot: only with owner keys enrolled".
@@ -136,30 +151,40 @@ scorecard says "verified boot: only with owner keys enrolled".
 
 | Tier | Needs | What holds |
 |---|---|---|
-| **D1** | an IOMMU with every PCI segment covered, every IOAPIC and HPET in scope, interrupt remapping on, compatibility format blocked, and x2APIC where present; and DMA blocked before the kernel takes over, by firmware pre-boot DMA protection (the DMAR opt-in flag with PMRs or translation on, or the IVRS equivalent) or by Optimal Boot, which sets a deny-all IOMMU or PMRs before `ExitBootServices` ([drivers.md](drivers.md)) | DMA attacks blocked; per-device isolation. A D1 machine with neither pre-boot protection shows a named "boot DMA window" exposure on the scorecard: from power-on until the kernel's IOMMU setup, a device can DMA into memory, including the kernel image after the loader checked it |
-| **D2** | no IOMMU, or an IOMMU short of D1's conditions; the reason is named | Devices the IOMMU does cover keep their domains. Other DMA attacks from a malicious device, or from compromised device firmware, are **not** blocked. External PCIe tunnels are refused: Bus Master Enable stays clear on Thunderbolt downstream and hotplug bridges and root ports from Phase 1c (a device's own BME is never relied on), and on firmware connection-manager controllers the ICM driver refuses the tunnel. A tier-1 or tier-2 driver bug can't aim DMA at kernel data: `DmaBuffer`s and rings come from a dedicated DMA region and only streaming maps are bounced; descriptor memory the device reads is a `DescRing<D>` whose `Iova` fields are built only from granted handles (no raw byte access); PRP and SGL lists come from typed builders; GPU page-table entries are built only from `DmaBuffer` or `Iova` handles (proof target 13 extended to D2), and a GPU without per-process GPU page tables (pre-PPGTT) gets no acceleration; DMA-address registers (NVMe ASQ/ACQ, ring bases, DCBAAP, display surface, cursor and LUT addresses, SMU DRAM-address messages) are written only by the core from a `DmaBuffer` handle. Tier 3 relies on the IOMMU alone, so on D2 no tier-3 process is given a DMA-capable device. Wi-Fi and Bluetooth radios that do PCIe DMA stay off until the user accepts a warning named "remote DMA exposure", and from then the scorecard says the remote promise does not hold on that machine (USB-attached radios can't DMA and are not affected). Big warning at install, with how to turn the IOMMU on if the firmware can |
+| **D1** | an IOMMU with every PCI segment covered, every IOAPIC and HPET in scope, interrupt remapping on, compatibility format blocked, and x2APIC where present; and DMA blocked before the kernel takes over, by firmware pre-boot DMA protection (the DMAR opt-in flag with PMRs or translation on, or the IVRS equivalent) or by Optimal Boot, which, after all firmware I/O, sets a deny-all IOMMU or PMRs, then calls `ExitBootServices`, then re-checks and re-arms the tables before hand-over ([drivers.md](drivers.md)). PMRs count only if the PMR base and limit registers, read at kernel entry, cover every page the kernel and loader occupy. The deny-all map has one exception list, the same in [boot.md](boot.md) and [drivers.md](drivers.md): the RMRRs, and the firmware framebuffer read-only | DMA attacks blocked; per-device isolation. A D1 machine with neither pre-boot protection shows a named "boot DMA window" exposure on the scorecard: from power-on until the kernel's IOMMU setup, a device can DMA into memory, including the kernel image after the loader checked it |
+| **D2** | no IOMMU, or an IOMMU short of D1's conditions; the reason is named | Devices the IOMMU does cover keep their domains. Other DMA attacks from a malicious device, or from compromised device firmware, are **not** blocked. External PCIe tunnels are refused: from Phase 1c Bus Master Enable stays clear on every external port's bridge or root port (a device's own BME is never relied on), where "external" means the ACPI `ExternalFacingPort` property, Thunderbolt/USB4 topology or a DMAR SATC entry, never the hotplug-capable bit alone; below a non-external hotplug-capable port, devices present at boot may master and devices added after boot are refused; on firmware connection-manager controllers the ICM driver refuses the tunnel. A tier-1 or tier-2 driver bug can't aim DMA at kernel data: `DmaBuffer`s and rings come from a dedicated DMA region and only streaming maps are bounced; descriptor memory the device reads is a `DescRing<D>` whose `Iova` fields are built only from granted handles (no raw byte access); PRP and SGL lists come from typed builders; GPU page-table entries are built only from `DmaBuffer` or `Iova` handles (proof target 13 extended to D2), and a GPU without per-process GPU page tables (pre-PPGTT) gets no acceleration; DMA-address registers (NVMe ASQ/ACQ, ring bases, DCBAAP, display surface, cursor and LUT addresses, SMU DRAM-address messages) are written only by the core from a `DmaBuffer` handle. Tier 3 relies on the IOMMU alone, so on D2 no tier-3 process is given a DMA-capable device. Wi-Fi and Bluetooth radios that do PCIe DMA stay off until the user accepts a warning named "remote DMA exposure", and from then the scorecard says the remote promise does not hold on that machine (USB-attached radios can't DMA and are not affected). Big warning at install, with how to turn the IOMMU on if the firmware can |
 
 ## Rules every component follows
 
 ### Default deny
 
-Apps start with no file or device grants; the default profile includes
-outbound network only. The network is closed inbound. Devices start
-unauthorised. There is no "root that can do anything".
+Apps start with no file, device or network grants: the default profile has
+no network. The network is closed inbound. Devices start unauthorised.
+There is no "root that can do anything".
 
 ### Files and network together are one explicit grant
 
 The most common real-world "remote read" is an app that can both read files
 and phone home. So:
 
-- **Network access** comes from the default profile for a program without a
-  manifest, or is declared in the app's manifest and approved at install, or
-  requested later through the network portal ([capabilities.md](capabilities.md)).
-  It is never prompted for lazily inside a system call. It is enforced by a
+- **Network access** is declared in the app's manifest and shown and
+  approved at install, or, for a program without a manifest, decided at its
+  first outbound use, once per identity and remembered: the first
+  non-loopback `connect` or send returns `ENETUNREACH` immediately (a system
+  call never waits on a human) and the egress filter queues one request
+  for that identity to the broker, which prompts or grants silently by the
+  user's prompt level (below); the app's next attempt uses the answer. It
+  can also be requested through the network portal
+  ([capabilities.md](capabilities.md)). An identity that holds a file grant
+  is always prompted, at every level (the files-and-network floor). Inbound
+  and listening ports and remote-control access (remote desktop, screen
+  sharing, input injection) are separate explicit grants, never implied by
+  outbound network, and always prompted. Network access is enforced by a
   per-identity egress filter checked on every connect and send, not by
   swapping network namespaces, so a grant or revocation reaches sockets that
   are already open. A network grant is **outbound only**. An app without it
   gets `ENETUNREACH`, immediately, for any non-loopback destination. Loopback
+  (a loopback-only TCP/UDP stack from Phase 5, the full stack from Phase 6)
   is per identity: an app reaches loopback ports bound by its own identity,
   and reaching another identity's port (a dev server started from the
   terminal, opened in the browser) needs a per-port grant naming both; that
@@ -175,37 +200,48 @@ and phone home. So:
   longer than one use) and network access can be held together only if the
   user approved that combination explicitly, in a prompt that says so in
   plain words ("This app will be able to read *Documents* and send data to
-  the internet").
+  the internet"). That prompt is part of the floor: it appears at every
+  prompt level.
 - **A file the user picks** in the file chooser for one use (an upload, an
   attachment, "open this photo") is handed to the app as a one-use document-portal entry even if the
   app has network access, because the user chose to give that file to that
   app. It doesn't widen the app's grants.
 - **Secrets are used, not read.** SSH keys, GPG keys, browser and app
-  passwords, and tokens live in agent services (an SSH agent, a GPG agent,
-  the secret service), each its own app. Programs use them through the
-  agent's socket; the agent confirms the first use per session with a
-  prompt naming the requesting app (see below). The files themselves
-  (`~/.ssh`, `~/.gnupg`, keyrings, browser profiles, and every app's
-  private home, `~/.var/app/<id>`, which is mounted as that app's `$HOME`)
-  are **protected paths**, never part of any folder grant.
+  passwords, and tokens live in agent services (the SSH agent, the GPG
+  agent, the secret service), which are TCB services with budgets in the
+  table above. Programs use them through the agent's socket; the agent
+  confirms the first use per session with a prompt through the broker
+  naming the requesting app (see below). The files themselves (`~/.ssh`,
+  `~/.gnupg`, keyrings, browser profiles, and every app's private home,
+  keyed by its identity ID and mounted as that app's `$HOME`; for a Flatpak
+  app `~/.var/app/<app id>` at its own path, as on Flatpak,
+  [capabilities.md](capabilities.md)) are **protected paths**, never part
+  of any folder grant.
   So are the places that decide what runs with which identity:
   `~/.config/autostart`, `~/.local/share/applications`, `~/Applications`,
   `~/.local/share/dbus-1/services`, `~/.config/systemd/user`,
-  `~/.config/environment.d`, `~/.config/mimeapps.list`, and the whole
-  install directory of every unpackaged app that holds a grant (its
-  executable, libraries and data files such as `app.asar`). These are
-  written only through the launcher portal. `~/.local/bin` is protected from
+  `~/.config/environment.d`, `~/.config/mimeapps.list`, the whole install
+  directory of every desktop-launched unpackaged program (its executable,
+  libraries and data files such as `app.asar`), and for an interpreted app
+  its script's own directory tree. These are written only through the
+  launcher portal. The shared settings projected into every view
+  (`~/.config/gtk-3.0`, `~/.config/fontconfig`, `~/.local/share/fonts`) are
+  protected paths written only by the settings portal. `~/.local/bin` is protected from
   every identity except the terminal's, which can write it so
   `pip install --user` and `cargo install` work; what is written there
   carries the kernel provenance attribute (below).
 - **Writable grants name their readers.** Data an app writes into a folder
   that another app may read is reachable by that app, so a folder one
-  identity can write and another can read joins the two as a direct channel
-  (below), and the prompt for a writable folder grant names every app
-  holding network together with a grant to that folder. A writable grant to
-  any folder inside the terminal's home is a direct channel to the terminal,
-  because the terminal runs what is written there (`.git/hooks`, a
-  `Makefile`, `.envrc`); its prompt says "*App* can run code as Terminal".
+  identity can write and another can read is a direct channel from the
+  writer to the reader (below), and the prompt for a writable folder grant
+  names every app holding network together with a grant to that folder.
+  The terminal's reads of the home don't count as a channel: executing a
+  file another identity wrote is refused by provenance until approved
+  (below), and the rest is data. Files the terminal's tools run without
+  exec (`Makefile`, `.envrc`, a sourced script) are covered by the grant
+  instead: a writable grant to a folder inside the terminal's home says
+  "*App* can run code as Terminal" in its prompt, and that prompt is in the
+  floor whenever the terminal holds network.
 
 ### The terminal
 
@@ -214,14 +250,20 @@ user's home directory **minus the protected paths**, and that is the one
 broad home grant in the system. It is not given network access by default;
 the first time a program run from it needs the network, the shell reports
 the denial and the terminal shows a one-click request for the
-"terminal: home + network" combination, with the warning above. Programs
-run from the terminal inherit the terminal's identity (that's what makes
-`git`, `make` and `cargo` work unchanged), so a user who grants both is
+"terminal: home + network" combination, with the warning above (a floor
+prompt). Programs run from the terminal inherit the terminal's identity
+(that's what makes `git`, `make` and `cargo` work unchanged), except a
+registered app's executable: when the terminal execs one (`firefox` typed
+in a shell), the exec goes through the launcher and runs under that app's
+own identity, with a fresh pty, stdio relayed, and the shell waiting on a
+pidfd, so one app never has two diverging identities. A user who grants both is
 explicitly trusting what they run there; protected paths stay out of reach
 either way, which is what keeps `curl | sh` from reaching SSH keys. A
 terminal-identity process that execs a file whose provenance is another
-identity gets `EACCES` until the user approves that file in a prompt naming
-its provenance. When the launcher spawns a different identity from a
+identity, "removable" or "downloaded" gets `EACCES` until the user approves
+that file in a prompt naming its provenance. Updates the terminal itself
+writes to an app installed from the terminal (`pip install --upgrade`) count
+as the same owner after one prompt. When the launcher spawns a different identity from a
 terminal (`flatpak run`, a desktop file), that process gets a fresh pty, so
 it can't inject input into the terminal. The launcher relays that pty's
 output to the terminal with OSC 52 (clipboard write), title-set and
@@ -232,38 +274,62 @@ foreign identity (lockdown table).
 
 Grants belong to an identity, so the identity has to be unforgeable:
 
-- A packaged app's identity is its store or Flatpak ID. An unpackaged
+- A packaged app's identity is its store or Flatpak ID **plus its
+  publisher's or remote's signing key**; a change of key is a new identity,
+  which resets its grants and its private home, so an administrator's
+  system-wide app with the same ID inherits nothing. An unpackaged
   program's identity is its **path plus the hash of its launch closure**:
   the executable, its `PT_INTERP` and every library loaded from a path
-  outside the system image; for an interpreter, the interpreter plus the
-  script's hash (plus the argument string for `-c` style calls, so
-  `python3 a.py`, `python3 b.py` and `sh -c '<x>'` are three identities);
-  for an AppImage, the AppImage file. When the hash changes, its grants
-  reset, except that grants carry across an update whose writer's
-  provenance is the app itself (a self-updater such as Steam or a Firefox
-  tarball).
+  outside the system image; for an interpreter, the interpreter, the
+  script, every file the interpreter opens from the script's own directory
+  tree, and the site-packages and classpath roots listed for the app (plus
+  the argument string for `-c` style calls, so `python3 a.py`, `python3
+  b.py` and `sh -c '<x>'` are three identities); for an AppImage, the
+  AppImage file. When the hash changes, its grants reset, except that
+  grants carry across an update whose writer's provenance is the app
+  itself (a self-updater such as Steam or a Firefox tarball), or, for a
+  child identity, its declared parent writing paths the parent's manifest
+  shares with it (Steam updating a game or Proton).
+- Grants and the private home are keyed by the **identity ID** = (path,
+  lineage ID, argument-string hash). The lineage ID is created at the
+  first grant and carried only across the provenance-approved updates
+  above, so a binary replaced at the same path by another writer gets an
+  empty home, and two `-c` identities get disjoint homes
+  ([capabilities.md](capabilities.md)).
 - An executable written by an app identity carries that identity as its
   provenance, in a kernel-set extended attribute no app can write or
-  remove. Launched from the desktop the first time, it gets no network
-  until a prompt naming it and its provenance is approved. The service
-  manager and D-Bus activation apply the same provenance rule to what they
-  start.
+  remove. Files copied from removable media carry provenance "removable"
+  and files a browser identity writes into its download folder carry
+  "downloaded" (set by the kernel from the writer's identity, not by the
+  browser's own say-so). An executable with any of these provenances, launched from
+  the desktop, runs as a new identity with no grants and no network until
+  a prompt naming it and its provenance is approved; from the terminal it
+  gets `EACCES` until approved (above). The service manager and D-Bus
+  activation apply the same provenance rule to what they start.
 - Only the launcher and the service manager hold the kernel capability
   "spawn with identity X". Every other process's children get the parent's
   identity, with grants only within the parent's.
-- Two identities that share a direct channel (parent and child, D-Bus peers,
+- Identities that share a direct channel (parent and child, D-Bus peers,
   shared IPC objects, a loopback connection between them, a folder one can
   write and the other can read, and traffic one relays to the other through
-  PipeWire or D-Bus) are checked **as one principal**. The check is
-  transitive: each session keeps a union-find of identities joined by any
-  direct channel, live or past, and the union of the grants of the whole
-  component must pass the files-and-network rule above, or the new channel
-  is refused. Components split only at logout. Each app has its own IPC
-  namespace (System V IPC, POSIX message queues, abstract Unix sockets).
-  The overt channels are a closed list checked in as `design/channels.toml`, each
-  with a test; covert channels (CPU and cache timing, `statfs` free space,
-  lock contention) are out of scope, and their measured bandwidth is
-  published on the scorecard.
+  PipeWire or D-Bus) are checked **as one principal**. Channels are
+  directional, writer to reader; two-way channels (sockets, D-Bus, shared
+  memory) point both ways. Each session keeps a graph of identities joined
+  by any direct channel, live or past, until logout. The files a networked
+  identity can reach are the file grants of every identity with a path to
+  it, and they must be covered by a **combined approval**: one prompt that
+  names that file set and the networked members, asked again whenever the
+  component grows. The check runs on every new channel and on every new
+  grant (network, folder, inbound port, persistent document) to any member,
+  against the whole component. A channel or grant that would need an
+  approval the user refuses is refused at the moment it is asked for, with
+  a reason the app and Settings both show ("*App* shares files with
+  *Other app*, which has the internet"). Each app has its own IPC namespace
+  (System V IPC, POSIX message queues, abstract Unix sockets). The overt
+  channels are a closed list checked in as `design/channels.toml`, listing
+  every portal and channel, each with a test; covert channels (CPU and
+  cache timing, `statfs` free space, lock contention) are out of scope, and
+  their measured bandwidth is published on the scorecard.
 
 ### Prompts can't be spoofed
 
@@ -288,6 +354,47 @@ can't read another device's keys. The polled xHCI boot-keyboard reader stops
 when the Phase 6 xHCI driver binds. The PIN on resume from suspend is typed
 through the in-kernel paths, which work while user space is frozen.
 
+Bluetooth is off until the user pairs a device, and pairing is confirmed on
+the trusted path. Link keys are held in the tier-2 Bluetooth transport, never
+in the tier-3 stack, and input events from Bluetooth reach any app only from
+a paired HID device's link, so an over-the-air exploit of the stack can't
+type into the focused app ([drivers.md](drivers.md)). The residual risk,
+compromised radio firmware injecting input on a paired keyboard's link, is
+listed on the scorecard.
+
+The lock screen fails closed: if it crashes or is killed, the session stays
+locked and the kernel switches to the prompt virtual terminal, which asks
+for the login secret.
+
+### How often Optimal asks
+
+Prompts are only a defence if people read them, so their number is a
+measured budget ([capabilities.md](capabilities.md) has the mechanism and
+the closed "suspicious" list). Grants are remembered, defaults are safe, and
+wording is plain. The user picks one prompt level, a TCB setting changed
+only on the trusted path (no app can change it through any portal or
+file): **"Always ask"**, **"Only when suspicious"** (the default) or
+**"Almost never"**. Below the chosen level a request is granted silently and
+logged, visible and revocable in Settings. Whatever the level, the **floor**
+always prompts, and Settings explains it in plain words:
+
+- inbound remote access, remote control and screen sharing;
+- a new keyboard-like (HID) interface, which also types the shown code (a
+  remembered keyboard re-plugged into the same port excepted, "USB and
+  external devices");
+- files and network for the same identity or component (the remote-read
+  promise).
+
+Tests: each entry of the suspicious list prompts at "Only when suspicious"
+(6 for the device and network entries, 7 for the rest); each floor item
+prompts at "Almost never" (6 for devices, inbound and files + network, 7 for
+remote control and screen sharing); an app that tries to change the level,
+through every portal and by writing the settings file, fails (5); the
+scripted "typical day" (install 5 apps, browse, download, plug in a known
+keyboard and a USB stick) shows at most 5 prompts after first-run at the
+default level, counted by the test, and the count is the scorecard row
+"prompts per typical day" (7).
+
 ### No confused deputies
 
 The launcher portal, the open-URI portal, file and URL handlers and D-Bus
@@ -297,8 +404,11 @@ both apps. The terminal can't be started with a command by another
 app at all.
 
 Every TCB service that sends traffic for an app (the resolver, open-URI,
-notifications, the email portal) checks the caller's grants first, because
-a networked deputy is a way out for an app without network. Open-URI with
+notifications, the email portal, the print portal) checks the caller's
+grants first, because a networked deputy is a way out for an app without
+network. Printing from an app without network needs a prompt naming the
+destination printer and its address, so a printer an attacker advertises
+over mDNS can't receive a document silently. Open-URI with
 any scheme other than `file` from an identity without outbound network
 shows a prompt naming both apps and the full URL, so
 `https://evil/?d=<data>` is visible before it is sent. The OAuth rule that
@@ -341,12 +451,16 @@ crosses app boundaries without the file system is mediated per app:
 
 Foreign and removable file systems, USB class drivers, HID report
 descriptors, the 802.11 and Bluetooth stacks, image and font decoding for
-the TCB, and network configuration protocols (DHCP, router advertisements)
-run in tier 3 or in sandboxed services ([drivers.md](drivers.md)). Wi-Fi and
-Bluetooth are split on every machine: a small tier-2 transport part (rings
-and DMA, no frame parsing) and the tier-3 stack. What stays in the kernel
-(TCP/IP, the system file system, the boot-protocol keyboard paths, the
-internal I2C-HID keyboard parser, the radio transport parts, and the
+the TCB, and network configuration and naming (DHCP, router advertisements,
+and DNS in the resolver) run in tier 3 or in sandboxed user-space services
+([drivers.md](drivers.md)). Wi-Fi and Bluetooth are split on every machine:
+a small tier-2 transport part (rings and DMA, no frame parsing) and the
+tier-3 stack. Proof target 15, the network-path parsers, lists each parser
+with its component: in the kernel IP, TCP, UDP, ICMP and ND; in sandboxed
+user-space services DHCP, RA and DNS ([verification.md](verification.md)).
+What stays in the kernel (those packet parsers, the system file system, the
+boot-protocol keyboard paths, the internal I2C-HID keyboard parser, the
+radio transport parts, and the
 pre-cap parser that reads the fixed-format Optimal header block before PCRs
 are capped, [boot.md](boot.md)) is continuously fuzzed from the phase it
 lands in (the pre-cap parser from 4b), to the thresholds in
@@ -374,7 +488,8 @@ it needs:
 | Cross-process branch poisoning | IBPB when switching between different apps, RSB filling on context switch |
 | Speculative store bypass | SSBD for processes that ask (prctl) and always for sandboxed renderer processes that declare it in their manifest |
 | MDS, TAA, MMIO stale data, RFDS | buffer clearing (`VERW`) on kernel exit; TSX disabled through `TSX_CTRL` where microcode allows; SMT per the rule below |
-| GDS | microcode mitigation required; without it, AVX gather is disabled for apps |
+| GDS | microcode mitigation; without it, AVX is disabled for apps through XCR0 (gather alone can't be turned off) |
+| Rowhammer | page tables come from a separate physical zone with guard rows around it; ECC and TRR errors are read and reported where the platform exposes them; the refresh policy is reported (the memory controller's refresh interval where it is documented, and whether the firmware's double-refresh setting is on, which Settings recommends), and the scorecard says which of these hold and that Rowhammer stays a residual risk |
 
 **SMT.** On CPUs affected by MDS, L1TF, TAA or RFDS, **SMT is off by
 default**, because a sibling thread can read kernel data that buffer clearing
@@ -403,18 +518,58 @@ attempts.
 
 ### USB and external devices
 
-- Authorisation is **per interface**, not per device, so a "storage" stick
-  with a hidden HID interface gets its storage approved and its HID
+The mechanism and the full rules are in [drivers.md](drivers.md), "Device
+authorization" (Phase 6); the rules are:
+
+- **Held until approved.** Every new USB device, Thunderbolt tunnel and
+  Bluetooth device is held until approved; nothing it presents reaches a
+  driver first. Authorization is **per USB interface**, so a "storage"
+  stick with a hidden HID interface gets its storage approved and its HID
   interface held.
-- Storage and audio interfaces are approved automatically while the session
-  is unlocked; anything new while locked waits for unlock and approval.
-- A new keyboard or other HID interface must type a code shown on screen
-  before its input is accepted (stops BadUSB).
-- Thunderbolt/USB4 PCIe tunnels need explicit approval per device. A
-  remembered identity only skips the prompt next time; it never relaxes the
-  IOMMU, HID confirmation or any other check, because device identities can
-  be spoofed. Where the controller supports the USB4 security challenge, it
-  is used.
+- **Identity.** An interface's identity is the device's vendor ID, product
+  ID and serial-number string (or, for a device without one, its port path
+  from the root hub), the interface number, and its class, subclass and
+  protocol, the class being that of the driver that would bind. A known
+  identity needs no new prompt. A device whose vendor, product and serial
+  match a known device but whose interface classes differ is new, and is
+  "suspicious". A remembered identity never relaxes the IOMMU or any other
+  check.
+- **Who is asked**, by the prompt level (above):
+  - A new HID interface (keyboard, mouse, anything HID) always prompts, at
+    every level (the floor), and its key events are accepted only after it
+    also types the code shown on screen (stops BadUSB). A remembered
+    keyboard identity re-plugged into the **same port** is accepted without
+    a code; on a different port it needs the confirmation again. USB can't
+    authenticate devices, so a perfect clone of a known keyboard on its
+    port is a residual listed on the scorecard.
+  - New storage and network interfaces, and any device presenting different
+    classes than last time, prompt at "Only when suspicious" and "Always
+    ask"; at "Almost never" they bind silently. Binding a storage device
+    never makes its contents trusted: every file on it carries provenance
+    "removable" (above).
+  - Every other new interface (audio, video, printer, serial and the rest)
+    prompts only at "Always ask"; otherwise it binds silently.
+  - Every silent binding is logged and shown in Settings, where it can be
+    revoked.
+- **Before unlock and on resume.** Until the volume is unlocked, the
+  in-kernel keyboard paths accept any keyboard, but only into the
+  passphrase or PIN prompt, where guessing is limited by the KDF and the
+  TPM's lockout. After unlock every device that isn't known goes through the
+  rules above, including one that typed the passphrase. Keyboards used
+  during installation are recorded as known; PS/2 and internal I2C-HID
+  keyboards need no approval. On resume only known keyboards present before
+  suspend type the PIN.
+- **While the screen is locked**, all USB and Thunderbolt ports refuse new
+  devices; devices attached before locking keep working. A device attached
+  while locked binds nothing until unlock, except a known HID interface,
+  whose events go only to the lock screen. No new Thunderbolt tunnel is
+  opened while locked.
+- **Thunderbolt/USB4 PCIe tunnels** need approval per device. Where the
+  controller supports the USB4 security challenge, it is used. On firmware
+  connection-manager (ICM) controllers the security level is read, never
+  set: approved tunnels need level "user" or "secure", and otherwise the
+  deny-all IOMMU (D1) or BME clear (D2) refuses the tunnel and the
+  scorecard notes it.
 
 ### Administrators
 
@@ -424,20 +579,26 @@ settings, create and delete accounts, and update the OS. An administrator
 **cannot** read another user's files, reset another user's login secret in a
 way that unlocks their data (resetting creates a fresh, empty key; the old
 data needs the old secret or that user's recovery key), install software into
-another user's session, or read another user's crash dumps.
+another user's session, or read another user's crash dumps. A system-wide
+app the administrator installs with the same ID as one a user granted is a
+new identity unless its signing key matches (above), so it inherits no
+grants.
 
 ### Crash reports stay local
 
 App dumps go to the crashing user's encrypted storage, are redacted of app
 memory by default, and are never uploaded unless the user chooses to send
 one, each time, after seeing what is in it. Kernel dumps contain **kernel
-memory only** by default (no user pages, no page cache), are encrypted to the
-administrators' keys, and are stored in an administrator-only location.
-Including a user's pages needs that user's consent, asked of each user whose
-pages would be included. Every dump excludes key pages. Test (Phase 5):
-with canary bytes in a key page, in a user's process memory and in a user's
-page cache, a forced kernel crash produces a dump that holds none of them
-unless that user consented, and no key bytes in any case.
+memory only** by default (no user pages, no page cache, and no slab cache
+tagged as carrying user data: keyring payloads, pipe and socket buffers,
+tty buffers, dentry names), are encrypted to the administrators' keys, and
+are stored in an administrator-only location. Including a user's pages or
+tagged caches needs that user's consent, asked of each user whose data
+would be included. Every dump excludes key pages. Test (Phase 5): with
+canary bytes in a key page, a user's process memory, a user's page cache,
+a keyring, a pipe, a tty, a socket buffer and a file name, a forced kernel
+crash produces a dump that holds none of them unless that user consented,
+and no key bytes in any case.
 
 ### Supply chain
 
@@ -478,7 +639,8 @@ file, which the test must match exactly ([compat.md](compat.md)).
 | EFI variables (`/sys/firmware/efi/efivars`) | read-only; writes only by the update and boot services, never to PK, KEK, db, dbx, MOK or boot entries except through their signed flows |
 | `mount` of block devices or image files (loop), from any namespace | only through the tier-3 file system server ([storage.md](storage.md)), never an in-kernel parser |
 | `CAP_*` inside a user namespace | grants authority only over objects owned by that namespace, never kernel-wide ([capabilities.md](capabilities.md)) |
-| hibernation | class-C keys and pages are evicted before the image is written, so the image holds none ([storage.md](storage.md)); the image is encrypted and authenticated, carrying the release's security version. On B1 its key is a per-boot random image key, generated before capping and sealed into a persistent TPM object with the full disk policy (PCR 4, 8 and 9 signed, PCR 7, the rollback floor, `TPM2_PolicyAuthValue` with the stretched PIN), and kept in kernel RAM until hibernate; resume unseals it before capping, so it needs the PIN. Otherwise the key comes from the passphrase. Resume refuses an image it can't authenticate or whose version is below the rollback floor |
+| hibernation | class-C keys and pages are evicted before the image is written, so the image holds none ([storage.md](storage.md)). The image lives in a dedicated hibernation extent, encrypted and authenticated under a fresh image key, and records the release, its security version, the commit generation and the replay value. On B1 the image key is AEAD-encrypted under HKDF(R ‖ stretched-PIN half 2), where R is sealed at hibernate to the signed pre-cap policy (PCR 4, 8 and 9 signed, PCR 7, the rollback floor, `TPM2_PolicyAuthValue`), and that blob goes in the header block, never into a persistent TPM object; after the snapshot only the fixed header area is written. Otherwise the key comes from the passphrase. Resume unseals before capping, so it needs the PIN; the boot kernel hands the volume key and S to the restored kernel in a reserved page the restored kernel wipes, and the resumed file system draws a new nonce prefix. Any normal mount first erases the image blob. Resume refuses an image it can't authenticate, whose version is below the rollback floor, whose release differs from the booting one (the loader keeps the old slot for the resume boot), or whose generation doesn't match the volume; a hibernation resume bumps nothing |
+| `modify_ldt` | allowed (Wine needs it); a return to a 16-bit stack segment goes through a per-CPU read-only espfix64-style alias stack, so `IRET` leaks no kernel stack bits |
 | ACPI table override, custom DSDT | not supported |
 
 ## Every attack path, its defence and its test
@@ -492,47 +654,65 @@ each row as pass, fail or not yet built, per hardware tier.
 |---|---|---|
 | A1 → open port | nothing listens; default-deny inbound firewall; inbound only through a per-port grant | IPv4 and IPv6 scans of a fresh install find 0 open ports (6) |
 | A1 → listening app | network grants are outbound only; a wildcard socket receives only loopback and non-loopback unicast inbound is dropped without an inbound grant | an app holding network binds a wildcard and a non-loopback address; both binds succeed and neither is reachable from another host; with an inbound grant for one port, exactly that port is reachable (6) |
-| A1 → network stack | TCP/IP in safe Rust, fuzzed, index masking; proof target 15 (packet parsers never panic or read out of range) | 10^9 fuzz executions, no open crash; IPv6 RA/NDP/ICMPv6 included; target 15 at B (6) |
-| A1 → DHCP, DNS, NTP, Wi-Fi supplicant | each a sandboxed service in the TCB list, fuzzed; DNS-over-TLS or DNSSEC validation where available; time from NTS, never below a floor: a stored, signed time floor shipped in the image until Phase 7, then the last-seen update metadata time | each service fuzzed 10^8 executions; spoofed-NTP test can't roll the clock back below the floor (6) |
+| A1 → remote control | remote desktop, screen sharing and input injection are separate explicit grants, never implied by network or inbound grants, and in the prompt floor | at "Almost never", an app holding network and a folder grant starts a VNC and an RDP listener and asks for screen capture and virtual input; every request prompts, and without the grants a remote host reaches nothing and captures nothing (7) |
+| A1 → network stack | IP, TCP, UDP, ICMP and ND in safe Rust in the kernel, fuzzed, index masking; proof target 15, network-path parsers (in-kernel part: these parsers never panic or read out of range) | 10^9 fuzz executions, no open crash; IPv6 RA/NDP/ICMPv6 included; target 15 at B (6) |
+| A1 → DHCP, DNS, NTP, Wi-Fi supplicant | each a sandboxed user-space service in the TCB list, fuzzed; their DHCP, RA and DNS parsers are target 15's user-space part; DNS-over-TLS or DNSSEC validation where available; time from NTS, never below a floor: a stored, signed time floor shipped in the image until Phase 7, then the last-seen update metadata time | each service fuzzed 10^8 executions; spoofed-NTP test can't roll the clock back below the floor (6) |
 | A1 → Wi-Fi, Bluetooth drivers | split on every machine: tier-2 transport (rings and DMA, no frame parsing) and tier-3 802.11 and Bluetooth stacks in their own IOMMU domain | frame fuzzing of the tier-3 stacks 24 h with no open crash; the transport parts fuzzed to the thresholds in [drivers.md](drivers.md) (6) |
 | A1 → compromised radio firmware → DMA | on D1, the radio's IOMMU domain holds only its rings and buffers; on D2, radios that do PCIe DMA stay off until the user accepts the "remote DMA exposure" warning | our vfio-user hostile device server on the pinned QEMU, bound to the Wi-Fi transport, DMAs and sends MSIs outside its domain; every attempt faults and is logged; on a D2 machine the radio stays off until the warning is accepted, and the scorecard then shows the remote promise as not holding (6) |
-| A1 → compromised Bluetooth stack or HID process → input | the secure-attention key and prompt answers are accepted only from in-kernel parsers or a typed-code-confirmed per-device HID process, never from Bluetooth unless opted in by name | a compromised Bluetooth stack and a compromised HID process each emit Ctrl+Alt+Delete and keypresses on the prompt terminal; no prompt opens or is answered (6); extended to compositor-drawn prompts (7) |
+| A1 → compromised Bluetooth stack or HID process → input | Bluetooth off until a device is paired; link keys held in the tier-2 transport; Bluetooth input reaches apps only from a paired HID device's link; the secure-attention key and prompt answers are accepted only from in-kernel parsers or a typed-code-confirmed per-device HID process, never from Bluetooth unless opted in by name; residual risk (compromised radio firmware on a paired link) on the scorecard | a compromised Bluetooth stack injects keystrokes into a focused terminal and emits Ctrl+Alt+Delete; nothing reaches the terminal and no prompt opens; a compromised HID process emits Ctrl+Alt+Delete and keypresses on the prompt terminal; no prompt opens or is answered (6); extended to compositor-drawn prompts (7) |
 | A2 → app parser bug | the app is sandboxed | sandbox escape suite (7) |
+| A2 → app control-flow hijack | user-space CET shadow stacks (`arch_prctl` as on Linux) where the CPU has them | on a CET-capable runner, a test program that overwrites its own return address faults with `#CP` and is killed (5) |
 | A3 → other apps' data | per-app file views, capabilities, per-app `/proc`, PID namespaces, `ptrace` policy | hostile-process suite: read another app's files, protected paths, another process's memory (`/proc/pid/mem`, `process_vm_readv`, `ptrace`), forge or guess a capability, map another app's frames. All fail, each with its defence present, not by `ENOSYS` (5, grows every phase) |
 | A3 → kernel | memory safety, proofs, fuzzing, SMEP/SMAP, KASLR; kernel CET shadow stacks and indirect-branch tracking from the phase they land (Phase 11 at the latest, [ROADMAP](../ROADMAP.md)) | syscall fuzzing (3), proof targets 4 to 6 (3), lockdown test (3); a kernel ROP and a forward-edge hijack test fault (11, or earlier in the phase kernel CET lands) |
-| A3 → forged identity | launch-closure hash, provenance, protected install directories and launch paths, spawn-with-identity capability held only by the launcher and service manager | **identity-forge suite**: an app replaces or edits a granted executable, a library beside a granted unpackaged app, or a granted app's script; writes into each protected launch path (a `systemd --user` unit running `python3 -c '<payload>'`, a D-Bus service file, `environment.d`, `mimeapps.list`); spawns a child claiming another identity; execs a copy of a granted binary from another path; runs an executable it wrote from the desktop; two Python apps get different identities; no grant transfers and the new code gets no network before its prompt (5) |
-| A3 → terminal | foreign-provenance exec refused, writable grants in the terminal's home are direct channels, fresh pty per identity, `TIOCSTI` refused, escape sequences filtered | an app with a writable grant to `~/Projects` plants a git hook and a `Makefile`, and the grant needed the "can run code as Terminal" prompt; the terminal execs the hook and gets `EACCES` until approved; a process of another identity started from the terminal tries `TIOCSTI`, `TIOCLINUX`, OSC 52 and report sequences; all fail (5) |
+| A3 → forged identity | launch-closure hash (interpreted apps include every file opened from the script's tree), identity ID with lineage, publisher key in packaged identities, provenance, protected install directories and launch paths, spawn-with-identity capability held only by the launcher and service manager | **identity-forge suite**: an app replaces or edits a granted executable, a library beside a granted unpackaged app, a granted app's script, and a `helper.py` it imports; writes into each protected launch path (a `systemd --user` unit running `python3 -c '<payload>'`, a D-Bus service file, `environment.d`, `mimeapps.list`); spawns a child claiming another identity; execs a copy of a granted binary from another path; two Python apps get different identities; a binary replaced at the same path sees an empty home; two `sh -c` identities see disjoint homes; `firefox` typed in the terminal runs under Firefox's identity; no grant transfers and the new code gets no network before its prompt (5); an executable the app wrote, launched from the desktop, gets no network before its prompt (7) |
+| A3 → removable or downloaded executable | provenance "removable" and "downloaded" set by the kernel; such an executable runs as a new identity with no grants and no network until approved, and gets `EACCES` from the terminal | an executable copied from a USB stick, started through the launcher, has no grants and no network, and from the terminal gets `EACCES`, until approved (6); the same for a file the browser downloaded, launched from the desktop (7) |
+| A3 → terminal | foreign, removable and downloaded provenance exec refused, writable grants in the terminal's home carry the "can run code as Terminal" prompt, fresh pty per identity, `TIOCSTI` refused, escape sequences filtered | an app with a writable grant to `~/Projects` plants a git hook and a `Makefile`, and the grant needed the "can run code as Terminal" prompt; the terminal execs the hook and gets `EACCES` until approved; a process of another identity started from the terminal tries `TIOCSTI`, `TIOCLINUX`, OSC 52 and report sequences; all fail (5) |
 | A3 → shared channels, D-Bus and keyrings | D-Bus proxy, per-app keyrings, per-app IPC namespace | for each, an app without the grant tries to use it and fails (5) |
 | A3 → shared channels, PipeWire | PipeWire permissions | an app without the grant tries to record or capture another app's stream and fails (6) |
 | A3 → shared channels, Wayland and X11 | Wayland security contexts, per-app XWayland | an app without the grant tries each privileged protocol and another app's X11 server and fails (7) |
-| A3 → confused deputy | portals pass nothing without confirmation; networked TCB services check the caller's grants | an app tries the launcher, open-URI, handlers and D-Bus activation to run a command or open a file through another app; all need confirmation; an app with files and no network calls open-URI with an `https` URL carrying data and gets a prompt showing the full URL, opens a loopback page in the browser and gets no auto-grant, and sends a notification and an email-portal message carrying data, which are refused (5) |
+| A3 → confused deputy | portals pass nothing without confirmation; networked TCB services check the caller's grants; printing without network names the destination | an app tries the launcher, open-URI, handlers and D-Bus activation to run a command or open a file through another app; all need confirmation; an app with files and no network calls open-URI with an `https` URL carrying data and gets a prompt showing the full URL, and sends a notification and an email-portal message carrying data, which are refused (5); it prints to an IPP printer advertised over mDNS and gets a prompt naming that printer (6); it opens a loopback page in the browser and gets no auto-grant (7) |
 | A3 → permission broker and portals | fuzzed, size-capped TCB service | 10^8 protocol fuzz executions, no open crash (5) |
 | A3 → D-Bus proxy and broker | fuzzed, size-capped TCB service | 10^8 protocol fuzz executions against the proxy and dbus-broker, no open crash (5) |
 | A3 → Flatpak launcher | fuzzed TCB service; `org.freedesktop.Flatpak` talk-name refused | 10^8 fuzz executions over manifests and launch requests, no open crash; `flatpak-spawn --host` fails (5) |
+| A3 → user service manager | fuzzed, size-capped TCB service; control interface unreachable from app proxies | 10^8 protocol fuzz executions over D-Bus activation and unit requests, no open crash (5) |
+| A3 → store service | fuzzed, size-capped TCB service | 10^8 fuzz executions over install requests, manifests and repository metadata, no open crash (5) |
+| A3 → storage service | fuzzed, size-capped TCB service; passthrough and firmware download only with signed firmware | 10^8 protocol fuzz executions, no open crash (5) |
+| A3 → log service | fuzzed, size-capped TCB service | 10^8 fuzz executions over log submissions and queries, no open crash (5) |
+| A3 → SSH agent, GPG agent, secret service | TCB services, prompts through the broker naming the requesting app | 10^8 protocol fuzz executions against each, no open crash; an app without a confirmed use gets no signature and no secret (5) |
+| A3 → lock screen | fuzzed, size-capped TCB service; fails closed | 10^8 fuzz executions over its input and protocol, no open crash; killing it and crashing it each leave the session locked, and the prompt virtual terminal asks for the login secret (5); repeated with the compositor's lock (7) |
 | A3 → document portal | tier-3 file system, fuzzed FUSE protocol | 10^8 protocol fuzz executions, no open crash; an app reaches only its own entries, and a revoked entry is gone (5) |
 | A3 → resolver | TCB service at `127.0.0.53` answering only identities with outbound network | 10^8 protocol fuzz executions, no open crash; an identity without network gets `ECONNREFUSED` (6) |
 | A3 → PipeWire | pinned upstream with our permission layer, fuzzed | 10^8 protocol fuzz executions, no open crash (6) |
+| A3 → udev-compatible daemon | fuzzed, size-capped TCB service; uevent records only for granted devices | 10^8 fuzz executions over uevents and libudev queries, no open crash (6) |
 | A3 → seat service | fuzzed, size-capped TCB service | 10^8 protocol fuzz executions, no open crash (7) |
 | A3 → compositor | 60,000-line cap, security contexts, Mesa exposure limited to buffer import | 10^8 Wayland protocol fuzz executions, no open crash, with hostile dma-buf and shm buffers included (7) |
+| A3 → update client | fuzzed, size-capped TCB service | 10^8 fuzz executions over TUF metadata, transparency proofs and downloads, no open crash (7) |
 | A3 → prompt spoofing, console | prompts on a dedicated virtual terminal reached by the secure-attention key | an app draws a fake prompt on its own terminal, injects keystrokes, and tries to switch virtual terminals; no grant is made without the secure-attention key and a keypress on the prompt terminal (5) |
 | A3 → screen, input, mic, camera | grants only through portals; prompts drawn by the compositor; keyboard and pointer emulation only to the focused surface behind a grant | prompt-spoofing test against the compositor; an app can't read another window's pixels or keys, and an app holding the virtual-input grant reaches only the focused surface (7) |
-| A3 → exfiltration | files + network is one explicit grant; per-identity egress filter; secrets used through agents; networked deputies check grants; direct channels checked transitively as one principal; the overt channels are the closed list in `design/channels.toml` | **exfiltration suite**: a canary file in a granted folder and a canary SSH key; an app (and a script run from the terminal) without the combined grant tries every overt channel (sockets of every family, loopback to another identity's port, io_uring socket ops, every portal, open-URI, clipboard, D-Bus, DNS lookups through the resolver, notifications, launching a networked app); the canary must not reach an external sink (6 for sockets, 5 for portals and open-URI). In full it adds **colluding apps**: two, one holding the folder and one holding network, and a chain of three (files, nothing, network), which try every channel in `design/channels.toml` between them, including relays through PipeWire and D-Bus, a granted loopback port, a shared writable folder, drag and drop, and the grants given to the networked one at run time; covert-channel bandwidth is measured and published (7) |
+| A3 → exfiltration | files + network is one explicit grant; first network use decided per identity; per-identity egress filter; secrets used through agents; networked deputies check grants; directional direct channels checked as one principal on every channel and every grant; the overt channels are the closed list in `design/channels.toml` | **exfiltration suite**: a canary file in a granted folder and a canary SSH key; an app (and a script run from the terminal) without the combined grant tries every overt channel (every portal and open-URI (5); sockets of every family, loopback to another identity's port, io_uring socket ops, DNS lookups through the resolver, notifications, printing, launching a networked app (6); the clipboard (7)); the canary must not reach an external sink. Grant after join: app A (files) opens a channel to B (nothing), then B asks for network; the grant prompts naming A's files, and refused, it is refused at grant time with the reason; an app holding Downloads and network does not join the terminal's component (6). In full it adds **colluding apps**: two, one holding the folder and one holding network, and a chain of three (files, nothing, network), which try every channel in `design/channels.toml` between them, including relays through PipeWire and D-Bus, a granted loopback port, a shared writable folder, drag and drop, and the grants given to the networked one at run time; the combined approval is asked again when a fourth app joins; covert-channel bandwidth is measured and published (7) |
+| A3 → network without approval | default profile has no network; first outbound use returns `ENETUNREACH` and queues one request per identity, prompted or granted by the prompt level, remembered | at "Always ask" a fresh unpackaged program's first `connect` returns `ENETUNREACH` at once and exactly one prompt appears; refused, it stays unreachable across restarts; at "Only when suspicious" an unsigned program first seen under 7 days ago prompts and a signed one older than 7 days is granted silently and logged; with a folder grant it prompts at "Almost never" (6) |
+| A3 → prompt level | the level is a TCB setting changed only on the trusted path | an app tries to change the level through every portal and by writing the settings file; all fail (5) |
 | A3 → side channels | the mitigation matrix, SMT off on affected CPUs | the PoC suite recovers zero secret bytes above chance on the shipped default for each CPU model, and app to app with opt-in SMT on (3) |
+| A3 → Rowhammer | page tables in a separate physical zone with guard rows; ECC/TRR reporting; refresh policy reported; residual risk on the scorecard | on each reference machine, a published hammering PoC run from an app for 24 h flips no page-table bit and gains no access outside the app; flips elsewhere are counted and published (3) |
+| A3 → 16-bit stack leak | espfix64-style per-CPU read-only alias stack for `modify_ldt` 16-bit SS | a 32-bit program with a 16-bit SS from `modify_ldt` reads `RSP[31:16]` after `IRET` 10^6 times and recovers 0 bits of the kernel stack address (9) |
 | A4 → signed malicious update | offline root, threshold signing, transparency log with witnessed checkpoints, reproducible builds | an unlogged but validly signed release is refused; a stale-metadata mirror is detected within 24 h (7; signing design from 4b) |
 | A4 → poisoned dependency | pinned hashes, cargo-vet, cargo-deny | CI fails on an unpinned fetch or unvetted crate (1) |
-| A5 → DMA attack | IOMMU deny-all (every unused AMD-Vi device table entry and Intel context entry blocking), per-device domains, ATS off by default, interrupt remapping; DMA is stopped by bridge or root-port BME plus the IOMMU, never by a device's own BME; pre-boot protection or Optimal Boot's deny-all IOMMU covers the hand-off | our vfio-user hostile device server on the pinned QEMU sends DMA and MSI writes outside its domain and from an unassigned requester ID; all fault and are logged (1c); a PCILeech-class FPGA card on a D1 reference machine with pre-boot DMA protection reads and writes nothing outside its domain, across the firmware-to-kernel hand-off too, and its spoofed requester IDs and ACS-bypass attempts fail (4a) |
-| A5 → BadUSB | per-interface authorisation; typed confirmation for HID | an emulated keyboard that types at once gets no keystroke accepted; a composite device's hidden HID is held (6) |
+| A5 → DMA attack | IOMMU deny-all (every unused AMD-Vi device table entry and Intel context entry blocking), per-device domains, ATS off by default, PASID and PRI off in devices and refused in the IOMMU, interrupt remapping with every IRTE checked against its exact requester ID, a global fault-rate cap; DMA is stopped by bridge or root-port BME plus the IOMMU, never by a device's own BME; pre-boot protection or Optimal Boot's deny-all IOMMU covers the hand-off | our vfio-user hostile device server on the pinned QEMU sends DMA and MSI writes outside its domain and from an unassigned requester ID; all fault and are logged (1c); a PCILeech-class FPGA card on a D1 reference machine with pre-boot DMA protection reads and writes nothing outside its domain, across the firmware-to-kernel hand-off too, and its spoofed requester IDs (including a storm cycling through many IDs), ACS-bypass attempts, PASID-prefixed requests, page requests and MSIs using another device's handle fail (4a) |
+| A5 → BadUSB | no driver binding before approval; per-interface authorization; typed confirmation for HID except a remembered keyboard on the same port (clone residual on the scorecard); new devices refused while locked | an emulated keyboard that types at once gets no keystroke accepted; a composite device's hidden HID is held; a rogue USB network adapter gets no driver binding until approved and prompts at the default level; a known storage identity re-presented with an added HID interface is treated as new; a mass-storage device plugged in while the screen is locked is not bound or mounted until unlock and approval, a known keyboard replugged while locked types only into the lock screen, and a remembered keyboard moved to a different port needs the typed code again (6) |
+| A5 → Thunderbolt/USB4 tunnel | per-device approval; refused while locked; ICM level read, never set; IOMMU domain per device | on the reference laptop, an unapproved Thunderbolt NVMe enclosure gets no PCIe tunnel; approved, its DMA outside its domain faults; plugged in while locked, it gets no tunnel; with the ICM security level set below "user" in firmware the tunnel is refused and the scorecard notes it (6) |
 | A5 → malformed descriptors | HID and class drivers in tier 3, one HID process per device, fuzzed | descriptor and report-descriptor fuzzing 24 h clean (6) |
 | A6 → read the disk | encryption ([storage.md](storage.md)); core-crypto proof target 14 | an offline disk image shows only ciphertext and the documented plaintext metadata; target 14 at T (4a) |
-| A6 → tamper with the boot chain | Secure Boot, signed config, measured boot, signed TPM policy over PCR 4, 7, 8, 9; floor state machine proof target 16 | tamper tests in [boot.md](boot.md), including an older signed loader, a signed tool replaying the event log and a config signed by a revoked key; target 16 at B (4b) |
-| A6 → substituted volume | before capping only the fixed-format Optimal header block is parsed, its volume tag checked over the raw bytes before any JSON; the service-key secret is released only after the tag matches | a volume with a hostile header and JSON area, swapped in for the real one, gets no secret and no counter bump; the pre-cap parser fuzzed to the in-kernel thresholds (4b) |
-| A6 → clear the TPM to reset the floor | the SRK name and the base-index name are recorded in loader state and the header; if either changed, the loader boots only the highest-SVN image present and warns; the loader disables an open platform hierarchy before `ExitBootServices` | clear the TPM, redefine the indices, then try to boot an older slot; it is refused with a warning (4b) |
+| A6 → tamper with the boot chain | Secure Boot, signed config, measured boot, signed TPM policy over PCR 4, 7, 8, 9; PCR-4-per-machine objects under the separate policy reference `optimal-disk-v1-pm/f`, the only one PCR 8/9-only digests are signed under; floor state machine proof target 16 | tamper tests in [boot.md](boot.md), including an older signed loader, a signed tool replaying the event log and a config signed by a revoked key; on a machine with per-machine PCR 4, a signed tool replaying the PCR 8 and 9 events can neither unseal the TOTP key nor increment the floor counter; target 16 at B (4b) |
+| A6 → substituted volume | before capping only the fixed-format Optimal header block is parsed (the recovery-wrapped volume key lives there, so no path parses LUKS2 JSON before capping); the volume tag, keyed from the volume key, covers both LUKS2 header copies and both JSON areas, and the kernel uses only a copy whose tag verifies, never choosing by seqid; the service-key secret is released only after the tag matches | a volume with a hostile header and JSON area, swapped in for the real one, gets no secret and no counter bump; a secondary header copy with a higher seqid and a valid checksum is refused (fuzz case); a recovery-key boot parses no JSON before capping; the pre-cap parser fuzzed to the in-kernel thresholds (4b) |
+| A6 → clear the TPM to reset the floor | the SRK name and the base-index name are recorded in loader state and the header; if either changed, the floor is max(the minimum config SVN built into the loader, the highest SVN present) and the loader warns; older loaders are retired through SBAT and dbx, which survive a clear; the loader disables an open platform hierarchy before `ExitBootServices` | clear the TPM, redefine the indices, delete the newer slots and recovery copies, then try to boot an older slot; it is refused with a warning (4b) |
 | A6 → tamper with ciphertext | stage 1: metadata checksums plus hardened parsing; stage 2: authenticated encryption | random and replayed sector writes to an encrypted ext4 image never crash or corrupt the kernel (4a); bit flips detected in stage 2 (file system track) |
 | A6 → TPM bus | salted, parameter-encrypted sessions bound to the SRK recorded at first sealing; PIN stretched and mixed into the key; the service-key secret also needs the PIN (`TPM2_PolicyAuthValue`) | swtpm traffic contains no key bytes; a swtpm man-in-the-middle proxy fails to unseal the disk secret or the service-key secret without the PIN (4b) |
-| A6 → TPM reset or lost state on resume | a PCR reset while running is treated as tamper; the resume object is bound to this boot's capped PCR 8 and 9 values, which a TPM reset destroys | resume after a forced TPM reset can't use the resume object, falls to recovery (passphrase or recovery key) and logs tamper (10) |
-| A6 → guess the PIN | TPM dictionary-attack lockout with owner and lockout authorisation set at install | lockout engages after 32 tries; root can't reset it (4b) |
-| A6 → locked or suspended laptop | protected-class keys and page cache evicted on lock; in stage 1, suspend wraps the volume key and the service-key secret into a resume object (this boot's capped PCR 8 and 9 plus the stretched PIN), then wipes them and the home keys | after suspend, a memory scan finds no volume key, home key or service-key secret, and resume asks for the PIN (10); after lock, a memory scan finds no protected-class key and no plaintext canary from protected files (file system track; until stage 2 the scorecard shows promise 4 as "partial") |
-| A6 → hibernation image | class-C keys evicted before hibernating; per-boot image key sealed with the full disk policy plus the PIN | the image holds no class-C key or canary; resume without the PIN, with tampered PCRs, or with an image below the rollback floor is refused (10) |
-| A7 → other user's data | per-user keys (stage 1: per-user encryption of home directories; stage 2: in the file system), per-user file trees, limited administrators | a second user, including an administrator, can't read the first user's files or reset their way in (5); on B1 a second user logs in after PCR capping (5, run once 4b is done) |
+| A6 → TPM secrets extracted (fTPM break) | every sealed object seals only a random R; the key material is AEAD-encrypted under HKDF(R ‖ stretched-PIN half 2) | with the TPM seeds extracted (swtpm state dump), the disk-secret and S blobs still need an Argon2id PIN search (4b), and so do the resume and hibernation blobs (10) |
+| A6 → TPM reset or lost state on resume | a PCR reset while running is treated as tamper; the resume object's policy is `TPM2_PolicyCounterTimer` resetCount equal to its value at suspend, plus PCR 4, 7 and capped 8 and 9, plus `TPM2_PolicyAuthValue`; it seals only R and its blob is in RAM only | resume after a forced TPM reset can't use the resume object, falls to recovery (passphrase or recovery key) and logs tamper; a reboot into another OS that replays the PCR 8 and 9 events fails to unseal it (10) |
+| A6 → guess the PIN | TPM dictionary-attack lockout with owner and lockout authorisation set at install; `TPM2_Shutdown` on every reboot and panic path so orderly boots add no failed tries, with the non-orderly increment budget stated in [boot.md](boot.md); lockout reset only through lockoutAuth unwrapped with the recovery key | lockout engages after 32 tries; root can't reset it; across at least 64 power cuts failedTries stays within the stated budget and every boot unseals without the recovery key (4b) |
+| A6 → locked or suspended laptop | protected-class keys and page cache evicted on lock; suspend wraps every key into the resume object (stage 1: the volume key, the service-key secret and the home keys; stage 2: every per-user, class and per-file key), then wipes them | after suspend, a stage-1 memory scan finds no volume key, home key or service-key secret and no canary from a stage-1 home, and resume asks for the PIN (10); the stage-2 scan finds no per-user, class or per-file key (10, once stage 2 lands); after lock, a memory scan finds no protected-class key and no plaintext canary from protected files (file system track; until stage 2 the scorecard shows promise 4's locked part as "partial") |
+| A6 → hibernation image | class-C keys evicted before hibernating; image key sealed as R plus a PIN-keyed blob in the header block; image tied to release, generation and replay value (lockdown table) | the image holds no class-C key or canary; resume without the PIN, with tampered PCRs, with an image below the rollback floor, with a different release, or after a normal boot mounted the volume is refused; the keys handed to the restored kernel are gone from the reserved page after resume (10) |
+| A6 → DRAM read (cold boot, bus probe) | memory encryption (AMD SME, Intel TME) where present, from Phase 11 at the latest; scorecard shows whether it is on | on a reference machine with SME, a canary page written through an encrypted mapping reads as ciphertext through a C-bit-clear alias; on one with TME, `IA32_TME_ACTIVATE` reads enabled and locked (11) |
+| A7 → other user's data | per-user keys (stage 1: per-user encryption of home directories; stage 2: in the file system), per-user file trees, limited administrators, packaged identities include the signing key | a second user, including an administrator, can't read the first user's files or reset their way in; an administrator who adds a Flatpak remote and installs an app with the first user's granted app ID gets none of its grants or its home (5); on B1 a second user logs in after PCR capping (5, run once 4b is done) |
 | A7 → kernel crash dumps | kernel memory only by default, encrypted to administrators, user pages only with each user's consent | the crash-dump canary test under "Crash reports stay local" (5) |
 | Promise 3 → telemetry | nothing phones home | a fresh install left idle 24 h contacts only the update and time hosts, all logged (7) |

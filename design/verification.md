@@ -45,13 +45,14 @@ assumptions. Contracts on our own code (every shim contract) are
 assumptions discharged by target 3b, which is at T, so a target that rests
 on a shim is effective T; only hardware, vendor and toolchain axioms (see
 the ledger) leave the level unchanged. P ranks above B and M, which both
-rank above T; a mix of B and M is reported as "B+M". Levels are written
-**own/effective**, for example "P/T" for a P proof over tested shims, and
-once when both are equal. The ledger script in CI computes the effective
-level from `proofs.toml` and `axioms.md` and fails if it differs from the
-expected value in the table below; every roadmap proof gate names the
-target's own level with the expected effective level next to it, and the
-scorecard reports both.
+rank above T; a mix of B and M is reported as "B+M". Levels are always
+written **own/effective**, for example "P/T" for a P proof over tested
+shims, and "T/T" when both are T. The ledger script in CI computes the
+effective level from `proofs.toml` and `axioms.md` and fails if it differs
+from the expected value in the table below; every roadmap proof gate names
+both, and the scorecard reports both. The gate-table check (below) also
+fails if any design file or the roadmap gives a target's level in any other
+form.
 
 ## Tools and how proofs see the real code
 
@@ -62,24 +63,35 @@ scorecard reports both.
 - **Verus** (MIT): unbounded proofs of invariants over abstract state
   machines plus refinement of the real code. Starts in **Phase 3**, first on
   the capability table (target 5), then page tables (target 1 moves from B
-  to P). Verus needs its `builtin`, `builtin_macros` and `vstd` crates;
-  they are vendored and audited under the procedural-macro rule in
-  [core.md](core.md). Spec and proof code is erased at compile time. Shipped
-  crates may use only the erased ghost-only `vstd` items (`Tracked`,
-  `Ghost` and spec functions); CI rejects any executable `vstd` item
-  (`PPtr`, `PAtomicU64` and the like) reached from a shipped crate. Verus
-  reasons about the real `core::sync::atomic` operations (page-table
-  entries are `AtomicU64`) through `assume_specification` items, each a
-  named toolchain axiom citing the Rust atomics documentation. Verus proves
-  functional properties of safe code; it does not prove the absence of
-  undefined behaviour in `unsafe` code, which stays at B (Kani) plus Miri
-  (target 3a). Verus's own rustc version is recorded in `proofs.toml`.
+  to P for its sequential effects). Shipped crates depend only on
+  `verus_builtin` (which holds `Ghost` and `Tracked`) and `builtin_macros`;
+  both are vendored and audited under the procedural-macro rule in
+  [core.md](core.md). `vstd` is a dependency only in Verus builds, behind
+  the Verus-only `cfg(verus_keep_ghost)`, and is pinned with the Verus
+  release rather than vendored; a CI check fails if the shipping
+  `cargo tree` of any kernel or loader binary contains `vstd`. Spec and
+  proof code is erased at compile time. Verus reasons about the real
+  `core::sync::atomic` operations (page-table entries are `AtomicU64`)
+  through `assume_specification` items, each a named toolchain axiom citing
+  the Rust atomics documentation. These are sequential specifications: they
+  can't track a value the hardware walker changes concurrently, so the
+  A/D-bit and walker clause of target 1 stays at B (Kani with a
+  nondeterministic walker) plus M (loom with a walker thread), never P.
+  Verus proves functional properties of safe code; it does not prove the
+  absence of undefined behaviour in `unsafe` code (target 3a). Verus's own
+  rustc version is recorded in `proofs.toml`.
 - **loom** (MIT): exhaustive interleaving checks of concurrent code compiled
   for the host, with the preemption bound of each model recorded in
   `proofs.toml`; this is level M. Data shared with interrupt handlers is
   declared through loom's cell and atomic types under `cfg(loom)`, so loom
-  sees every access. **shuttle** (Apache-2.0) explores randomised
-  schedules of larger configurations; that is level T. Both start in Phase 2.
+  sees every access; these `cfg(loom)` type swaps mean loom checks a build
+  whose cell and atomic types differ from the shipping ones, which the
+  ledger lists as not checked. loom starts in Phase 1c with the
+  single-CPU interrupt re-entry models (the LAPIC timer and the clocksource
+  watchdog handlers preempting the code they share data with) and the
+  target 1 walker thread; multi-CPU models start in Phase 2. **shuttle**
+  (Apache-2.0) explores randomised schedules of larger configurations; that
+  is level T. It starts in Phase 2.
 - **Miri**: runs the host test suite of every pure tier-0 crate and reports
   undefined behaviour. Lands in Phase 1a with the proofs job.
 - Property-based tests and fuzzing check the same properties on the real
@@ -90,19 +102,31 @@ scorecard reports both.
   accepts, or that behaves differently under one, fails.
 
 **Proved code is host-compilable.** Every proved module is split into a pure
-crate (no `asm!`, no target-specific `cfg`, no hardware access) containing
-the logic, and a thin shim that does the hardware part (writing CR3,
-`INVLPG`, MMIO). CI fails if a proved crate contains `asm!` or `cfg(target_*)`.
-Every tier-0 module with `asm!`, a target-specific `cfg` or hardware access
-is a shim. Each shim function has a written contract (what the instruction
-does, from the manual section it cites). The contract is an our-code
+crate (no `asm!`, no target-specific `cfg`, no hardware access, no
+dereference of a pointer into physical memory) containing the logic, and a thin shim that does the
+hardware part (writing CR3, `INVLPG`, MMIO). CI fails if a proved crate
+contains `asm!` or `cfg(target_*)`. Every tier-0 module with `asm!`, a
+target-specific `cfg`, hardware access or a raw-pointer dereference of
+physical memory is a shim. One shim class is the **memory-access backend**:
+the page-table code, the frame allocator's metadata and the heap reach
+physical memory only through a `MemoryBackend` trait (phys-to-virt
+translation through the direct map, and accessors that return a reference
+to one page-table entry or one metadata record) that the pure crates are
+generic over. The shipping kernel implements it with direct-map raw
+pointers in about 150 lines of `core-mm`; Kani, Miri and loom use a host
+implementation over an array. A CI check fails if a pure `core-mm` crate
+dereferences a raw pointer, calls `ptr::read`/`ptr::write` or names the
+direct-map base other than through the trait. Each shim function, including
+every backend method, has a written contract (what the instruction or
+access does, from the manual section it cites, and for the backend which
+frames the returned reference may alias). The contract is an our-code
 contract in the ledger, discharged by target 3b (QEMU test per function plus
 the unsafe review) at T, so it lowers the effective level of every target
 that rests on it. Shim code is capped at 3,000 lines and `core-crypto` at
-4,000 lines, both inside the 15,000-line tier-0 cap, with a per-crate shim
+6,000 lines, both inside the 15,000-line tier-0 cap, with a per-crate shim
 estimate in [core.md](core.md); all three counts are on the scorecard. So
-the proofs check the same source that ships; the remaining gap is the
-compiler and the shims.
+the proofs check the same source that ships, except for the shims, the
+`cfg(loom)` type swaps and the compiler.
 
 **Text poking.** Trace points ([scheduler.md](scheduler.md)) are the only
 kernel text that changes after boot, through one `core-arch` shim. Each
@@ -117,25 +141,27 @@ remaining four bytes, serialise again, write the first byte of the new
 state, serialise again. A CPU that hits the `int3` meanwhile resumes after
 the 5-byte site, as if the no-op ran (the tracer misses one event). Direct-map aliases of kernel text are read-only.
 Lockdown ([threat-model.md](threat-model.md)) permits only these two
-states. Target 1 covers the mapping rules and target 3b the shim.
+states. Target 1 covers the mapping rules (extended at Phase 2, when the
+poke code lands) and target 3b the shim.
 
 ## The assumption ledger
 
 Each proof's assumptions are listed in `design/axioms.md` (created with the
 first proof), in two separate sections. Every assumption is either:
 
-- **discharged** by another target's guarantee (assume-guarantee: target 1
-  assumes "only `core-mm` writes page tables", which target 3a and the crate
-  boundary guarantee). The **our-code contracts** section holds the
-  only contracts on our own code that proofs rely on, the shim contracts,
-  each discharged by target 3b; or
+- **discharged** by another target's guarantee (assume-guarantee: target 4
+  assumes the capability table's guarantee from target 5). The **our-code
+  contracts** section holds the only contracts on our own code that proofs
+  rely on, the shim contracts (memory-access backend included), each
+  discharged by target 3b; or
 - a **named axiom** in the **hardware, vendor and toolchain axioms**
   section: an Intel SDM or AMD APM section (4-level and 5-level
   paging walk, TLB and PCID behaviour, `INVLPG`, x86-TSO memory ordering),
   the IOMMU and TPM 2.0 specifications, the `assume_specification` items
-  for `core::sync::atomic`, "RNG output uniform; salt collision <= 2^-64
-  per volume lifetime" (used only by target 12c, which is therefore
-  reported "B, probabilistic"), "the page-table walker reads
+  for `core::sync::atomic`, "each hardware and firmware entropy source
+  (`RDSEED`, the `EFI_RNG_PROTOCOL` seed, the TSC jitter samples) has at
+  least its published SP 800-90B min-entropy estimate" (the kernel's own
+  generator is our code, target 14, never an axiom), "the page-table walker reads
   each entry with a single-copy-atomic 64-bit load" (which is why the shims
   write entries through `AtomicU64`, never plain stores: Rust code follows
   the C++20 memory model, not x86-TSO, and a plain store raced by the
@@ -143,7 +169,10 @@ first proof), in two separate sections. Every assumption is either:
   and Dirty bits of any present entry at any time with a locked
   read-modify-write" (SDM Vol. 3A §4.8, which is why present entries change
   only through `swap`, `compare_exchange` or `fetch_and`, never load then
-  store, so a Dirty bit the walker set can't be lost), rustc and LLVM compile correctly,
+  store, so a Dirty bit the walker set can't be lost), rustc and LLVM compile correctly
+  (including privacy and `#![forbid(unsafe_code)]`, which is how "only
+  `core-mm` writes page tables", assumed by target 1, holds: raw entries
+  are `pub(crate)` in `core-mm` and no other crate may use `unsafe`),
   each tool's own compiler front end (Kani, Verus and Miri pin their own
   rustc versions, recorded in `design/proofs.toml`) treats the code the same
   as the shipping compiler (narrowed by the two-toolchain CI job), and Verus's
@@ -151,13 +180,20 @@ first proof), in two separate sections. Every assumption is either:
   executable code unchanged. Kani, Verus and loom are assumed sound.
 
 A CI script fails if any proof cites an assumption that is neither discharged
-nor on the axiom list.
+nor on the axiom list. **The discharge graph is acyclic:** the script builds
+the graph of "target X rests on target Y" edges from `proofs.toml` and
+fails on any cycle, because circular assume-guarantee is unsound without an
+induction rule. Where two properties really depend on each other, they are
+proved jointly as one target. (Target 4's mapping property and target 5's
+per-syscall test were such a pair; the mapping half now lives in target 4
+alone.)
 
 The ledger also lists what each tool does not check, so the scorecard can't
 imply more: Kani, paths beyond each loop's unwinding bound, concurrency,
 inline assembly and aliasing rules (Stacked or Tree Borrows); loom,
-interleavings beyond the recorded preemption bound
-and `Relaxed` behaviours it doesn't generate (load buffering); Verus, every
+interleavings beyond the recorded preemption bound, `Relaxed` behaviours it
+doesn't generate (load buffering) and the shipping types it replaces under
+`cfg(loom)`; all host tools, the shipping `MemoryBackend` implementation; Verus, every
 `external_body`, `external` and `assume_specification` item (each also a
 named axiom) and undefined behaviour in `unsafe` code;
 Miri, paths the tests don't execute and aliasing rules beyond its current
@@ -182,7 +218,12 @@ model; shuttle, every schedule it didn't sample.
   slow harnesses move to the nightly run and the change waits for it.
   Nightly-only harnesses are labelled as such in `proofs.toml` and on the
   scorecard, and are at most 20% of each target's harnesses; CI fails above
-  that.
+  that. So every target runs on every change, but up to 20% of its
+  harnesses run nightly instead.
+- **The loader is in scope.** `bootloader/` follows the rules of
+  [core.md](core.md) and this file: its harnesses run in the same proofs job,
+  its functions are named in the same `proofs.toml`, and its floor code is
+  in target 16's scope.
 - **No vacuous proofs.** Every Kani harness has `kani::cover!` statements for the
   states its property is about (a full table, a split huge page, a revoked
   subtree); an unreachable cover fails CI, so an over-strong `kani::assume`
@@ -209,34 +250,36 @@ gains the parts whose code lands in Phase N) is a done-when item of the
 phase in the "gate" column**, named there by target number and
 own/effective level; see the [roadmap](../ROADMAP.md). A CI script checks
 that this table and the roadmap's proof-gate lines name the same targets,
-levels and phases, and fails if any design file calls a target "proved"
-when it isn't at P (or M for concurrency). Phase 1 is split into 1a (CPU
+levels and phases, fails if any design file or the roadmap writes a
+target's level other than as own/effective, and fails if any design file
+calls a target "proved" when it isn't at P (or M for concurrency). Phase 1 is split into 1a (CPU
 setup and exceptions), 1b (memory), 1c (ACPI, PCI, interrupts, IOMMU and
 time) and 1d (console); Phase 4 into 4a (storage) and 4b (trusted boot
 chain). The file system track starts after 4a.
 
 | # | Target | Level and gate (own/effective) | Property |
 |---|---|---|---|
-| 1 | Page-table manipulation | B/T at 1b; P/T at 3; writeback clause and its QEMU test extended at 4a (P/T) | `map`/`unmap`/`protect` only change the entries they were asked to; present entries change only by `swap`/`compare_exchange`/`fetch_and`, and the Dirty bit of a replaced or write-protected entry is moved to its page before the entry is gone (the Kani harness runs a nondeterministic walker that may set A/D bits between any two steps); outside the direct map, never create a writable+executable kernel mapping and never map one frame writable at two virtual addresses unless asked; the only writable alias of a kernel-text frame is the text-poke mapping, which is non-executable, present only in the poking page table and only during a poke; direct-map aliases of kernel text are read-only; the direct map is no-execute, supervisor-only and never reachable through an entry with the user bit set; intermediate tables stay well-formed; translation matches the hardware walk (axiom: SDM paging chapter). Extended at 4a, when the page cache lands: writeback of a page starts only after the shootdown of its write-protect completes, plus a QEMU test that writes through a file mapping while its page is under writeback and checks no write is lost |
-| 1s | TLB shootdown protocol | M/T at 2; re-gated at M/T at 3 (PCIDs and user address spaces) and at 5 (INVLPGB and transparent huge pages) | written as a state machine with per-CPU acknowledgement generations: **no CPU can use a stale translation** or paging-structure entry for a frame, including a freed page-table page, once the frame is returned to the allocator. The two obligations, using the may-cache set and PCID generations of [scheduler.md](scheduler.md): every CPU in the address space's may-cache set at the unmap has acknowledged an invalidation issued after it, and on every other CPU each PCID slot holding that address space has a recorded generation older than the unmap, so reloading it forces a full flush first; a PCID or global ASID is reassigned only after a full flush. Axioms: an IPI that is sent is delivered and its handler runs; `INVLPG` and `INVPCID` semantics and `MOV CR3` with bit 63 set not flushing the new PCID (SDM Vol. 3A §4.10.4); paging-structure caches are invalidated by the same operations as leaf entries (§4.10.3); a mapping whose page size changes is invalidated before reuse (§4.10.2.3); `INVLPGB` followed by `TLBSYNC` completes the invalidation on every CPU (AMD APM Vol. 3). Plus a QEMU test that delays acknowledgements and checks the frame isn't reused |
-| 2 | Physical frame allocator | B/T at 1b (owners: allocator and page tables); owner kinds extended at 3 (memory objects) and 4a (`DmaBuffer` and DMA pins); P/T at 4a | a frame is never handed out twice without being freed; freed frames were allocated; never returns reserved or out-of-range memory; every frame has exactly one owner among the kinds that exist at that gate (allocator, a page table, a memory object, a `DmaBuffer`), plus any number of recorded DMA pins on frames owned by a memory object; a pinned frame is never freed |
-| 3a | Soundness of tier-0 safe APIs (pure crates) | B per API from 1a; M for interrupt re-entry at 2 (B+M from then); P/B+M at 5 for the functional invariants of the safe-only pure capability and memory APIs | every `pub` safe item of a tier-0 crate is sound for **arbitrary safe callers**, including ones that leak, `forget`, panic or re-enter ([core.md](core.md)). Kani harnesses drive each API with nondeterministic call sequences including `forget`; loom models interrupt re-entry as a preempting thread gated by the interrupt-flag state; compile-fail tests check that tokens and guards can't escape or cross threads; Miri runs every pure crate's tests; every `unsafe impl Send`/`Sync` is inventoried with a justification. Freedom from undefined behaviour in `unsafe` code stays at B plus Miri at every phase (Kani doesn't check aliasing; Miri covers the aliasing rules on the paths the tests run); the P step at 5 proves functional invariants of APIs whose implementation is safe code only. Also a 3a obligation from 3: user page-table entries are installed only through the single `core-mm` user-PTE API (target 4) |
-| 3b | Shim soundness | T from 1a; text-poke shim at 2 | each shim function does what its contract (an our-code contract citing the manual section) says, for every argument its safe wrapper can pass: a QEMU test per shim function plus the unsafe-inventory review of its module. Shim code stays within its 3,000-line cap. Includes the text-poke shim from 2 (a QEMU test toggles a trace point under a load running on every CPU and checks no CPU faults or executes a mixed state) |
-| 4 | Memory isolation between processes | P/T at 3 for the sharing paths that exist then; extended at 5 (shared memory, memfd, `SCM_RIGHTS`, `ptrace`, `process_vm_*`, io_uring buffers), 7 (dma-buf) and 8 (GPU buffers) | a user mapping in process A reaches a frame only if A holds a capability for the memory object that owns it; kernel memory is never user-accessible. Proved over one `core-mm` API that installs user page-table entries and takes a memory-object capability witness, plus the capability table; every syscall, the page-fault handler, copy-on-write and file mappings reach user PTEs only through it, and the sharing paths are the closed list in `proofs.toml` ([capabilities.md](capabilities.md)). A CI call-graph check fails if anything other than that API reaches the PTE-writing shim |
-| 5 | Capability derivation and revocation | P/T at 3; the per-syscall test T at 3 | derived capabilities never have more rights than their parent; revocation removes the whole subtree, including every open file description (OFD) derived from the object and every fd slot that shares an OFD through `dup`, `fork` or `SCM_RIGHTS`, and every mount derived from a view grant, including copies made by `CLONE_NEWNS`; a revoked handle behaves as defined in [capabilities.md](capabilities.md). Plus a per-syscall property test that no input yields a capability, OFD or mapping the caller didn't hold |
-| 6 | User-copy routines | B/T at 3 | the pure part of the `UserPtr` copy routines (range checks, chunking, the read-once wrapper) only touches the user range it was given, never a kernel address, turns a fault into an error, and reads each user value once; the `stac`/`rep movsb`/`clac` instructions and their exception-table fixup are a shim (target 3b). That no syscall or driver entry point reaches user memory any other way follows from `UserPtr<T>` having no dereference and raw pointers not existing outside tier 0 (target 3a) |
+| 1 | Page-table manipulation | B/T at 1b; A/D-bit and walker clause B+M/T at 1c (loom walker thread added); text-poke clauses extended at 2 (B/T); P/T at 3 for the sequential effects, with the A/D-bit and walker clause staying B+M/T; writeback clause and its QEMU test extended at 4a (P/T) | `map`/`unmap`/`protect` only change the entries they were asked to; outside the direct map, never create a writable+executable kernel mapping and never map one frame writable at two virtual addresses unless asked; the only writable alias of a kernel-text frame is the text-poke mapping, which is non-executable, present only in the poking page table and only during a poke; direct-map aliases of kernel text are read-only; the direct map is no-execute, supervisor-only and never reachable through an entry with the user bit set; intermediate tables stay well-formed; translation matches the hardware walk (axiom: SDM paging chapter). **A/D-bit and walker clause** (B with Kani's nondeterministic walker, which may set A/D bits between any two steps, plus M with a loom walker thread; never P, see Verus above): present entries change only by `swap`/`compare_exchange`/`fetch_and`, and the Dirty bit of a replaced or write-protected entry is moved to its page before the entry is gone. Extended at 4a, when the page cache lands: writeback of a page starts only after the shootdown of its write-protect completes, plus a QEMU test that writes through a file mapping while its page is under writeback and checks no write is lost |
+| 1s | TLB shootdown protocol | M/T at 2; re-gated at M/T at 3 (PCIDs, user address spaces, copy-on-write and `mprotect` downgrades) and at 5 (INVLPGB, transparent huge pages, lazy-CPU teardown) | written as a state machine with per-CPU acknowledgement generations: **no CPU uses a translation with more rights than the current PTE once the operation returns**, and no CPU uses any translation or paging-structure entry for a frame, including a freed page-table page, once the frame is returned to the allocator. Any change that removes a permission (write-protect for copy-on-write, `mprotect` to read-only, executable or `PROT_NONE`) or changes a frame bumps the address space's generation and shoots down before returning, exactly as an unmap does. The two obligations, using the may-cache set and PCID generations of [scheduler.md](scheduler.md): every CPU in the address space's may-cache set at the change has acknowledged an invalidation issued after it, and on every other CPU each PCID slot holding that address space has a recorded generation older than the change, so reloading it forces a full flush first; a PCID or global ASID is reassigned only after a full flush. At address-space teardown, and whenever a top-level table is freed, every lazy CPU in the may-cache set is sent an IPI that switches it to the kernel-only table before the table is freed, on the IPI and the INVLPGB paths alike (part of the gate at 5). Axioms: an IPI that is sent is delivered and its handler runs; `INVLPG` and `INVPCID` semantics and `MOV CR3` with bit 63 set not flushing the new PCID (SDM Vol. 3A §4.10.4); paging-structure caches are invalidated by the same operations as leaf entries (§4.10.3); a mapping whose page size changes is invalidated before reuse (§4.10.2.3); `INVLPGB` followed by `TLBSYNC` completes the invalidation on every CPU (AMD APM Vol. 3). Plus QEMU tests: one delays acknowledgements and checks the frame isn't reused (at 2); one forks a process while its other threads write to every page and checks the parent never writes into a frame now shared with the child (at 3) |
+| 2 | Physical frame allocator | B/T at 1b (owners: allocator and page tables); owner kinds extended at 3 (memory objects, B/T) and 4a (`DmaBuffer` and DMA pins, B/T); P/T at 4a | a frame is never handed out twice without being freed; freed frames were allocated; never returns reserved or out-of-range memory; every frame has exactly one owner among the kinds that exist at that gate (allocator, a page table, a memory object, a `DmaBuffer`), plus any number of recorded DMA pins on frames owned by a memory object; a pinned frame is never freed |
+| 3a | Soundness of tier-0 safe APIs (pure crates) | B/T per API from 1a for panics, bounds and functional behaviour; T/T from 1a for aliasing (Miri); interrupt re-entry M/T at 1c (single CPU) and at 2 (multi-CPU); P/T at 5 for the functional invariants of the safe-only pure capability and memory APIs | every `pub` safe item of a tier-0 pure crate is sound for **arbitrary safe callers**, including ones that leak, `forget`, panic or re-enter ([core.md](core.md)). **B part:** Kani harnesses drive each API with nondeterministic call sequences including `forget`, and check no panic, overflow or out-of-bounds access. **T part:** Kani doesn't check aliasing, so freedom from aliasing violations in `unsafe` code rests on Miri running every pure crate's tests (Tree Borrows) and stays T at every phase. **M part:** loom models interrupt re-entry as a preempting thread gated by the interrupt-flag state. Compile-fail tests check that tokens and guards can't escape or cross threads; every `unsafe impl Send`/`Sync` is inventoried with a justification. The P step at 5 proves functional invariants of APIs whose implementation is safe code only. Also a 3a obligation from 3: user page-table entries are installed only through the single `core-mm` user-PTE API (target 4) |
+| 3b | Shim soundness | T/T from 1a; extended at 1b (memory-access backend), 1c (IOMMU register and queue programming, PCI config, MSI-X), 2 (text poke), 3 (user-copy instructions, PCID and `INVPCID`), 4b (TPM CRB/TIS, the loader's shims) and 5 (`INVLPGB`/`TLBSYNC`), each T/T | each shim function does what its contract (an our-code contract citing the manual section) says, for every argument its safe wrapper can pass: a QEMU test per shim function plus the unsafe-inventory review of its module. For the memory-access backend, the tests also check that each returned reference lies inside the frame it was asked for and the direct map. Kernel shim code stays within its 3,000-line cap and the loader's within its own ([core.md](core.md)). The text-poke test toggles a trace point under a load running on every CPU and checks no CPU faults or executes a mixed state |
+| 3c | Soundness of shim-backed safe APIs | T/T from 1a (`with_irqs_disabled`, IRQ and preemption tokens); extended at 1c (MMIO, port I/O, IRQ and DMA handles), 2 (context switch, `RunnableThread`) and 3 (`UserPtr` copies), each T/T | every `pub` safe item whose implementation calls a shim is sound for arbitrary safe callers: compile-fail tests check its tokens and handles can't escape, be copied or cross threads, and QEMU tests call it with a `forget` of every guard and handle it returns, a panic at every callback point it offers, and an interrupt injected at each instruction boundary of its shim (single-stepped under QEMU's gdbstub), checking no undefined behaviour and no broken core invariant (the interrupt state is restored, the token count matches, no frame is leaked into two owners) |
+| 4 | Memory isolation between processes | P/T at 3 for the sharing paths that exist then, plus the per-syscall mapping test (T/T); extended at 5 (shared memory, memfd, `SCM_RIGHTS`, `ptrace`, `process_vm_*`, io_uring buffers), 7 (dma-buf) and 8 (GPU buffers), each P/T | a user mapping in process A reaches a frame only if A holds a capability for the memory object that owns it; kernel memory is never user-accessible. Proved over one `core-mm` API that installs user page-table entries and takes a memory-object capability witness, plus the capability table (target 5); every syscall, the page-fault handler, copy-on-write and file mappings reach user PTEs only through it, and the sharing paths are the closed list in `proofs.toml` ([capabilities.md](capabilities.md)). A CI call-graph check fails if anything other than that API reaches the PTE-writing shim. Plus a per-syscall property test that no input yields a mapping of a memory object the caller didn't hold |
+| 5 | Capability derivation and revocation | P/T at 3; the per-syscall test T/T at 3 | derived capabilities never have more rights than their parent; revocation removes the whole subtree, including every open file description (OFD) derived from the object and every fd slot that shares an OFD through `dup`, `fork` or `SCM_RIGHTS`, and every mount derived from a view grant, including copies made by `CLONE_NEWNS`; a revoked handle behaves as defined in [capabilities.md](capabilities.md). Plus a per-syscall property test that no input yields a capability or OFD the caller didn't hold (mappings are target 4's, so this target rests on no other) |
+| 6 | User-copy routines | B/T at 3 | the pure part of the `UserPtr` copy routines (range checks, chunking, the read-once wrapper) only touches the user range it was given, never a kernel address, turns a fault into an error, and reads each user value once; the `stac`/`rep movsb`/`clac` instructions and their exception-table fixup are a shim (target 3b). That no syscall or driver entry point reaches user memory any other way follows from `UserPtr<T>` having no dereference and raw pointers not existing outside tier 0 (targets 3a and 3c) |
 | 7 | Resource accounting | B/T at 2 for scheduler CPU accounting; extended at 4a (B/T) to memory and interrupt budgets and the driver real-time cap | budgets ([drivers.md](drivers.md)) and the driver real-time cap ([scheduler.md](scheduler.md)) are charged and released exactly once, never go negative, and a component can't exceed its budget |
-| 8 | Scheduler invariants | M/T at 2 for run queues and priority inheritance (loom); B at 2 for real-time throttling (Kani over an abstract clock) | every runnable thread is on exactly one run queue; class order and priority inheritance rules in [scheduler.md](scheduler.md) hold; real-time threads never run past their throttling budget in any period, for every sequence of clock readings up to the bound. (A thread running on two CPUs is prevented by the core's move-only `RunnableThread`, not by this policy-level proof, so a policy bug can't cause undefined behaviour) |
-| 9 | Driver message boundary | B/B+M at 4a | ring code never reads a descriptor field twice; never uses a driver-supplied index without bounds-checking it; every buffer handle resolves only to a buffer the kernel granted to that driver |
-| 10 | IOMMU tables and DMA ownership | B/T at 1c; invalidation-before-free order M/T at 2; streaming maps extended at 4a; P/T at 4a | a device's domain maps only frames owned by its live `DmaBuffer`s or, from 4a, pinned for it by a streaming map; context and domain tables stay well-formed, with every unused context entry blocking and every unused AMD-Vi device table entry set to block DMA and interrupts; interrupt remapping entries only target vectors the core allocated. The invalidation-before-free order is checked at level M/T at 2, as part of the same state machine as target 1s, with "a queued invalidation's wait descriptor completes only after the invalidation" as the axiom |
+| 8 | Scheduler invariants | M/T at 2 for run queues and priority inheritance (loom); B/T at 2 for real-time throttling (Kani over an abstract clock; effective T because the clock comes from the timer shim) | every runnable thread is on exactly one run queue; class order and priority inheritance rules in [scheduler.md](scheduler.md) hold; real-time threads never run past their throttling budget in any period, for every sequence of clock readings up to the bound. (A thread running on two CPUs is prevented by the core's move-only `RunnableThread`, not by this policy-level proof, so a policy bug can't cause undefined behaviour) |
+| 9 | Driver message boundary | B/T at 4a | ring code never reads a descriptor field twice; never uses a driver-supplied index without bounds-checking it; every buffer handle resolves only to a buffer the kernel granted to that driver |
+| 10 | IOMMU tables and DMA ownership | B/T at 1c; invalidation-before-free order M/T at 2; streaming maps extended at 4a (B/T); P/T at 4a | a device's domain maps only frames owned by its live `DmaBuffer`s or, from 4a, pinned for it by a streaming map; context and domain tables stay well-formed, with every unused context entry blocking and every unused AMD-Vi device table entry set to block DMA and interrupts; interrupt remapping entries only target vectors the core allocated. The invalidation-before-free order is checked at level M/T at 2, as part of the same state machine as target 1s, with "a queued invalidation's wait descriptor completes only after the invalidation" as the axiom |
 | 11 | SMP locks and per-CPU data | M/T at 2 | spinlocks give mutual exclusion and are IRQ-safe as typed; per-CPU access tokens are never held across a context switch |
-| 12a | Storage: allocator, commit order, restart | B at 4a | the block allocator never double-allocates ([storage.md](storage.md)); a commit is issued only after the writes it covers have completed; after a driver restart, every write not covered by a completed flush is re-sent and treated as not durable |
-| 12b | Storage: volume map and XTS tweak | B at 5 | the per-user volume map's extents never overlap and stay inside the device; the XTS sector-to-tweak mapping is injective per key |
-| 12c | Own file system: AEAD nonces | B, probabilistic; gated by the file system track's done-when | no AEAD nonce repeats under one key, including after a crash, a fallback to an older commit or a replayed image: each mount draws a 128-bit random prefix and counts writes with a 64-bit counter; XChaCha20-Poly1305 uses the 192-bit prefix and counter directly, and a 96-bit-nonce suite (AES-256-GCM) uses a per-mount subkey HKDF(key, prefix), the key being the per-file key for class-B files and the volume or class key otherwise, with the counter zero-padded to 96 bits as its nonce; a counter about to wrap draws a new prefix first, so no (key, nonce) pair repeats. Rests on the RNG axiom (collision at most 2^-64 per volume lifetime). The own file system's further proofs are in `fs/docs/DESIGN.md` |
-| 13 | GPU address-space isolation | B/T at 8 | a GPU command stream from process A can only reach GPU virtual addresses mapped in A's GPU address space, which map only buffer objects A holds a capability for; GPU page-table entries are built only from `DmaBuffer` or `Iova` handles, on D1 and D2 ([drivers.md](drivers.md)) |
-| 14 | Kernel cryptography | T from 4a | `core-crypto` and the kernel's other cryptographic code (AES-XTS, AES-GCM and GHASH, SHA-256, ChaCha20-Poly1305, HKDF, Argon2id) match the NIST CAVP vectors, the Wycheproof vectors and the RFC vectors where they exist, and agree with a reference implementation in differential tests over random inputs; every function that handles key or plaintext bytes has no secret-dependent branch or memory index, checked by running it under a ctgrind-style tool with secrets marked undefined. Verified generated code (HACL*/libcrux-derived, fiat-crypto) is used wherever it exists for the algorithm and instruction set, and counts in the `core-crypto` cap |
-| 15 | Network packet parsers | B at 6 | every in-kernel packet parser (Ethernet, ARP, IPv4, IPv6 and its extension headers, ICMPv4 and ICMPv6, UDP, TCP with options, DHCPv4 and DHCPv6, and DNS in the resolver) never panics, never indexes out of range and never reads beyond the frame, for every frame up to the bound recorded in `proofs.toml` (at least 128 bytes, which covers every fixed header and its options up to that length); longer frames are fuzzed |
-| 16 | Anti-rollback floor state machine | B at 4b | over an abstract TPM NV counter with a power cut injected at every step: the floor never decreases; an image is accepted only if its SVN is at least the floor; counter minus base never overflows or underflows; a raise increments the counter only after every sealed object in [boot.md](boot.md) is resealed at the new state, test-unsealed and kept in two copies; after a power cut at any step, the machine boots either the old or the new state without the recovery key |
+| 12a | Storage: allocator, commit order, restart | B/T at 4a | the block allocator never double-allocates ([storage.md](storage.md)); a commit is issued only after the writes it covers have completed; after a driver restart, every write not covered by a completed flush is re-sent from the replay log's exact device bytes and treated as not durable |
+| 12b | Storage: volume map and XTS tweak | B/T at 5 | the per-user volume map's extents never overlap and stay inside the device; the XTS sector-to-tweak mapping is injective per key |
+| 12c | Own file system: AEAD nonces | B/T, probabilistic; gated by the file system track's done-when | no AEAD nonce repeats under one key, including after a crash, a fallback to an older commit, a replayed image or a hibernation resume: each mount (and each resume) draws a 128-bit random prefix from the kernel generator (target 14) and counts writes with a 64-bit counter; XChaCha20-Poly1305 uses the 192-bit prefix and counter directly, and a 96-bit-nonce suite (AES-256-GCM) uses a per-mount subkey HKDF(key, prefix), the key being the per-file key for class-B files and the volume or class key otherwise, with the counter zero-padded to 96 bits as its nonce; a counter about to wrap draws a new prefix first, so no (key, nonce) pair repeats. "Probabilistic": two prefixes under one key collide with probability at most 2^-64 per volume lifetime (2^32 mounts, birthday bound on 128 bits), given that the generator's output is indistinguishable from random. The own file system's further proofs are in `fs/docs/DESIGN.md` |
+| 13 | GPU address-space isolation | B/T at 8 | a GPU command stream from process A can only reach GPU virtual addresses mapped in A's GPU address space, which map only buffer objects A holds a capability for; GPU page-table entries are built only from `DmaBuffer`, `Iova` or `VramBuffer` handles (a `VramBuffer` names a VRAM range the kernel allocated to that buffer object and cleared, [drivers.md](drivers.md)), on D1 and D2 |
+| 14 | Kernel and loader cryptography | T/T at 3 (the kernel generator, ChaCha20 and BLAKE2b); extended at 4a (AES-XTS, AES-GCM and GHASH, ChaCha20-Poly1305 and XChaCha20-Poly1305, SHA-256, HMAC-SHA-256, HKDF, PBKDF2-HMAC-SHA-256, Argon2id, T/T) and 4b (Ed25519 verification and SHA-512, HMAC-SHA-1 for TOTP, and the loader's build of every primitive it uses, T/T) | all of `core-crypto` ([core.md](core.md)), which is all cipher, hash, MAC, KDF, signature and random-generator code in the kernel and the loader, matches the NIST CAVP vectors, the Wycheproof vectors and the RFC vectors (RFC 8439, 7693, 5869, 8018, 9106, 8032, 6238) where they exist, and agrees with a reference implementation in differential tests over random inputs. The generator ([core.md](core.md)) is checked against RFC 8439 ChaCha20 vectors and known-answer vectors from a reference model of its construction (seed, reseed, fast key erasure, per-CPU rekey), its output passes the NIST SP 800-22 statistical suite over 10^9 bits, and tests check `getrandom` blocks until 256 bits are credited, a forked child and a resumed hibernation image never repeat the parent's output, and readiness on the slowest boot-matrix machine with no `RDSEED` and no firmware RNG. Every function that handles key or plaintext bytes has no secret-dependent branch or memory address, checked by a binary-level secret-taint checker (a DynamoRIO client we maintain, running natively on a CI machine with VAES and AVX-512, so every backend executes) with secrets marked tainted. Verified generated code (HACL*/libcrux-derived, fiat-crypto) is used wherever it exists for the algorithm and instruction set, and counts in the `core-crypto` cap |
+| 15 | Network-path parsers | B/T at 4b for the pre-cap header-block parser; B/T at 6 for the network-path parsers | each parser never panics, never indexes out of range and never reads beyond its input, for every input up to the bound recorded in `proofs.toml`; longer inputs are fuzzed. **In the kernel:** Ethernet, ARP, IPv4, IPv6 and its extension headers, ICMPv4, ICMPv6 including neighbour discovery (neighbour solicitation and advertisement; router advertisements are passed whole to user space), UDP and TCP with options; bound at least 128 bytes, which covers every fixed header and its options up to that length. **In sandboxed user-space services** ([threat-model.md](threat-model.md)): DHCPv4 and DHCPv6 (DHCP client), router advertisements (the same client) and DNS (resolver); bound at least 512 bytes. **Pre-cap, in the kernel:** the parser of the fixed 16 KiB header block (two 8 KiB copies, [storage.md](storage.md)), over the whole 8 KiB copy |
+| 16 | Anti-rollback floor state machine | B/T at 4b | over an abstract TPM NV counter with a power cut injected at every step, covering both the kernel's raise code and the loader's floor code: the floor never decreases; an image is accepted only if its SVN is at least the floor; after a TPM clear the floor is max(the minimum config SVN built into the loader, the highest SVN present); counter minus base never overflows or underflows; a raise increments the counter only after every sealed object in [boot.md](boot.md) is resealed at the new state, each new object's authPolicy matched against a trial-session policy digest, and kept in two copies (the real test-unseal runs on the next boot before capping); after a power cut at any step, the machine boots either the old or the new state without the recovery key |
 
 ## Not provable here, and tested instead
 

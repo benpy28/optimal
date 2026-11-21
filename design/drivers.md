@@ -50,9 +50,10 @@ webcams, and the network configuration services. Device-facing drivers we keep i
 thresholds before their phase closes, because a malicious device that crashes
 a tier-1 driver crashes the kernel. The TCP/IP stack stays in the kernel for
 speed under the same rule. Wi-Fi and Bluetooth are split on every machine:
-a small tier-2 transport part (rings, DMA, firmware loading, no frame
-parsing), which must meet the thresholds, and a tier-3 802.11 or Bluetooth
-stack.
+a small tier-2 transport part (rings, DMA, firmware loading; for Bluetooth
+also the link-key store and HID channel routing, "Bluetooth" below; no other
+frame parsing), which must meet the thresholds, and a tier-3 802.11 or
+Bluetooth stack.
 
 **Promotion on evidence, with numbers.** A driver is allowed in the kernel
 (or moves towards more trust) only after: 10^9 device-side fuzz executions
@@ -67,9 +68,11 @@ process per device), so a malicious device that takes over its process can't
 read or forge another device's events. The secure-attention key and answers
 to prompts are accepted only from in-kernel parsers (PS/2, the boot-protocol
 USB paths and the in-kernel I2C-HID keyboard parser, each meeting the
-thresholds) or from a per-device HID process whose device passed the
+thresholds; a USB keyboard only once it is authorized, "Device
+authorization" below) or from a per-device HID process whose device passed the
 typed-code confirmation in [threat-model.md](threat-model.md); never from
-Bluetooth unless the user opts that keyboard in by name. PIN entry on resume
+Bluetooth unless the user opts that keyboard in by name (Bluetooth input
+rules: "Device authorization" below). PIN entry on resume
 uses only the in-kernel paths, because user space is frozen. Test: a
 compromised Bluetooth stack or HID process injects the secure-attention key
 and approves a prompt, and both fail (Phase 6; extended to the compositor's
@@ -87,7 +90,7 @@ meets the thresholds):
 | AML interpreter | 1c | hosted by the core on the boot thread with an operation budget until Phase 2, its own budgeted thread from Phase 2, the tier-2 framework from Phase 4a (below) |
 | Framebuffer; 16550 serial (from Phase 1 the clock-drift exchange with a host-side timestamper, from Phase 2 timestamping a PPS pulse on the DCD pin, [scheduler.md](scheduler.md)) | 1 | 1 |
 | PS/2 keyboard | 4a | 1, thresholds required |
-| PCI(e) enumeration policy, hotplug, AER/DPC | 4a | 1 (config space and MSI tables stay in tier 0) |
+| PCI(e) enumeration policy, hotplug, AER/DPC, `_OSC`, APEI/GHES and EDR handling | 4a | 1 (config space and MSI tables stay in tier 0) |
 | NVMe, AHCI, each with its in-driver controller reset path (faults, below) | 4a | 1, thresholds required |
 | virtio-blk | 4a | **2**: the first tier-2 driver, so the restart machinery is exercised from Phase 4a |
 | TPM 2.0 (CRB, TIS) | 4b | 0 (MMIO and the TPM service, which alone holds raw TPM access) and 1 (protocol, a safe crate) |
@@ -99,7 +102,8 @@ meets the thresholds):
 | USB mass storage transport | 6 | 2, thresholds required |
 | Thunderbolt/USB4 connection manager, and an ICM driver for controllers whose firmware runs the connection manager | 6 | 2, thresholds required |
 | virtio-net, Intel and Realtek Ethernet | 6 | 3 → 2 (fuzzed to the thresholds within Phase 6) |
-| Wi-Fi and Bluetooth transport (rings, DMA, firmware loading; no frame parsing) | 6 | 2, thresholds required |
+| Wi-Fi and Bluetooth transport (rings, DMA, firmware loading; Bluetooth link keys and HID channel routing; no other frame parsing) | 6 | 2, thresholds required |
+| USB and Bluetooth device authorization ("Device authorization" below) | 6 | 1 in the USB hub logic, 2 in the Bluetooth transport; thresholds required |
 | 802.11 and Bluetooth protocol stacks | 6 | 3 (PCIe radios on D2 machines: see the IOMMU section) |
 | HD Audio | 6 | 2 |
 | USB Audio Class 2 | 6 | 3 → 2 |
@@ -122,10 +126,23 @@ address; a tier-3 driver sees only IOVAs in its own domain.
   gone" error instead of data, so a surprise removal can't make a driver loop
   or index out of bounds on garbage, and registers that legitimately read all
   ones still work. A non-posted read to a dead device stalls the CPU until
-  the completion timeout, so the core sets Completion Timeout to range A
-  (50 µs to 10 ms) in Device Control 2 of every root port and device that
-  supports it, and never issues an MMIO or ECAM read with interrupts off;
-  devices that don't support range A are listed in the boot log.
+  the completion timeout, and a stalled CPU takes no interrupt whatever its
+  interrupt flag says. So the core sets Completion Timeout in Device Control
+  2 of every root port and device to the 50 to 100 µs sub-range of range A
+  where Device Capabilities 2 lists it, otherwise to the shortest range it
+  lists (devices without the 50 to 100 µs sub-range are named in the boot
+  log); no MMIO or ECAM read is issued in any non-preemptible section
+  (interrupts off, preemption off, or a spinlock held); and the handler
+  threads of devices that can be hot-removed (below an external port or a
+  hotplug-capable port) are kept off the CPUs reserved for real-time and
+  audio threads ([scheduler.md](scheduler.md)). Platforms that escalate a
+  completion timeout to a machine check instead of returning all ones are
+  handled under "Hotplug, errors and external devices". Test (Phase 4a
+  gate): surprise removal (`device_del`) of an NVMe device under load while
+  the Phase 2 real-time latency workload runs, in QEMU and on the reference
+  machines with a hot-pluggable NVMe or Thunderbolt device; the worst stall
+  on any CPU is published, and the Phase 2 real-time target holds on the
+  real-time CPUs.
 - **The MSI-X table and pending-bit array are never writable by a driver**,
   even though they live in a device BAR. The core alone programs them;
   otherwise a driver could aim interrupts at any CPU and vector. When the
@@ -169,11 +186,13 @@ address; a tier-3 driver sees only IOVAs in its own domain.
   extended to streaming maps at 4a). Each
   map carries a direction: to-device maps are read-only in the IOMMU,
   from-device and bidirectional maps are writable. A buffer that doesn't
-  cover whole pages is bounced when the device is behind a hotplug-capable
-  port or its driver is tier 3, so the rest of the page is never exposed.
+  cover whole pages is bounced when the device is external (IOMMU section)
+  or its driver is tier 3, so the rest of the page is never exposed.
 - **Config space** reads go through the core; writes are allowed only to a
-  per-device-class list of registers, never to BARs, MSI capability
-  registers or another function.
+  per-device-class list of registers, never to BARs, the command register's
+  Bus Master Enable, MSI and MSI-X capability registers, ACS, Device Control
+  2, the PASID and PRI capabilities, or another function. The same filter
+  handles config writes from AML (below).
 
 ## The IOMMU, from Phase 1
 
@@ -187,51 +206,92 @@ address; a tier-3 driver sees only IOVAs in its own domain.
 - **Pre-boot protection.** From `ExitBootServices` until the kernel's IOMMU
   tables are live in 1c, the kernel image, the page tables Limine built and
   everything 1a and 1b allocate are exposed unless DMA is already blocked.
-  D1 therefore requires firmware pre-boot DMA protection (the DMAR
-  DMA-protection opt-in flag with Protected Memory Regions enabled or
-  translation on at hand-off, or on AMD the IVRS IVinfo DMA-remap-support
-  bit with the IOMMU enabled at hand-off), or Optimal Boot, which just
-  before `ExitBootServices` (after its last firmware I/O) installs a
-  deny-all IOMMU root table whose only mappings are the firmware display's
-  framebuffer, read-only, and the RMRRs, or PMRs covering all RAM when the
-  IOMMU can't be programmed. A machine that meets every other D1 condition
-  but has neither keeps D1's runtime rules and shows a named "boot DMA
-  window" exposure in the boot log, Settings and the scorecard
-  ([threat-model.md](threat-model.md)).
+  D1 therefore requires one of two things. (a) Firmware pre-boot DMA
+  protection: translation on at hand-off (Intel GSTS.TES set; on AMD the
+  IVRS IVinfo DMA-remap-support bit with the IOMMU enabled), or the DMAR
+  DMA-protection opt-in flag with Protected Memory Regions enabled. PMRs
+  count only if they cover: at entry the core reads PLMBASE/PLMLIMIT and
+  PHMBASE/PHMLIMIT and checks that every page the kernel and the loader
+  occupy lies inside them (EDK2, for example, leaves its DMA buffer pool
+  outside them, so a loader page there is a hole). (b) Optimal Boot
+  (Phase 4b), which works in this order: all of its firmware I/O (the PIN
+  through `ConIn`, disk reads); then a deny-all IOMMU root table; then
+  `ExitBootServices`; then it re-checks the IOMMU (Intel GSTS.TES and the
+  root-table address, AMD IommuEn and the device-table base) and re-arms
+  it if a firmware `ExitBootServices` handler turned it off (EDK2's
+  `IntelVTdDxe` does by default), before handing over. Where it can't
+  program an IOMMU it sets the PMRs over one low and one high range that
+  hold every page the kernel and loader occupy, and places those pages so
+  neither range covers an exception. The deny-all exceptions are one list,
+  the same in [boot.md](boot.md): the RMRRs, and the firmware framebuffer,
+  read-only. A machine that meets every other D1 condition but neither (a)
+  nor (b) keeps D1's runtime rules and shows a named "boot DMA window"
+  exposure in the boot log, Settings and the scorecard
+  ([threat-model.md](threat-model.md)). Test (Phase 4b gate): OVMF with its
+  VT-d DXE driver enabled, the hostile device DMAing continuously from
+  firmware through `ExitBootServices` to the kernel's tables; no write
+  lands, and a PMR set with a hole over a loader page is reported as a boot
+  DMA window.
 - **Bring-up order (1c).** The core walks the PCI buses (through ECAM from
   the ACPI MCFG table) and clears BME on every bridge and root port and then
   on every function, except the IOMMU's own function, the firmware display
   and the bridges on its path (below), and USB controllers still owned by
-  the firmware (below). A bridge's BME is set again only when the first
-  device below it is assigned a domain. UEFI boot-services memory and
-  Limine's bootloader-reclaimable memory are not reclaimed until BME is
-  cleared and the IOMMU is live, because a device the firmware left running
-  may still DMA into them.
+  the firmware and the bridges on their paths (below). A bridge's BME is set
+  again only when the first device below it is assigned a domain. UEFI
+  boot-services memory and Limine's bootloader-reclaimable memory are not
+  reclaimed until BME is cleared and the IOMMU is live, because a device
+  the firmware left running may still DMA into them.
 - **USB controllers stay with the firmware until their driver starts.** A
   USB host controller is taken over from the firmware (the xHCI/EHCI/OHCI
   ownership handshake, which ends the firmware's legacy keyboard emulation)
   only when the Optimal driver that runs it starts: the polled xHCI reader in
-  4a, the full host-controller drivers in Phase 6. Until then it keeps its
-  BME and gets its own domain that maps only its RMRRs, so firmware legacy
-  emulation keeps feeding the in-kernel PS/2 path on machines whose only
-  controllers are EHCI, OHCI or UHCI. On Intel 7- and 8-series chipsets the
-  ports route to EHCI until XUSB2PR and USB3_PSSEN are written, so the xHCI
-  reader writes both when it starts on such a chipset. Tests: QEMU
-  `usb-ehci` and `piix-uhci` controllers are left with the firmware, BME
-  on, in a domain holding only their RMRRs (1c gate); a USB keyboard on a
-  USB 3 port of a 7- or 8-series Intel machine types the passphrase through
-  the reader (4a gate).
-- **Firmware protection carries over.** If the DMAR table sets the
+  4a, the full host-controller drivers in Phase 6. Until then it and the
+  bridges on its path (AMD chipset USB sits behind the chipset's bridges,
+  add-in cards behind a root port) keep BME, and it gets its own domain that
+  maps only its RMRRs, so firmware legacy emulation keeps feeding the
+  in-kernel PS/2 path for the 4a passphrase on machines whose only
+  controllers are EHCI, OHCI or UHCI or sit behind a bridge. When its driver
+  starts, the bridges' BME follows the normal rule. On Intel 7- and 8-series
+  chipsets the ports route to EHCI until XUSB2PR and USB3_PSSEN are written,
+  so the xHCI reader writes both when it starts on such a chipset. Tests:
+  QEMU `usb-ehci` and `piix-uhci` controllers, and a `qemu-xhci` behind a
+  `pcie-root-port`, are left with the firmware, BME on along their path, in a
+  domain holding only their RMRRs (1c gate); a USB keyboard on a USB 3 port
+  of a 7- or 8-series Intel machine and on an AMD chipset USB port types the
+  passphrase (4a gate).
+- **Taking over an IOMMU that is already on.** If the DMAR table sets the
   DMA-protection opt-in flag, or Intel Protected Memory Regions are enabled,
   they stay on until the kernel's tables are live; the PMRs are turned off
   (PMEN cleared, PRS checked) only after translation runs on the kernel's
   root table. If translation is already on at hand-off (GSTS.TES set by the
-  firmware, Optimal Boot or a previous kernel), the core never turns it off:
-  it loads its own root table with SRTP while translation stays on, then
-  does a global context-cache and IOTLB invalidation. On AMD-Vi, if the
-  IOMMU is already enabled, the core switches to its own device table, with
-  the firmware display's scanout range and the RMRRs already mapped in it,
-  and then invalidates every device table entry.
+  firmware, Optimal Boot or a previous kernel), the core never turns it off
+  and never changes the translation table mode (RTADDR_REG.TTM, legacy or
+  scalable), which the hardware doesn't allow while translation is on: it
+  builds its root table in the inherited mode, loads it with SRTP while
+  translation stays on, then does a global context-cache and IOTLB
+  invalidation. On AMD-Vi, where the device-table base must not be
+  reprogrammed while IommuEn=1, the core keeps the inherited device table
+  (its pages stay reserved for the life of the boot) and rewrites its
+  entries in place, the firmware display's scanout range and the RMRRs
+  mapped first, invalidating each entry after its write. Optimal Boot
+  builds its tables in the mode the kernel will choose (next bullet), so a
+  loader hand-off never forces the kernel into the other mode.
+- **Translation mode, PASID and PRI.** On Intel, with translation off at
+  hand-off, the core uses scalable mode where ECAP.SMTS=1 and legacy mode
+  otherwise; both are implemented and both are covered by target 10. In
+  scalable mode every present context entry points to a PASID directory
+  whose only present entry is the RID_PASID entry (second-stage
+  translation, PGTT=010b), with Page Request Enable 0, so a request with any
+  other PASID faults; in legacy mode requests with a PASID are blocked by
+  the hardware. On AMD-Vi every device table entry has GV=0 and PPR=0, so
+  PASID-tagged requests and page requests are refused. In every device the
+  PASID and PRI capabilities' enable bits stay 0, and only the core can
+  write them (config space, above). Interrupt remapping: every Intel IRTE
+  has SVT=01, SQ=00 and the exact requester ID the device's MSIs arrive
+  with (the alias, for devices behind a PCIe-to-PCI bridge), so a device
+  can't trigger another device's vector by borrowing its handle; on AMD-Vi
+  each device table entry has its own interrupt remapping table, so an MSI
+  is looked up only in its sender's table.
 - **Firmware display.** The device scanning out the firmware framebuffer,
   and the bridges on its path, keep BME so the screen stays on. Once the
   IOMMU is live, its domain maps only the framebuffer range, read-only, plus
@@ -241,16 +301,25 @@ address; a tier-3 driver sees only IOVAs in its own domain.
   domain with nothing mapped; only `DmaBuffer`s and streaming maps appear in
   it. Requester IDs with no device assigned are blocked too, not left open:
   on AMD-Vi all 65,536 device table entries of every segment are written
-  with V=1, TV=1, Mode=0 with IR=IW=0 (every access refused) and IV=1 with interrupts
-  blocked (IntCtl=00b), because an entry with V=0 passes DMA untranslated
-  and IV=0 passes interrupts unremapped; on Intel, where a not-present root
-  or context entry blocks and faults every request, unused root and context
-  entries stay not present (none is ever set to pass-through) and every
-  unused interrupt-remapping entry is not present. Fault storms from an
-  unassigned requester ID are rate-limited per requester ID like a
-  device's. Firmware-reserved regions
-  (RMRR, IVMD) are mapped only for the devices that need them, logged, and
-  shown on the scorecard.
+  with V=1, TV=1, Mode=0 with IR=IW=0 (every access refused) and IV=1 with
+  interrupts blocked (IntCtl=00b), because an entry with V=0 passes DMA
+  untranslated and IV=0 passes interrupts unremapped; on Intel, where a
+  not-present root or context entry blocks and faults every request, unused
+  root and context entries stay not present (none is ever set to
+  pass-through) and every unused interrupt-remapping entry is not present.
+  Firmware-reserved regions (RMRR, IVMD) are mapped only for the devices
+  that need them, logged, and shown on the scorecard.
+- **Requester-ID aliases.** Some devices DMA with a requester ID other than
+  their own: devices behind a PCIe-to-PCI or PCI-X bridge (the bridge's
+  secondary bus number with devfn 0, or the bridge's own ID), IDs named by
+  IVRS alias entries and DMAR PCI sub-hierarchy scopes, phantom functions (Phantom
+  Functions Enable is left 0 unless a quirk entry needs it), and parts in the
+  quirk table that use another function's ID (for example Marvell
+  88SE9xxx SATA controllers). Every alias ID gets a context or device table
+  entry pointing at the device's domain and interrupt remapping table, and
+  all devices sharing an alias are one IOMMU group. Test (1c gate): QEMU
+  devices behind a `pcie-pci-bridge` do DMA and MSIs that work, and a
+  sibling behind the same bridge is in the same group.
 - **What counts as D1.** A machine is DMA tier D1 only if every PCI segment
   is covered by an IOMMU unit (DMAR INCLUDE_PCI_ALL or scopes listing every
   device; IVRS entries for every device), every I/O APIC and HPET is in a
@@ -265,40 +334,69 @@ address; a tier-3 driver sees only IOVAs in its own domain.
   core enables Source Validation, P2P Request Redirect, P2P Completion
   Redirect, Upstream Forwarding and Translation Blocking, so a device can't
   send a requester ID from outside its port's bus range or reach a peer
-  without passing the IOMMU.
-- **IOMMU groups.** Devices that still can't be separated (one IOMMU group,
-  such as functions behind a port without ACS or functions of one
-  multi-function device without ACS) share one domain. The domain is
-  reference-counted, one reference per member with a live driver, and the
-  whole group runs under the rules of its lowest-trust member (the highest
-  tier number in it): if any member's driver is tier 3, partial-page buffers
-  of every member are bounced and ATS stays off for all of them. Stopping
-  one member unmaps only that member's buffers, waits for the invalidation
-  and drops its reference; the domain is torn down only when the count
-  reaches zero, so a tier-1 sibling keeps running. External devices behind
-  a port without ACS share one domain; the approval prompt names every
-  device in the group, and approval is refused if the group holds an
-  internal device.
+  without passing the IOMMU. Ports without the standard capability but with
+  vendor registers that do the same (for example Intel PCH root ports) are
+  handled through an audited ACS-quirk table: each entry names the part,
+  the registers and the isolation they give, and has a test that programs
+  the registers on a recorded config-space image and checks the read-back;
+  entries for parts in the reference machines are also exercised by the 4a
+  FPGA peer-to-peer test.
+- **IOMMU groups.** Devices that can't be separated share one domain and
+  form one group: functions below a port without ACS (standard or quirk),
+  functions of one multi-function device without ACS, and alias sets
+  (above). A root-complex integrated endpoint is its own group unless it is
+  part of a multi-function device without ACS or shares an alias. The
+  domain is reference-counted, one reference per member with a live
+  driver. **Viable-group rule:** a domain never holds a tier-3 device
+  together with a tier-1 or tier-2 device, because a tier-3 driver could
+  program its device to DMA into a sibling's streaming maps, which hold page
+  cache and user data. In a mixed group the tier-3 driver is refused, or
+  the whole group is given to that one process (its tier-1 and tier-2
+  drivers are then not started); the choice and the reason appear in the
+  boot log and Settings. Stopping one member unmaps only that member's
+  buffers, waits for the invalidation and drops its reference; the domain
+  is torn down only when the count reaches zero, so a sibling keeps
+  running. External devices that share a group: the approval prompt names
+  every device in the group, and approval is refused if the group holds an
+  internal device. Test (1c gate): QEMU devices behind a port without ACS,
+  one with a tier-1 and one with a tier-3 driver; the tier-3 driver is
+  refused, and given the whole group when it is the only driver.
+- **External ports.** A port is external if ACPI gives it the
+  `ExternalFacingPort` property, it is part of a Thunderbolt or USB4
+  topology, or a DMAR SATC entry names it; a device below one is external.
+  Slot Capabilities' Hot-Plug Capable bit alone never makes a port
+  external, because U.2 bays and many internal root ports set it.
 - **ATS (devices sending pre-translated addresses) is off by default** for
   every device. It is turned on only for a named internal device where a
-  benchmark shows a need, never for a tier-3 device or one behind a
-  hotplug-capable port (all of which are treated as external, whether or
-  not ACPI marks them so). A device with ATS on can send translated
-  requests the IOMMU doesn't check, and root-complex integrated devices have
-  no ACS Translation Blocking above them, so every ATS-enabled device and its
-  firmware are listed in the TCB in [threat-model.md](threat-model.md) and on
-  the scorecard. When ATS is on, unmap also waits for the device's own
-  translation cache invalidation to complete.
+  benchmark shows a need, never for a tier-3 device or an external one. A
+  device with ATS on can send translated requests the IOMMU doesn't check,
+  and root-complex integrated devices have no ACS Translation Blocking
+  above them, so every ATS-enabled device and its firmware are listed in
+  the TCB in [threat-model.md](threat-model.md) and on the scorecard. When
+  ATS is on, unmap also waits for the device's own translation cache
+  invalidation to complete.
 - **Free only after invalidation.** A page unmapped from a domain is freed
   only after its IOTLB invalidation (and device-TLB invalidation, if ATS is
   on) has completed. Invalidations may be batched for speed, as long as
   freeing waits for the batch; Linux's lazy mode, which frees before the
   flush, is not used. The cost is benchmarked.
-- **Fault storms.** IOMMU faults are logged and rate-limited per device:
-  past 100 in one second, the core suppresses further fault reporting for
-  that device (Fault Processing Disable in its context and interrupt
-  remapping entries on Intel, SA in its device table entry on AMD), and
-  stops its driver (below), which clears BME and empties its mappings.
+- **Fault storms.** IOMMU faults are logged and rate-limited per requester
+  ID: past 100 in one second from one assigned device, the core suppresses
+  further fault reporting for it (Fault Processing Disable in its context
+  and interrupt remapping entries on Intel, SA in its device table entry on
+  AMD) and stops its driver (below), which clears BME and empties its
+  mappings. An unassigned requester ID past the same limit gets a present
+  entry that still blocks everything with reporting off (on Intel a context
+  entry pointing at an empty table with FPD=1; on AMD SA=1 added to its
+  blocking entry). A global cap covers a spoofer cycling through many IDs:
+  past 1,000 fault events in one second on one IOMMU unit, the core masks
+  that unit's fault interrupt (FECTL.IM on Intel, EventIntEn in the AMD
+  control register) and polls its fault recording registers or event log
+  every 1 ms, on a CPU not reserved for real-time or audio, until a whole
+  second passes under the cap. A hardware log overflow (Intel FSTS.PFO, AMD
+  EventOverflow) is logged as one event carrying the number of polls during
+  which it was set, so every fault is either logged or counted in an
+  overflow event.
 - **D2** (no IOMMU, or one short of D1; [threat-model.md](threat-model.md)):
   for every device no IOMMU unit covers, `DmaBuffer`s, `DmaPool`s and
   `DescRing`s (including xHCI device contexts and an NVMe Host Memory
@@ -308,15 +406,19 @@ address; a tier-3 driver sees only IOVAs in its own domain.
   descriptor rules above, tier-1 and tier-2 driver bugs still can't aim DMA
   at kernel data; a malicious device, or its firmware, can.
   GPUs follow the same rule: every GPU page-table entry (GPUVM, GTT,
-  PPGTT) is built by the GPU core only from a `DmaBuffer` or `Iova` handle,
-  never from a raw address (target 13, which covers D2 machines too), and a
-  GPU without per-process hardware page tables (for example Intel before
-  Gen8) gets no acceleration: it is driven as a
+  PPGTT) is built by the GPU core only from a `DmaBuffer`, `Iova` or
+  `VramBuffer` handle, never from a raw address (target 13, which covers D2
+  machines too), and a GPU without per-process hardware page tables (for
+  example Intel before Gen8) gets no acceleration: it is driven as a
   simple framebuffer with llvmpipe.
-  Thunderbolt and USB4 PCIe tunnels are refused: from 1c the core keeps BME
-  clear on every Thunderbolt downstream port and every hotplug-capable port,
-  so a tunnelled or hot-plugged device can't master even if a firmware
-  connection manager opens the tunnel. Because tier 3 relies on the IOMMU
+  On D2 only, from 1c the core keeps BME clear on every external port
+  (above), so a tunnelled device can't master even if a firmware
+  connection manager opens the tunnel. Below a hotplug-capable port that
+  isn't external, devices present at boot may master; once that device is
+  removed the port's BME is cleared and stays clear until reboot, so a
+  device added after boot is refused (no BME, no driver, reported). On D1
+  these rules don't apply: the IOMMU's deny-all default and the approval
+  rules below protect memory. Because tier 3 relies on the IOMMU
   alone, DMA-capable devices whose drivers would be tier 3 get an in-kernel
   tier-2 build of their driver instead, marked degraded on the scorecard.
   Wi-Fi and Bluetooth radios that do PCIe DMA stay off until the user
@@ -324,9 +426,14 @@ address; a tier-3 driver sees only IOVAs in its own domain.
   compromised over the air could DMA anywhere; the scorecard then says the
   promise that nobody can read a user's data remotely does not hold on that
   machine. USB-attached radios can't master the bus and need no warning. The
-  boot log, Settings and scorecard say "DMA protection: off".
-- **Test (Phase 1c gate):** QEMU machines with an emulated Intel IOMMU and
-  an emulated AMD IOMMU. The hostile device is our own vfio-user device
+  boot log, Settings and scorecard say "DMA protection: off". Test (1c
+  gate): a QEMU machine with no IOMMU boots from an NVMe device behind a
+  `pcie-root-port` with hotplug on and does I/O through it; an NVMe device
+  added with `device_add` under a second such port gets no BME and no
+  driver.
+- **Test (Phase 1c gate):** QEMU machines with an emulated Intel IOMMU (once
+  in legacy mode, once with `x-scalable-mode=on`) and an emulated AMD
+  IOMMU. The hostile device is our own vfio-user device
   server (permissively licensed, built on libvfio-user), attached to an
   unmodified QEMU at a pinned version used as an external test tool, once
   on the root bus and once behind a root port. It tries DMA reads and writes
@@ -334,26 +441,32 @@ address; a tier-3 driver sees only IOVAs in its own domain.
   unassigned requester ID), forged MSI writes, compatibility-format MSIs and
   a fault storm, and DMAs continuously into boot-services memory from
   firmware through `ExitBootServices` and IOMMU bring-up. Every attempt
-  must fault or be dropped and be logged, no write may land after the IOMMU
+  must fault or be dropped and be logged (or counted in an overflow event),
+  no write may land after the IOMMU
   is live or the bridge above it has BME clear, none may land in a
   reclaimed page, the boot DMA window must be reported on OVMF without
   pre-boot protection, and the kernel must keep running. QEMU can't model
-  a device that ignores its own BME, forge another device's requester ID or
-  enforce ACS Source Validation, so those tests are in the 4a hardware gate.
+  a device that ignores its own BME, forge another device's requester ID,
+  send PASID prefixes or enforce ACS Source Validation, so those tests are
+  in the 4a hardware gate.
 - **Hardware test and audit (Phase 4a gate):** from a PCILeech-class FPGA
   board in a D1 reference machine with firmware pre-boot protection: the
   1c attacks, a device that ignores its own BME, requester-ID spoofing
-  through an ACS port, translated requests from a device with ATS off, and
-  the same DMA across the firmware-to-kernel hand-off. The outside audit of
-  the IOMMU, DMA and driver boundary code is also in Phase 4a's done-when.
-  Optimal Boot's pre-`ExitBootServices` deny-all set-up is tested with the
-  same board when the loader lands (Phase 4b).
+  through an ACS port, spoofing that cycles through all 65,536 requester IDs
+  (the global fault cap holds and the kernel keeps running), translated
+  requests from a device with ATS off, PASID-prefixed requests, page
+  requests, MSIs that borrow another device's interrupt handle, peer-to-peer
+  requests through each ACS-quirk port in the machine, and the same DMA
+  across the firmware-to-kernel hand-off. The outside audit of the IOMMU,
+  DMA and driver boundary code is also in Phase 4a's done-when. Optimal
+  Boot's pre-`ExitBootServices` deny-all set-up is tested with the same
+  board when the loader lands (Phase 4b).
 
 ## The message interface (tiers 2 and 3)
 
 The isolation layer is itself attack surface: if the boundary is complicated,
 the boundary is where the bugs go. The design rule is **small,
-one-directional, fuzzed and bounded-checked** (target 9, B at 4a).
+one-directional, fuzzed and bounded-checked** (target 9, B/B+M at 4a).
 
 - Each driver gets a pair of single-producer, single-consumer rings
   (requests in, completions out) in memory shared with the kernel, in the
@@ -371,7 +484,7 @@ one-directional, fuzzed and bounded-checked** (target 9, B at 4a).
 - **Cost is measured:** per-I/O latency and throughput for the same device in
   tier 1, 2 and 3, against Linux, are on the scorecard.
 - Every ring entry point is fuzzed continuously with hostile drivers from
-  Phase 4a; the ring validation is target 9, checked at B (bounded) from 4a.
+  Phase 4a; the ring validation is target 9, checked at B/B+M from 4a.
 - Linux's VFIO and UIO interfaces are **not** offered to apps (they would
   bypass this layer). Tier-3 drivers use Optimal's own interface.
 
@@ -402,7 +515,7 @@ Every component in tiers 1 to 3 is charged against budgets set when it loads:
   can't storm forever and audio isn't cut off.
 - **Locks:** tier-2 and tier-3 code can't hold core spinlocks at all.
 
-Charging and releasing budgets is target 7, at B from 4a for these driver
+Charging and releasing budgets is target 7, at B/T from 4a for these driver
 budgets, the real-time cap included.
 
 ## Faults, stopping and restarting
@@ -413,11 +526,11 @@ budgets, the real-time cap included.
 | Panic (tier 3) | process exits | stop, restart |
 | Device hang | a command the driver handed to the device has no completion within its device class's timeout (storage 30 s, matching Linux's I/O timeout, so spinning-up disks aren't killed; network 5 s; input and audio 1 s) | the driver's own controller reset, in every tier (below); stop, restart (tier 2 and 3) or device stopped and reported (tier 1) if three resets in a row fail |
 | Driver loop or hang | per-component watchdog: requests waiting on its ring that the driver hasn't taken for longer than the class timeout, or a driver thread running for 1 s without taking or completing a request | stop, restart (tier 2 and 3); crash report (tier 1) |
-| CPU stuck | NMI watchdog: a CPU with interrupts off for 10 ms anywhere in the kernel, or a tier-2 thread with preemption off for 10 ms | a stop event for the tier-2 component (parked on core exit, below); otherwise a crash report, as for a tier-2 core call that still hasn't returned 1 s later |
+| CPU stuck | NMI watchdog: a CPU with interrupts off for 10 ms anywhere in the kernel, or a tier-2 thread with preemption off for 10 ms. SMI time is excluded: a window in which `MSR_SMI_COUNT` advanced isn't counted, and on CPUs without that counter two consecutive windows are needed. In a VM (CPUID hypervisor bit set) the watchdog only reports, because the host can stall a vCPU; the CI fault-injection boots below force it to act (`nmi_watchdog=act`) on vCPUs pinned to dedicated host CPUs | a stop event for the tier-2 component (parked on core exit, below); otherwise a crash report, as for a tier-2 core call that still hasn't returned 1 s later |
 | Out of memory | allocation fails | the driver handles the error; repeated failure is reported |
 | Interrupt storm | per-class limit above | mask or rate-limit, report, then stop and restart if it continues |
-| IOMMU fault storm | over 100 faults in one second (IOMMU section) | suppress fault reporting, clear BME, stop, restart |
-| Device error or removal | AER/DPC interrupt, confirmed all-ones reads, hotplug event | stop, then restart if the device is still there |
+| IOMMU fault storm | over 100 faults in one second from one requester ID, or 1,000 on one unit (IOMMU section) | suppress fault reporting, clear BME, stop, restart; for unassigned IDs a blocking entry with reporting off; past the unit cap, mask and poll |
+| Device error or removal | AER/DPC interrupt, or where firmware kept those (`_OSC`), a GHES error record or an EDR notification; a machine check attributed to a device; confirmed all-ones reads; hotplug event | stop, then restart if the device is still there ("Hotplug, errors and external devices") |
 
 **Stopping a driver**, in this order:
 
@@ -456,6 +569,23 @@ budgets, the real-time cap included.
 Only then can a new instance start. Because the core holds every resource a
 driver uses in a per-component handle table, nothing is left dangling.
 
+**Stopping part of a split driver.** When one PCI function is driven by
+components of different tiers (the GPU's tier-1 core and tier-2 display and
+power part), stopping the lower-trust component must not touch the
+function, because BME, FLR and the domain belong to the tier-1 core. The
+sub-function stop is: stop accepting its requests; revoke its register-range
+accessor and its core-only operations (so it can't reach a register or
+address message after this point); park its threads as in step 2; hand its
+pending operations back to the tier-1 core, which completes them with an
+error; revoke its handles and free its arena. The new instance then re-runs
+display and power initialisation through the same accessor, with no FLR and
+no change to the domain, so GPU contexts and the core's mappings survive.
+Only if that re-initialisation fails, or the display engine doesn't come
+back within 2 s, is it escalated to the adapter reset in "GPUs" below. Test
+(Phase 8 gate): the tier-2 display part is made to panic while a Vulkan app
+renders; the app keeps running without a device-lost error and the display
+comes back.
+
 Tier-1 drivers can't be restarted this way (a panic there is a kernel crash),
 which is why tier 1 is small and gets the hardest testing. A hung device is
 not a driver bug, though, so it never crashes the kernel: every storage
@@ -475,8 +605,8 @@ I/O must resume after the reset, and the crash oracle in
 
 **Tests:** CI injects each fault (panic, stack overflow, endless loop at
 core depth 0, a loop that repeatedly calls into the core, preemption held off
-for 10 ms inside a core call, interrupt storm, allocation failure, surprise removal with `device_del` under
-load) into every tier-2 and tier-3 driver. Each must be contained, including
+for 10 ms inside a core call, interrupt storm, allocation failure, surprise
+removal with `device_del` under load) into every tier-2 and tier-3 driver. Each must be contained, including
 on an emulated device with no FLR and one whose reset never completes. For
 storage (virtio-blk from Phase 4a), I/O must resume within 500 ms of restart,
 and the crash oracle in [storage.md](storage.md) must hold: every fsync'd byte
@@ -488,22 +618,154 @@ successfully. The
 
 - PCIe native hotplug and ACPI hotplug: devices can appear and disappear at
   runtime; domains and handles are created and destroyed dynamically.
-- PCIe Advanced Error Reporting and Downstream Port Containment are handled:
-  a containment event stops the affected drivers as above.
+- **Who owns errors and hotplug (`_OSC`).** On every host bridge the core
+  evaluates `_OSC` declaring support for ASPM, MSI, segments, extended
+  config space and Error Disconnect Recover (EDR), and requesting control
+  of native PCIe hotplug, SHPC hotplug, PME, AER, the PCIe capability
+  structure, LTR and DPC. Each control granted is handled natively: AER and
+  DPC interrupts stop the affected drivers as above, and hotplug runs from
+  the slot's interrupts. Each control refused stays with the firmware, and
+  the core uses the firmware's path instead:
+  - **Errors (AER refused):** the core consumes APEI. It parses HEST, and
+    for every GHES error source waits for its notification (SCI, GPIO, NMI,
+    or polling at the interval HEST gives), reads the Generic Error Status
+    Block, acknowledges it, and decodes CPER PCIe sections; the device named
+    by segment, bus, device and function has its driver stopped (and the
+    devices below the port, for an uncorrectable fatal error), then
+    restarted if it is still there.
+  - **Containment (DPC refused):** the firmware runs DPC and sends Notify
+    0x0F on the port's ACPI object. The core stops the drivers below the
+    port, evaluates the EDR `_DSM` Locate function (0x0D) to find the port
+    that contained the error, reports the result with `_OST` (0x80 recovered,
+    0x81 failed), and restarts the drivers if the link comes back.
+  - **Hotplug refused:** ACPI hotplug through Notify Bus Check, Device
+    Check and Eject Request on the slot's object; `_EJ0` is evaluated only
+    after the drivers below are stopped.
+  - **Machine checks from PCIe errors.** Some platforms turn a completion
+    timeout or poisoned completion into a machine check instead of all-ones
+    data. The `MmioRegion` and ECAM read instructions have exception-table
+    fixups, so a recoverable machine check (MCG_STATUS.RIPV=1 or EIPV=1 at
+    that instruction) taken on one returns "device gone" to the driver and
+    the device is stopped as for a removal; a recoverable machine check
+    whose address (MCi_ADDR) falls in a device's BAR, or that a GHES record
+    attributes to a device, stops that device; any other uncorrected machine
+    check is a kernel crash with a crash report.
+  - The boot log and Settings list which controls the firmware kept. Test
+    (Phase 4a gate): QEMU with a patched DSDT whose `_OSC` refuses AER, DPC
+    and native hotplug, a polled GHES source whose status block lives in a
+    BAR of the vfio-user device server (which writes CPER PCIe records), an
+    EDR notification raised by the patched DSDT, and ACPI hotplug with
+    `device_add`/`device_del`; each event stops the named device's driver,
+    and only that one.
 - **External PCIe (Thunderbolt, USB4) needs user approval** per device
   before its tunnel is opened ([threat-model.md](threat-model.md)), enforced
   from Phase 6 by our own connection manager or, on controllers whose
   firmware runs the connection manager (ICM, such as Thunderbolt 3 before
-  Ice Lake), by our ICM driver, which sets the controller's security level
-  to user approval and sends the approve message only after the user
-  approves. Where the firmware opens tunnels by itself anyway (security
-  level fixed at "none", or before Phase 6), the IOMMU's deny-all default is
-  what protects memory on D1: the new device gets no DMA mapping and no
-  driver until approved, and is reset if refused. On D2, BME stays clear on
-  the Thunderbolt and hotplug-capable ports from 1c (IOMMU section), so
-  tunnels are refused.
-- **USB devices need authorisation** before their class driver binds, per
-  the USB rules in the threat model.
+  Ice Lake), by our ICM driver. The ICM security level is a firmware setting
+  the OS can only read, so the ICM driver reads it and never sets it: at
+  "user" or "secure" it sends the approve message only after the user
+  approves (with the challenge-response key at "secure"). At any other
+  level, or before Phase 6, the firmware opens tunnels by itself, and the
+  fallback protects memory: on D1 the IOMMU's deny-all default (the new
+  device gets no DMA mapping and no driver until approved, and is reset if
+  refused); on D2, BME stays clear on external ports from 1c (IOMMU
+  section), so tunnels are refused. That level is named on the scorecard
+  ("Thunderbolt: firmware security level none"). Test (Phase 6 gate): on a
+  reference machine with a software-managed USB4 port and one with an ICM
+  controller, a Thunderbolt NVMe enclosure gets no tunnel (or no approve
+  message) and no DMA mapping until approved, none while the screen is
+  locked, and with the ICM level set to "none" in firmware it gets no
+  mapping and no driver and the scorecard note appears.
+
+## Device authorization (USB, Thunderbolt and Bluetooth), from Phase 6
+
+Every new USB device, Thunderbolt tunnel and Bluetooth device is held until
+approved; nothing it presents reaches a driver first.
+
+- **Identity.** Authorization is per USB interface. An interface's identity
+  is the device's vendor ID, product ID and serial-number string (or, for a
+  device without one, its port path from the root hub), the interface
+  number, and its class, subclass and protocol. The class used for every
+  decision is the class of the driver that would bind, so a vendor-specific
+  interface a network driver claims counts as network. A known identity
+  (approved before, remembered in the TCB settings store) needs no new
+  prompt. A device whose vendor, product and serial match a known device
+  but whose interface classes differ is new, and is "suspicious" (below).
+  Device identities can be copied, so a remembered identity never relaxes
+  the IOMMU or any other check; a copy of a known keyboard plugged into the
+  same port is accepted without a code, and that residual is on the
+  scorecard.
+- **Held until approved.** The xHCI hub logic (tier 1) addresses a new
+  device and reads its device, configuration and string descriptors with a
+  parser fuzzed to the thresholds, then selects a configuration but
+  configures endpoints (xHCI Configure Endpoint) only for authorized
+  interfaces, so an unauthorized interface moves no data and no class
+  driver sees it.
+- **Who is asked.** The prompt comes on the trusted path ([threat-model.md](threat-model.md))
+  and follows the user's prompt level ("Always ask", "Only when suspicious",
+  the default, or "Almost never"; [capabilities.md](capabilities.md)):
+  - HID interfaces (keyboards, mice, anything HID) always prompt, at every
+    level (the non-negotiable floor). After approval the device's pointer
+    events are accepted; its key events are accepted only after it also
+    passes the typed-code confirmation, and until then the kernel's input
+    layer drops every key event tagged with that device.
+  - New storage and network interfaces, and any device presenting different
+    classes than last time, prompt at "Only when suspicious" and "Always
+    ask"; at "Almost never" they bind silently.
+  - Every other new interface (audio, video, printer, serial and the rest)
+    prompts only at "Always ask"; otherwise it binds silently.
+  - Every silent binding is logged and shown in Settings, where it can be
+    revoked (the driver is stopped and the identity forgotten).
+- **Before unlock and on resume.** Until the volume is unlocked the
+  settings store holding known identities can't be read, so the in-kernel
+  keyboard paths (PS/2, USB boot protocol, I2C-HID) accept any keyboard, and
+  only into the passphrase or PIN prompt, where a guessing device is
+  limited by the KDF and the TPM's lockout ([storage.md](storage.md)).
+  After unlock, every USB or Bluetooth device that isn't known goes through
+  the rules above, including one that typed the passphrase. Keyboards used
+  during installation are recorded as known. PS/2 and internal I2C-HID
+  keyboards are internal and need no approval. On resume from suspend the
+  known identities are in memory, so only known keyboards present before
+  suspend type the PIN; a device attached during suspend is held.
+- **While the screen is locked**, all USB and Thunderbolt ports refuse new
+  devices; devices attached before locking keep working. A device attached
+  while locked has its descriptors read but binds nothing: unknown
+  interfaces and known storage, network and other interfaces wait until
+  unlock (then the rules above apply); a known HID interface binds, but its
+  events go only to the lock screen until unlock, so a replugged keyboard
+  can still unlock the session. The connection manager opens no new tunnel
+  and the ICM driver sends no approve message while locked.
+- **Bluetooth** stays off (the transport keeps the controller in reset and
+  sends it no commands) until the user starts pairing from Settings on the
+  trusted path, and goes off again when nothing is paired. Link keys are held
+  by the tier-2 transport, never by the tier-3 stack: the transport answers
+  HCI Link Key Request events from its own store and removes HCI Link Key
+  Notification events from the stream before the stack sees them, and it
+  stores a key only for a device the user approved. A new Bluetooth HID
+  device follows the USB HID rule (prompt and typed code). Input from
+  Bluetooth is accepted only for paired HID devices: the transport feeds a
+  per-device HID process directly with the data of an ACL connection that
+  the controller reports encrypted (HCI Encryption Change) with that
+  device's stored key, routing by the 4-byte L2CAP basic header (the HID
+  control and interrupt channels, and for Bluetooth LE the ATT
+  notifications on the HID report handles the stack registered); that
+  routing is its only frame parsing. Nothing the stack itself emits is ever
+  input. The residual (a stack compromised over the air can still read and
+  forge its own non-HID traffic, such as audio) is on the scorecard.
+- **Tests (Phase 6 gate):** QEMU `usb-kbd` added with `device_add` and
+  typing at once (BadUSB) has no key accepted before approval and the
+  typed code, and prompts at "Almost never"; a composite storage-plus-HID
+  device gets its HID interface held; `usb-net` (a rogue network adapter)
+  gets no driver until approved at "Only when suspicious"; a known
+  `usb-storage` identity re-presented with an added HID interface is
+  treated as new; `usb-storage` attached while locked gets no binding and no
+  mount until unlock and approval; a known keyboard replugged while locked
+  types only into the lock screen; a remembered keyboard moved to a
+  different port needs the typed code again; the same keyboard and storage cases on a
+  reference machine with a programmable USB board running a
+  keystroke-injection script; a test build of the Bluetooth stack that
+  forges HID reports and replays a pairing injects keys into a focused
+  terminal and no key arrives.
 
 ## Power management in the interface from day one
 
@@ -529,9 +791,16 @@ Rust, because firmware bytecode is untrusted input.
   through the core, which refuses: system memory regions overlapping RAM in
   the firmware memory map or any core-owned range (IOMMU, APIC, HPET, TPM,
   MSI-X tables, device BARs assigned to drivers); I/O ports owned by drivers
-  and the PCI config ports `0xCF8` and `0xCFC`; and PCI config writes to BAR,
-  command (Bus Master Enable) and MSI registers of assigned devices. Every
-  refusal is logged; a test runs a hostile DSDT that tries each.
+  and the PCI config ports `0xCF8` and `0xCFC`. A SystemMemory access that
+  overlaps any MCFG (ECAM) range is decoded into segment, bus, device,
+  function and offset and goes through the same PCI config filter as a
+  PCI_Config access. That filter refuses writes to BARs, the command
+  register (Bus Master Enable), MSI and MSI-X capabilities, ACS and Device
+  Control 2 of **every** function, bridges and unassigned ports included,
+  not only assigned devices. Every refusal is logged. Test (1c gate, rerun
+  at 4a under the tier-2 framework): a hostile DSDT tries each refused
+  access, including ECAM writes through a SystemMemory region and setting
+  BME on a hotplug-capable port and on an unassigned bridge.
 - **Faults.** AML state can't safely be rebuilt (re-running `_INI` methods
   changes hardware), so a fault doesn't restart the interpreter: the kernel
   enters a reported "ACPI events disabled" mode (no hotplug, power button or
@@ -573,11 +842,25 @@ hundreds of driver-specific ioctls for Mesa, and hangs routinely. It is split:
   kept small (at most 30,000 lines per vendor, generated register headers
   excluded, reported on the scorecard), must meet the promotion thresholds
   (it parses untrusted command streams), and its reset paths never panic.
-  It is target 13 (B at 8), on D1 and D2 machines alike: every GPU
-  page-table entry is built from a `DmaBuffer` or `Iova` handle (D2 bullet
-  in the IOMMU section).
+  It is target 13 (B/T at 8), on D1 and D2 machines alike: every GPU
+  page-table entry is built from a `DmaBuffer` or `Iova` handle for system
+  memory, or a `VramBuffer` handle for VRAM (D2 bullet in the IOMMU
+  section). A `VramBuffer` is the GPU core's handle for a VRAM range it
+  allocated to one buffer object, with offset and length checked like an
+  `Iova`.
+- **Buffers are cleared before first mapping.** VRAM is outside the frame
+  allocator, so nothing else zeroes it. Every VRAM and GTT buffer object,
+  including memory reused after a context kill or an adapter reset, is
+  cleared by the GPU's own copy or clear engine (AMD SDMA, Intel blitter or
+  the vendor's equivalent) before it is first mapped into any GPU address
+  space or CPU mapping; the mapping waits on the clear's fence. GTT objects
+  backed by system memory come from the frame allocator already zeroed.
+  The clear's cost (allocation latency and throughput per buffer size) is
+  benchmarked and on the scorecard.
 - **Display and power programming (tier 2):** display engine programming
-  and power and clock sequencing run under the tier-2 framework. Their
+  and power and clock sequencing run under the tier-2 framework, and a fault
+  in this part uses the sub-function stop ("Stopping part of a split
+  driver" above), not an FLR. Their
   register access goes through an accessor that checks every offset against
   a per-ASIC list of display and power register ranges, because GPU
   registers aren't split at page granularity and the page-table base and
@@ -601,9 +884,14 @@ hundreds of driver-specific ioctls for Mesa, and hangs routinely. It is split:
   TCB list in [threat-model.md](threat-model.md), each blob pinned by
   SHA-256 with its version in the firmware ledger; the IOMMU still confines
   them to the GPU's domain.
-- **Isolation test:** a process tries to read another process's GPU buffers
-  through every path (submitting commands that reference foreign addresses,
-  guessing buffer handles, dma-buf imports it wasn't given); all must fail.
+- **Isolation test (Phase 8 gate):** a process tries to read another
+  process's GPU buffers through every path (submitting commands that
+  reference foreign addresses, guessing buffer handles, dma-buf imports it
+  wasn't given); all must fail. Canary test: one process fills VRAM and GTT
+  buffers with a canary and frees them, including through a context kill
+  and an adapter reset; another allocates until it has reused that memory
+  and reads it through the GPU and through CPU mappings; no canary byte is
+  found.
 - **Hang recovery:** a hung engine is reset within 2 seconds without losing
   the desktop session; only the guilty context is killed. When engine reset
   fails, the whole adapter is reset: the session must survive (the

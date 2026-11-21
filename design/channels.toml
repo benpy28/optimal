@@ -1,0 +1,623 @@
+# Closed list of every direct channel between app identities, every scoped
+# object that must not cross identities, every grant check, every TCB service
+# that is not a principal, and every portal. Rules: design/capabilities.md,
+# "Direct channels make one principal" and "Granting access: portals".
+#
+# CI parses this file and fails if a row lacks a test, if a test named here
+# doesn't exist, or if a portal or channel kind in the code has no row.
+# The exfiltration suite (design/threat-model.md, A3 -> exfiltration) runs
+# every row in the row's phase.
+#
+# direction: "writer_to_reader" (one edge) or "both" (two edges).
+# created:   "open"   = the edge is made when the channel is opened;
+#            "grant"  = made when the grant that allows it is given;
+#            "write"  = made on the first actual write (terminal only).
+# refusal:   what the app sees when the component check refuses it.
+
+schema = 1
+
+# ---------------------------------------------------------------- channels
+
+[[channel]]
+id = "parent-child-identity"
+what = "a child identity started by its parent (launcher child identities, Flatpak portal Spawn): argv, environment, inherited fds, exit status"
+direction = "both"
+created = "open"
+refusal = "spawn fails: EACCES, or org.freedesktop.DBus.Error.AccessDenied from Spawn"
+phase = 5
+test = "exfil/parent-child-identity"
+
+[[channel]]
+id = "dbus-peer"
+what = "two identities exchanging messages that the D-Bus proxy policy allows"
+direction = "both"
+created = "open"
+refusal = "org.freedesktop.DBus.Error.AccessDenied from the proxy"
+phase = 5
+test = "exfil/dbus-peer"
+
+[[channel]]
+id = "unix-socket"
+what = "a path-bound or passed Unix socket connected across identities"
+direction = "both"
+created = "open"
+refusal = "ECONNREFUSED on connect, EACCES on passing the fd"
+phase = 5
+test = "exfil/unix-socket"
+
+[[channel]]
+id = "pipe-fifo"
+what = "a pipe end or FIFO held by another identity (passed fd or FIFO open)"
+direction = "writer_to_reader"
+created = "open"
+refusal = "EACCES on open or on passing the fd"
+phase = 5
+test = "exfil/pipe-fifo"
+
+[[channel]]
+id = "pty"
+what = "a pty whose master and slave are held by different identities"
+direction = "both"
+created = "open"
+refusal = "EACCES on open or on passing the fd"
+phase = 5
+test = "exfil/pty"
+
+[[channel]]
+id = "shared-memory-fd"
+what = "memfd or shm fd passed across identities; a read-only mapping is one edge from the writer"
+direction = "both"
+created = "open"
+refusal = "EACCES on passing the fd or on mmap"
+phase = 5
+test = "exfil/shared-memory-fd"
+
+[[channel]]
+id = "file-fd-passing"
+what = "an OFD on a file passed by SCM_RIGHTS, pidfd_getfd or a portal fd (writable OFD = both)"
+direction = "writer_to_reader"
+created = "open"
+refusal = "EACCES on passing the fd"
+phase = 5
+test = "exfil/file-fd-passing"
+
+[[channel]]
+id = "debug-attach"
+what = "ptrace or process_vm_* across identities through the debugger portal"
+direction = "both"
+created = "open"
+refusal = "the debugger portal refuses the attach"
+phase = 5
+test = "exfil/debug-attach"
+
+[[channel]]
+id = "shared-folder"
+what = "a folder one app identity can write and another can read (persistent grants)"
+direction = "writer_to_reader"
+created = "grant"
+refusal = "the second grant is refused at grant time, with the reason in the portal's denial"
+phase = 5
+test = "exfil/shared-folder"
+
+[[channel]]
+id = "terminal-write"
+what = "the terminal identity writing a file inside a folder another identity's grant covers (the terminal's reads make no edge)"
+direction = "writer_to_reader"
+created = "write"
+refusal = "the write fails EACCES; the terminal shows a one-click request for the combined approval"
+phase = 5
+test = "exfil/terminal-write"
+
+[[channel]]
+id = "launch-relay-stdin"
+what = "stdin the launch relay forwards from a terminal-identity process to a registered app"
+direction = "writer_to_reader"
+created = "open"
+refusal = "the app's stdin is /dev/null"
+phase = 5
+test = "exfil/launch-relay-stdin"
+
+[[channel]]
+id = "host-command"
+what = "output of a prompted flatpak-spawn --host command, run as the terminal, back to the app"
+direction = "writer_to_reader"
+created = "open"
+refusal = "HostCommand returns org.freedesktop.DBus.Error.AccessDenied"
+phase = 5
+test = "exfil/host-command"
+
+[[channel]]
+id = "loopback-cross-identity"
+what = "a TCP or UDP loopback connection to another identity's port under a per-port grant (loopback-only stack in Phase 5)"
+direction = "both"
+created = "open"
+refusal = "ECONNREFUSED"
+phase = 5
+test = "exfil/loopback-cross-identity"
+exfil_rows_phase = 6
+
+[[channel]]
+id = "oauth-loopback-grant"
+what = "the browser granted the loopback port of a networked app that opened it through open-URI"
+direction = "both"
+created = "grant"
+refusal = "an ordinary open-URI request (prompt) when the requester lacks network"
+phase = 6
+test = "exfil/oauth-loopback-grant"
+
+[[channel]]
+id = "pipewire-relay"
+what = "a PipeWire link carrying one app's stream to another app"
+direction = "writer_to_reader"
+created = "open"
+refusal = "PipeWire refuses the link"
+phase = 6
+test = "exfil/pipewire-relay"
+
+[[channel]]
+id = "wayland-x11-relay"
+what = "surface or buffer sharing between identities through the compositor (xdg-foreign, dma-buf export); each app has its own XWayland"
+direction = "writer_to_reader"
+created = "open"
+refusal = "the compositor refuses the request with a protocol error"
+phase = 7
+test = "exfil/wayland-x11-relay"
+
+[[channel]]
+id = "steam-child-shared"
+what = "a launcher's manifest-declared shared channels to a child identity: read-only paths (parent to child), named shared memory and socket endpoints (both)"
+direction = "both"
+created = "open"
+refusal = "EACCES; nothing undeclared crosses"
+phase = 9
+test = "milestone13/shared-channels"
+
+# Moves the user makes with their own action. Not channels; each is a row
+# because the suite checks that only the user's action moves data.
+
+[[user_transfer]]
+id = "file-chooser-pick"
+rule = "one-use or persistent document-portal entry for the picking app only; a persistent pick is a grant (grant checks below)"
+phase = 5
+test = "exfil/file-chooser"
+
+[[user_transfer]]
+id = "drag-and-drop"
+rule = "each dropped file becomes a one-use document-portal entry for the receiving app"
+phase = 7
+test = "exfil/drag-and-drop"
+
+[[user_transfer]]
+id = "clipboard"
+rule = "the compositor gives clipboard contents only to the focused surface on a paste; no background reads"
+phase = 7
+test = "exfil/clipboard"
+
+# Scoped per identity: these never cross, and the test checks they don't.
+
+[[scoped]]
+id = "ipc-namespace"
+what = "SysV IPC, POSIX message queues, /dev/shm"
+phase = 5
+test = "exfil/scoped-ipc"
+
+[[scoped]]
+id = "abstract-unix-sockets"
+what = "abstract Unix socket names, scoped per app"
+phase = 5
+test = "exfil/scoped-abstract"
+
+[[scoped]]
+id = "kernel-keyrings"
+what = "session and user keyrings, per app"
+phase = 5
+test = "exfil/scoped-keyrings"
+
+[[scoped]]
+id = "tmp-and-home"
+what = "private /tmp, /var/tmp and private homes (keyed by identity ID)"
+phase = 5
+test = "exfil/scoped-tmp-home"
+
+# Out of scope; bandwidth measured and published on the scorecard (Phase 7).
+covert = ["CPU and cache timing", "statfs free space", "flock on shared read-only files", "signals between processes the sender may signal"]
+
+# ---------------------------------------------------------- grant checks
+# Every new grant is checked against the holder's component and every
+# networked identity downstream of it before it is made.
+
+[[grant_check]]
+id = "network"
+rule = "first use raises one request; prompts per level; floor when the component holds file grants"
+phase = 5
+test = "exfil/grant-network"
+
+[[grant_check]]
+id = "folder"
+rule = "persistent folder grant; creates its shared-folder channels at grant time"
+phase = 5
+test = "exfil/grant-folder"
+
+[[grant_check]]
+id = "persistent-document"
+rule = "persistent document-portal entry counts as a file grant"
+phase = 5
+test = "exfil/grant-document"
+
+[[grant_check]]
+id = "inbound-port"
+rule = "per-port inbound grant; floor, prompts at every level"
+phase = 6
+test = "exfil/grant-inbound"
+
+[[grant_check]]
+id = "grant-after-join"
+rule = "A (files) -> B (nothing), then network for B: the combined approval is asked at B's grant, and a refusal refuses the grant"
+phase = 5
+test = "exfil/grant-after-join"
+
+# ------------------------------------------- TCB services (not principals)
+
+[[tcb_service]]
+id = "resolver"
+rule = "answers only identities holding outbound network; others get ECONNREFUSED"
+phase = 6
+
+[[tcb_service]]
+id = "launcher"
+rule = "spawns with identity; launch relay for registered apps run from a terminal; turns private-home autostart and desktop files into portal requests"
+phase = 5
+
+[[tcb_service]]
+id = "dbus-proxy"
+rule = "per-app policy; joins only peers it lets talk"
+phase = 5
+
+[[tcb_service]]
+id = "compositor"
+rule = "draws prompts; clipboard and DnD only on user action; virtual keyboard and pointer reach only the focused surface"
+phase = 7
+
+[[tcb_service]]
+id = "pipewire"
+rule = "per-app permissions; links between apps are the pipewire-relay channel"
+phase = 6
+
+[[tcb_service]]
+id = "ssh-agent"
+rule = "first use per session per app confirmed by a broker prompt naming the app; keys never leave the agent"
+phase = 5
+
+[[tcb_service]]
+id = "gpg-agent"
+rule = "as ssh-agent"
+phase = 5
+
+[[tcb_service]]
+id = "secret-service"
+rule = "per-app collections; cross-app reads confirmed by a broker prompt"
+phase = 5
+
+[[tcb_service]]
+id = "document-portal"
+rule = "each app sees only its own entries; revocation reaches every OFD"
+phase = 5
+
+[[tcb_service]]
+id = "flatpak-launcher"
+rule = "reads permissions only from store-owned storage; answers HostCommand itself"
+phase = 5
+
+[[tcb_service]]
+id = "user-service-manager"
+rule = "applies the provenance rule to every unit and D-Bus-activated service"
+phase = 5
+
+# ------------------------------------------------------------------ portals
+# sends: "no" | "deputy" (sends for the app; rule applies to callers without
+# network) | "remote" (gives others access to this machine).
+# prompt: "level" (per the prompt level), "floor" (every level),
+# "per-send" (a confirmation showing one send's content, every level),
+# "always" (the request is itself a one-off approval, as for sudo),
+# "user-action" (the user's own pick; not a prompt).
+
+[[portal]]
+id = "file-chooser"
+interface = "org.freedesktop.portal.FileChooser"
+sends = "no"
+prompt = "user-action"
+phase = 5
+test = "portal/file-chooser"
+
+[[portal]]
+id = "documents"
+interface = "org.freedesktop.portal.Documents"
+sends = "no"
+prompt = "user-action"
+phase = 5
+test = "portal/documents"
+
+[[portal]]
+id = "file-transfer"
+interface = "org.freedesktop.portal.FileTransfer"
+sends = "no"
+prompt = "user-action"
+phase = 7
+test = "portal/file-transfer"
+
+[[portal]]
+id = "open-uri"
+interface = "org.freedesktop.portal.OpenURI"
+sends = "deputy"
+rule = "non-file URI from a caller without network: prompt naming both apps and the full URL"
+prompt = "per-send"
+phase = 5
+test = "exfil/open-uri"
+
+[[portal]]
+id = "email"
+interface = "org.freedesktop.portal.Email"
+sends = "deputy"
+rule = "caller without network: prompt showing recipients, subject and attachments"
+prompt = "per-send"
+phase = 5
+test = "exfil/email"
+
+[[portal]]
+id = "notification"
+interface = "org.freedesktop.portal.Notification"
+sends = "deputy"
+rule = "caller without network: remote content dropped, action URIs go through the open-uri rule"
+prompt = "level"
+phase = 5
+test = "exfil/notification"
+
+[[portal]]
+id = "print"
+interface = "org.freedesktop.portal.Print"
+sends = "deputy"
+rule = "caller without network: prompt naming the destination printer, its address and whether it was found over the network"
+prompt = "per-send"
+phase = 6
+test = "exfil/print-mdns-printer"
+
+[[portal]]
+id = "network"
+interface = "org.optimal.portal.Network"
+sends = "no"
+rule = "outbound grant (first-use request) and per-port inbound grants"
+prompt = "level"
+phase = 5
+test = "portal/network"
+
+[[portal]]
+id = "launcher"
+interface = "org.optimal.portal.Launcher"
+sends = "no"
+rule = "desktop, D-Bus service, unit, environment and mimeapps.list entries; passes no arguments or files to another app without a prompt naming both"
+prompt = "level"
+phase = 5
+test = "portal/launcher"
+
+[[portal]]
+id = "dynamic-launcher"
+interface = "org.freedesktop.portal.DynamicLauncher"
+sends = "no"
+rule = "same rule as the launcher portal"
+prompt = "level"
+phase = 5
+test = "portal/dynamic-launcher"
+
+[[portal]]
+id = "background"
+interface = "org.freedesktop.portal.Background"
+sends = "no"
+rule = "background running and autostart entries"
+prompt = "level"
+phase = 5
+test = "portal/background-autostart"
+
+[[portal]]
+id = "settings"
+interface = "org.freedesktop.portal.Settings"
+sends = "no"
+rule = "read for every app; writes to the projected shared settings only through the settings writer"
+prompt = "level"
+phase = 5
+test = "portal/settings"
+
+[[portal]]
+id = "flatpak"
+interface = "org.freedesktop.portal.Flatpak"
+sends = "no"
+rule = "Spawn creates child identities with a subset of the caller's grants; SpawnSignal only to own children; latest-version and CreateUpdateMonitor refused"
+prompt = "level"
+phase = 5
+test = "portal/flatpak-spawn"
+
+[[portal]]
+id = "trash"
+interface = "org.freedesktop.portal.Trash"
+sends = "no"
+rule = "only files the app holds an OFD for"
+prompt = "level"
+phase = 5
+test = "portal/trash"
+
+[[portal]]
+id = "account"
+interface = "org.freedesktop.portal.Account"
+sends = "no"
+prompt = "level"
+phase = 5
+test = "portal/account"
+
+[[portal]]
+id = "secret"
+interface = "org.freedesktop.portal.Secret"
+sends = "no"
+rule = "per-app secret from the secret service"
+prompt = "level"
+phase = 5
+test = "portal/secret"
+
+[[portal]]
+id = "monitors"
+interface = "org.freedesktop.portal.NetworkMonitor, MemoryMonitor, PowerProfileMonitor, ProxyResolver"
+sends = "no"
+rule = "read-only status"
+prompt = "level"
+phase = 5
+test = "portal/monitors"
+
+[[portal]]
+id = "debugger"
+interface = "org.optimal.portal.Debugger"
+sends = "no"
+rule = "asks before a cross-app attach; hands over a debug capability"
+prompt = "always"
+phase = 5
+test = "portal/debugger"
+
+[[portal]]
+id = "process"
+interface = "org.optimal.portal.Process"
+sends = "no"
+rule = "lists the user's processes with attested identities; signals beyond terminate and stop need a grant"
+prompt = "level"
+phase = 5
+test = "portal/process"
+
+[[portal]]
+id = "administrator-action"
+interface = "org.optimal.portal.AdministratorAction"
+sends = "no"
+rule = "replaces sudo and pkexec"
+prompt = "always"
+phase = 5
+test = "portal/administrator-action"
+
+[[portal]]
+id = "accounts"
+interface = "org.optimal.portal.Accounts"
+sends = "no"
+rule = "replaces passwd and chsh"
+prompt = "always"
+phase = 5
+test = "portal/accounts"
+
+[[portal]]
+id = "realtime"
+interface = "org.freedesktop.portal.Realtime"
+sends = "no"
+prompt = "level"
+phase = 6
+test = "portal/realtime"
+
+[[portal]]
+id = "usb"
+interface = "org.freedesktop.portal.Usb"
+sends = "no"
+rule = "access to an approved USB device; new HID devices are in the floor (drivers.md)"
+prompt = "level"
+phase = 6
+test = "portal/usb"
+
+[[portal]]
+id = "camera"
+interface = "org.freedesktop.portal.Camera"
+sends = "no"
+prompt = "level"
+phase = 7
+test = "portal/camera"
+
+[[portal]]
+id = "location"
+interface = "org.freedesktop.portal.Location"
+sends = "no"
+prompt = "level"
+phase = 7
+test = "portal/location"
+
+[[portal]]
+id = "screenshot"
+interface = "org.freedesktop.portal.Screenshot"
+sends = "remote"
+prompt = "floor"
+phase = 7
+test = "portal/screenshot"
+
+[[portal]]
+id = "screencast"
+interface = "org.freedesktop.portal.ScreenCast"
+sends = "remote"
+prompt = "floor"
+phase = 7
+test = "portal/screencast"
+
+[[portal]]
+id = "remote-desktop"
+interface = "org.freedesktop.portal.RemoteDesktop"
+sends = "remote"
+rule = "includes its Clipboard interface"
+prompt = "floor"
+phase = 7
+test = "portal/remote-desktop"
+
+[[portal]]
+id = "input-capture"
+interface = "org.freedesktop.portal.InputCapture"
+sends = "remote"
+prompt = "floor"
+phase = 7
+test = "portal/input-capture"
+
+[[portal]]
+id = "virtual-keyboard-pointer"
+interface = "org.optimal.portal.VirtualInput"
+sends = "remote"
+rule = "events reach only the focused surface, never the prompt layer"
+prompt = "floor"
+phase = 7
+test = "portal/virtual-input"
+
+[[portal]]
+id = "global-shortcuts"
+interface = "org.freedesktop.portal.GlobalShortcuts"
+sends = "no"
+prompt = "level"
+phase = 7
+test = "portal/global-shortcuts"
+
+[[portal]]
+id = "inhibit"
+interface = "org.freedesktop.portal.Inhibit"
+sends = "no"
+prompt = "level"
+phase = 7
+test = "portal/inhibit"
+
+[[portal]]
+id = "wallpaper"
+interface = "org.freedesktop.portal.Wallpaper"
+sends = "no"
+prompt = "level"
+phase = 7
+test = "portal/wallpaper"
+
+[[portal]]
+id = "virtual-gamepad"
+interface = "org.optimal.portal.VirtualGamepad"
+sends = "no"
+rule = "uinput fd accepting gamepad codes only"
+prompt = "level"
+phase = 9
+test = "milestone13/virtual-gamepad"
+
+[[portal]]
+id = "gamemode"
+interface = "org.freedesktop.portal.GameMode"
+sends = "no"
+prompt = "level"
+phase = 9
+test = "portal/gamemode"

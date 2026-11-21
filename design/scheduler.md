@@ -34,13 +34,32 @@ audio keeps up under load. This file is the design that the targets in
   SMI count (`MSR_SMI_COUNT` on Intel, the SMIs-received PMC event on AMD) at
   the entry and exit of each section; sections an SMI overlapped are
   firmware time, so they are reported separately with their count published
-  and excluded from the 50 µs gate. MMIO reads with interrupts off are not
-  allowed ([drivers.md](drivers.md)), so a removed device's completion
-  timeout (range A, at most 10 ms) can't stall an interrupts-off section. In virtual machines
-  the host can stall a vCPU at any moment, so there the tracer only reports;
-  the limit is enforced (CI fails above it) on the bare-metal reference
-  machines, which run the stress suites nightly from Phase 2. The target
-  tightens to 20 µs in Phase 10.
+  and excluded from the 50 µs gate (the NMI watchdog likewise leaves SMI
+  time out of its 10 ms and only reports in VMs, [drivers.md](drivers.md)).
+- **Device stalls.** A CPU waiting on a non-posted MMIO read takes no
+  interrupt until the read completes, whatever the interrupt flag says, so
+  a surprise-removed device stalls that CPU for its whole Completion
+  Timeout. Three rules bound it ([drivers.md](drivers.md)): Completion
+  Timeout is set to the 50 to 100 µs sub-range of range A on every device
+  that supports it (else range A, at most 10 ms); no MMIO read happens in
+  any non-preemptible section (spinlock held, preemption or interrupts
+  off), so hard-IRQ handlers only write; and handler threads of
+  hot-removable devices (behind a hotplug-capable or Thunderbolt/USB4 port)
+  are affine to one "removable-device core" (the highest-numbered
+  non-isolated core, with its SMT sibling; on hybrid CPUs an E-core), on
+  which the real-time class never places a thread while any other CPU can
+  take it, so audio, input and other real-time threads don't share a CPU
+  with a stall (on machines with fewer than 4 CPUs this is off, and the
+  scorecard says so). Test (Phase 4a): the
+  surprise-removal latency test pulls a QEMU NVMe device behind a hotplug
+  root port during reads, with the real-time wake-up load running, and
+  publishes the worst CPU stall and the worst real-time wake-up latency.
+- **Where the 50 µs limit is enforced.** In virtual machines the host can
+  stall a vCPU at any moment, so there the tracer only reports; the limit
+  is enforced (CI fails above it) on the bare-metal reference machines, in
+  dedicated stress boots from Phase 2 (their own slot in the machine-hours
+  budget, [benchmarks.md](benchmarks.md)). Benchmark boots run with the
+  tracer off. The target tightens to 20 µs in Phase 10.
 - **Interrupt handlers are threaded.** Hard-IRQ handlers live in the core and
   only acknowledge the device and wake the driver's handler thread, which is
   an ordinary schedulable thread with its own priority. Audio, input and
@@ -86,8 +105,12 @@ thread on that CPU.
   removes those CPUs from load balancing, from unbound kernel threads and
   timer migration, and from the default destination of device interrupts:
   the kernel programs every I/O APIC and MSI destination to the other CPUs
-  and rejects affinity changes that would add an isolated CPU (a Phase 2
-  test counts interrupts per CPU and requires 0 on isolated CPUs). They stop
+  and rejects affinity changes that would add an isolated CPU. A Phase 2
+  test runs one spinning thread per isolated CPU for 10 s and counts
+  interrupts per CPU by source: 0 device (I/O APIC and MSI) interrupts, at
+  most 10 LAPIC timer interrupts (the tick-stop bound below) and at most 10
+  IPIs, each IPI logged by type, none from load balancing or timer
+  migration. They stop
   their tick when they run one thread (the single-thread tick stop below,
   Phase 2). Only threads placed there by affinity run on them. The harness
   uses it only for the per-change microbenchmark tier; every desktop,
@@ -148,8 +171,9 @@ thread on that CPU.
   TSC-deadline mode, falling back to LAPIC one-shot, then HPET, then the
   PIT. The drift test measures against an independent reference only, never
   the calibration source. On KVM (the Phase 1 gate: under 1 ppm over
-  10 minutes) QEMU runs with an explicit `tsc-frequency`, which the guest
-  reads from CPUID 0x15; once a second the kernel writes its clock reading
+  10 minutes, on the dedicated KVM host, an owner need from Phase 1) QEMU
+  runs with CPUID level at least 0x15 and an explicit `tsc-frequency`,
+  which the guest reads from CPUID 0x15; once a second the kernel writes its clock reading
   as a line on the 16550 UART (polled, no DMA), and a host-side program
   timestamps each line's arrival with `CLOCK_MONOTONIC_RAW`; drift is the
   slope of a least-squares fit of guest time against host time, so serial
@@ -193,10 +217,16 @@ explicit:
   with page-table isolation the user half uses the same PCID with bit 11
   set. Switching to an address space already in a slot whose generation
   matches loads CR3 with the no-flush bit (bit 63); otherwise the least
-  recently used slot is taken and CR3 is loaded with a flush. Every unmap
-  bumps the address space's generation and a CPU that completes a shootdown
-  records the new generation in its slot, so a CPU can never reuse a stale
-  PCID without flushing.
+  recently used slot is taken and CR3 is loaded with a flush. Every change
+  that removes a permission or changes a frame (unmap; write-protect for
+  copy-on-write at `fork`; `mprotect` that drops write, execute or user
+  access, including `PROT_NONE` and W→X; page migration; huge-page split
+  or collapse; a cache-type change) bumps the address space's generation
+  and completes its shootdown before the operation returns, and a CPU that
+  completes a shootdown records the new generation in its slot, so a CPU
+  can never reuse a stale PCID without flushing. Only changes that add
+  rights (a fault filling a PTE, an upgrade from read-only) skip the
+  shootdown; a CPU then takes at most a spurious fault.
 - **TLB: "may cache" tracking.** Each address space has a CPU set of CPUs
   that may cache its translations: a CPU joins when it loads the address
   space's CR3, and stays while it runs a kernel thread with that CR3 still
@@ -204,11 +234,21 @@ explicit:
   that receives one switches to the kernel-only page table and leaves the
   set. A CPU leaves the set otherwise only when it loads another address
   space's CR3; translations it still holds under an unloaded PCID are covered
-  by the generation rule above. [verification.md](verification.md) target 1s
-  states the property as "no CPU can use a stale translation", with two
-  obligations at each unmap: every CPU in the may-cache set has
-  acknowledged, and every other PCID slot holding that address space has a
-  generation older than the unmap, so reloading it flushes.
+  by the generation rule above. When an address space is torn down or its
+  top-level table is freed, every lazy CPU still in the set gets an IPI,
+  switches to the kernel-only table and acknowledges before the table is
+  freed, on both shootdown paths (INVLPGB sends no IPI, so without this a
+  lazy CPU could keep a freed PML4 in CR3 and walk it speculatively).
+  [verification.md](verification.md) target 1s states the property as "no
+  CPU uses a translation with more rights than the current PTE once the
+  operation returns", with two obligations at each such change: every CPU
+  in the may-cache set has acknowledged, and every other PCID slot holding
+  that address space has a generation older than the change, so reloading
+  it flushes. Tests: a QEMU test forks while other threads of the parent
+  write continuously and checks no write lands in a page the child sees
+  (Phase 3); a QEMU test tears down an address space with lazy CPUs on
+  each path and checks no CPU holds its freed top-level table in CR3
+  (Phase 3 IPI path, Phase 5 INVLPGB path).
 - **TLB: shootdown paths.** Remote shootdowns are batched per unmap
   operation. The IPI path lands in Phase 2 and the INVLPGB path in Phase 5.
   Without INVLPGB, the initiator sends an IPI to every other CPU in the set
@@ -226,9 +266,9 @@ explicit:
   ASIDs on every CPU (INVLPGB by ASID, then TLBSYNC); until then the address
   space falls back to a dynamic PCID and IPIs. A frame is reused only after
   its shootdown has completed on every CPU in the set
-  ([verification.md](verification.md) target 1s: level M at Phase 2 for the
-  IPI path, re-gated at M in Phase 3 with PCID and lazy switch and in Phase
-  5 with INVLPGB and THP).
+  ([verification.md](verification.md) target 1s: M/T at Phase 2 for the
+  IPI path, re-gated at M/T in Phase 3 with PCID, lazy switch, permission
+  downgrades and teardown, and in Phase 5 with INVLPGB and THP).
 - **Huge pages** (Phase 5). Transparent huge pages for anonymous memory on
   fault where the region is aligned and large enough, plus background
   collapse; a fault never waits for compaction (if no 2 MiB frame is free it
@@ -243,12 +283,20 @@ explicit:
   longer than background apps'.
 - **Swap and compression.** Compressed in-memory swap (zram-style, our own
   implementation, LZ4 or Zstd from permissively licensed crates) is on by
-  default, with optional encrypted disk swap. Phase 5.
+  default, sized at half of usable RAM, LZ4 by default (lowest
+  decompression latency), with swappiness 100 (anonymous and file pages
+  weighted equally, as suits in-memory swap) and optional encrypted disk
+  swap. Phase 5. Matched Linux in the memory-pressure test uses the same
+  size, compressor and swappiness ([benchmarks.md](benchmarks.md)).
 - **Pressure information and OOM.** Pressure stall information
   (`/proc/pressure/*`, needed by systemd-oomd-style daemons and by the
   desktop) is implemented in Phase 5. The kernel OOM killer is the last
-  resort; a user-space OOM service acts earlier, killing the least important
-  background app first, never the compositor or the foreground app.
+  resort; a user-space OOM service acts earlier, when an app group's memory
+  pressure (`full` avg10) stays at or above 50% for 20 s, killing the least
+  important background app first, never the compositor or the foreground
+  app. Matched Linux runs systemd-oomd with the same limit and duration on
+  per-app scopes, so the test measures the kernel and the victim choice,
+  not the thresholds.
 - **Benchmarks** (added to [benchmarks.md](benchmarks.md)): TLB shootdown
   latency against core count (Phase 2); 4 KiB fault cost, mmap/munmap and
   page-fault scaling across cores (Phase 3); 2 MiB fault cost (Phase 5); and a memory pressure test in
@@ -282,7 +330,9 @@ a loop inside a core call).
 
 ## Proof and test obligations
 
-- [verification.md](verification.md) target 8 (level M at Phase 2) covers:
+- [verification.md](verification.md) target 8 (M/T at Phase 2 for run
+  queues, class order and priority inheritance; B/T at Phase 2 for real-time
+  throttling) covers:
   every runnable thread is on exactly one run queue; a higher class always
   runs before a lower one on the same CPU; RT throttling never lets RT use
   more than its budget; priority inheritance chains are acyclic and restore
@@ -291,7 +341,7 @@ a loop inside a core call).
   recorded in the ledger); RT throttling is checked with Kani over an
   abstract clock; property tests run in QEMU. (No thread runs on two CPUs is
   guaranteed by the core's move-only `RunnableThread`, not by this check.)
-- Target 7 at level B in Phase 2 covers the scheduler's CPU accounting only
+- Target 7 at B/T in Phase 2 covers the scheduler's CPU accounting only
   (the RT throttle); it is extended at 4a, when drivers exist, to the driver
   real-time cap above and to memory and interrupt budgets.
 - Phase 2 tests: priority-inheritance chains (nested and across classes),
@@ -299,5 +349,7 @@ a loop inside a core call).
   (no periodic tick on an idle CPU over 10 s), single-thread tick stop and
   isolated-CPU interrupt counts (above), timer expiry accuracy, and the
   bare-metal PPS drift test.
-- The latency tracer and the stress suite run in every CI boot from Phase 2
-  (report-only in VMs, enforced on bare metal, as above).
+- The latency tracer and the stress suite run in every functional CI boot
+  from Phase 2 (report-only in VMs) and in the bare-metal stress boots,
+  where the limit is enforced; benchmark boots keep the tracer off (its
+  cost when off is the Phase 3 gate above).

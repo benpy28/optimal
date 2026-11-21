@@ -35,7 +35,8 @@ sets the requirements it must meet.
   records the error against the file (below). A write that fails with a
   retryable status (NVMe DNR=0, ATA aborted or interface CRC error) is
   retried 3 times, the last after a controller reset; a non-retryable status
-  (NVMe DNR=1, ATA uncorrectable or ID-not-found) is not retried. A device is
+  (NVMe DNR=1, ATA uncorrectable or ID-not-found) is not retried at the
+  command level (writeback's own bound is below). A device is
   set read-only, never hidden, when 16 writes have failed all retries within
   10 minutes, or at once when it reports itself read-only (NVMe Critical
   Warning bit 3, ATA write-protect). Every file system on Optimal, the own
@@ -49,12 +50,17 @@ sets the requirements it must meet.
   re-initialisation if the abort doesn't complete in 5 s; AHCI COMRESET of
   the port) and re-sends through the replay log below, exactly as after a
   restart. A kernel crash is never the result of a device stall. PCIe
-  Completion Timeout is set to range A (at most 10 ms) on every device that
-  supports it, and drivers never do MMIO reads with interrupts off, so a
-  removed device can't stall a CPU past the watchdog ([drivers.md](drivers.md)).
+  Completion Timeout is set to the 50–100 µs sub-range of range A where the
+  device supports it (range A, at most 10 ms, otherwise), and drivers never
+  do MMIO reads in any non-preemptible section, so a removed device can't
+  stall a CPU past the watchdog ([drivers.md](drivers.md)).
   Test (Phase 4a): an emulated NVMe and AHCI device stops completing
   commands for 60 s; the controller is reset, no write is lost, no
-  application sees an error, and the latency gate holds.
+  application sees an error, and the latency gate holds. **The latency
+  gate** is the Phase 2 real-time target under storage load: real-time
+  wake-up latency, measured during the stall with all other cores
+  saturated, meets P99 < 50 µs and P99.9 < 100 µs, in a guest whose vCPUs
+  are pinned to isolated host CPUs on the dedicated KVM host.
 - **Driver restarts are invisible when nothing was lost.** When a storage
   driver is restarted ([drivers.md](drivers.md)), the block layer keeps its
   in-flight requests and resubmits them to the new instance. A controller
@@ -63,18 +69,34 @@ sets the requirements it must meet.
   re-issued, and any commit that depends on it waits until it and a new
   flush complete. To re-issue it, the block layer keeps a per-device replay
   log of completed, unflushed writes on every drive treated as unprotected
-  (above; on others a completed write is durable and nothing is kept). Page-cache writes are kept by reference: the page stays
-  write-protected until the flush completes, and a process writing to it
-  meanwhile gets a bounce copy (stable pages, below). `O_DIRECT` writes are
-  copied into the log when they complete, because the caller may reuse its
-  buffer. A completed write fully covered by a later completed write to the
-  same blocks is dropped from the log. When the log reaches 64 MiB the block
-  layer issues a flush and empties the log when it completes. After a
-  restart the log is re-sent in completion order, then flushed, then the
-  held commits go out. Applications see `EIO` only if three restarts in a
-  row fail. Tests (Phase 4a): overlapping writes to the same blocks
-  completed in both orders, then a driver kill before the flush; the disk
-  must hold the later-completed data, for page-cache and `O_DIRECT` writes.
+  (above; on others a completed write is durable and nothing is kept). The
+  log holds **the exact bytes sent to the device**, because nothing above
+  can recreate them (XTS ciphertext in stage 1, AEAD output with a one-time
+  nonce in stage 2): the buffer the device read from is kept instead of
+  freed at completion. That is the ciphertext bounce buffer on an encrypted
+  volume, the page itself (write-protected until the flush, with a bounce
+  copy for a process that writes to it meanwhile; stable pages, below) for
+  an unencrypted page-cache write, and a copy made at completion for an
+  unencrypted `O_DIRECT` write, whose caller may reuse its buffer. The log
+  is capped at min(64 MiB, RAM/64) per device, preallocated at device
+  probe, and every kept buffer counts against it. When it is full the
+  block layer issues a flush and holds further completions (not reported
+  upward, buffers not released) until that flush completes, then reports
+  them and empties the log; it never allocates for the log. A completed
+  write fully covered by a later completed write to the same blocks is
+  dropped from the log. After a restart the log is re-sent in completion
+  order, then flushed, then the held commits go out. Applications see
+  `EIO` only if three restarts in a row fail. Tests (Phase 4a, all with
+  LUKS2 on): overlapping writes to the same blocks completed in both
+  orders, then a driver kill before the flush; the disk must hold the
+  later-completed data, for page-cache and `O_DIRECT` writes; a full log
+  on a 256 MiB guest holds completions and allocates nothing. Its cost is
+  gated by two Phase 4a storage-set entries against Linux
+  ([benchmarks.md](benchmarks.md)): 1 MiB sequential `O_DIRECT` write at
+  QD32, and a page-rewrite microbenchmark (the same 4 KiB page rewritten
+  and written back in a loop, the SQLite WAL-tail pattern); each passes
+  when the worse end of its Holm-corrected 95% confidence interval, over at
+  least 20 boots, is within 10% of matched Linux.
 
 ## What durability calls promise (the Linux contract)
 
@@ -101,12 +123,21 @@ are written down and each has a crash test.
 as Linux's errseq). When writeback fails, the counter moves on. Every open
 file description sees the error exactly once, on its next `fsync`, `fdatasync`
 or `close`, even if another process already saw it and even if the pages were
-since cleaned. Pages whose writeback failed stay dirty and are retried. If
-the device is gone, up to 64 MiB (or 1% of RAM, whichever is smaller) of
-them are kept per device in case it comes back; beyond that, or after the
-device is gone for 10 minutes, they are dropped, and the error stays reported
-on every file that had them. A test pulls a USB stick mid-write. (This is the PostgreSQL "fsyncgate" case: an error must
-never be silently forgotten.)
+since cleaned. Pages whose writeback failed stay dirty and are retried, at
+most 3 writeback cycles on a device that is still present (the own
+copy-on-write file system writes each retry to a newly allocated block
+instead of the failing one; ext4 rewrites in place). After the third failed
+cycle the pages are marked clean, the errseq error stays, and the failure
+counts toward the 16-in-10-minutes read-only rule above. If the device is
+gone, up to 64 MiB (or 1% of RAM, whichever is smaller) of them are kept
+per device in case it comes back; beyond that, or after the device is gone
+for 10 minutes, they are dropped, and the error stays reported on every
+file that had them. `sync` and unmount always complete. Tests (Phase 4a):
+pull a USB stick mid-write; on a present virtio-blk and NVMe device, an LBA
+that fails every write with a non-retryable status gives `EIO` on the next
+`fsync` of each open description, then `sync` returns and unmount
+completes, with dirty memory back to its pre-test level. (This is the
+PostgreSQL "fsyncgate" case: an error must never be silently forgotten.)
 
 Tests: an ALICE/CrashMonkey-style suite that, for each row above, records the
 block request stream, generates every crash state at every flush boundary
@@ -145,10 +176,13 @@ There are two stages, and the scorecard always says which one a machine is in.
 encryption layer under ext4 using AES-256-XTS with the CPU's AES
 instructions, in the LUKS2 on-disk format (implemented from its public
 specification, so Linux can open the same volume and the rescue tools work).
-All cipher, hash and KDF code (AES-XTS, AES-GCM, GHASH, ChaCha20-Poly1305,
-SHA-2, HKDF, Argon2id) is the core-crypto crate, proof target 14 (T from
+All cipher, hash, MAC, KDF and signature code (AES-XTS, AES-GCM, GHASH,
+ChaCha20-Poly1305, SHA-2, BLAKE2b inside Argon2id, HMAC-SHA-256, HKDF,
+PBKDF2, Argon2id, Ed25519) and the kernel CSPRNG that draws every key and
+nonce prefix below are the core-crypto crate, proof target 14 (T from
 Phase 4a: CAVP and Wycheproof vectors, differential tests, constant-time
-check; [verification.md](verification.md)).
+check with a binary-level tool that executes VAES and AVX-512; the CSPRNG
+from Phase 3 with SP 800-90A vectors; [verification.md](verification.md)).
 XTS gives **confidentiality only**: it hides data on a powered-off disk but
 doesn't stop an attacker who changes ciphertext. They can't choose the
 plaintext they produce, but they can scramble sectors or put back older
@@ -169,11 +203,28 @@ copies of them. So in stage 1:
   cache still holds plaintext.
 
 **What is parsed before capping.** Before capping ([boot.md](boot.md)) the
-kernel parses only the fixed-format Optimal header block (the last 16 KiB
-before the 16 MiB LUKS2 data offset, layout in [boot.md](boot.md))
-of the system volume (sealed blobs and volume tag; the tag is checked over
-the raw header bytes before anything else is parsed). The LUKS2 JSON header
-and the volume map (below) are parsed only after capping.
+kernel parses only the fixed-format Optimal header block of the system
+volume (the last 16 KiB before the 16 MiB LUKS2 data offset, two 8 KiB
+copies with version and CRC-32C, layout in [boot.md](boot.md)). It holds
+the sealed blobs, every wrapped copy of the volume key that Optimal opens
+(the TPM slot's, the passphrase's and the recovery key's) and the volume
+tag, so no boot path, the first boot and recovery-key boots included,
+reads a LUKS2 key slot. The LUKS2 JSON carries matching passphrase and
+recovery-key slots only so that Linux can open the volume; Optimal writes
+them and never opens one. The tag is HMAC-SHA-256 under a key derived from
+the volume key ([boot.md](boot.md)) and covers **both** LUKS2 header copies
+(binary headers and JSON areas) and the header block's fields other than
+the tag and the blob slots. Once the volume key is unwrapped, the tag is
+checked over those bytes as read, before S is unsealed and before any JSON
+is parsed; on mismatch the key is wiped and the volume refused. The kernel
+never selects a LUKS2 header by seqid: it uses a copy only if the tag
+verifies it. After capping, the JSON is parsed as `Untrusted<T>` and held
+to an allow-list: exactly one segment, of type crypt, `aes-xts-plain64`,
+`sector_size` 4096, offset 16 MiB, `iv_tweak` 0; anything else is refused.
+The volume map (below) is parsed only after capping. Tests: JSON outside
+the allow-list (a `cipher_null` segment, a second segment, another offset)
+is refused (Phase 4a); a secondary header copy with a higher seqid and a
+valid checksum is refused, in the header fuzzer (Phase 4b).
 
 **KDF (one rule everywhere).** Every human secret (PIN, passphrase, fTPM
 passphrase, LUKS2 key slots, the own file system's slots) is stretched with
@@ -183,34 +234,64 @@ Argon2id, 4 lanes, memory = min(1 GiB, RAM/4) but at least 64 MiB, at least
 [benchmarks.md](benchmarks.md)). The parameters are stored per key slot and
 shown on the scorecard. The minimum RAM for an encrypted install is
 256 MiB; below it the installer refuses to create an encrypted install and
-the scorecard says "disk not encrypted: under 256 MiB RAM". PBKDF2 is used
-only for the slot of the 256-bit random recovery key, whose entropy makes a
-slow KDF pointless. Tests (Phase 4a): a slot below the floor for its
-machine's RAM is refused by the installer, the key-slot tools and the
-unlock path; CI unlocks an encrypted install on 256 MiB and 512 MiB guests.
+the scorecard says "disk not encrypted: under 256 MiB RAM". Two slots are
+exempt, because their input is already high-entropy and a second slow KDF
+would only add seconds to every unlock: the slot of the 256-bit random
+recovery key, and the TPM key slot (its input is the TPM-released disk
+secret, already mixed with the stretched PIN; [boot.md](boot.md)). Both
+use PBKDF2-SHA-256 at the LUKS2 minimum of 1,000 iterations. Tests
+(Phase 4a; the TPM slot's case in 4b): a human-secret slot below the floor
+for its machine's RAM is refused by the installer, the key-slot tools and
+the unlock path, and the recovery and TPM slots are accepted at the
+PBKDF2 minimum; CI unlocks an encrypted install on 256 MiB and 512 MiB
+guests.
 
 **Suspend wipes the disk key.** On suspend, dirty pages are written back
-and the volume is frozen. On B1, the kernel then wraps the LUKS2 volume key
-and the service-key secret S into a **resume object**: a TPM object whose
-policy is this boot's capped PCR 8/9 values (they persist across S3 through
-`TPM2_Shutdown(STATE)`) plus `TPM2_PolicyAuthValue` (the stretched PIN);
-it is listed with the other sealed objects in [boot.md](boot.md). Then the
-volume key and S are wiped from memory. On resume the PIN is read through
-the in-kernel input paths only ([threat-model.md](threat-model.md)), the
-resume object releases the volume key and S, and the volume is thawed. A
-TPM reset during suspend makes the resume object unusable, and the machine
-goes to recovery. Without a TPM, resume asks for the passphrase. Resume
-reserves the KDF's memory before suspending, or drops clean page cache
-first if it can't. Test (Phase 10): suspend, scan memory for the volume key
-and S, resume with and without the right secret, and resume after a TPM
-reset (must reach recovery). Home volumes (below) are frozen and their keys
-wiped the same way; each thaws when its user next unlocks their session.
+and the volume is frozen. On B1, the kernel then draws a random 256-bit R
+and seals only R into a **resume object** (listed with the other sealed
+objects in [boot.md](boot.md)). Its policy is `TPM2_PolicyCounterTimer`
+requiring the TPM's resetCount to equal its value at suspend (an S3 resume
+leaves it unchanged; any reboot changes it), PCR 4 and 7, this boot's
+capped PCR 8 and 9 (they persist across S3 through `TPM2_Shutdown(STATE)`),
+and `TPM2_PolicyAuthValue` (the stretched PIN). The volume key and S are
+AEAD-encrypted under HKDF(R ‖ second half of the stretched PIN), the
+resume object's blob and that ciphertext stay **in RAM only**, and the
+plaintext keys, R and the held PIN half are wiped (the kernel keeps that
+half from boot, encrypted like its other held secrets under
+HKDF(S, `optimal-held`), [boot.md](boot.md), and gets it again from the
+PIN typed at resume). So a RAM dump of the
+suspended machine plus the TPM's extracted seeds still leaves an Argon2id
+search over the PIN, as for a powered-off disk. In stage 2 the same step
+wraps every per-user, class and class-B per-file key in memory and wipes
+them. On resume the PIN is read through the in-kernel input paths only
+([threat-model.md](threat-model.md)), stretched in memory reserved before
+suspending (or got by dropping clean page cache), the resume object
+releases R, the keys are decrypted, and the volume is thawed. A TPM reset
+during suspend makes the resume object unusable, and the machine goes to
+recovery. Without a TPM, resume asks for the passphrase. Home volumes
+(below) are frozen and their keys wiped the same way; each thaws when its
+user next unlocks their session. Tests (Phase 10): suspend, then scan
+memory for the volume key, S, every home-volume key and (stage 2) every
+per-user, class and per-file key, using canary keys planted in each (stage
+1 has its own canary set, with no class C); with the TPM's seeds extracted
+(a swtpm state dump) plus the RAM dump, recovering the keys still needs
+the Argon2id PIN search; resume with and without the right PIN; reboot,
+replay the published PCR 8 and 9 events and try the unseal (must fail);
+resume after a TPM reset (must reach recovery).
 
 **Per-user home volumes (Phase 5).** Each user's home is its own volume, so
 another user's files aren't readable by them even before the own file
 system exists. The system volume's Optimal header block and LUKS2 header
 sit at a fixed offset at the start of the outer device, before the volume
-map, so nothing in the map is read before capping. The map, stored twice,
+map, so nothing in the map is read before capping. Each home volume has the
+same layout at the start of that user's first extent: its LUKS2 header and
+key slots, then an Optimal header block in the last 16 KiB before its
+16 MiB data offset, holding that user's wrapped home keys and a tag keyed
+from the home volume key over both of its LUKS2 header copies and the
+block's own fields other than the tag and the blob slots. All of it
+is read after capping; the tag is checked as soon as the home key is
+unwrapped and before the home volume is mounted, and its JSON is held to
+the allow-list above. The map, stored twice,
 lists extents of 1 GiB that belong to the system volume or to one user's
 home volume; it is authenticated with HMAC-SHA-256 under a key derived by
 HKDF from the system volume key, and parsed only after capping and after
@@ -224,23 +305,45 @@ logs in long after capping on B1), and holds an ext4 created by Optimal's
 nothing is encrypted twice). Home volumes are mounted in-kernel as internal
 volumes, and grow by adding extents and resizing ext4 online
 (`resize_inode`); shrinking is offline. The map is still parsed as
-untrusted input and fuzzed, and its format is documented so a Linux rescue
-system can open each volume with a `dm-linear` table. The XTS tweak is the
+untrusted input and fuzzed, and its format is documented for rescue: the
+rescue tool turns the map into one `dm-linear` table per volume (the system
+volume's table starts with the outer device's first 16 MiB, so its header
+comes first; a home volume's starts with its first extent), and Linux opens
+each with `cryptsetup open --header` naming that header (on the
+`dm-linear` device, or a header backup file). A Phase 5 CI test opens the
+system volume and every home volume this way on the pinned Linux and reads
+back the tree. The XTS tweak is the
 sector number within each volume, so the tweak mapping must be injective
 per key; that and the map's extent rules are proof target 12b (Phase 5).
-The Phase 5 storage benchmarks run on a home volume and must be within 10%
-of the same benchmarks on the system volume, and are compared against
-Linux ext4 on dm-crypt over `dm-linear` with the same extents.
+The Phase 5 storage benchmarks run on a home volume and each must be
+within 10% of the same benchmark on the system volume (the worse end of
+its Holm-corrected 95% confidence interval, over at least 20 boots), and
+are compared against Linux ext4 on dm-crypt over `dm-linear` with the same
+extents.
 
 **Stage 2, own file system (default once its track is done):** encryption
 moves into the file system. Every block is encrypted and authenticated, with
 the authentication tag kept in the parent pointer, so the whole tree is
 tamper-evident from the superblock down. There is no separate block layer
-under it. Before capping the kernel parses only the own file system's
-frozen plaintext header, bytes 0..512 of the volume (sealed blobs and volume
-tag, same rule as the stage-1 header block); everything else is read after
+under it. Before capping the kernel parses only a **fixed plaintext header
+area** outside the file system's allocatable space, at the same device
+offset as the stage-1 header block and in exactly its format (16 KiB, two
+8 KiB copies, each with a version and a CRC-32C, holding the sealed blobs,
+the wrapped volume keys and the volume tag). The superblock's generation
+and slot number live in its encrypted body, never in that area, so the
+area's bytes are identical whichever superblock slot is newest, and the
+volume tag covers only its frozen bytes (everything but the tag and the
+blob slots); first-boot sealing, a floor raise or a hibernation blob
+rewrites the area without a file-system commit. A fixed magic at the
+start of each copy says which stage the volume is in, and the kernel reads
+it before capping to pick the parser; nothing else is read before
 capping. The pre-cap parser of both stages is fuzzed to the in-kernel
-thresholds in Phase 4b. On top of that:
+thresholds in Phase 4b, with both stage magics and unknown ones in the
+corpus (an unknown magic is refused). **Migration** from stage 1 (LUKS2, ext4 and home
+volumes) to stage 2 is per user, resumable after any crash or power cut,
+and crash-tested with the oracle below; it is a deliverable of the file
+system track, and until it lands the scorecard says "stage 2: new installs
+only". On top of that:
 
 - **Per-user keys.** Each user's files are under their own key, wrapped by
   their login secret (and on B1 by the TPM, through the same post-cap
@@ -249,7 +352,8 @@ thresholds in Phase 4b. On top of that:
 - **Data protection classes** (modelled on iOS's, because they're what
   makes "a locked laptop gives up nothing" true while apps keep working):
   - *A, after first unlock:* app caches and data that background work needs.
-    Keys stay in memory until shutdown.
+    Keys stay in memory until shutdown, except across suspend (wrapped
+    into the resume object above).
   - *B, complete unless open:* the default for app data, including browser
     profiles. Every class-B file has its own random per-file key, wrapped
     by the class-B key; a file created while locked has its per-file key
@@ -273,22 +377,48 @@ thresholds in Phase 4b. On top of that:
   found, and the frozen apps must not have run. Browsers downloading for an
   hour while locked must finish without errors.
 - **Swap** is encrypted with a key that doesn't survive a cold boot.
-- **Hibernation.** Class-C eviction (and in stage 1 the suspend steps
-  above) runs before the image is written, so the image holds no class-C
-  key or plaintext. The image key is a per-boot random key generated before
-  capping and sealed at once into a persistent TPM object with the full
-  disk policy shape (signed PCR 4/8/9 policy, PCR 7, the floor check and
-  `TPM2_PolicyAuthValue` with the stretched PIN; [boot.md](boot.md), which
-  lists it among the sealed objects every floor raise and PCR 7 reseal
-  covers); the key stays in kernel memory until hibernation encrypts the
-  image with it. Resume from hibernation is a fresh boot that unseals it
-  before capping, with the PIN. It is not a post-cap object. Without a TPM
-  the image key is wrapped under a key derived by HKDF from the volume key,
-  which resume gets from the passphrase like any boot. Format and rollback
-  rules are in [threat-model.md](threat-model.md). Test (Phase 10):
-  hibernate, scan the image for class-C canaries, resume with a wrong PIN,
-  resume through an old signed loader (PCR 4 differs; must fail), and try
-  the unseal after capping (must fail).
+- **Hibernation (both stages).** At hibernate the volume is frozen and
+  written back (stage 2: with a final commit), class-C eviction runs, and
+  the image records the volume's commit generation (stage 1: the ext4
+  superblock's mount count and the journal's sequence number) and the
+  replay counter's current value. The volume key, S and every home-volume
+  key are wiped, then memory is snapshotted, so the image holds none of
+  them and no class-C key or plaintext. The kernel then draws a random
+  image key K and a random R, seals only R into a TPM object with the
+  signed pre-cap policy (steps 1 to 5 in [boot.md](boot.md); `TPM2_Create`
+  needs no matching PCRs), and AEAD-encrypts K under HKDF(R ‖ second half
+  of the stretched PIN). The image goes into a **dedicated hibernation
+  extent** (stage 1: extents of the volume map marked for hibernation;
+  stage 2: a reserved region outside the file system's allocatable space;
+  sized at install to 40% of RAM rounded up to 1 GiB), AEAD-encrypted under
+  K with a fresh random nonce prefix. The sealed blob and the encrypted K
+  go into the fixed header area. After the snapshot nothing but the
+  hibernation extent and the fixed header area is written. An image that
+  doesn't fit after dropping clean page cache is refused, and the machine
+  stays suspended. Resume is a normal boot of the same release: the loader
+  keeps the slot the image was made by for the resume boot, and an image of
+  another release is refused. Before capping it unseals R with the PIN as
+  well as the disk secret and S; after capping it refuses the image unless
+  its generation matches the volume's and its replay value equals the
+  counter (a hibernation resume bumps nothing). The boot kernel writes the
+  volume key and S into a reserved page named in the image header, the
+  restored kernel reads them, wipes the page, erases the image blob from
+  both header copies and flushes before thawing, and in stage 2 draws a new
+  nonce prefix. **Any normal mount first erases the image blob** and
+  flushes, so a stale image can't be resumed over a newer volume. Without a
+  TPM, K is wrapped under HKDF(volume key, `optimal-hibernate`), which
+  resume gets from the passphrase like any boot. Rollback rules are in
+  [threat-model.md](threat-model.md). Tests (Phase 10): hibernate and scan
+  the image for the volume key, S, home keys and (stage 2) class-C keys and
+  canaries; with the TPM's seeds extracted the blob still needs the
+  Argon2id PIN search; resume with a wrong PIN or through an old signed
+  loader (PCR 4 differs; both must fail); hibernate after an update made
+  the other slot active (the resume boot runs the image's slot and
+  resumes); try the unseal after
+  capping (must fail); boot normally, then put back the old header area and
+  image (refused: generation and replay value); after a good resume the
+  handoff page (which carries the 256-bit generator seed, see core.md) is
+  zero and the nonce prefix is new.
 - **Cipher choice is measured.** The format records a cipher ID per volume.
   Allowed: AES-256-GCM (fast with AES-NI and VAES) and XChaCha20-Poly1305
   (fast without AES instructions). The installer picks the faster one on
@@ -305,8 +435,10 @@ thresholds in Phase 4b. On top of that:
   class-B files and the volume or class key otherwise. A rewound volume gets
   a new prefix at its next mount, so its new writes never reuse a
   (key, nonce) pair; if the counter would wrap, the file system draws a new
-  prefix (and subkey) without unmounting. Nonce uniqueness, including across crash fallback, lying-drive
-  fallback and replay, is proof target 12c, gated by the file system
+  prefix (and subkey) without unmounting. Prefixes come from the kernel
+  CSPRNG (proof target 14). Nonce uniqueness, including across crash
+  fallback, lying-drive fallback, replay and hibernation resume, is proof
+  target 12c, gated by the file system
   track's done-when, with the named axiom "RNG output uniform; salt
   collision <= 2^-64 per volume lifetime", reported as "B, probabilistic".
 - **Whole-volume replay.** Tags in parent pointers stop tampering, but an
@@ -314,11 +446,12 @@ thresholds in Phase 4b. On top of that:
   machines the superblock carries a replay value bound to a TPM NV counter
   (an ordinary counter, not `TPMA_NV_ORDERLY`, whose jump after a power
   cut would refuse the genuine volume). The counter is bumped only at mount
-  and at resume, never per commit, to spare NV write endurance. A bump with
-  the counter at *c* commits *c*+1 in two consecutive superblock
-  generations (all four superblock slots), flushes, and only then
-  increments the counter, so a torn or lost newest superblock still falls
-  back to a generation carrying *c*+1. Mount accepts a superblock whose value is
+  and at resume from suspend (a hibernation resume bumps nothing, above),
+  never per commit, to spare NV write endurance. A bump with the counter at
+  *c* commits *c*+1 in two consecutive generations of the root ring (below;
+  both stored copies of each), flushes, and only then increments the
+  counter, so a torn or lost newest root still falls back to a generation
+  carrying *c*+1. Mount accepts a superblock whose value is
   **at least** the counter's, so a crash between the two steps is harmless,
   and refuses a lower one: any image captured while the machine was off or
   suspended is refused once the next mount or resume has bumped the
@@ -327,13 +460,15 @@ thresholds in Phase 4b. On top of that:
   owner or platform auth, so root can't advance it to lock the user out, and
   S is released only after the volume tag matches, so a substituted volume
   can't bump it. A
-  drive that lost the flushed superblock looks like a replay; the user can
-  accept the older state with the recovery key. On machines without a TPM,
+  drive that lost the flushed superblock looks like a replay, and so does a
+  lying-drive fallback (below) to a generation before a bump: both end at
+  the recovery-key prompt, where the user can accept the older state. On machines without a TPM,
   replay is **not detected**, and the scorecard says so. Tests (file system
   track): restore an old image and mount it (refused); a power cut between
   the superblock flush and the increment, and after the increment, must both
   mount; tearing the newest superblock right after a bump must mount with
-  no prompt.
+  no prompt; a lying-drive drop point before a bump inside the K window
+  gives the recovery-key prompt.
 - **What the own file system's design must specify** (`fs/docs/DESIGN.md`,
   with a table mapping each requirement here to the section that meets it):
   the key hierarchy (volume, system, per-user, per-class and class-B
@@ -341,12 +476,18 @@ thresholds in Phase 4b. On top of that:
   TPM key-slot kind, file-name encryption, the exact list of metadata left
   in plaintext (for example sizes rounded to blocks, timestamps), the
   discard (TRIM) policy and what it reveals, the nonce scheme above with
-  its replay-value superblock field, the frozen plaintext header bytes
-  0..512, free-block quarantine for the lying-drive window below, a
+  its replay-value superblock field, the fixed plaintext header area above
+  (stage-1 header-block format, generation and slot number in the body, the
+  stage magic), root history (each superblock body carries the previous 8
+  commits' full root sets, so the two newest slots reach back 9 commits) and
+  free-block quarantine for the K = 8 commit lying-drive window below,
+  the rate limit on full commits, the hibernation region and the
+  stage-1 → stage-2 migration above, a
   per-file `fsync` intent log replayed at mount (so `fsync` of one file
   doesn't commit the whole volume; benchmarked as `fsync` latency under
   background writeback against ext4), the error policy of the block layer
-  above, and its own proof targets (copy-on-write never overwrites a live
+  above (a failed write retried at a newly allocated block, at most 3
+  writeback cycles), and its own proof targets (copy-on-write never overwrites a live
   block; commits are atomic).
 
 ## Reading and writing other systems' disks (ext4)
@@ -396,7 +537,10 @@ install. So:
   SD cards, image files and any volume Optimal did not format are mounted
   through a tier-3 file system server ([drivers.md](drivers.md)), because a
   crafted image is a classic physical attack. Only the system's own internal
-  volumes are mounted in-kernel, with the hardening above.
+  volumes are mounted in-kernel, with the hardening above. A new USB storage
+  device binds no driver until the user approves it, and none while the
+  screen is locked ([drivers.md](drivers.md)); files the server reads from
+  removable media carry provenance "removable" ([capabilities.md](capabilities.md)).
 - GPL tools such as `e2fsck` are used only as external test oracles: never
   linked, vendored or shipped.
 
@@ -413,13 +557,24 @@ install. So:
 - **A lying-drive model** injects a drop point: flushes after it are
   ignored, and "really persisted" means the state at the drop point plus
   any subset of later writes. Data loss is then unavoidable. The own file
-  system quarantines freed blocks for **K = 8 commits or 30 seconds,
-  whichever is longer**, so no block of the last K commits' trees is
-  reused; within that window it must still mount at its last commit before
-  the drop point, losing only commits after it. Tests drop flushes 1..K
-  commits back. A drop more than K commits back is outside the promise:
-  the volume is reported unrecoverable and opened with the read-only rescue
-  mount (below). ext4 overwrites in place and has no such fallback, so for
+  system's superblock bodies each carry the **previous 8 commits' full root
+  sets**, in 4 slots, and freed blocks are quarantined for **K = 8 commits**
+  (no time hold), so both the root pointers and every block of the last K
+  commits' trees survive even when only the newest superblock pair lands
+  (depth 8 is the minimum that passes this test; depth 7 fails it); within
+  that window it must still mount at its last commit before the drop point,
+  losing only commits after it. Full commits are rate-limited to at most one
+  per second, and `fsync` calls between them go to the per-file intent log,
+  so an `fsync` burst can't push the drop point out of the window in
+  milliseconds. Every fallback is reported to the user (what was lost, back
+  to which time); a fallback to a generation before a replay-counter bump
+  gives the recovery-key prompt (above). Tests drop flushes 1..K commits
+  back while every later superblock write lands, then again with only the
+  newest superblock pair landing, including the bump case. The one-per-second
+  rate limit lives in the VFS, not the file system.
+  A drop more than K commits back is outside the promise: the volume is
+  reported unrecoverable and opened with the read-only rescue mount
+  (below). ext4 overwrites in place and has no such fallback, so for
   ext4 the only promise is that the volume is clean after `e2fsck -fy`.
 - **Oracle.** After every crash state: the file system's own checker reports
   clean; every byte that was fsynced (by the table above) is present; every
@@ -428,12 +583,16 @@ install. So:
   be a confidentiality bug); and **data that was durable before is
   unchanged** by later, unrelated writes.
 - **Volume.** The nightly run reports the number of distinct crash states
-  checked; the target is at least 10^7 per night. States are deduplicated
-  by a hash of the block versions they contain, so identical disk images
-  count once. The runner is sized to fit 10^7 states in 4 hours at the
-  measured checking rate (states are copy-on-write overlays on one base
-  image, checked in parallel, one per core); if the rate drops, runners are
-  added, the target stays.
+  checked. States are deduplicated by a hash of the block versions they
+  contain, so identical disk images count once, and are copy-on-write
+  overlays on one base image, checked in parallel, one per core. They run
+  on an owner-provided crash-test machine listed in the roadmap's hardware
+  needs (32 cores, 128 GiB RAM, local NVMe). The nightly target is fixed
+  at Phase 4a entry as 4 hours times the states per second measured on
+  that machine with the ext4 checker (both runs (a) and (b) above
+  included), rounded down to a power of ten, and published; it can only be
+  raised. A night below the target fails the nightly job; the target is
+  never lowered to fit.
 - **Real power cuts.** Before each release: a relay-controlled power-cut rig,
   at least 1,000 cuts on at least 3 drive models (Phase 4a included), with
   the same oracle. The first run is on ext4 over LUKS2, before the first release with read-write
@@ -469,7 +628,11 @@ requires for every Linux comparison (Phase 4a included).
 
 ## Tooling shipped with format version 1
 
-Checker (`fsck`), online scrub, metadata stored twice on single-disk volumes,
+Checker (`fsck`), online scrub, metadata stored twice on single-disk volumes
+(pointers stay 64 bytes and hold a logical address; metadata is allocated in
+paired chunks and a superblock chunk table maps each logical metadata block
+to its two physical copies, so the MAC binds the logical address and both
+copies are byte-identical),
 a read-only rescue mount that skips damaged subtrees, and an export tool that
 copies everything still readable to another disk. The checker is fuzzed with
 corrupted images: it must never crash, and every image must end either

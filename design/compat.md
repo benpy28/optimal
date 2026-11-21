@@ -15,9 +15,26 @@ gamed. Security rules that shape the ABI are in
   needs 32-bit code segments and `modify_ldt` even in its WoW64 mode. The
   32-bit entry paths (`int 0x80`, `sysenter`, 32-bit `syscall`), the compat
   syscall table, compat struct layouts and compat signal frames are designed
-  in **Phase 3**, alongside the 64-bit ones. Every syscall handler and every
-  `ioctl` declares its 32-bit layout when it is written; an `ioctl` without
-  one fails CI. x32 (the ILP32 ABI on 64-bit) is not supported; it is
+  in **Phase 3**, alongside the 64-bit ones. Because `sysenter` from
+  compat mode is `#UD` on AMD and 32-bit `syscall` is `#UD` on Intel, a
+  **32-bit vDSO** ships in Phase 3 too: `__kernel_vsyscall` (picking the
+  fast instruction the CPU supports, else `int 0x80`), passed in
+  `AT_SYSINFO`, plus the 32-bit time calls. Tests (Phase 3): the entry
+  test runs each instruction on an Intel and an AMD reference machine and
+  checks the `#UD` cases are never taken through `__kernel_vsyscall`; the
+  32-bit vDSO `clock_gettime` benchmark runs beside the 64-bit one. Every
+  syscall handler and every `ioctl` declares its 32-bit layout when it is
+  written; an `ioctl` without one fails CI.
+- **16-bit stack segments from `modify_ldt` don't leak kernel bits.**
+  Linux lets `modify_ldt` install a 16-bit SS, and `IRET` to a 16-bit stack
+  restores only RSP[15:0], leaving RSP[31:16] of the kernel stack visible.
+  Optimal uses the espfix64 scheme: each CPU has an espfix stack mapped
+  read-only at a fixed virtual region whose bits 31:16 are a per-CPU value
+  unrelated to any kernel address; on return to a 16-bit SS the kernel
+  writes the `IRET` frame through a writable alias and runs `IRET` from the
+  espfix stack, so the leaked bits carry nothing. It lands with
+  `modify_ldt` in milestone 13 (Phase 9); A3 row test: a 16-bit-SS
+  `IRET` leak program recovers 0 bits of any kernel address. x32 (the ILP32 ABI on 64-bit) is not supported; it is
   almost unused and Linux distributions have dropped it.
 - **Kernel identity.** `uname` reports the newest Linux release whose
   feature checklist Optimal fully implements, as `<x.y>.0-optimal-<build>`.
@@ -80,16 +97,24 @@ The ELF loader and first syscalls must provide: static, static-PIE and
 dynamic (`PT_INTERP`) ELF loading; the full auxiliary vector (`AT_PHDR`,
 `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ`, `AT_BASE`, `AT_ENTRY`, `AT_RANDOM`,
 `AT_HWCAP`, `AT_HWCAP2`, `AT_PLATFORM`, `AT_SECURE`, `AT_MINSIGSTKSZ`,
-`AT_SYSINFO_EHDR`, `AT_EXECFN`, `AT_UID`/`GID` and friends); `arch_prctl`
+`AT_SYSINFO_EHDR`, `AT_EXECFN`, `AT_UID`/`GID` and friends, and
+`AT_SYSINFO` for 32-bit programs); `arch_prctl`
 (`ARCH_SET_FS`, `ARCH_GET_FS`, and the shadow stack calls later),
 `set_tid_address`, `set_robust_list`, `rseq`, `prlimit64`, `getrandom`,
 `brk`, `mmap`, `mprotect`, `munmap`, `uname`, `exit_group`; and signal frames
 sized for the CPU's real XSAVE area (AVX-512 frames exceed 2 KiB).
 
 **The vDSO** ships in Phase 3, not later: `clock_gettime`, `gettimeofday`,
-`time`, `clock_getres` and `getcpu` without entering the kernel. Without it,
-every frame-pacing loop pays a full syscall. "vDSO `clock_gettime` cost
-against Linux" is on the benchmark list.
+`time`, `clock_getres`, `getcpu` and `getrandom` without entering the
+kernel, for 64- and 32-bit programs (above). Without it, every
+frame-pacing loop pays a full syscall. vDSO `getrandom` follows Linux
+6.11's `vgetrandom` interface: per-thread ChaCha20 state in user memory,
+seeded from the kernel's per-CPU ChaCha20 generator ([core.md](core.md))
+and discarded whenever that generator's generation counter changes
+(reseed, fork, VM snapshot), so it never returns bytes the kernel's
+generator wouldn't vouch for. "vDSO `clock_gettime` cost against Linux"
+(64- and 32-bit) and "vDSO `getrandom` cost against Linux" are on the
+benchmark list.
 
 ## Milestones and what each needs
 
@@ -104,13 +129,13 @@ on the scorecard, measured as described below. The phase column is the one
 | 2 | Processes and threads | 5 (starts in 3) | `fork`, `clone`, `wait*`, futexes including `FUTEX_LOCK_PI` and `futex_waitv`, `membarrier`, scheduling policies and affinity ([scheduler.md](scheduler.md)), `pidfd`, `prctl` basics | LTP process and thread tests, kselftest futex, glibc nptl tests, pthread stress |
 | 3 | Memory and signals | 5 (starts in 3) | `mmap` semantics, COW, `mremap`, `madvise`, `userfaultfd` (later), per-thread signal masks, `tgkill`, `sigaltstack`, `SA_RESTART`, `signalfd` | LTP mm and signal tests, glibc and musl test suites, kselftest mm |
 | 4 | Files, `/proc` and `/sys` | 5 (starts in 4a) | VFS semantics, durability contract ([storage.md](storage.md)), `inotify`, `fanotify` (read-only uses), `/proc` and `/sys` per the contract below, per-app private homes ([capabilities.md](capabilities.md)) | LTP fs tests, xfstests subset, SQLite crash tests, BusyBox, Python, GCC and git test suites |
-| 5 | Desktop IPC and async I/O | 5 | io_uring, `AF_UNIX` with `SCM_RIGHTS` and `SCM_CREDENTIALS`, abstract sockets scoped per app, `memfd_create` with seals, `eventfd`, `timerfd`, `epoll`, pipes, pseudo-terminals | dbus-daemon tests, Wayland's test suite (protocol layer), LTP ipc tests |
-| 6 | Containers and sandboxes | 5 | user, mount, PID, network, UTS and IPC namespaces (unprivileged user namespaces included), `pivot_root`, bind mounts, `seccomp` with classic BPF and `RET_ERRNO`/`RET_TRAP`/`RET_USER_NOTIF`, `no_new_privs`, cgroup v2 subset (cpu, memory, pids, io), the FUSE protocol (`/dev/fuse`, the broker's `fusermount3` replacement, the document portal), `/dev/net/tun` per user namespace, the Flatpak launcher ([capabilities.md](capabilities.md)) | `bwrap` running a Steam Runtime container, Chromium's and Firefox's sandbox self-tests, kselftest seccomp and namespaces, libfuse's tests and the FUSE protocol fuzzed with 10^8 executions, rootless podman (`podman run` with pasta and with slirp4netns networking), the Flatpak launcher's own conformance tests plus upstream Flatpak's `flatpak run` tests |
+| 5 | Desktop IPC and async I/O | 5 | io_uring, `AF_UNIX` with `SCM_RIGHTS` and `SCM_CREDENTIALS`, abstract sockets scoped per app, `memfd_create` with seals, `eventfd`, `timerfd`, `epoll`, pipes, pseudo-terminals, a loopback-only TCP and UDP stack (`AF_INET` and `AF_INET6` on `127.0.0.0/8` and `::1`) with the per-identity loopback rule ([capabilities.md](capabilities.md)), which milestone 4's Python and git suites need | dbus-daemon tests, Wayland's test suite (protocol layer), LTP ipc tests |
+| 6 | Containers and sandboxes | 5 | user, mount, PID, network, UTS and IPC namespaces (unprivileged user namespaces included), `pivot_root`, bind mounts, `seccomp` with classic BPF and `RET_ERRNO`/`RET_TRAP`/`RET_USER_NOTIF`, `no_new_privs`, cgroup v2 subset (cpu, memory, pids, io), the FUSE protocol (`/dev/fuse`, the broker's `fusermount3` replacement, the document portal), the Flatpak launcher and `org.freedesktop.portal.Flatpak` ([capabilities.md](capabilities.md)) | `bwrap` running a Steam Runtime container, pressure-vessel under `/.flatpak-info` starting one through `Spawn`, Chromium's and Firefox's sandbox self-tests (headless Chromium also in Flatpak mode), kselftest seccomp and namespaces, libfuse's tests and the FUSE protocol fuzzed with 10^8 executions, rootless `podman run --network=none` and with a loopback-only network namespace, the Flatpak launcher's own conformance tests plus upstream Flatpak's `flatpak run` tests and the `~/.var/app` migration test |
 | 7 | Debugging and profiling | 5 | `ptrace` (policy in [capabilities.md](capabilities.md)), `perf_event_open` (own process or one held with a debug capability, user-space counters only), core dumps (local only) | gdb test suite subset, strace's tests, rr's tests where the CPU supports it |
-| 8 | Networking | 6 | sockets (TCP, UDP, ICMP for unprivileged ping), `netlink` route and uevent basics, `getaddrinfo` paths | LTP net tests, curl and OpenSSH test suites, a browser's network tests |
+| 8 | Networking | 6 | sockets (TCP, UDP, ICMP for unprivileged ping) over real interfaces, `netlink` route and uevent basics, `getaddrinfo` paths, `/dev/net/tun` per user namespace | LTP net tests, curl and OpenSSH test suites, a browser's network tests, rootless podman with pasta and with slirp4netns networking |
 | 9 | Input and devices | 6 | evdev (`/dev/input/event*`), uevent netlink and the `/sys/class` and `/sys/dev/char` layout libudev expects, `hidraw` and `usbfs` for approved devices, `uinput` (input service and compositor; gamepad codes only through the virtual-gamepad portal; keyboard and pointer emulation through the compositor's virtual keyboard and pointer) | libinput test suite, SDL gamepad tests, libusb tests |
 | 10 | Audio | 6 | ALSA PCM, control and timer interfaces including mmap mode; real-time scheduling for PipeWire through the rtkit portal | alsa-lib tests, PipeWire tests, underrun counts from the benchmark |
-| 11 | Graphics | 8 (starts in 7 with virtio-gpu) | DRM/KMS, GEM, render nodes, dma-buf, `sync_file`, timeline syncobj, the per-driver uAPI of the chosen GPU family, DRM master handed out by the seat service | Mesa's tests, piglit, the Vulkan Conformance Test Suite subset (pass rate published), IGT subset |
+| 11 | Graphics | 8 (starts in 7 with virtio-gpu) | DRM/KMS, GEM, render nodes, dma-buf, `sync_file`, timeline syncobj, the per-driver uAPI of the chosen GPU family, DRM master handed out by the seat service | Mesa's tests, piglit, the pinned Vulkan Conformance Test Suite subset, IGT subset (each at the 90% target below) |
 | 12 | Wayland desktop | 7 | milestones 1 to 10, milestone 11's Phase 7 part (KMS, GEM, dma-buf and sync objects on virtio-gpu and simple framebuffers) and the seat service, so a compositor, GTK and Qt apps and a browser run | compositor plus GTK and Qt test apps, a browser's test suite |
 | 13 | Wine and Proton | 9 | everything above, 32-bit in full, Steam's child identities with their declared shared channels and the virtual-gamepad portal ([capabilities.md](capabilities.md)), `modify_ldt`, `/dev/ntsync` (the NT synchronisation driver current Proton uses), `RLIMIT_NOFILE` soft 1024 and hard 524,288 by default (soft stays at 1024 so `select()` users keep working; Proton raises its own soft limit for esync), the futex and fd-heavy patterns Proton uses | Wine's conformance tests, the published game list |
 
@@ -146,11 +171,20 @@ sanitizers read `/proc/self/status`, glibc reads
   minimal init (it reaps orphans and forwards termination signals, like
   bwrap's), and `/proc` shows only processes in the viewer's PID namespace
   and the namespaces below it. So an app can't see or read other apps'
-  command lines, environments or memory maps. System monitors and the
-  terminal's `ps`, `top` and `kill` reach other apps' processes only through
-  the **process portal**, which lists the user's processes with their
-  attested identities and signals one, with the user's grant. Kernel
-  pointers are hidden as in the lockdown table.
+  command lines, environments or memory maps. System monitors reach
+  other apps' processes through the **process portal**, which lists the
+  user's processes with their attested identities and signals one, with
+  the user's grant. Unmodified `ps`, `top` and `kill` run as the terminal
+  identity and read `/proc` directly, so the terminal's view has a
+  portal-backed `/proc`: it lists every process of the user's session,
+  showing for other identities' processes only `stat`, `statm`, `status`,
+  `comm` and `cmdline` (`environ`, `maps`, `mem`, `fd` and the rest are
+  absent), and `kill(2)` from the terminal reaches them with `SIGTERM`,
+  `SIGINT`, `SIGKILL`, `SIGSTOP` and `SIGCONT` only; other signals need
+  the process portal's grant (`EPERM` without it). Golden test
+  (Phase 5): `ps aux`, `top -b -n1` and `kill` against another app's
+  process on Linux and Optimal. Kernel pointers are hidden as in the
+  lockdown table.
 
 ## Measuring compatibility honestly
 
@@ -164,24 +198,40 @@ sanitizers read `/proc/self/status`, glibc reads
   the net tests), as uid 0 inside an unprivileged user namespace that maps
   0 to the test user's uid and the rest to the user's allocated subuid and
   subgid range, so tests that check for root run; it holds the `CAP_*`
-  that namespace gives and no grant beyond that profile. The harness spec
-  is checked in beside the pinned list.
+  that namespace gives and no grant beyond that profile. Its view also
+  holds `/dev/loop-control` and `/dev/loop*` backed by the tier-3 file
+  system server (the same service that does every loop mount), so
+  `.needs_device` and `.all_filesystems` tests run on images it serves.
+  The harness spec is checked in beside the pinned list, with a
+  **classification file** that puts every pinned test in one class:
+  *security* (it exercises capabilities, identity, namespaces, mounts,
+  seccomp, `ptrace` or `perf_event_open`), *divergent* (its result is
+  decided by an intended divergence, for example `iopl`, `bpf`,
+  `init_module`, `settimeofday`, `swapon` or `/proc/sys` writes) or
+  *normal*. The classification and every expectation file are signed by
+  the owner; CI fails on an unsigned change or an unclassified test.
 - **Results are reported by outcome**, never as one blended percentage:
   pass, fail, broken, and "not configured" (LTP's `TCONF`, a test that skips
   because a feature is missing). Pass rates are computed over the **full
   pinned list**. **The skip rule**, the same in the roadmap: every skipped
-  test (`TCONF` or any test that doesn't run) counts as a failure; a test on
-  the phase's excused list is shown separately and still counts against
-  the rate.
+  test (`TCONF` or any test that doesn't run) counts as a failure, unless
+  its output exactly matches its signed expectation file, which overrides
+  the skip rule and counts as a pass; a test on the phase's excused list is
+  shown separately and still counts against the rate.
 - **Targets are fixed now.** Every suite must reach a 90% pass rate, and
-  100% of its tests that touch security (capabilities, identity, namespaces,
-  mounts, seccomp, `ptrace`, `perf_event_open`), by the end of its gating
-  phase. Every security test has a checked-in **expectation file** giving
-  its exact expected output on Optimal: Linux's output, or, where an
-  intended divergence applies (setuid ignored, no `CAP_*` outside a user
-  namespace, file capabilities ignored, loop mounts only through the
-  tier-3 service, the `/proc/<pid>/fd` reopen cap), the divergent output.
-  Matching it exactly counts as a pass; any other output is a fail. Security tests can never be on an excused list. The
+  100% of its security-class tests, by the end of its gating phase. Every
+  security and divergent test has a signed **expectation file** giving its
+  exact expected output on Optimal: Linux's output, or, where an intended
+  divergence applies (setuid ignored, no `CAP_*` outside a user namespace,
+  file capabilities ignored, loop mounts only through the tier-3 service,
+  the `/proc/<pid>/fd` reopen cap, no loadable modules, no eBPF), the
+  divergent output. Matching it exactly counts as a pass; any other output
+  is a fail. Security tests can never be on an excused list. Each
+  milestone's suite and target are named in its gating phase's done-when
+  in the [roadmap](../ROADMAP.md) (milestones 8 to 10 in Phase 6, 12 and
+  11's virtio-gpu part in Phase 7, 11 in Phase 8); the gate-table CI check
+  that covers proof gates and attack rows also covers this table and fails
+  when a milestone's gating phase doesn't name its suite and target. The
   excused list for a phase is frozen when that phase starts and can only
   shrink; adding to it needs the owner's sign-off, recorded in the change.
 - **Differential testing.** A corpus of programs runs on Linux and Optimal
@@ -195,9 +245,19 @@ sanitizers read `/proc/self/status`, glibc reads
   `/proc/<pid>/fd` reopen cap, the `EXDEV` confinement of directory fds
   from another identity, `TIOCSTI` returning `EPERM` and `TIOCLINUX`
   absent, wildcard sockets receiving only loopback without an inbound
-  grant, the per-app private home, and the toolkits whose file dialogs
-  can't be forced onto the portal (Wine, Java's Swing and JavaFX, Blender),
-  each with the user-facing outcome stated in capabilities.md.
+  grant, no network in the default profile until the first-use request is
+  answered, the per-app private home, `SO_PEERCRED` giving pid 0 for a peer
+  in another app's PID namespace (as Linux does for a pid outside the
+  receiver's namespace), the terminal's portal-backed `/proc` and its
+  limited signals to other identities (above), a registered app run from a
+  shell running under its own identity behind the launch relay, autostart
+  and desktop entries written inside a private home becoming Background
+  and launcher portal requests (nothing appears until approved; Phase 5
+  test, and Steam's shortcuts in milestone 13), the Flatpak portal's
+  refused `latest-version` and `CreateUpdateMonitor`, and the toolkits
+  whose file dialogs can't be forced onto the portal (Wine, Java's Swing
+  and JavaFX, Blender), each with the user-facing outcome stated in
+  capabilities.md.
 - **Status tables.** CI publishes a per-syscall and per-`ioctl` table:
   implemented, partial (which flags), or not yet, for 64 and 32 bit.
 - **App suites by phase.** Phase 5: coreutils, Python, GCC, git, SQLite.

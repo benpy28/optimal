@@ -25,7 +25,12 @@ Consequences:
   the caller could forget.
 - Every review of a tier-0 API asks: is this still sound if Drop never runs,
   if the caller panics halfway, and if an interrupt arrives between any two
-  instructions?
+  instructions? Pure-crate APIs are checked by proof target 3a, and APIs
+  whose implementation calls a shim (`with_irqs_disabled`, MMIO and DMA
+  handles, the context switch, `UserPtr` copies) by target 3c: compile-fail
+  tests plus QEMU tests that `forget` every guard, panic at every callback
+  and inject an interrupt at every instruction boundary of the shim
+  ([verification.md](verification.md)).
 
 ## Crate layout and mechanical enforcement
 
@@ -36,10 +41,10 @@ The kernel is a Cargo workspace. Tier-0 crates are the only ones allowed
 |---|---|
 | `core-boot` | entry, early CPU setup, the boot protocol, the SMP start-up trampoline |
 | `core-arch` | GDT/TSS/IDT, interrupt and syscall entry stubs, exception fixup tables, context switch, signal-frame and XSAVE save/restore, CPU feature control, MSR access, microcode loading, the APIC, I/O APIC and timer hardware, the text-poke shim for trace points ([verification.md](verification.md)) |
-| `core-mm` | frame allocator, page tables, kernel heap, TLB shootdown, user-copy routines, and the one API that installs user page-table entries, which takes a memory-object capability witness (proof target 4) |
+| `core-mm` | frame allocator, page tables, kernel heap, TLB shootdown, user-copy routines, the memory-access backend (the only code that turns a physical address into a reference, through the direct map; [verification.md](verification.md)), and the one API that installs user page-table entries, which takes a memory-object capability witness (proof target 4) |
 | `core-io` | typed MMIO, port I/O, IRQ and DMA handles, PCI config access and MSI/MSI-X programming (tier 3 writes the other registers on a shared MSI-X page through `mmio_write(handle, offset, width, value)`, never by trapping), the IOMMU, the raw TPM and ACPI table mappings |
 | `core-sync` | spinlocks, sleeping locks, per-CPU data, preemption and IRQ tokens |
-| `core-crypto` | the few primitives that need CPU intrinsics (AES-NI/VAES, SHA extensions, carry-less multiply), behind safe APIs; verified generated code (HACL*/libcrux-derived, fiat-crypto) wherever it exists for the algorithm and instruction set; proof target 14 |
+| `core-crypto` | all cipher, hash, MAC, KDF, signature and random-generator code in the kernel and the loader, behind safe APIs: AES-XTS, AES-GCM and GHASH, ChaCha20-Poly1305 and XChaCha20-Poly1305, SHA-1 (TOTP only), SHA-256, SHA-512, BLAKE2b, HMAC, HKDF, PBKDF2, Argon2id, Ed25519 verification and the kernel generator (below), each with an intrinsic backend (AES-NI/VAES, SHA extensions, carry-less multiply, AVX2/AVX-512) where one exists and a constant-time portable backend for CPUs without; verified generated code (HACL*/libcrux-derived, fiat-crypto) wherever it exists for the algorithm and instruction set; no other crate implements a primitive; proof target 14 |
 
 Parsing stays out of tier 0 even when the data comes from hardware: ACPI
 tables, the TPM protocol and its event log, the boot information and device
@@ -74,7 +79,10 @@ tests):
   or hashing crate) is either counted as tier 0 (inventoried, inside the
   size cap, covered by proof target 3a, and by 3b and the shim cap for any
   module that touches hardware) or not used. Most such needs are
-  met by `core-crypto` or by writing the code safely.
+  met by `core-crypto` or by writing the code safely. Cryptography is
+  always `core-crypto`: the loader's current `ed25519-dalek` and `sha2`
+  dependencies are replaced by it before Phase 4b, so the kernel and the
+  loader run one implementation with one set of tests.
 - **Size budget.** Tier-0 code is capped at 15,000 lines per architecture
   (x86_64 now; ARM64 gets its own cap for its arch code, while
   architecture-independent tier-0 code counts once), including tier-0
@@ -82,14 +90,20 @@ tests):
   (every tier-0 module with `asm!`, a target-specific `cfg` or hardware
   access; [verification.md](verification.md)) is capped at 3,000 lines,
   and `core-crypto`, whose intrinsic backends are all shim by that rule, has
-  its own cap of 4,000 lines instead; both are reported separately. The
-  shim estimate per crate, checked against the actual counts on the
-  scorecard: `core-boot` 300, `core-arch` 1,100 (entry stubs, context
-  switch, XSAVE and signal frames, APIC and timer, MSRs, text poke),
-  `core-mm` 250 (CR3, `INVLPG`/`INVPCID`/`INVLPGB`, the user-copy
-  instructions), `core-io` 850 (MMIO and port access, PCI config, MSI-X,
-  VT-d and AMD-Vi register and queue programming, TPM CRB/TIS access),
-  `core-sync` 100; 2,600 in all, leaving 400 lines of headroom. Exceeding
+  its own cap of 6,000 lines instead; both are reported separately. The
+  `core-crypto` estimate: AES with AES-NI, VAES and bitsliced portable
+  backends 1,100; XTS, GCM and GHASH 700; ChaCha20, Poly1305 and XChaCha
+  900; SHA-1, SHA-256 and SHA-512 550; BLAKE2b 250; HMAC, HKDF and PBKDF2
+  150; Argon2id 350; Ed25519 verification over fiat-crypto field
+  arithmetic 1,300; the generator 250; 5,550 in all. The kernel shim
+  estimate per crate, checked against the actual counts on the
+  scorecard: `core-boot` 300, `core-arch` 1,120 (entry stubs, context
+  switch, XSAVE and signal frames, APIC and timer, MSRs, `RDSEED`/`RDRAND`,
+  text poke), `core-mm` 400 (CR3, `INVLPG`/`INVPCID`/`INVLPGB`, the
+  user-copy instructions, and about 150 lines of memory-access backend),
+  `core-io` 850 (MMIO and port access, PCI config, MSI-X, VT-d and AMD-Vi
+  register and queue programming, TPM CRB/TIS access), `core-sync` 100;
+  2,770 in all, leaving 230 lines of headroom. Exceeding
   any cap fails CI until the cap is raised by a written design change
   explaining why the code can't live outside the core.
 - **Panic lints everywhere.** `unwrap_used`, `expect_used`, `panic` and
@@ -100,10 +114,12 @@ tests):
   wrapping arithmetic says so explicitly. "Parsing crates", where
   `arithmetic_side_effects` is also denied and `Untrusted<T>` is required,
   are listed in `design/crates.toml`.
-- **Toolchain.** `kernel/rust-toolchain.toml` must pin an exact stable
-  version (for example `1.100.0`), never the floating `stable` channel; the
-  Phase 0 file still says `stable`, and the exact pin lands in Phase 1 with
-  a CI check that rejects a channel name. The Limine release the build
+- **Toolchain.** `kernel/rust-toolchain.toml` and
+  `bootloader/rust-toolchain.toml` must pin the same exact stable version
+  (for example `1.100.0`), never the floating `stable` channel; both files
+  still say `stable`, and the exact pin lands in Phase 1a with a CI check
+  that rejects a channel name in any `rust-toolchain.toml` in the
+  repository. The Limine release the build
   fetches is pinned by SHA-256 of its files, checked before use, from the
   same phase. Bumping either is its own change with the full test, proof and
   benchmark suites green. rustc and LLVM are named axioms in
@@ -113,8 +129,66 @@ tests):
   for each `unsafe` it contains) gate every change. Kernel crates may not
   depend on crates with `build.rs` scripts or procedural macros unless the
   crate is vendored and audited, because both run arbitrary code at build
-  time. Verus's `builtin` and `builtin_macros` crates are vendored and
-  audited on this rule ([verification.md](verification.md)).
+  time. Verus's `verus_builtin` and `builtin_macros` crates are vendored
+  and audited on this rule; `vstd` is used only in Verus builds and a CI
+  check keeps it out of every shipping `cargo tree`
+  ([verification.md](verification.md)).
+
+## The bootloader workspace
+
+Optimal Boot (`bootloader/`) is in the trusted computing base, so every
+rule above applies to it from Phase 1a, with its own numbers: tier-0 crates
+(the UEFI application's protocol calls, its page tables and hand-off, the
+pre-boot IOMMU deny-all programming and its TPM access) are the only ones
+allowed `unsafe`, capped at 3,000 lines, of which shim code is at most
+1,500; the pure crates (`optimal-boot-core`: config, signatures, ELF,
+memory map, KASLR) are `#![forbid(unsafe_code)]`. `core-crypto` is shared
+and counted once, in the kernel's caps. The same lints, unsafe inventory,
+dependency rules and toolchain pin apply, its harnesses run in the proofs
+job, and its floor code is in proof target 16's scope. Configs are signed
+with Ed25519 (RFC 8032, verified by `core-crypto`). The whole loader's
+size budget is in the TCB table of [threat-model.md](threat-model.md).
+
+## Kernel random generator
+
+Every key the system makes (recovery key, hibernation and resume keys, the
+TOTP key, file-system nonce prefixes, `getrandom`) comes from one generator
+in `core-crypto`, proof target 14 from Phase 3.
+
+- **Inputs.** A BLAKE2b-512 pool absorbs the 256-bit seed Optimal Boot takes
+  from `EFI_RNG_PROTOCOL`, `RDSEED` output, TSC jitter samples (timing of a
+  fixed memory-access loop, taken until the credit target is reached on
+  machines with no other credited source), and, uncredited, `RDRAND`,
+  `TPM2_GetRandom`, interrupt timings and the seed file written at shutdown
+  ([boot.md](boot.md) lists the same sources). A source is credited at the
+  SP 800-90B min-entropy estimate published for it (for the EFI seed, the
+  lowest estimate measured across the reference firmware); `RDRAND` and
+  the TPM are credited 0.
+- **Construction.** When 256 bits are credited, the base generator is keyed
+  with 256 bits of pool output. It is ChaCha20 with fast key erasure: each
+  request generates a block batch whose first 32 bytes replace the key
+  before any output leaves, so a later state compromise can't recover
+  earlier output. Each CPU has its own generator, rekeyed from the base
+  when the base's generation number has advanced, so the hot path takes no
+  lock.
+- **Reseeding.** The base reseeds from the pool every 60 s, and before any
+  caller can draw again after resume from suspend, a hibernation resume
+  (which also mixes in 256 bits the boot kernel passes in the reserved
+  hand-over page, [storage.md](storage.md)) and an ACPI VM Generation ID
+  change. Each reseed bumps the generation, so every per-CPU generator
+  rekeys before its next output.
+- **Before the seed exists.** Kernel callers and `getrandom` block until
+  256 bits are credited (`GRND_NONBLOCK` returns `EAGAIN`), and the kernel
+  starts PID 1 only after that, so user space always sees a ready
+  generator and `/dev/random`, `/dev/urandom` and `GRND_INSECURE` behave as
+  on an initialised Linux. The TSC jitter source makes readiness reachable
+  on every machine; the Phase 3 boot-matrix test publishes the time to
+  readiness and fails above 2 s.
+- **Fork and snapshot safety.** Generator state lives only in kernel memory.
+  The vDSO `getrandom` state that user space holds is in pages that are
+  wiped on fork and carries the generation number, so a forked child, a
+  resumed image or a restored VM snapshot rekeys from the kernel before its
+  next output.
 
 ## What a safe component can still break, and the API answers
 
