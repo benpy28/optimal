@@ -173,6 +173,11 @@ impl<D: BlockDevice> Io<D> {
         self.repairs.len()
     }
 
+    /// Whether physical block `phys` has a repair queued.
+    pub fn repair_queued(&self, phys: u64) -> bool {
+        self.repairs.contains_key(&phys)
+    }
+
     /// Moves queued repairs into the write batch (called by commit, before
     /// its first flush). Rewriting a live block in place is safe here: the
     /// bytes are exactly the ones every commit referencing it expects, so a

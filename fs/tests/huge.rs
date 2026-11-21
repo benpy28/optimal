@@ -28,9 +28,13 @@ fn exercise(blocks: u64) {
         Box::new(ZeroClock),
     )
     .unwrap();
-    // Format touched only a handful of blocks however big the device is.
+    // Format touched only a handful of blocks however big the device is:
+    // at most 2 copies x (tree leaf + root block + space root + 3 paths of
+    // 4 tables and a bitmap, to the first block, to copy 1 of chunk 0 half
+    // a device away, and to the last block) + the chunk leaf's 2 copies +
+    // 2 superblocks = 2 x 18 + 2 + 2 = 40 (the zeroed slots aren't stored).
     assert!(
-        fs.device().stored_blocks() < 40,
+        fs.device().stored_blocks() <= 40,
         "{}",
         fs.device().stored_blocks()
     );
@@ -92,4 +96,33 @@ fn largest_supported_and_one_past() {
         Box::new(ZeroClock),
     );
     assert!(matches!(r, Err(Error::Unsupported(_))), "{:?}", r.err());
+}
+
+
+#[test]
+fn format_footprint_hand_worked() {
+    // Logical metadata after format = tree leaf + root block + space root
+    // + the distinct tables and bitmaps on the paths to bitmap 0, to the
+    // bitmap holding copy 1 of chunk 0 (half the usable area away) and to
+    // the last bitmap. Each is stored twice, plus the chunk leaf's two
+    // copies and the two superblock slots gen 1 writes.
+    //  16 TiB (3 levels): 3 paths x (2 tables + 1 bitmap) = 9, + 3 = 12.
+    //  8 GiB + 12345 (2 levels): bitmaps 0, 32, 64; level-1 tables 0 and 1
+    //   (bitmaps 0 and 32 share table 0): 3 + 2 = 5, + 3 = 8.
+    //  128 PiB (5 levels): 3 x (4 + 1) = 15, + 3 = 18.
+    for (blocks, logical) in [(1u64 << 32, 12u32), ((1 << 21) + 12_345, 8), (1 << 45, 18)] {
+        let mut fs = Filesystem::format(
+            SparseDevice::new(blocks),
+            &opts(),
+            &mut Rng::new(1),
+            Box::new(ZeroClock),
+        )
+        .unwrap();
+        let ch = fs.metadata_chunks().unwrap();
+        assert_eq!(ch.len(), 1);
+        let e = ch[0].1;
+        assert_eq!((e.p0, e.len, e.used.count_ones()), (2, 64, logical), "{blocks}");
+        assert_eq!(e.p1, 2 + (blocks - 4) / 2, "{blocks}");
+        assert_eq!(fs.device().stored_blocks(), 2 * logical as usize + 2 + 2, "{blocks}");
+    }
 }

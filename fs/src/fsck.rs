@@ -36,8 +36,10 @@ pub struct Report {
     pub inodes: u64,
     pub snapshots: u64,
     pub data_blocks_verified: u64,
-    /// Metadata copies that fail verification (each is also an error).
+    /// Metadata copies that fail verification. Each is an error unless a
+    /// repair from the good copy is already queued (`repairs_pending`).
     pub bad_copies: u64,
+    pub repairs_pending: u64,
 }
 
 impl Report {
@@ -347,8 +349,7 @@ fn check_chunks<D: BlockDevice>(fs: &mut Filesystem<D>, cx: &mut Ctx, body: &Bod
         let (ok0, ok1) = fs.store.io.verify_copies(*kind, p, p0, p1);
         for (ok, c, at) in [(ok0, 0, p0), (ok1, 1, p1)] {
             if !ok {
-                cx.rep.bad_copies += 1;
-                cx.err(format!("{kind:?} {:#x}: copy {c} (block {at}) fails verification", p.addr));
+                note_bad_copy(fs, cx, *kind, p.addr, c, at);
             }
         }
     }
@@ -364,12 +365,31 @@ fn check_chunks<D: BlockDevice>(fs: &mut Filesystem<D>, cx: &mut Ctx, body: &Bod
         let (ok0, ok1) = fs.store.io.verify_copies(kind, &p, p.addr, p.aux);
         for (ok, c, at) in [(ok0, 0, p.addr), (ok1, 1, p.aux)] {
             if !ok {
-                cx.rep.bad_copies += 1;
-                cx.err(format!("{kind:?} {:#x}: copy {c} (block {at}) fails verification", p.addr));
+                note_bad_copy(fs, cx, kind, p.addr, c, at);
             }
         }
     }
     Ok(())
+}
+
+/// A metadata copy that fails: an error, unless a repair (rewriting it from
+/// the good copy at the next commit) is already queued.
+fn note_bad_copy<D: BlockDevice>(
+    fs: &mut Filesystem<D>,
+    cx: &mut Ctx,
+    kind: BlockKind,
+    addr: u64,
+    copy: u32,
+    at: u64,
+) {
+    cx.rep.bad_copies += 1;
+    if fs.store.io.repair_queued(at) {
+        cx.rep.repairs_pending += 1;
+    } else {
+        cx.err(format!(
+            "{kind:?} {addr:#x}: copy {copy} (block {at}) fails verification"
+        ));
+    }
 }
 
 /// Structural walk of one tree: verifies each node and key bounds, claims blocks.
