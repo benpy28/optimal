@@ -17,6 +17,15 @@ use optimal_wtf8::{Wtf8, Wtf8Buf, decode_at};
 /// at least half of the buffer.
 const COMPACT_MIN: usize = 64 * 1024;
 
+/// The compaction policy: drop consumed text once at least `COMPACT_MIN`
+/// bytes are consumed and they are at least half the buffer. This bounds the
+/// buffer to about twice the unconsumed text (or `2 * COMPACT_MIN`), while
+/// copying each byte at most a constant number of times overall.
+#[inline]
+fn should_compact(consumed: usize, len: usize) -> bool {
+    consumed >= COMPACT_MIN && consumed * 2 >= len
+}
+
 #[derive(Debug)]
 pub(crate) struct Input {
     /// Unconsumed text plus some already-consumed text before `pos`.
@@ -137,7 +146,7 @@ impl Input {
 
     /// Drop consumed text when enough has built up.
     fn maybe_compact(&mut self) {
-        if self.pos >= COMPACT_MIN && self.pos * 2 >= self.buf.len() {
+        if should_compact(self.pos, self.buf.len()) {
             let keep = self.pos;
             // Move the position anchor to the new start so later lookups never
             // need the dropped text.
@@ -189,5 +198,74 @@ impl Input {
     /// Position of the first byte of the buffer.
     fn anchor_at_base(&self) -> Position {
         self.base_pos
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compaction_policy_boundaries() {
+        assert!(!should_compact(COMPACT_MIN - 1, COMPACT_MIN - 1));
+        assert!(should_compact(COMPACT_MIN, COMPACT_MIN));
+        assert!(should_compact(COMPACT_MIN, 2 * COMPACT_MIN));
+        assert!(!should_compact(COMPACT_MIN, 2 * COMPACT_MIN + 1));
+        assert!(should_compact(10 * COMPACT_MIN, 20 * COMPACT_MIN));
+        assert!(!should_compact(10 * COMPACT_MIN, 20 * COMPACT_MIN + 1));
+        assert_eq!(COMPACT_MIN, 65536);
+    }
+
+    /// Reference: line and column of byte offset `off` in `text`, counted
+    /// from scratch.
+    fn reference(text: &str, off: usize) -> Position {
+        let before = &text[..off];
+        let line = 1 + before.matches('\n').count() as u64;
+        let last = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let column = 1 + before[last..].encode_utf16().count() as u64;
+        Position { line, column }
+    }
+
+    /// Feed a large text in chunks, consuming everything as it arrives (as
+    /// the tokenizer does). Memory stays bounded and positions stay exact,
+    /// including positions asked for out of order.
+    #[test]
+    fn compaction_bounds_memory_and_keeps_positions() {
+        let line = "abc é😀 def\n";
+        let text: String = line.repeat(40_000);
+        let mut input = Input::new();
+        let mut fed = 0;
+        let mut max_len = 0;
+        let mut compactions = 0;
+        let chunk = 1000 * line.len();
+        while fed < text.len() {
+            let end = (fed + chunk).min(text.len());
+            let before = input.base;
+            input.push(Wtf8::from_str(&text[fed..end]));
+            if input.base != before {
+                compactions += 1;
+            }
+            fed = end;
+            max_len = max_len.max(input.len());
+            // Positions of a few offsets in the live buffer, ascending then
+            // one out of order.
+            let lo = input.base as usize;
+            let hi = fed;
+            for off in [lo, (lo + hi) / 2, hi, lo + 1] {
+                let off = (off..=hi).find(|&o| text.is_char_boundary(o)).unwrap();
+                assert_eq!(
+                    input.position_of(off as u64),
+                    reference(&text, off),
+                    "offset {off}"
+                );
+            }
+            input.pos = input.len();
+        }
+        assert!(compactions >= 5, "only {compactions} compactions");
+        assert!(
+            max_len <= 2 * COMPACT_MIN + chunk,
+            "buffer grew to {max_len}"
+        );
+        assert_eq!(input.base as usize + input.len(), text.len());
     }
 }
