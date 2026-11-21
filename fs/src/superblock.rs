@@ -71,7 +71,28 @@ pub struct Body {
     /// Generation of the newest snapshot (0 if none).
     pub latest_snap_gen: u64,
     pub commit_time_ns: i64,
+    /// Anti-rollback counter, mirrored into a TPM monotonic counter once
+    /// the kernel has one (stage 2). Carried forward unchanged by commits.
+    pub replay_value: u64,
+    /// [`FLAG_CLEAN`] and future flags; unknown bits are rejected.
+    pub flags: u64,
+    /// Oldest generation inside the quarantine window when this commit was
+    /// made: every block born at or after it may be one a lying drive lost,
+    /// and every block older is protected. Recovery verifies from here.
+    pub window_gen: u64,
+    /// Reserved for the per-file fsync intent log. Always null in v1.
+    pub log_root: BlockPtr,
+    /// The previous [`HISTORY`] commits, newest first (fewer on a young
+    /// volume). Their entries have no history of their own. Mount falls
+    /// back through these when the newest commit's blocks did not all
+    /// reach the media, which quarantine keeps possible for K commits.
+    pub history: Vec<Body>,
 }
+
+/// The volume was unmounted cleanly at this commit.
+pub const FLAG_CLEAN: u64 = 1;
+/// Commits recorded in each superblock's history ring (K - 1).
+pub const HISTORY: usize = 7;
 
 pub fn slot_addr(slot: u32, total: u64) -> u64 {
     match slot {
@@ -143,9 +164,11 @@ impl Header {
         let salt = r.array()?;
         let mut keyslots = [KeySlot::default(); KEYSLOTS];
         for ks in &mut keyslots {
+            // Slot kind: 0 empty, 1 passphrase (Argon2id). 2 is reserved for
+            // TPM-sealed slots (stage 2); other values are unknown.
             let used = r.u8()?;
             if used > 1 {
-                return Err(r.err());
+                return Err(Error::Unsupported("key slot kind"));
             }
             ks.used = used == 1;
             r.skip(7)?;
@@ -210,15 +233,10 @@ impl Header {
 }
 
 impl Body {
-    fn encode(&self, header_hash: &[u8; 32], w: &mut Writer) {
-        w.bytes(header_hash);
+    /// The commit-state fields shared by a body and its history entries.
+    fn encode_core(&self, w: &mut Writer) {
         w.u64(self.generation);
-        for p in [
-            &self.fs_root,
-            &self.meta_root,
-            &self.space_root,
-            &self.free_log,
-        ] {
+        for p in [&self.fs_root, &self.meta_root, &self.space_root, &self.free_log] {
             p.encode(w);
         }
         w.u64(self.next_ino);
@@ -227,17 +245,18 @@ impl Body {
         w.u64(self.next_deadlist);
         w.u64(self.latest_snap_gen);
         w.i64(self.commit_time_ns);
+        w.u64(self.replay_value);
+        w.u64(self.flags);
+        w.u64(self.window_gen);
     }
 
-    fn decode(b: &[u8], at: u64) -> Result<([u8; 32], Body)> {
-        let mut r = Reader::new(b, "superblock body", at);
-        let hh = r.array()?;
+    fn decode_core(r: &mut Reader) -> Result<Body> {
         let generation = r.u64()?;
-        let fs_root = BlockPtr::decode(&mut r)?;
-        let meta_root = BlockPtr::decode(&mut r)?;
-        let space_root = BlockPtr::decode(&mut r)?;
-        let free_log = BlockPtr::decode(&mut r)?;
-        let body = Body {
+        let fs_root = BlockPtr::decode(r)?;
+        let meta_root = BlockPtr::decode(r)?;
+        let space_root = BlockPtr::decode(r)?;
+        let free_log = BlockPtr::decode(r)?;
+        let b = Body {
             generation,
             fs_root,
             meta_root,
@@ -249,12 +268,65 @@ impl Body {
             next_deadlist: r.u64()?,
             latest_snap_gen: r.u64()?,
             commit_time_ns: r.i64()?,
+            replay_value: r.u64()?,
+            flags: r.u64()?,
+            window_gen: r.u64()?,
+            log_root: BlockPtr::NULL,
+            history: Vec::new(),
         };
+        if b.flags & !FLAG_CLEAN != 0 {
+            return Err(Error::Unsupported("superblock flags"));
+        }
+        if b.window_gen > b.generation {
+            return Err(Error::Corrupt("superblock window", generation));
+        }
+        Ok(b)
+    }
+
+    fn encode(&self, header_hash: &[u8; 32], w: &mut Writer) {
+        w.bytes(header_hash);
+        self.encode_core(w);
+        self.log_root.encode(w);
+        debug_assert!(self.history.len() <= HISTORY);
+        w.u32(self.history.len() as u32);
+        w.u32(0);
+        for h in &self.history {
+            h.encode_core(w);
+        }
+    }
+
+    fn decode(b: &[u8], at: u64) -> Result<([u8; 32], Body)> {
+        let mut r = Reader::new(b, "superblock body", at);
+        let hh = r.array()?;
+        let mut body = Body::decode_core(&mut r)?;
+        body.log_root = BlockPtr::decode(&mut r)?;
+        if !body.log_root.is_null() {
+            return Err(Error::Unsupported("fsync log (newer format)"));
+        }
+        let n = r.u32()? as usize;
+        if n > HISTORY || r.u32()? != 0 {
+            return Err(Error::Corrupt("superblock history", at));
+        }
+        let mut prev = body.generation;
+        for _ in 0..n {
+            let h = Body::decode_core(&mut r)?;
+            // Strictly older, newest first.
+            if h.generation >= prev {
+                return Err(Error::Corrupt("superblock history order", at));
+            }
+            prev = h.generation;
+            body.history.push(h);
+        }
         let rest = r.bytes(r.remaining())?;
         if rest.iter().any(|&x| x != 0) {
             return Err(Error::Corrupt("superblock body padding", at));
         }
         Ok((hh, body))
+    }
+
+    /// This commit's state without its history (a history entry).
+    pub fn core(&self) -> Body {
+        Body { history: Vec::new(), log_root: BlockPtr::NULL, ..self.clone() }
     }
 }
 
@@ -359,14 +431,35 @@ pub fn open_body(c: &Candidate, sealer: &Sealer) -> Result<Body> {
 /// Writes the superblock copies for `body.generation`, with a flush before (so
 /// everything it points to is durable first) and after (so the commit is
 /// durable when this returns).
-pub fn commit<D: BlockDevice>(io: &mut Io<D>, header: &Header, body: &Body) -> Result<()> {
+///
+/// With `all_slots`, the other pair is then overwritten with this commit
+/// too (after the first pair is durable), so no older or stray copy is
+/// left anywhere: used after mount fell back past newer copies, and for
+/// replay-counter bumps.
+pub fn commit<D: BlockDevice>(
+    io: &mut Io<D>,
+    header: &Header,
+    body: &Body,
+    all_slots: bool,
+) -> Result<()> {
     io.flush()?;
     let total = io.num_blocks();
-    for slot in slots_for_gen(body.generation) {
+    let own = slots_for_gen(body.generation);
+    for slot in own {
         let b = encode(header, body, slot, &mut io.sealer);
         io.write_now(slot_addr(slot, total), &b[..])?;
     }
-    io.flush()
+    io.flush()?;
+    if all_slots {
+        for slot in slots_for_gen(body.generation + 1) {
+            let b = encode(header, body, slot, &mut io.sealer);
+            io.write_now(slot_addr(slot, total), &b[..])?;
+        }
+        io.flush()?;
+    }
+    Ok(())
 }
 
-const _: () = assert!(BODY_LEN >= 32 + 8 + 4 * 64 + 6 * 8);
+/// Bytes of one history entry / the core of a body.
+const CORE_LEN: usize = 8 + 4 * 64 + 10 * 8;
+const _: () = assert!(BODY_LEN >= 32 + CORE_LEN + 64 + 8 + HISTORY * CORE_LEN);

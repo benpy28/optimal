@@ -856,6 +856,44 @@ impl Space {
         Ok(out)
     }
 
+    /// Loads (verifying) every table and bitmap born at or after
+    /// `min_birth`, skipping older subtrees. Returns how many it read.
+    pub fn verify_since<D: BlockDevice>(&mut self, io: &mut Io<D>, min_birth: u64) -> Result<u64> {
+        let mut n = 1;
+        let mut stack = vec![(self.levels, 0u64)];
+        while let Some((level, idx)) = stack.pop() {
+            let kids = self.table(io, level, idx)?.kids.clone();
+            for (j, k) in kids.iter().enumerate() {
+                if k.is_null() || k.birth < min_birth {
+                    continue;
+                }
+                let c = idx * FANOUT + j as u64;
+                n += 1;
+                if level == 1 {
+                    self.load(io, c)?;
+                } else {
+                    stack.push((level - 1, c));
+                }
+            }
+        }
+        self.evict_clean();
+        Ok(n)
+    }
+
+    /// The oldest generation whose frees are still quarantined, if any.
+    pub fn oldest_held(&self) -> Option<u64> {
+        self.held.front().map(|h| h.generation)
+    }
+
+    /// Renumbers quarantined batches by `delta` generations, after mount
+    /// fell back to an older commit and new commits skip ahead: quarantine
+    /// then still counts real commits.
+    pub fn rebase_held(&mut self, delta: u64) {
+        for h in self.held.iter_mut() {
+            h.generation += delta;
+        }
+    }
+
     pub fn log_addrs(&self) -> &[u64] {
         &self.log_addrs
     }
