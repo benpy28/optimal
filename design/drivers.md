@@ -721,6 +721,8 @@ approved; nothing it presents reaches a driver first.
   keyboard paths (PS/2, USB boot protocol, I2C-HID) accept any keyboard, and
   only into the passphrase or PIN prompt, where a guessing device is
   limited by the KDF and the TPM's lockout ([storage.md](storage.md)).
+  The resume PIN prompt after suspend takes input only from keyboards that
+  were connected before suspend ([boot.md](boot.md)).
   After unlock, every USB or Bluetooth device that isn't known goes through
   the rules above, including one that typed the passphrase. Keyboards used
   during installation are recorded as known. PS/2 and internal I2C-HID
