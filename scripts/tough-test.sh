@@ -38,6 +38,7 @@ pass=0
 fail=0
 skipped=0
 failed=()
+platform=()
 
 # scenario <name> <expect> <iso> <firmware> <machine> <mem> <smp> <timeout> <accel: kvm|tcg> [-- extra qemu args]
 # <expect> is "boot" or "refuse:<text the refusal must contain>".
@@ -62,23 +63,39 @@ scenario() {
         if ! printf '%s\n' "$@" | grep -qx -- -cpu; then QEMU_ACCEL+=(-cpu host); fi
     fi
 
-    local run log ok
+    local run log ok attempt why
     for run in $(seq 1 "$REPEAT"); do
         log="$LOGDIR/$name-run$run.log"
         local start=$SECONDS
-        run_qemu "$iso" "$log" "$fw" "$machine" "$mem" "$smp" "$timeout"
-        ok=no
-        if [ "$expect" = boot ]; then
-            if grep -qE "OPTIMAL: ktest [0-9]+ passed, 0 failed" "$log" &&
-                ! grep -qE "KTEST FAIL|KERNEL PANIC|EXCEPTION" "$log"; then
-                ok=yes
+        for attempt in 1 2; do
+            run_qemu "$iso" "$log" "$fw" "$machine" "$mem" "$smp" "$timeout"
+            ok=no
+            if [ "$expect" = boot ]; then
+                if grep -qE "OPTIMAL: ktest [0-9]+ passed, 0 failed" "$log" &&
+                    ! grep -qE "KTEST FAIL|KERNEL PANIC|EXCEPTION" "$log"; then
+                    ok=yes
+                fi
+            else
+                why="${expect#refuse:}"
+                if grep -qF "$why" "$log" && ! grep -q "Optimal kernel" "$log"; then
+                    ok=yes
+                fi
             fi
-        else
-            local why="${expect#refuse:}"
-            if grep -qF "$why" "$log" && ! grep -q "Optimal kernel" "$log"; then
-                ok=yes
+            [ "$ok" = yes ] && break
+            # A failure is only blamed on the platform (firmware or hypervisor)
+            # when it provably happened before our bootloader ran: no Limine
+            # or kernel output at all, and the VM died with a hypervisor
+            # internal error or the CPU never even reached 64-bit mode. Such a
+            # run gets one retry; failing twice fails the scenario anyway.
+            why=$(platform_failure "$log")
+            if [ "$attempt" = 1 ] && [ -n "$why" ]; then
+                echo "PLATFORM: $name run $run: $why, before the bootloader ran; retrying once"
+                platform+=("$name-run$run: $why")
+                mv "$log" "$log.platform-attempt1"
+                continue
             fi
-        fi
+            break
+        done
         if [ "$ok" = yes ]; then
             pass=$((pass + 1))
             echo "PASS: $name run $run ($((SECONDS - start))s)"
@@ -96,6 +113,20 @@ scenario() {
 }
 
 has_uefi() { [ -n "$OVMF" ]; }
+
+# Prints why a failed boot is the platform's fault, or nothing if it isn't
+# provably so (see the comment in scenario).
+platform_failure() {
+    local log="$1"
+    if grep -qiE "limine|optimal" "$log"; then
+        return 0
+    fi
+    if grep -q "VM status: paused (internal-error)" "$log"; then
+        echo "hypervisor internal error inside the firmware"
+    elif grep -q "^EFER=0000000000000000" "$log"; then
+        echo "firmware crashed before entering 64-bit mode"
+    fi
+}
 
 # ---------------------------------------------------------------------------
 # CPU models. Emulated (TCG) so each gets exactly its own feature set, even
@@ -223,6 +254,7 @@ else
     skipped=$((skipped + 1))
 fi
 
-echo "===== tough conditions: $pass passed, $fail failed, $skipped skipped ====="
+echo "===== tough conditions: $pass passed, $fail failed, $skipped skipped, ${#platform[@]} platform retries ====="
+for p in "${platform[@]}"; do echo "  platform retry: $p"; done
 for f in "${failed[@]}"; do echo "  failed: $f"; done
 [ "$fail" -eq 0 ]
