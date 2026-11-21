@@ -98,7 +98,6 @@ fn largest_supported_and_one_past() {
     assert!(matches!(r, Err(Error::Unsupported(_))), "{:?}", r.err());
 }
 
-
 #[test]
 fn format_footprint_hand_worked() {
     // Logical metadata after format = tree leaf + root block + space root
@@ -121,8 +120,16 @@ fn format_footprint_hand_worked() {
         let ch = fs.metadata_chunks().unwrap();
         assert_eq!(ch.len(), 1);
         let e = ch[0].1;
-        assert_eq!((e.p0, e.len, e.used.count_ones()), (2, 64, logical), "{blocks}");
+        assert_eq!(
+            (e.p0, e.len, e.used.count_ones()),
+            (2, 64, logical),
+            "{blocks}"
+        );
         assert_eq!(e.p1, 2 + (blocks - 4) / 2, "{blocks}");
-        assert_eq!(fs.device().stored_blocks(), 2 * logical as usize + 2 + 2, "{blocks}");
+        assert_eq!(
+            fs.device().stored_blocks(),
+            2 * logical as usize + 2 + 2,
+            "{blocks}"
+        );
     }
 }

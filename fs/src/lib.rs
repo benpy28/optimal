@@ -17,6 +17,8 @@ pub mod chunk;
 mod codec;
 pub mod crypto;
 pub mod device;
+#[cfg(test)]
+mod dup_tests;
 mod error;
 mod fs;
 pub mod fsck;
@@ -29,8 +31,6 @@ mod snapshot;
 mod space;
 mod superblock;
 #[cfg(test)]
-mod dup_tests;
-#[cfg(test)]
 mod tests;
 mod tree;
 
@@ -42,8 +42,8 @@ pub use device::FileDevice;
 pub use device::{BLOCK_SIZE, BlockDevice, IoError, MemDevice};
 pub use error::{Error, Result};
 pub use fs::{
-    auto_chunk_blocks, Attr, Clock, DirEntry, FileKind, Filesystem, FormatOptions, MountOptions, ROOT_INO, SetAttr,
-    StatFs, ZeroClock,
+    Attr, Clock, DirEntry, FileKind, Filesystem, FormatOptions, MountOptions, ROOT_INO, SetAttr,
+    StatFs, ZeroClock, auto_chunk_blocks,
 };
 pub use io::IoStats;
 pub use recover::RecoveryStats;

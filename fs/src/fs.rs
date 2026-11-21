@@ -416,7 +416,11 @@ impl<D: BlockDevice> Filesystem<D> {
         let chunk_blocks = match opts.meta_chunk_blocks {
             0 => auto_chunk_blocks(total),
             c if c.is_power_of_two() && c <= 64 => c,
-            _ => return Err(Error::Invalid("metadata chunk size must be 1, 2, 4, .. or 64")),
+            _ => {
+                return Err(Error::Invalid(
+                    "metadata chunk size must be 1, 2, 4, .. or 64",
+                ));
+            }
         };
         let mut header = Header {
             uuid,
@@ -631,8 +635,7 @@ impl<D: BlockDevice> Filesystem<D> {
             };
             io.repair_enabled = !opts.read_only;
             let mut body = body;
-            let (mut space, fs_tree, meta) = match Self::open_commit(&mut io, &header, &mut body)
-            {
+            let (mut space, fs_tree, meta) = match Self::open_commit(&mut io, &header, &mut body) {
                 Ok(x) => x,
                 Err(e) => {
                     last_err = e;
@@ -818,7 +821,13 @@ impl<D: BlockDevice> Filesystem<D> {
     /// moving metadata off a failing region, balancing, and tests.
     pub fn relocate_metadata_chunk(&mut self, id: u64) -> Result<()> {
         self.check_writable()?;
-        if !self.store.space.chunks.entry(&mut self.store.io, id)?.mapped() {
+        if !self
+            .store
+            .space
+            .chunks
+            .entry(&mut self.store.io, id)?
+            .mapped()
+        {
             return Err(Error::NotFound);
         }
         if !self.store.space.relocations.contains(&id) {
@@ -1900,10 +1909,10 @@ impl<D: BlockDevice> Filesystem<D> {
             self.store.space.free(&mut self.store.io, old, 1)?;
         }
         let root_addr = self.store.space.alloc_meta(&mut self.store.io, 1)?[0].0;
-        let (space_root, free_log, chunk_root) = self
-            .store
-            .space
-            .write(&mut self.store.io, generation, now)?;
+        let (space_root, free_log, chunk_root) =
+            self.store
+                .space
+                .write(&mut self.store.io, generation, now)?;
         let mut body = Body {
             generation,
             chunk_root,

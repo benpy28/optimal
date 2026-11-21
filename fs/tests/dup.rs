@@ -87,7 +87,10 @@ fn every_copy_pair_differs() {
             let x = &img[a as usize * BS..][..BS];
             let y = &img[b as usize * BS..][..BS];
             let same = x.iter().zip(y).filter(|(p, q)| p == q).count();
-            assert!(same < 100, "enc {enc}: copies at {a} and {b} share {same} bytes");
+            assert!(
+                same < 100,
+                "enc {enc}: copies at {a} and {b} share {same} bytes"
+            );
         }
     }
 }
@@ -114,9 +117,16 @@ fn bit_flip_in_copy1_is_found_by_recovery_and_repaired() {
         let damaged = img[p1 as usize * BS..(p1 as usize + 1) * BS].to_vec();
         let model = h.model.clone();
         let fs = remount(img, enc, seed);
-        let st = fs.recovery_stats().expect("unclean mount runs recovery").clone();
+        let st = fs
+            .recovery_stats()
+            .expect("unclean mount runs recovery")
+            .clone();
         assert_eq!(st.bad_copies, 1, "seed {seed}: {st:?}");
-        assert_eq!(fs.fell_back_from(), None, "one bad copy is no reason to fall back");
+        assert_eq!(
+            fs.fell_back_from(),
+            None,
+            "one bad copy is no reason to fall back"
+        );
         let mut rh = Harness::from_mounted(fs, model.clone(), enc, seed);
         rh.verify(&model);
         let rep = fsck::check(rh.fs(), true).unwrap();
@@ -151,7 +161,10 @@ fn one_bad_copy_of_every_block_loses_nothing() {
         // Unmount cleanly, then list the blocks of that final commit.
         let dev = h.fs.take().unwrap().unmount().unwrap();
         let mut fs = remount(dev.clean_image(), enc, seed);
-        let mut pairs: Vec<(u64, u64)> = meta_blocks(&mut fs).iter().map(|&(_, a, b)| (a, b)).collect();
+        let mut pairs: Vec<(u64, u64)> = meta_blocks(&mut fs)
+            .iter()
+            .map(|&(_, a, b)| (a, b))
+            .collect();
         pairs.extend(fs.chunk_table_blocks_for_tests().unwrap());
         let mut img = fs.into_device().clean_image();
         let mut r = Rng::new(seed ^ 0x5eed);
@@ -170,10 +183,17 @@ fn one_bad_copy_of_every_block_loses_nothing() {
         // block first (a bitmap rewritten by an earlier move) and it needed
         // none. Never both, never neither.
         assert_eq!(sc.repaired + sc.dropped, pairs.len() as u64, "seed {seed}");
-        assert!(sc.repaired >= pairs.len() as u64 * 3 / 4, "seed {seed}: {sc:?}");
+        assert!(
+            sc.repaired >= pairs.len() as u64 * 3 / 4,
+            "seed {seed}: {sc:?}"
+        );
         assert_eq!(sc.unreadable, 0);
         let rep = fsck::check(rh.fs(), true).unwrap();
-        assert!(rep.ok() && rep.bad_copies == 0, "seed {seed}: {:?}", rep.errors);
+        assert!(
+            rep.ok() && rep.bad_copies == 0,
+            "seed {seed}: {:?}",
+            rep.errors
+        );
         // Remount: everything still there, nothing bad left.
         let dev = rh.fs.take().unwrap().unmount().unwrap();
         let fs = remount(dev.clean_image(), enc, seed + 100);
@@ -239,7 +259,10 @@ fn relocated_chunks_read_back_and_old_runs_stay_quarantined() {
         for (id, _) in &before {
             h.fs().relocate_metadata_chunk(*id).unwrap();
         }
-        assert_eq!(h.fs().relocate_metadata_chunk(1 << 40), Err(Error::NotFound));
+        assert_eq!(
+            h.fs().relocate_metadata_chunk(1 << 40),
+            Err(Error::NotFound)
+        );
         h.fs().commit().unwrap();
         let after = h.fs().metadata_chunks().unwrap();
         let img = h.fs().device().clean_image();
@@ -247,7 +270,10 @@ fn relocated_chunks_read_back_and_old_runs_stay_quarantined() {
             // Every chunk still mapped moved both copies; the old runs
             // still hold their old bytes (quarantined, not reused).
             if let Some((_, n)) = after.iter().find(|(j, _)| j == id) {
-                assert!(n.p0 != e.p0 && n.p1 != e.p1, "seed {seed} chunk {id} did not move");
+                assert!(
+                    n.p0 != e.p0 && n.p1 != e.p1,
+                    "seed {seed} chunk {id} did not move"
+                );
                 for off in 0..e.len as usize {
                     for p in [e.p0 as usize + off, e.p1 as usize + off] {
                         assert_eq!(img[p * BS..][..BS], old_img[p * BS..][..BS], "seed {seed}");
@@ -263,7 +289,10 @@ fn relocated_chunks_read_back_and_old_runs_stay_quarantined() {
         for _ in 0..9 {
             h.fs().commit_forced_for_tests().unwrap();
         }
-        assert!(h.fs().statfs().available_blocks + 64 >= avail0, "seed {seed}");
+        assert!(
+            h.fs().statfs().available_blocks + 64 >= avail0,
+            "seed {seed}"
+        );
         let dev = h.fs.take().unwrap().into_device();
         let fs = remount(dev.clean_image(), enc, seed);
         let mut rh = Harness::from_mounted(fs, model.clone(), enc, seed);
@@ -344,7 +373,10 @@ fn emptied_chunks_are_released() {
     assert!(left * 3 <= grown, "{grown} chunks shrank only to {left}");
     // Physical space comes back with them: 2 copies of 2 blocks per chunk.
     let free = h.fs().statfs().free_blocks;
-    assert!(free + 4 * left as u64 + 64 >= free0, "free {free} vs {free0}");
+    assert!(
+        free + 4 * left as u64 + 64 >= free0,
+        "free {free} vs {free0}"
+    );
     h.fsck();
 }
 
@@ -392,6 +424,9 @@ fn fragmented_free_space_gets_shorter_chunks() {
         .iter()
         .filter(|(_, e)| e.len < 64)
         .count();
-    assert!(short > 0, "expected shortened chunks on a fragmented device");
+    assert!(
+        short > 0,
+        "expected shortened chunks on a fragmented device"
+    );
     h.fsck();
 }

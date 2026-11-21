@@ -9,20 +9,20 @@
 //!
 //! The torture tests run this after every simulated crash.
 
+use crate::chunk::Entry;
+use crate::chunk::{LOGICAL, is_logical};
 use crate::crypto::BlockKind;
-use crate::io::CopyOwner;
 use crate::device::{BLOCK_SIZE, BlockDevice};
 use crate::error::{Error, Result};
 use crate::fs::{
     Attr, Extent, FileKind, Filesystem, K_DIRENT, K_EXTENT, K_INLINE, K_INODE, ROOT_INO,
     decode_dirents,
 };
-use crate::chunk::{LOGICAL, is_logical};
+use crate::io::CopyOwner;
 use crate::ptr::BlockPtr;
-use crate::chunk::Entry;
-use crate::superblock::Body;
 use crate::snapshot::{K_DEAD, K_SNAP, decode_dead, list_records};
 use crate::space::{BITS_PER_BMP, SB_RESERVED_BACK, SB_RESERVED_FRONT};
+use crate::superblock::Body;
 use crate::tree::{Child, Key, TreeId};
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
@@ -86,7 +86,10 @@ pub fn scrub_metadata<D: BlockDevice>(fs: &mut Filesystem<D>) -> Result<ScrubRep
     out.check = check;
     if pending > 0 {
         fs.mark_dirty();
-        let (r0, d0) = (fs.store.io.stats.copies_repaired, fs.store.io.stats.copies_dropped);
+        let (r0, d0) = (
+            fs.store.io.stats.copies_repaired,
+            fs.store.io.stats.copies_dropped,
+        );
         fs.commit()?;
         out.repaired = fs.store.io.stats.copies_repaired - r0;
         out.dropped = fs.store.io.stats.copies_dropped - d0;
@@ -136,7 +139,10 @@ impl Ctx {
     /// table later) and remembers it for the copy check.
     fn claim_meta(&mut self, kind: BlockKind, role: Role, p: &BlockPtr) {
         if !is_logical(p.addr) {
-            self.err(format!("{role:?} pointer {} is not a logical address", p.addr));
+            self.err(format!(
+                "{role:?} pointer {} is not a logical address",
+                p.addr
+            ));
             return;
         }
         let fresh = !self.owners.contains_key(&p.addr);
@@ -250,7 +256,9 @@ pub fn check<D: BlockDevice>(fs: &mut Filesystem<D>, verify_data: bool) -> Resul
     }
     let log = fs.store.space.log_ptrs(&mut fs.store.io, body.free_log)?;
     if log.iter().map(|p| p.addr).collect::<Vec<_>>() != fs.store.space.log_addrs() {
-        cx.err(String::from("free log chain differs from the loaded free log"));
+        cx.err(String::from(
+            "free log chain differs from the loaded free log",
+        ));
     }
     for p in &log {
         cx.claim_meta(BlockKind::FreeLog, Role::FreeLog, p);
@@ -259,9 +267,8 @@ pub fn check<D: BlockDevice>(fs: &mut Filesystem<D>, verify_data: bool) -> Resul
 
     check_chunks(fs, &mut cx, &body)?;
 
-    cx.rep.referenced_blocks = cx.owners.range(..LOGICAL).count() as u64
-        + SB_RESERVED_FRONT
-        + SB_RESERVED_BACK;
+    cx.rep.referenced_blocks =
+        cx.owners.range(..LOGICAL).count() as u64 + SB_RESERVED_FRONT + SB_RESERVED_BACK;
     let total = cx.total;
     let reserved = |b: u64| b < SB_RESERVED_FRONT || b >= total - SB_RESERVED_BACK;
     let mut mismatches = 0u64;
@@ -355,14 +362,18 @@ fn check_chunks<D: BlockDevice>(fs: &mut Filesystem<D>, cx: &mut Ctx, body: &Bod
         }
         mapped.insert(id, e);
     }
-    let (free, count) = mapped.values().fold((0, 0), |(f, c), e| (f + e.free_slots(), c + 1));
+    let (free, count) = mapped
+        .values()
+        .fold((0, 0), |(f, c), e| (f + e.free_slots(), c + 1));
     if (free, count)
         != (
             fs.store.space.chunks.free_slots(),
             fs.store.space.chunks.mapped_chunks(),
         )
     {
-        cx.err(format!("chunk table totals wrong: walked {free} free / {count} mapped"));
+        cx.err(format!(
+            "chunk table totals wrong: walked {free} free / {count} mapped"
+        ));
     }
     let logical: Vec<u64> = cx.owners.range(LOGICAL..).map(|(&l, _)| l).collect();
     for l in logical {
@@ -391,7 +402,9 @@ fn check_chunks<D: BlockDevice>(fs: &mut Filesystem<D>, cx: &mut Ctx, body: &Bod
                 .and_then(|(id, off)| mapped.get(&id).map(|e| e.is_used(off)))
                 .unwrap_or(false);
             if cx.owners.contains_key(&l) || used {
-                cx.err(format!("logical block {l:#x} is in the free log but in use"));
+                cx.err(format!(
+                    "logical block {l:#x} is in the free log but in use"
+                ));
             }
         }
     }
@@ -419,7 +432,8 @@ fn check_chunks<D: BlockDevice>(fs: &mut Filesystem<D>, cx: &mut Ctx, body: &Bod
         };
         cx.claim(p.addr, 1, Role::ChunkMap, p.birth, p.mac);
         cx.claim(p.aux, 1, Role::ChunkMap, p.birth, p.mac);
-        cx.metas_out.push((kind, p, p.addr, p.aux, CopyOwner::Table(level, idx)));
+        cx.metas_out
+            .push((kind, p, p.addr, p.aux, CopyOwner::Table(level, idx)));
         let (ok0, ok1) = fs.store.io.verify_copies(kind, &p, p.addr, p.aux);
         for (ok, c, at) in [(ok0, 0, p.addr), (ok1, 1, p.aux)] {
             if !ok {

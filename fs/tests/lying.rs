@@ -204,7 +204,10 @@ fn report(t: &Tally) {
         "lying drives: {} fallbacks, {} damaged-file reports, {} second rounds, {} chunk moves",
         t.fallbacks, t.damaged, t.second_round, t.relocations
     );
-    eprintln!("commits back from the newest copy each mount landed: {:?}", t.depths);
+    eprintln!(
+        "commits back from the newest copy each mount landed: {:?}",
+        t.depths
+    );
 }
 
 #[test]
@@ -220,7 +223,8 @@ fn lost_commits_with_chunk_moves_in_every_window() {
         for i in 0..scale().max(1) * 2 {
             let seed = base ^ (lies << 40) ^ (i * 0x51_7cc1);
             let enc = i % 2 == 0;
-            let mut h = Harness::new_chunked(1500, enc, seed, [1, 2, 4, 0][(i % 4) as usize]).unwrap();
+            let mut h =
+                Harness::new_chunked(1500, enc, seed, [1, 2, 4, 0][(i % 4) as usize]).unwrap();
             let mut r = Rng::new(seed);
             for _ in 0..40 {
                 let op = gen_op(&mut r, &h.model, &cfg());

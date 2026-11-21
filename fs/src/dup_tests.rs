@@ -66,12 +66,17 @@ fn copy_mask_hand_worked() {
         // Copy 1, swapped back, opens under the parent's MAC.
         let mut y = c1.clone();
         s.swap_copy(BlockKind::Node, l, 7, &nonce, &mut y[..]);
-        s.open(BlockKind::Node, l, 7, &nonce, &mac, &mut y[..]).unwrap();
+        s.open(BlockKind::Node, l, 7, &nonce, &mac, &mut y[..])
+            .unwrap();
         assert_eq!(y[..], p[..], "{name}");
         // Plain volumes have a zero nonce, so the mask depends on kind,
         // address and birth; encrypted ones on the (unique) nonce.
         if name == "plain" {
-            for (k, a, b) in [(BlockKind::Bitmap, l, 7), (BlockKind::Node, l + 1, 7), (BlockKind::Node, l, 8)] {
+            for (k, a, b) in [
+                (BlockKind::Bitmap, l, 7),
+                (BlockKind::Node, l + 1, 7),
+                (BlockKind::Node, l, 8),
+            ] {
                 let mut z = p.clone();
                 s.seal_copy1(k, a, b, &nonce, &mut z[..]);
                 assert!(differing(&z[..], &c1[..]) >= 4000, "{name} {k:?} {a} {b}");
@@ -154,13 +159,19 @@ fn dup_reads_reject_what_the_parent_did_not_commit() {
         flip(&mut io, 10, 100);
         flip(&mut io, 20, 200);
         io.copy_mode = CopyMode::Both;
-        assert!(io.read_dup(BlockKind::Node, &p, 10, 20, OWN).is_err(), "{name}");
+        assert!(
+            io.read_dup(BlockKind::Node, &p, 10, 20, OWN).is_err(),
+            "{name}"
+        );
         // Copies in each other's place: neither verifies (copy 1's bytes
         // are not copy 0's), so a swapped or misdirected copy is caught.
         let (mut io, p, c0, c1) = dup_fixture(mk());
         io.dev.write(10, &c1).unwrap();
         io.dev.write(20, &c0).unwrap();
-        assert!(io.read_dup(BlockKind::Node, &p, 10, 20, OWN).is_err(), "{name} swapped");
+        assert!(
+            io.read_dup(BlockKind::Node, &p, 10, 20, OWN).is_err(),
+            "{name} swapped"
+        );
         // A stale copy 1: an earlier version of the same logical block with
         // the same birth (a crashed attempt at this generation, replayed).
         // On plain volumes the nonce is zero, so only the parent's MAC can
@@ -174,7 +185,10 @@ fn dup_reads_reject_what_the_parent_did_not_commit() {
         io.dev.write(20, &stale).unwrap();
         flip(&mut io, 10, 5);
         io.copy_mode = CopyMode::Either;
-        assert!(io.read_dup(BlockKind::Node, &p, 10, 20, OWN).is_err(), "{name} stale copy 1");
+        assert!(
+            io.read_dup(BlockKind::Node, &p, 10, 20, OWN).is_err(),
+            "{name} stale copy 1"
+        );
         // With repairs off (read-only mounts) a bad copy is counted only.
         let (mut io, p, _, _) = dup_fixture(mk());
         io.repair_enabled = false;
@@ -250,17 +264,29 @@ fn chunk_table_against_model() {
                 "seed {seed} step {step} id {q}"
             );
             let want_unmapped = (0..t.capacity()).find(|i| !model.contains_key(i));
-            assert_eq!(t.find_unmapped(&mut io).unwrap(), want_unmapped, "seed {seed} step {step}");
+            assert_eq!(
+                t.find_unmapped(&mut io).unwrap(),
+                want_unmapped,
+                "seed {seed} step {step}"
+            );
             let from = pick_id(&mut rng);
             let want_free = model
                 .range(from..)
                 .find(|(_, e)| e.free_slots() > 0)
                 .map(|(&i, _)| i);
-            assert_eq!(t.find_free(&mut io, from).unwrap(), want_free, "seed {seed} step {step} from {from}");
+            assert_eq!(
+                t.find_free(&mut io, from).unwrap(),
+                want_free,
+                "seed {seed} step {step} from {from}"
+            );
             let (f, m) = model
                 .values()
                 .fold((0, 0), |(f, m), e| (f + e.free_slots(), m + 1));
-            assert_eq!((t.free_slots(), t.mapped_chunks()), (f, m), "seed {seed} step {step}");
+            assert_eq!(
+                (t.free_slots(), t.mapped_chunks()),
+                (f, m),
+                "seed {seed} step {step}"
+            );
             // Commit now and then: every dirty node gets a fresh pair.
             if step % 97 == 96 {
                 generation += 1;
@@ -287,7 +313,11 @@ fn chunk_table_against_model() {
                 let depth = t.depth();
                 let mut u = ChunkTable::open(&mut io, total, shift, root, depth).unwrap();
                 let all: Vec<(u64, Entry)> = model.iter().map(|(&i, &e)| (i, e)).collect();
-                assert_eq!(u.all_entries(&mut io).unwrap(), all, "seed {seed} gen {generation}");
+                assert_eq!(
+                    u.all_entries(&mut io).unwrap(),
+                    all,
+                    "seed {seed} gen {generation}"
+                );
                 assert_eq!((u.free_slots(), u.mapped_chunks()), (f, m));
                 // verify_since reads exactly the nodes born at or after.
                 let born_now = u
@@ -311,7 +341,10 @@ fn chunk_table_decoder_rejects_bad_entries() {
     // Hand-made leaves: a valid entry decodes; each kind of bad one is
     // refused as corruption (never a panic, never accepted).
     let total = 1000u64;
-    let mut io = Io::new(MemDevice::new(total), Sealer::new([1; 16], None, &mut Rng::new(1)));
+    let mut io = Io::new(
+        MemDevice::new(total),
+        Sealer::new([1; 16], None, &mut Rng::new(1)),
+    );
     let good = Entry {
         p0: 10,
         p1: 500,
@@ -319,12 +352,20 @@ fn chunk_table_decoder_rejects_bad_entries() {
         len: 4,
     };
     let bads = [
-        Entry { len: 5, ..good },                 // longer than the 4-block chunk size
-        Entry { used: 0b10000, ..good },          // used bit past len
-        Entry { p0: 1, ..good },                  // in the superblock area
-        Entry { p1: 996, ..good },                // runs into the back slots
-        Entry { p1: 12, ..good },                 // copies overlap
-        Entry { p0: 0, p1: 0, used: 1, len: 0 },  // unmapped but not zero
+        Entry { len: 5, ..good }, // longer than the 4-block chunk size
+        Entry {
+            used: 0b10000,
+            ..good
+        }, // used bit past len
+        Entry { p0: 1, ..good },  // in the superblock area
+        Entry { p1: 996, ..good }, // runs into the back slots
+        Entry { p1: 12, ..good }, // copies overlap
+        Entry {
+            p0: 0,
+            p1: 0,
+            used: 1,
+            len: 0,
+        }, // unmapped but not zero
     ];
     for (i, e) in core::iter::once(good).chain(bads).enumerate() {
         let mut t = ChunkTable::format(total, 2);

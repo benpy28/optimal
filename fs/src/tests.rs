@@ -119,7 +119,10 @@ fn fresh_volume_space_hand_worked() {
     assert_eq!(fs.statfs().free_blocks, 4096 - 134);
     let chunks = fs.metadata_chunks().unwrap();
     assert_eq!(chunks.len(), 1);
-    assert_eq!((chunks[0].0, chunks[0].1.len, chunks[0].1.used), (0, 64, 0b1111));
+    assert_eq!(
+        (chunks[0].0, chunks[0].1.len, chunks[0].1.used),
+        (0, 64, 0b1111)
+    );
     // Copy 1 sits half the usable area (4092 / 2 = 2046 blocks) after copy 0.
     assert_eq!(chunks[0].1.p1, chunks[0].1.p0 + 2046);
     assert!(

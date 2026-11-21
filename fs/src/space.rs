@@ -293,13 +293,9 @@ impl Space {
                 // stay logical.
                 let logical = is_logical(start);
                 let bad = len == 0
-                    || start.checked_add(len).is_none_or(|e| {
-                        if logical {
-                            e - 1 < LOGICAL
-                        } else {
-                            e > total
-                        }
-                    });
+                    || start
+                        .checked_add(len)
+                        .is_none_or(|e| if logical { e - 1 < LOGICAL } else { e > total });
                 let batch = match s.held.iter_mut().find(|h| h.generation == generation) {
                     Some(h) => h,
                     None => {
@@ -616,7 +612,11 @@ impl Space {
 
     /// Allocates `n` logical metadata blocks, as runs of consecutive
     /// addresses (each run inside one chunk).
-    pub fn alloc_meta<D: BlockDevice>(&mut self, io: &mut Io<D>, n: u64) -> Result<Vec<(u64, u64)>> {
+    pub fn alloc_meta<D: BlockDevice>(
+        &mut self,
+        io: &mut Io<D>,
+        n: u64,
+    ) -> Result<Vec<(u64, u64)>> {
         let mut out = Vec::new();
         let mut left = n;
         while left > 0 {
@@ -895,7 +895,11 @@ impl Space {
             io.stats.copies_dropped += good.len() as u64;
             return Ok(());
         }
-        let (run, other) = if copy == 0 { (e.p0, e.p1) } else { (e.p1, e.p0) };
+        let (run, other) = if copy == 0 {
+            (e.p0, e.p1)
+        } else {
+            (e.p1, e.p0)
+        };
         let len = e.len as u64;
         let mut fixed = 0;
         let mut blocks = Vec::new();
@@ -1123,9 +1127,8 @@ impl Space {
                 changed = true;
             }
             for k in self.chunks.dirty_nodes() {
-                if !chunk_homes.contains_key(&k) {
-                    let pair = self.alloc_pair(io)?;
-                    chunk_homes.insert(k, pair);
+                if let alloc::collections::btree_map::Entry::Vacant(v) = chunk_homes.entry(k) {
+                    v.insert(self.alloc_pair(io)?);
                     changed = true;
                 }
             }
@@ -1398,7 +1401,11 @@ impl Space {
     }
 
     /// The pointers of every block of the free log starting at `head`.
-    pub fn log_ptrs<D: BlockDevice>(&mut self, io: &mut Io<D>, head: BlockPtr) -> Result<Vec<BlockPtr>> {
+    pub fn log_ptrs<D: BlockDevice>(
+        &mut self,
+        io: &mut Io<D>,
+        head: BlockPtr,
+    ) -> Result<Vec<BlockPtr>> {
         let mut out = Vec::new();
         let mut p = head;
         while !p.is_null() {

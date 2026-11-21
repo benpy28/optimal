@@ -79,7 +79,11 @@ impl Entry {
         self.len as u64 - self.used.count_ones() as u64
     }
     pub fn mask(len: u32) -> u64 {
-        if len >= 64 { u64::MAX } else { (1u64 << len) - 1 }
+        if len >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << len) - 1
+        }
     }
     pub fn is_used(&self, off: u64) -> bool {
         self.used & (1 << off) != 0
@@ -134,7 +138,10 @@ impl CNode {
     fn sums(&self) -> (u64, u64) {
         match &self.contents {
             Contents::Leaf(es) => es.iter().fold((0, 0), |(f, m), e| {
-                (f + if e.mapped() { e.free_slots() } else { 0 }, m + e.mapped() as u64)
+                (
+                    f + if e.mapped() { e.free_slots() } else { 0 },
+                    m + e.mapped() as u64,
+                )
             }),
             Contents::Table(ks) => ks
                 .iter()
@@ -444,7 +451,12 @@ impl ChunkTable {
     /// writes them to new homes and frees their old copies into quarantine
     /// (how a chunk-table block with a bad copy is repaired). Returns false
     /// if the node no longer exists (its subtree was emptied and pruned).
-    pub fn redirty<D: BlockDevice>(&mut self, io: &mut Io<D>, level: u32, idx: u64) -> Result<bool> {
+    pub fn redirty<D: BlockDevice>(
+        &mut self,
+        io: &mut Io<D>,
+        level: u32,
+        idx: u64,
+    ) -> Result<bool> {
         if level > self.depth || idx >= ids_at(self.depth - level) / LEAF_ENTRIES {
             return Ok(false);
         }
@@ -483,7 +495,8 @@ impl ChunkTable {
                 break;
             }
             let parent = idx / TABLE_FANOUT;
-            let k = &mut self.node(io, level + 1, parent)?.kids_mut()[(idx % TABLE_FANOUT) as usize];
+            let k =
+                &mut self.node(io, level + 1, parent)?.kids_mut()[(idx % TABLE_FANOUT) as usize];
             k.free = (k.free as i64 + df) as u64;
             k.mapped = (k.mapped as i64 + dm) as u64;
             let mut old = None;

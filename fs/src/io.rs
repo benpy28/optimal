@@ -142,9 +142,10 @@ impl<D: BlockDevice> Io<D> {
             self.sealer.open(kind, a, birth, &nonce, &mac, &mut b[..])?;
             Ok((raw, b))
         });
-        if r0.is_ok() && mode == CopyMode::Either {
-            return Ok(r0.unwrap().1);
-        }
+        let r0 = match r0 {
+            Ok((_, b)) if mode == CopyMode::Either => return Ok(b),
+            r => r,
+        };
         let r1 = self.read_copy(p1).and_then(|mut raw| {
             self.sealer.swap_copy(kind, a, birth, &nonce, &mut raw[..]);
             let mut b = raw.clone();

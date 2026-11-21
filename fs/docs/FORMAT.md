@@ -1,5 +1,14 @@
 # OptimalFS on-disk format, version 1
 
+**Status: pre-v1 draft.** This is the layout version 1 will have, and the
+code writes exactly this today, but it may still change until the first
+release that stores user data. From then on it is frozen (see the end).
+
+One key derivation function is used for every internal subkey: BLAKE3
+`derive_key(context, key material)`, with the context strings given below.
+Passphrases go through Argon2id first (key slots). HKDF is not used here;
+it appears only in other layers of the system (LUKS2 and boot).
+
 All integers are little-endian. A block is 4096 bytes. Block numbers are
 `u64`. "Sealed" means the block was passed through the volume's sealer (see
 *Sealing*) and its MAC and nonce live in the pointer that refers to it.
@@ -244,22 +253,43 @@ Copy 1 is not a byte-for-byte duplicate, so a drive that deduplicates
 writes or mixes up the two can't silently collapse them:
 
 - Encrypted volumes: copy 0 is the XChaCha20-Poly1305 ciphertext. Copy 1
-  is copy 0 encrypted again (stream only, tag discarded) under
-  `derive_key("OptimalFS v1 copy 1 block encryption key", block key)` with
-  the same nonce and associated data.
+  is copy 0 encrypted again exactly as XChaCha20-Poly1305 encryption does
+  it (so the XChaCha20 keystream starts at block counter 1; block 0 would
+  be the Poly1305 key) and the tag is discarded. The key is
+  `derive_key("OptimalFS v1 copy 1 block encryption key", block key)`, the
+  nonce is the block's own (in its pointer). Nonces are a random per-mount
+  prefix plus a counter and never repeat, so no (copy 1 key, nonce) pair
+  repeats either, across mounts included; the mask is different for every
+  block written. Any later cipher suite uses the same rule: a copy 1 key
+  derived from that suite's block key, the block's own nonce, and the
+  suite's normal encryption stream (for an AES-GCM suite, the counter
+  starts at J0 + 1).
 - Plain volumes: copy 1 is copy 0 XOR the BLAKE3 XOF output keyed with
   `derive_key("OptimalFS v1 plain copy 1 mask key", checksum key)` over the
-  36-byte associated data.
+  36-byte associated data (which holds the kind, logical address, birth
+  generation and volume UUID, so the mask differs for every logical address
+  and generation). The plain checksum key is derived from the UUID, so this
+  key is public: the mask only stops a drive from deduplicating or
+  confusing the two copies. It is not secrecy, and plain volumes have none.
 
 Both maps are involutions given the pointer, so a reader turns copy 1 back
 into copy 0's bytes and checks them against the parent's MAC. There is no
 separate tag for copy 1: the only thing that makes a copy good is that it
-matches the MAC its parent committed.
+matches the MAC its parent committed. Nothing unmasked from copy 1 is used
+(decrypted, parsed or repaired from) before that check passes.
 
 A normal read checks copy 0 and uses copy 1 only if copy 0 fails. After an
 unclean shutdown, and during a scrub, both copies of every block read are
-checked. A bad copy is rewritten from the good one at the next commit
-(never on a read-only mount). If both are bad the read fails.
+checked. If both are bad the read fails.
+
+A bad copy is repaired by the next commit (never on a read-only mount), by
+moving it, never by writing over it in place: the chunk's bad run is
+rebuilt at a fresh place (in the other half from the good copy) from its
+good blocks and the corrected bytes, the chunk entry is changed, and the
+old run goes through the quarantine like any freed block. A chunk table
+block with a bad copy is rewritten to a new pair by that commit. A bad copy
+of a block the repairing commit has already stopped using is left alone:
+older commits still map it through their own tables, with the good copy.
 
 ## Lying drives
 
