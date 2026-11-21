@@ -10,12 +10,13 @@ benchmark, and nothing merges unless CI builds it, boots it and passes the tests
 
 ## Pillars, in priority order
 1. **Performance.** The main focus. Measured against Linux on the same machine, never guessed.
-2. **Lean.** Nothing runs unless something needs it. Small memory footprint, fast boot.
-3. **Runs on almost anything.** Any 64-bit x86 PC first, ARM64 later.
-4. **Compatibility.** Runs existing Linux programs unchanged, which is the road to Windows games through Wine/Proton.
-5. **User respect.** The kernel does what the user says. No hidden telemetry, ever.
-6. **Polish.** Clear error messages, clean crash reports, good docs.
-7. **Customisation.** The smallest pillar: boot options, schedulers and modules the user can choose.
+2. **Security.** An absolute focus. Nobody can read a user's data remotely, and a compromised app can't reach anything it wasn't given. Every security feature ships on by default unless it would cause a major performance or compatibility cost, and that cost has to be measured, not assumed.
+3. **Lean.** Nothing runs unless something needs it. Small memory footprint, fast boot.
+4. **Runs on almost anything.** Any 64-bit x86 PC first, ARM64 later.
+5. **Compatibility.** Runs existing Linux programs unchanged, which is the road to Windows games through Wine/Proton.
+6. **User respect.** The kernel does what the user says. No hidden telemetry, ever.
+7. **Polish.** Clear error messages, clean crash reports, good docs.
+8. **Customisation.** The smallest pillar: boot options, schedulers and modules the user can choose.
 
 ## Core architecture decisions
 
@@ -27,6 +28,22 @@ These are decided now because they are expensive to change later.
 - **Boot: Limine** (BSD-2-Clause) on UEFI and BIOS. A good bootloader already exists, so we don't write one.
 - **First target: x86_64.** ARM64 comes once the core is stable. Code that depends on the architecture lives in its own module from day one.
 - **Licence: our own code only, never GPL.** We write clean-room code from specs (Intel/AMD manuals, ACPI, PCI, NVMe, xHCI and USB specs, the Linux man pages for the syscall interface). We never copy or translate Linux, BSD or other kernels' code. Dependencies must be MIT, Apache-2.0, BSD or similar. The repo has no licence file yet, which means all rights are reserved until you pick one.
+
+## Security model
+
+Security is built in from Phase 1, not bolted on at the end.
+
+- **Memory safety:** Rust everywhere, with `unsafe` kept to the small audited core.
+- **Hardware protections on from day one:** no-execute pages, write-xor-execute for all kernel memory, SMEP/SMAP (the kernel can't run or casually read user memory), UMIP, guard pages around every stack, and kernel address randomisation (KASLR). Later: control-flow protection (CET shadow stacks and indirect-branch tracking) where the CPU supports it.
+- **Least privilege through capabilities:** a process can only touch objects it holds a handle to. The Linux-compatible interface is built on top of that, so even Linux programs run inside a capability sandbox.
+- **Every app sandboxed by default:** its own view of the filesystem, no access to other apps' data, and access to the camera, microphone, screen, location and files only through permission prompts.
+- **IOMMU on by default:** devices (Thunderbolt, PCIe, USB4) can only reach memory that was handed to them, which blocks "plug in a device and read RAM" attacks.
+- **Full-disk encryption by default:** the key is sealed in the TPM and also needs the user's PIN or passphrase. AES-XTS on the CPU's AES instructions, which costs almost nothing in speed (measured in our benchmarks, not assumed).
+- **Verified boot:** firmware checks the bootloader, the bootloader checks the kernel, the kernel checks the system image. Every step is measured into the TPM, so a tampered system can't unlock the disk.
+- **Nothing listening by default:** no remote-access services, a default-deny inbound firewall, and an optional per-app outbound network permission.
+- **Signed updates only,** with instant rollback.
+- **CPU side-channel mitigations** (Spectre and friends) are on by default, picked per CPU model, with their speed cost benchmarked and published.
+- **Testing security like everything else:** continuous syscall and driver fuzzing, sanitiser builds, and outside audits of the unsafe core before 1.0.
 
 ## How we know it is good
 
@@ -52,6 +69,7 @@ Each phase ends with a "done when" test. The next phase doesn't start until it p
 - Interrupts and time: local APIC and I/O APIC, an accurate clock (TSC calibrated against HPET or the ACPI timer), a timer interrupt.
 - ACPI tables parsed so we can find CPUs, interrupt routing and power controls.
 - A framebuffer text console so the kernel can talk without serial.
+- Security baseline: no-execute, write-xor-execute kernel mappings, SMEP, SMAP, UMIP, guard pages, and a relocatable kernel so the bootloader can randomise its address (KASLR).
 - In-kernel test runner that runs in CI.
 - Done when: every exception type is triggered on purpose in tests and reported correctly, the allocator and page tables pass their tests, and the timer keeps accurate time over a 10-minute run.
 
@@ -66,10 +84,12 @@ Each phase ends with a "done when" test. The next phase doesn't start until it p
 - Ring 3, processes with their own address spaces, ELF loading, system calls, signals.
 - Virtual memory features programs need: `mmap`, copy-on-write `fork`, demand paging.
 - The first part of the Linux system-call interface, enough for statically linked programs.
+- The capability system: every process starts with only the handles it is given. Syscall entry hardened against Spectre-style attacks.
 - Done when: a statically linked "hello world" and a small test suite of syscall programs, built with the normal Linux toolchain, run unchanged.
 
 ### Phase 4: Storage and files
-- PCI enumeration, then NVMe and AHCI (SATA) drivers.
+- PCI enumeration, then NVMe and AHCI (SATA) drivers, with the IOMMU locking each device to its own memory.
+- Full-disk encryption (AES-XTS) with the key sealed in the TPM plus a PIN or passphrase.
 - A virtual filesystem layer, a RAM filesystem, a page cache, and read/write support for an existing disk format (ext4 first, written from the spec).
 - Syscall fuzzing starts.
 - Done when: the kernel boots from a real NVMe drive, survives a 24-hour file stress test with no corruption, and file throughput is within 10% of Linux.
@@ -82,6 +102,7 @@ Each phase ends with a "done when" test. The next phase doesn't start until it p
 ### Phase 6: Input, USB and networking
 - xHCI USB with keyboards, mice and storage. PS/2 as a fallback.
 - Network drivers (virtio, Intel and Realtek first) and a TCP/IP stack.
+- Default-deny inbound firewall and no listening services.
 - Done when: the PC can be used with USB devices only, and can download a large file at full line speed.
 
 ### Phase 7: Graphics and a desktop
@@ -104,7 +125,7 @@ Each phase ends with a "done when" test. The next phase doesn't start until it p
 - Done when: Optimal beats Linux on most of the benchmark set on two different real PCs, and laptop battery life is within 10% of Linux.
 
 ### Phase 11: Hardening and release
-- Security: kernel address randomisation, W^X memory, stack protection, fuzzing in CI full time, and an outside review of the unsafe core.
+- Security: verified boot end to end, control-flow protection (CET), full-time fuzzing in CI, and an outside audit of the unsafe core.
 - ARM64 port.
 - Customisation: selectable schedulers and boot options.
 - Done when: a month of nightly builds on test machines with no crash.
