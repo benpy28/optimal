@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 optimal-wtf8 = { path = "../wtf8" }
+optimal-dom = { path = "../dom" }
 
 [dev-dependencies]
 serde_json = "1"

@@ -406,8 +406,10 @@ pub struct Tokenizer {
     /// errors (controls, noncharacters, surrogates).
     checked: usize,
     report_errors: bool,
-    /// Errors found since the last token, reported to the sink with it.
-    pending_errors: Vec<ParseError>,
+    /// Errors not yet reported, each with the length the pending text had
+    /// when it was found, so text and errors reach the sink in input order
+    /// however the input was chunked.
+    pending_errors: Vec<(ParseError, usize)>,
 
     /// Character tokens waiting to be emitted as one run.
     text: Wtf8Buf,
@@ -689,7 +691,9 @@ impl Tokenizer {
         }
         let abs = self.input.abs(at);
         let position = self.input.position_of(abs);
-        self.pending_errors.push(ParseError { code, position });
+        let offset = self.text.len();
+        self.pending_errors
+            .push((ParseError { code, position }, offset));
     }
 
     // ---- Emitting ------------------------------------------------------
@@ -699,18 +703,39 @@ impl Tokenizer {
         self.text.push_code_point(c);
     }
 
+    /// Send the pending text, split at the points where errors were found,
+    /// with each error between the text before and after it.
     fn flush_text<S: TokenSink>(&mut self, sink: &mut S) -> Step {
-        self.flush_errors(sink);
-        if self.text.is_empty() {
-            return Step::Continue;
+        let mut sent = 0;
+        let mut step = Step::Continue;
+        let errors = std::mem::take(&mut self.pending_errors);
+        for (e, mut offset) in errors {
+            // A lone low surrogate appended after a lone high one joins it
+            // into one code point (as the UTF-16 text would), which can put
+            // an offset inside that pair; report the error before the pair.
+            while !self.text.as_wtf8().is_boundary(offset) {
+                offset -= 1;
+            }
+            if offset > sent {
+                let r = sink.process(Token::Characters(self.text.as_wtf8().slice(sent, offset)));
+                sent = offset;
+                step = self.apply(r);
+            }
+            sink.parse_error(e);
         }
-        let r = sink.process(Token::Characters(self.text.as_wtf8()));
+        if self.text.len() > sent {
+            let r = sink.process(Token::Characters(
+                self.text.as_wtf8().slice(sent, self.text.len()),
+            ));
+            step = self.apply(r);
+        }
         self.text.clear();
-        self.apply(r)
+        step
     }
 
     fn flush_errors<S: TokenSink>(&mut self, sink: &mut S) {
-        for e in self.pending_errors.drain(..) {
+        debug_assert!(self.text.is_empty(), "text is flushed before other tokens");
+        for (e, _) in self.pending_errors.drain(..) {
             sink.parse_error(e);
         }
     }
