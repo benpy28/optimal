@@ -120,6 +120,17 @@ fn pieces(usable: &[Range], min_addr: u64) -> impl Iterator<Item = Range> + '_ {
     })
 }
 
+/// Pieces of both lists, in address order.
+fn merged<'a>(a: &'a [Range], b: &'a [Range], min_addr: u64) -> impl Iterator<Item = Range> + 'a {
+    let mut a = pieces(a, min_addr).peekable();
+    let mut b = pieces(b, min_addr).peekable();
+    core::iter::from_fn(move || match (a.peek(), b.peek()) {
+        (Some(x), Some(y)) if y.start < x.start => b.next(),
+        (Some(_), _) => a.next(),
+        (None, _) => b.next(),
+    })
+}
+
 fn check_sorted(usable: &[Range]) -> Result<(), PlanError> {
     let mut prev_end = 0;
     for r in usable.iter().filter(|r| !r.is_empty()) {
@@ -143,12 +154,31 @@ fn carved(piece: Range, zones: &[Zone]) -> u64 {
 /// Plan zones for `usable` memory, ignoring everything below `min_addr`.
 /// Writes them to `out` and returns how many there are. On error nothing
 /// useful is in `out`.
-pub fn plan(usable: &[Range], min_addr: u64, out: &mut [Zone]) -> Result<usize, PlanError> {
+///
+/// `usable` is memory free now: metadata is only ever carved from it.
+/// `later` is memory that becomes free later (the bootloader's, once the
+/// kernel no longer needs it): zones cover it too, so it can be handed to
+/// the allocators then ([`later_ranges`]), but nothing is placed in it.
+/// Each list must be sorted, and no two ranges (in either list) may overlap.
+pub fn plan(
+    usable: &[Range],
+    later: &[Range],
+    min_addr: u64,
+    out: &mut [Zone],
+) -> Result<usize, PlanError> {
     check_sorted(usable)?;
+    check_sorted(later)?;
+    let mut prev_end = 0;
+    for p in merged(usable, later, 0) {
+        if p.start < prev_end {
+            return Err(PlanError::Unsorted);
+        }
+        prev_end = p.end;
+    }
     // Group pieces into zones.
     let mut n = 0;
     let mut last_end = 0;
-    for p in pieces(usable, min_addr) {
+    for p in merged(usable, later, min_addr) {
         let same_zone = n > 0
             && p.start - last_end <= SPLIT_GAP
             && p.start / ZONE_WINDOW == (last_end - 1) / ZONE_WINDOW;
@@ -205,6 +235,12 @@ pub fn free_ranges(usable: &[Range], min_addr: u64, zones: &[Zone], mut f: impl 
     }
 }
 
+/// Call `f` for every range of `later` memory (as passed to [`plan`]), trimmed
+/// the same way. Every range lies inside exactly one zone.
+pub fn later_ranges(later: &[Range], min_addr: u64, mut f: impl FnMut(Range)) {
+    pieces(later, min_addr).for_each(&mut f);
+}
+
 /// Index of the zone covering physical address `addr`.
 pub fn zone_of(zones: &[Zone], addr: u64) -> Option<usize> {
     zones.iter().position(|z| z.span().contains(addr))
@@ -224,7 +260,7 @@ mod tests {
 
     fn plan_vec(usable: &[Range], min: u64) -> Result<Vec<Zone>, PlanError> {
         let mut out = [Zone::EMPTY; 64];
-        plan(usable, min, &mut out).map(|n| out[..n].to_vec())
+        plan(usable, &[], min, &mut out).map(|n| out[..n].to_vec())
     }
 
     fn free_vec(usable: &[Range], min: u64, zones: &[Zone]) -> Vec<Range> {
@@ -355,6 +391,51 @@ mod tests {
     }
 
     #[test]
+    fn later_memory_is_covered_but_never_used_for_metadata() {
+        // Usable 1..64 MiB now; bootloader memory 64..128 MiB and 4 GiB +
+        // 64 MiB later. Worked by hand:
+        //   zone 0 spans 0..128 MiB (32768 frames): metadata 32768 * 12 =
+        //   384 KiB (0x60000), carved at 1 MiB from the usable range;
+        //   zone 1 spans 4 GiB..4 GiB + 64 MiB (16384 frames, 192 KiB =
+        //   0x30000) but holds only later memory, so its metadata is carved
+        //   from the usable range too, right after zone 0's.
+        let usable = [r(MIB, 64 * MIB)];
+        let later = [r(64 * MIB, 128 * MIB), r(4 * GIB, 4 * GIB + 64 * MIB)];
+        let mut out = [Zone::EMPTY; 8];
+        let n = plan(&usable, &later, MIB, &mut out).unwrap();
+        let z = &out[..n];
+        assert_eq!(
+            z,
+            [
+                Zone {
+                    base_frame: 0,
+                    frames: 32768,
+                    meta: r(MIB, MIB + 0x60000)
+                },
+                Zone {
+                    base_frame: 4 * GIB / 4096,
+                    frames: 16384,
+                    meta: r(MIB + 0x60000, MIB + 0x90000)
+                },
+            ]
+        );
+        assert_eq!(free_vec(&usable, MIB, z), [r(MIB + 0x90000, 64 * MIB)]);
+        let mut l = Vec::new();
+        later_ranges(&later, MIB, |x| l.push(x));
+        assert_eq!(l, later);
+        // Later memory overlapping usable memory is refused.
+        assert_eq!(
+            plan(&usable, &[r(32 * MIB, 65 * MIB)], MIB, &mut out),
+            Err(PlanError::Unsorted)
+        );
+        // Only later memory, nothing to carve from: refused.
+        assert_eq!(
+            plan(&[], &later, MIB, &mut out),
+            Err(PlanError::NoRoomForMetadata)
+        );
+    }
+
+    #[test]
     fn refusals() {
         // Unsorted, overlapping, and no room at all.
         assert_eq!(
@@ -378,9 +459,9 @@ mod tests {
             .map(|i| r(i * 4 * GIB, i * 4 * GIB + 64 * MIB))
             .collect();
         let mut out = [Zone::EMPTY; 4];
-        assert_eq!(plan(&map, 0, &mut out), Err(PlanError::TooManyZones));
+        assert_eq!(plan(&map, &[], 0, &mut out), Err(PlanError::TooManyZones));
         let mut out = [Zone::EMPTY; 5];
-        assert_eq!(plan(&map, 0, &mut out), Ok(5));
+        assert_eq!(plan(&map, &[], 0, &mut out), Ok(5));
     }
 
     #[test]
@@ -429,19 +510,23 @@ mod tests {
 
     /// Reference model of `plan` and `free_ranges`, written plainly with
     /// vectors: the spec in the module comment, step by step.
-    fn model(map: &[Range], min: u64) -> Result<(Vec<Zone>, Vec<Range>), PlanError> {
-        let live: Vec<&Range> = map.iter().filter(|x| x.start < x.end).collect();
-        if live.windows(2).any(|w| w[1].start < w[0].end) {
+    /// `map` holds every range in address order, each tagged free now or
+    /// later.
+    fn model(map: &[(Range, bool)], min: u64) -> Result<(Vec<Zone>, Vec<Range>), PlanError> {
+        let live: Vec<&(Range, bool)> = map.iter().filter(|x| x.0.start < x.0.end).collect();
+        if live.windows(2).any(|w| w[1].0.start < w[0].0.end) {
             return Err(PlanError::Unsorted);
         }
         let mut pieces = Vec::new();
-        for x in live {
+        let mut now = Vec::new();
+        for &&(x, is_now) in &live {
             let mut s = x.start.max(min).min(PHYS_LIMIT).div_ceil(4096) * 4096;
             let e = x.end.min(PHYS_LIMIT) / 4096 * 4096;
             while s < e {
                 let w = s / ZONE_WINDOW;
                 let pe = e.min((w + 1) * ZONE_WINDOW);
                 pieces.push(r(s, pe));
+                now.push(is_now);
                 s = pe;
             }
         }
@@ -472,7 +557,10 @@ mod tests {
                 let mut best: Option<usize> = None;
                 for (i, p) in pieces.iter().enumerate() {
                     let room = p.len() - used[i];
-                    if (local && !(span.start <= p.start && p.start < span.end)) || room < need {
+                    if !now[i]
+                        || (local && !(span.start <= p.start && p.start < span.end))
+                        || room < need
+                    {
                         continue;
                     }
                     if best.is_none_or(|b| room > pieces[b].len() - used[b]) {
@@ -495,7 +583,9 @@ mod tests {
         let free = pieces
             .iter()
             .zip(&used)
-            .map(|(p, u)| r(p.start + u, p.end))
+            .zip(&now)
+            .filter(|(_, n)| **n)
+            .map(|((p, u), _)| r(p.start + u, p.end))
             .filter(|x| !x.is_empty())
             .collect();
         Ok((zones, free))
@@ -508,23 +598,28 @@ mod tests {
         /// plan must satisfy.
         #[test]
         fn random_maps_plan_correctly(
-            parts in prop::collection::vec((0u64..(4u64 << 40), 1u64..(1u64 << 36), any::<bool>()), 1..24),
+            parts in prop::collection::vec(
+                (0u64..(4u64 << 40), 1u64..(1u64 << 36), any::<bool>(), prop::bool::weighted(0.75)),
+                1..24,
+            ),
             min in prop_oneof![Just(0u64), Just(MIB), 0u64..(16 * MIB)],
         ) {
-            let mut map = Vec::new();
+            let mut tagged = Vec::new();
             let mut at = 0u64;
-            for (gap, len, ragged) in parts {
+            for (gap, len, ragged, now) in parts {
                 // Mostly small gaps, sometimes huge ones.
                 let gap = if gap % 3 == 0 { gap } else { gap % (2 * GIB) };
                 let len = if len % 2 == 0 { len % (64 * MIB) + 1 } else { len };
                 let (s, e) = (at + gap, at + gap + len);
                 let (s, e) = if ragged { (s, e) } else { (s & !4095, e & !4095) };
-                map.push(r(s, e));
+                tagged.push((r(s, e), now));
                 at = e;
             }
+            let map: Vec<Range> = tagged.iter().filter(|t| t.1).map(|t| t.0).collect();
+            let later: Vec<Range> = tagged.iter().filter(|t| !t.1).map(|t| t.0).collect();
             let mut out = [Zone::EMPTY; 64];
-            let got = plan(&map, min, &mut out).map(|n| out[..n].to_vec());
-            let (want, want_free) = match model(&map, min) {
+            let got = plan(&map, &later, min, &mut out).map(|n| out[..n].to_vec());
+            let (want, want_free) = match model(&tagged, min) {
                 Ok((z, f)) => (Ok(z), f),
                 Err(e) => (Err(e), Vec::new()),
             };
@@ -561,14 +656,36 @@ mod tests {
             parts.sort_by_key(|x| x.start);
             for w in parts.windows(2) { prop_assert!(w[0].end <= w[1].start, "overlap {:?}", w); }
             prop_assert_eq!(normalise(parts), usable.clone());
+            // Later memory: trimmed the same way, each range inside one
+            // zone, never overlapping metadata or free memory.
+            let mut later_got = Vec::new();
+            later_ranges(&later, min, |x| later_got.push(x));
+            let later_model = normalise(later.iter().map(|x| {
+                let s = x.start.max(min).next_multiple_of(4096);
+                let e = x.end.min(PHYS_LIMIT) & !4095;
+                r(s, e.max(s))
+            }).collect());
+            prop_assert_eq!(normalise(later_got.clone()), later_model.clone());
+            for l in &later_got {
+                let i = zone_of(zones, l.start);
+                prop_assert!(i.is_some(), "later range {:?} outside every zone", l);
+                prop_assert!(l.end <= zones[i.unwrap()].span().end);
+                for z in zones {
+                    prop_assert!(l.end <= z.meta.start || z.meta.end <= l.start);
+                }
+            }
             // Every free range lies inside exactly one zone.
             for f in &free {
                 let i = zone_of(zones, f.start);
                 prop_assert!(i.is_some());
                 prop_assert!(f.end <= zones[i.unwrap()].span().end);
             }
-            // Usable ranges more than SPLIT_GAP apart are in different zones.
-            for w in usable.windows(2) {
+            // Memory (now or later) more than SPLIT_GAP apart is in
+            // different zones.
+            let mut all = usable.clone();
+            all.extend(later_model.iter().copied());
+            let all = normalise(all);
+            for w in all.windows(2) {
                 if w[1].start - w[0].end > SPLIT_GAP {
                     prop_assert_ne!(zone_of(zones, w[0].start), zone_of(zones, w[1].start));
                 }

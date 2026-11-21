@@ -24,6 +24,15 @@ pub const CACHE_DISABLE: u64 = 1 << 4;
 pub const HUGE: u64 = 1 << 7;
 pub const GLOBAL: u64 = 1 << 8;
 pub const NO_EXECUTE: u64 = 1 << 63;
+/// PAT index bit 2 in a 4 KiB page entry (the same bit is HUGE higher up).
+pub const PAT_4K: u64 = 1 << 7;
+/// PAT index bit 2 in a 2 MiB or 1 GiB page entry.
+pub const PAT_HUGE: u64 = 1 << 12;
+/// The PAT MSR (0x277) value these entries assume, the same layout Limine
+/// sets up: PA0 WB, PA1 WT, PA2 UC-, PA3 UC, PA4 WP, PA5 WC, PA6 UC-, PA7 UC.
+/// An entry picks PA(PAT*4 + PCD*2 + PWT): write-back is index 0, uncached
+/// index 3 (PCD|PWT), write-combining index 5 (PAT|PWT).
+pub const PAT_VALUE: u64 = 0x0007_0105_0007_0406;
 /// Physical address bits of a table pointer or 4 KiB page entry.
 pub const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 /// Largest physical address the architecture allows (52 bits).
@@ -70,6 +79,8 @@ pub enum Cache {
     WriteBack,
     /// Device registers (MMIO): no caching at all.
     Uncached,
+    /// Framebuffers: writes are buffered and combined, reads are uncached.
+    WriteCombining,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,12 +110,15 @@ impl Flags {
         ..Flags::READ
     };
 
-    fn bits(self) -> u64 {
+    /// Entry bits for a leaf at `level` (1 = 4 KiB). Without `nx` the CPU
+    /// has no no-execute bit (it would be a reserved-bit fault), so it is
+    /// left out.
+    fn bits(self, level: usize, nx: bool) -> u64 {
         let mut b = PRESENT;
         if self.writable {
             b |= WRITABLE;
         }
-        if !self.executable {
+        if !self.executable && nx {
             b |= NO_EXECUTE;
         }
         if self.user {
@@ -113,22 +127,32 @@ impl Flags {
         if self.global {
             b |= GLOBAL;
         }
-        if self.cache == Cache::Uncached {
-            b |= CACHE_DISABLE | WRITE_THROUGH;
-        }
+        let pat = if level == 1 { PAT_4K } else { PAT_HUGE };
+        b |= match self.cache {
+            Cache::WriteBack => 0,
+            Cache::Uncached => CACHE_DISABLE | WRITE_THROUGH,
+            Cache::WriteCombining => pat | WRITE_THROUGH,
+        };
         b
     }
 
-    fn from_bits(e: u64) -> Flags {
+    /// Flags of a leaf entry at `level`. Without `nx` every page is
+    /// executable, and is reported so. Cache types this module never
+    /// writes (WT, UC-, WP) read back as Uncached, the safe assumption.
+    fn from_bits(e: u64, level: usize, nx: bool) -> Flags {
+        let pat = if level == 1 { PAT_4K } else { PAT_HUGE };
+        let index = (e & pat != 0) as u8 * 4
+            + (e & CACHE_DISABLE != 0) as u8 * 2
+            + (e & WRITE_THROUGH != 0) as u8;
         Flags {
             writable: e & WRITABLE != 0,
-            executable: e & NO_EXECUTE == 0,
+            executable: !nx || e & NO_EXECUTE == 0,
             user: e & USER != 0,
             global: e & GLOBAL != 0,
-            cache: if e & CACHE_DISABLE != 0 {
-                Cache::Uncached
-            } else {
-                Cache::WriteBack
+            cache: match index {
+                0 => Cache::WriteBack,
+                5 => Cache::WriteCombining,
+                _ => Cache::Uncached,
             },
         }
     }
@@ -177,11 +201,22 @@ fn leaf_addr_mask(level: usize) -> u64 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AddressSpace {
     pub root: u64,
+    /// Whether the CPU has the no-execute bit (EFER.NXE on). Without it
+    /// non-executable mappings can't be expressed, and none are written.
+    pub nx: bool,
 }
 
 impl AddressSpace {
+    /// A new, empty address space on a CPU with the no-execute bit.
     pub fn new<M: TableMemory>(mem: &mut M) -> Option<AddressSpace> {
-        mem.alloc_table().map(|root| AddressSpace { root })
+        mem.alloc_table()
+            .map(|root| AddressSpace { root, nx: true })
+    }
+
+    /// The same, for a CPU without the no-execute bit.
+    pub fn new_without_nx<M: TableMemory>(mem: &mut M) -> Option<AddressSpace> {
+        mem.alloc_table()
+            .map(|root| AddressSpace { root, nx: false })
     }
 
     /// Map `[virt, virt + size)` to `[phys, phys + size)`.
@@ -237,7 +272,7 @@ impl AddressSpace {
             table = new;
             level -= 1;
         }
-        let mut e = phys | flags.bits();
+        let mut e = phys | flags.bits(leaf, self.nx);
         if size != PageSize::Size4K {
             e |= HUGE;
         }
@@ -277,7 +312,7 @@ impl AddressSpace {
         Some(Translation {
             phys: (e & leaf_addr_mask(level)) + (virt & (size.bytes() - 1)),
             size,
-            flags: Flags::from_bits(e),
+            flags: Flags::from_bits(e, level, self.nx),
         })
     }
 
@@ -325,7 +360,7 @@ impl AddressSpace {
             return Err(MapError::NotMapped);
         }
         let e = mem.read(table, i);
-        let mut new = (e & leaf_addr_mask(level)) | flags.bits();
+        let mut new = (e & leaf_addr_mask(level)) | flags.bits(level, self.nx);
         if level != 1 {
             new |= HUGE;
         }
@@ -340,6 +375,7 @@ impl AddressSpace {
             table: u64,
             level: usize,
             base: u64,
+            nx: bool,
             f: &mut impl FnMut(u64, Translation),
         ) {
             for i in 0..512 {
@@ -362,15 +398,15 @@ impl AddressSpace {
                         Translation {
                             phys: e & leaf_addr_mask(level),
                             size,
-                            flags: Flags::from_bits(e),
+                            flags: Flags::from_bits(e, level, nx),
                         },
                     );
                 } else {
-                    walk(mem, e & ADDR_MASK, level - 1, virt, f);
+                    walk(mem, e & ADDR_MASK, level - 1, virt, nx, f);
                 }
             }
         }
-        walk(mem, self.root, 4, 0, &mut f);
+        walk(mem, self.root, 4, 0, self.nx, &mut f);
     }
 }
 
@@ -695,6 +731,99 @@ mod tests {
     }
 
     #[test]
+    fn write_combining_uses_pat_index_5_at_every_level() {
+        // PA5 = PAT bit + PWT. In a 4 KiB entry the PAT bit is bit 7; in a
+        // 2 MiB or 1 GiB entry bit 7 is PS (HUGE) and PAT moves to bit 12.
+        const NX: u64 = 1 << 63;
+        let wc = Flags {
+            cache: Cache::WriteCombining,
+            ..Flags::READ_WRITE
+        };
+        // 4 KiB: 0x5000 | PAT(0x80) | PWT(0x8) | W | P.
+        assert_eq!(raw_walk(K, 0x5000, PageSize::Size4K, wc)[3], NX | 0x508b);
+        // 2 MiB: 0x40_0000 | PAT(0x1000) | PS(0x80) | PWT | W | P.
+        assert_eq!(
+            raw_walk(K, 0x40_0000, PageSize::Size2M, wc)[2],
+            NX | 0x40_108b
+        );
+        // 1 GiB, same layout as 2 MiB.
+        assert_eq!(
+            raw_walk(K, 0x4000_0000, PageSize::Size1G, wc)[1],
+            NX | 0x4000_108b
+        );
+        // Each reads back as write-combining, at the right size and frame.
+        let mut m = Mem::new(16);
+        let a = AddressSpace::new(&mut m).unwrap();
+        a.map(&mut m, K, 0x5000, PageSize::Size4K, wc).unwrap();
+        a.map(&mut m, K + (2 << 20), 0x40_0000, PageSize::Size2M, wc)
+            .unwrap();
+        a.map(&mut m, K + (1 << 30), 0x4000_0000, PageSize::Size1G, wc)
+            .unwrap();
+        for (v, p, s) in [
+            (K, 0x5000, PageSize::Size4K),
+            (K + (2 << 20), 0x40_0000, PageSize::Size2M),
+            (K + (1 << 30), 0x4000_0000, PageSize::Size1G),
+        ] {
+            let t = a.translate(&m, v).unwrap();
+            assert_eq!((t.phys, t.size, t.flags), (p, s, wc));
+        }
+        // An uncached huge page is index 3 (PCD | PWT), not mistaken for WC.
+        let uc = Flags {
+            cache: Cache::Uncached,
+            ..Flags::READ
+        };
+        assert_eq!(
+            raw_walk(K, 0x40_0000, PageSize::Size2M, uc)[2],
+            NX | 0x40_0099
+        );
+        // Cache types never written read back as Uncached: WT (PWT only,
+        // index 1) in a 4 KiB entry.
+        assert_eq!(Flags::from_bits(0x5009, 1, true).cache, Cache::Uncached);
+        assert_eq!(Flags::from_bits(0x5001, 1, true).cache, Cache::WriteBack);
+        // PAT bit alone (index 4, WP) at 2 MiB.
+        assert_eq!(Flags::from_bits(0x40_1081, 2, true).cache, Cache::Uncached);
+    }
+
+    #[test]
+    fn without_nx_no_execute_bit_is_ever_written() {
+        let mut m = Mem::new(16);
+        let a = AddressSpace::new_without_nx(&mut m).unwrap();
+        assert!(!a.nx);
+        a.map(&mut m, K, 0x5000, PageSize::Size4K, Flags::READ_WRITE)
+            .unwrap();
+        a.map(
+            &mut m,
+            K + (2 << 20),
+            0x40_0000,
+            PageSize::Size2M,
+            Flags::READ,
+        )
+        .unwrap();
+        // Leaves: plain P|W and P|PS, no bit 63.
+        assert_eq!(m.read(0x4000, 0), 0x5003);
+        assert_eq!(m.read(0x3000, 1), 0x40_0081);
+        // The hardware will execute them, and translate says so.
+        assert!(a.translate(&m, K).unwrap().flags.executable);
+        // W^X is still refused as a request.
+        let wx = Flags {
+            executable: true,
+            ..Flags::READ_WRITE
+        };
+        assert_eq!(
+            a.map(&mut m, K + 0x1000, 0, PageSize::Size4K, wx),
+            Err(MapError::WriteAndExecute)
+        );
+        a.protect(&mut m, K, PageSize::Size4K, Flags::READ).unwrap();
+        assert_eq!(m.read(0x4000, 0), 0x5001);
+        let mut leaves = 0;
+        a.for_each_leaf(&m, |_, t| {
+            assert!(t.flags.executable);
+            leaves += 1;
+        });
+        assert_eq!(leaves, 2);
+    }
+
+    #[test]
     fn flag_constants_are_what_they_say() {
         let plain = |writable, executable| Flags {
             writable,
@@ -900,13 +1029,16 @@ mod tests {
         #[test]
         fn random_ops_match_model(
             ops in prop::collection::vec(
-                (0u8..3, 0u8..3, 0u64..64, 0u8..3, 0u64..1024, 0u8..5),
+                (0u8..3, 0u8..3, 0u64..64, 0u8..3, 0u64..1024, 0u8..6),
                 1..160,
             ),
             probes in prop::collection::vec((any::<bool>(), 0u64..(64u64 << 30)), 80),
+            nx in prop::bool::weighted(0.8),
         ) {
             let mut m = Mem::new(1 << 13);
-            let a = AddressSpace::new(&mut m).unwrap();
+            let a = if nx { AddressSpace::new(&mut m) } else { AddressSpace::new_without_nx(&mut m) }.unwrap();
+            // What the hardware will do: without NX everything executes.
+            let seen = |f: Flags| Flags { executable: f.executable || !nx, ..f };
             // Model: virt page start -> (phys, size, flags).
             let mut model: BTreeMap<u64, (u64, PageSize, Flags)> = BTreeMap::new();
             // Regions that have a page table (2 MiB) or page directory (1 GiB)
@@ -915,7 +1047,8 @@ mod tests {
             let mut pd_regions = std::collections::BTreeSet::new();
             let wx = Flags { writable: true, executable: true, ..Flags::READ };
             let flag_set = [Flags::READ, Flags::READ_WRITE, Flags::READ_EXECUTE,
-                Flags { cache: Cache::Uncached, global: true, ..Flags::READ_WRITE }, wx];
+                Flags { cache: Cache::Uncached, global: true, ..Flags::READ_WRITE }, wx,
+                Flags { cache: Cache::WriteCombining, ..Flags::READ_WRITE }];
             for (kind, half, slot, sz, phys_slot, fl) in ops {
                 let size = size_of(sz);
                 // half 0: user page, user flags; 1: kernel page, kernel flags;
@@ -972,7 +1105,7 @@ mod tests {
                 let virt = if user { p } else { K + p };
                 let expect = model.range(..=virt).next_back()
                     .filter(|(v, (_, s, _))| virt < **v + s.bytes())
-                    .map(|(v, (ph, s, f))| Translation { phys: ph + (virt - v), size: *s, flags: *f });
+                    .map(|(v, (ph, s, f))| Translation { phys: ph + (virt - v), size: *s, flags: seen(*f) });
                 prop_assert_eq!(a.translate(&m, virt), expect);
             }
             // Every leaf in the tables is in the model with the same frame,
@@ -980,8 +1113,8 @@ mod tests {
             let mut leaves = 0;
             a.for_each_leaf(&m, |v, t| {
                 leaves += 1;
-                assert!(!(t.flags.writable && t.flags.executable));
-                assert_eq!(model.get(&v).copied(), Some((t.phys, t.size, t.flags)));
+                assert!(!nx || !(t.flags.writable && t.flags.executable));
+                assert_eq!(model.get(&v).map(|e| (e.0, e.1, seen(e.2))), Some((t.phys, t.size, t.flags)));
             });
             prop_assert_eq!(leaves, model.len());
         }
@@ -1075,10 +1208,10 @@ mod proofs {
             executable: kani::any(),
             user: kani::any(),
             global: kani::any(),
-            cache: if kani::any() {
-                Cache::WriteBack
-            } else {
-                Cache::Uncached
+            cache: match kani::any::<u8>() % 3 {
+                0 => Cache::WriteBack,
+                1 => Cache::Uncached,
+                _ => Cache::WriteCombining,
             },
         }
     }
