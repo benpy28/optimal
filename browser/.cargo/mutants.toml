@@ -11,4 +11,11 @@ exclude_re = [
     # the pattern so the other letter checks in Tokenizer::step stay tested;
     # if the line moves, this stops matching and CI says so.
     "tokenizer\\.rs:1294:22: replace match guard is_ascii_alpha\\(c\\) with true in Tokenizer::step",
+    # Named character reference in an attribute, at the end of a chunk: the
+    # wait for the next character is skipped when the name ends in ";",
+    # because the historical rule only applies without one. Waiting anyway
+    # (the mutant) re-matches the same name once more input comes and gives
+    # the same tokens and errors; it only costs a second scan. Equivalent.
+    # Line-pinned like the one above.
+    "tokenizer\\.rs:2486:24: delete ! in Tokenizer::named_character_reference",
 ]

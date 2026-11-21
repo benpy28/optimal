@@ -410,3 +410,25 @@ proptest! {
         }
     }
 }
+
+/// A named reference without its semicolon at the very end of the input,
+/// inside an attribute value. The historical attribute rule looks at the next
+/// character, so mid-stream the tokenizer waits for it; once the input has
+/// ended there is no next character and it must carry on to EOF instead of
+/// asking for input that will never come.
+#[test]
+fn attribute_reference_at_end_of_input_reaches_eof() {
+    for src in ["<a b=&amp", "<a b=\"&amp", "<a b='&amp"] {
+        let got = whole(src);
+        let codes: Vec<&str> = got.errors.iter().map(|e| e.code.as_str()).collect();
+        assert_eq!(
+            codes,
+            ["missing-semicolon-after-character-reference", "eof-in-tag"],
+            "{src}"
+        );
+        assert!(
+            got.tokens.is_empty(),
+            "{src}: the unfinished tag is dropped"
+        );
+    }
+}

@@ -64,29 +64,32 @@ pub const fn encoded_len(cp: CodePoint) -> usize {
     }
 }
 
-/// Encode `cp` (any code point, surrogates included) as generalized UTF-8.
-/// Returns the buffer and the number of bytes used.
+/// Encode `cp` (U+0080 or above, surrogates included) as generalized UTF-8.
+/// Returns the buffer and the number of bytes used. ASCII never comes here:
+/// every caller pushes it as a single byte first.
+///
+/// The parts are added rather than OR-ed: they never share a bit, so the
+/// result is the same, and a slip in either operand changes the bytes.
 #[inline]
 fn encode(cp: CodePoint) -> ([u8; 4], usize) {
-    debug_assert!(cp <= MAX_CODE_POINT);
+    debug_assert!((0x80..=MAX_CODE_POINT).contains(&cp));
     let mut b = [0u8; 4];
     let n = encoded_len(cp);
     match n {
-        1 => b[0] = cp as u8,
         2 => {
-            b[0] = 0xC0 | (cp >> 6) as u8;
-            b[1] = 0x80 | (cp & 0x3F) as u8;
+            b[0] = 0xC0 + (cp >> 6) as u8;
+            b[1] = 0x80 + (cp & 0x3F) as u8;
         }
         3 => {
-            b[0] = 0xE0 | (cp >> 12) as u8;
-            b[1] = 0x80 | ((cp >> 6) & 0x3F) as u8;
-            b[2] = 0x80 | (cp & 0x3F) as u8;
+            b[0] = 0xE0 + (cp >> 12) as u8;
+            b[1] = 0x80 + ((cp >> 6) & 0x3F) as u8;
+            b[2] = 0x80 + (cp & 0x3F) as u8;
         }
         _ => {
-            b[0] = 0xF0 | (cp >> 18) as u8;
-            b[1] = 0x80 | ((cp >> 12) & 0x3F) as u8;
-            b[2] = 0x80 | ((cp >> 6) & 0x3F) as u8;
-            b[3] = 0x80 | (cp & 0x3F) as u8;
+            b[0] = 0xF0 + (cp >> 18) as u8;
+            b[1] = 0x80 + ((cp >> 12) & 0x3F) as u8;
+            b[2] = 0x80 + ((cp >> 6) & 0x3F) as u8;
+            b[3] = 0x80 + (cp & 0x3F) as u8;
         }
     }
     (b, n)
@@ -100,23 +103,23 @@ fn encode(cp: CodePoint) -> ([u8; 4], usize) {
 #[inline]
 pub fn decode_at(bytes: &[u8], i: usize) -> (CodePoint, usize) {
     let b0 = bytes[i] as u32;
-    if b0 < 0x80 {
+    if b0 <= 0x7F {
         (b0, 1)
     } else if b0 < 0xE0 {
-        (((b0 & 0x1F) << 6) | (bytes[i + 1] as u32 & 0x3F), 2)
+        (((b0 & 0x1F) << 6) + (bytes[i + 1] as u32 & 0x3F), 2)
     } else if b0 < 0xF0 {
         (
             ((b0 & 0x0F) << 12)
-                | ((bytes[i + 1] as u32 & 0x3F) << 6)
-                | (bytes[i + 2] as u32 & 0x3F),
+                + ((bytes[i + 1] as u32 & 0x3F) << 6)
+                + (bytes[i + 2] as u32 & 0x3F),
             3,
         )
     } else {
         (
             ((b0 & 0x07) << 18)
-                | ((bytes[i + 1] as u32 & 0x3F) << 12)
-                | ((bytes[i + 2] as u32 & 0x3F) << 6)
-                | (bytes[i + 3] as u32 & 0x3F),
+                + ((bytes[i + 1] as u32 & 0x3F) << 12)
+                + ((bytes[i + 2] as u32 & 0x3F) << 6)
+                + (bytes[i + 3] as u32 & 0x3F),
             4,
         )
     }
@@ -290,7 +293,10 @@ impl<'a> Wtf8<'a> {
     /// like surrogates; this crate never does that.
     #[inline]
     pub fn is_boundary(self, i: usize) -> bool {
-        i == self.bytes.len() || (i < self.bytes.len() && self.bytes[i] & 0xC0 != 0x80)
+        match self.bytes.get(i) {
+            Some(&b) => b & 0xC0 != 0x80,
+            None => i == self.bytes.len(),
+        }
     }
 }
 
@@ -383,8 +389,8 @@ impl Iterator for EncodeUtf16<'_> {
         let cp = self.inner.next()?;
         if cp >= 0x10000 {
             let v = cp - 0x10000;
-            self.low = Some(0xDC00 | (v & 0x3FF) as u16);
-            Some(0xD800 | (v >> 10) as u16)
+            self.low = Some(0xDC00 + (v & 0x3FF) as u16);
+            Some(0xD800 + (v >> 10) as u16)
         } else {
             Some(cp as u16)
         }
