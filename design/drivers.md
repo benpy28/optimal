@@ -466,7 +466,10 @@ address; a tier-3 driver sees only IOVAs in its own domain.
 
 The isolation layer is itself attack surface: if the boundary is complicated,
 the boundary is where the bugs go. The design rule is **small,
-one-directional, fuzzed and bounded-checked** (target 9, B/B+M at 4a).
+one-directional, fuzzed and bounded-checked** (target 9, B/T at 4a: its evidence
+is Kani harnesses over the ring code, with no loom model, and its
+effective level is T because it rests on the tested-only shims, target
+3b, in [verification.md](verification.md)).
 
 - Each driver gets a pair of single-producer, single-consumer rings
   (requests in, completions out) in memory shared with the kernel, in the
@@ -484,7 +487,7 @@ one-directional, fuzzed and bounded-checked** (target 9, B/B+M at 4a).
 - **Cost is measured:** per-I/O latency and throughput for the same device in
   tier 1, 2 and 3, against Linux, are on the scorecard.
 - Every ring entry point is fuzzed continuously with hostile drivers from
-  Phase 4a; the ring validation is target 9, checked at B/B+M from 4a.
+  Phase 4a; the ring validation is target 9, checked at B/T from 4a.
 - Linux's VFIO and UIO interfaces are **not** offered to apps (they would
   bypass this layer). Tier-3 drivers use Optimal's own interface.
 
@@ -716,6 +719,9 @@ approved; nothing it presents reaches a driver first.
     prompts only at "Always ask"; otherwise it binds silently.
   - Every silent binding is logged and shown in Settings, where it can be
     revoked (the driver is stopped and the identity forgotten).
+  - The optional camera and microphone kill switches deauthorize the
+    sensor's interfaces here and stop their drivers, keeping the identity
+    (F1 in [features.md](features.md)).
 - **Before unlock and on resume.** Until the volume is unlocked the
   settings store holding known identities can't be read, so the in-kernel
   keyboard paths (PS/2, USB boot protocol, I2C-HID) accept any keyboard, and
@@ -908,5 +914,8 @@ hundreds of driver-specific ioctls for Mesa, and hangs routinely. It is split:
   produced by a separate person who studied the behaviour, so the
   implementer never sees GPL code. The process is written down and
   followed for every GPU driver.
-- **Done-when (Phase 8)** includes a published pass rate on the Vulkan
-  Conformance Test Suite and piglit, not just a game benchmark.
+- **Done-when (Phase 8)** includes milestone 11's suite in
+  [compat.md](compat.md), not just a game benchmark: Mesa's tests, piglit,
+  the pinned Vulkan Conformance Test Suite subset and the IGT subset, each
+  at a 90% pass rate and 100% of its security-class tests, every rate
+  published on the scorecard.

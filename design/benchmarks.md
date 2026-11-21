@@ -375,6 +375,14 @@ the sample column gives the rest.
 | Large TCP download over the named NIC | ≥ 95% of Linux's measured goodput on the same link | 20 boots, 3 downloads of 60 s per boot | 6 |
 | Games from the game list, average and 1% low frame rate | each within 15% of Linux | 20 boots, 3 runs of a pinned 60 s scene per title per boot (at least 5 titles) | 8 |
 | Battery life, each of the three workloads | no worse than matched Linux | 20 runs per workload, each the mean discharge power over 1 h at fixed brightness | 10 |
+| Panic lock (F4 in [features.md](features.md)): chord to keys wiped, writeback bound 0 | ≤ 200 ms | 20 boots, 10 chords each | 5 |
+| VPN-only guard on (F6): large TCP download through the tunnel | ≥ 99% of the same with the guard off | 20 boots, 3 downloads of 60 s per boot | 6 |
+| Game mode overlay (F8), 144 Hz direct scanout on the reference discrete GPU | CPU cost ≤ 0.5%; input-to-display P99 and frame time P99 no worse than overlay off; per-frame agreement with the input-latency rig within 0.5 ms at P99 | 20 boots per condition, 5 min per boot | 8 |
+| Focus boost ×4 (F9): 60 Hz frame-pacing app in focus while a pinned compile runs | frame time P99 ≤ refresh period + 1 ms; compile wall time ≤ 1.5 times its time with the boost off | 20 boots per condition | 10 |
+| Background freezing (F9): a frozen app shown again | first new frame presented ≤ 100 ms after it becomes visible | 20 boots, 20 thaws each | 10 |
+| Power meter (F10): attribution error of each of two loads run together | within 10% of its solo increment; meter cost ≤ 0.1% CPU; a 10 W cap held at ≤ 11 W over 60 s | 20 runs per load level | 10 |
+| Privacy dashboard recording (F2): TCP connect rate and 64-byte UDP send rate | each ≥ 99% of recording off | 20 boots, 3 runs each | 12 |
+| Browser blocking (F15), EasyList and EasyPrivacy loaded | per-request match ≤ 10 µs at P99; page load over the 50-page corpus no worse than blocking off | 20 boots, the corpus once per boot | browser engine track |
 
 ## Responsiveness (the main event)
 
@@ -531,4 +539,22 @@ is on in the image people actually download:
   compositor's own lines against its 60,000-line cap (Mesa listed
   separately with its exposure).
 - Driver-interrupt maskings and driver restarts seen in the soak.
+- **Optional features** ([features.md](features.md)): each feature's
+  default and whether it is on in the shipped image, and the measured
+  security results: buffers delivered before a sensor indicator was
+  presented (target 0, F1); packets outside the tunnel from power-on and
+  across 1,000 VPN-client kills (target 0) and plain-DNS packets with
+  encrypted DNS on (target 0, F6); the tamper alert's scope per boot tier
+  (F7); the panic-lock residual (frozen apps' memory, DRAM remanence and
+  cold boot, F4); the hidden vault's limits in the words of its Settings
+  text (defeats one-time inspection of a powered-off disk; not two images
+  over time, a compromised running system, forced unlock of the outer
+  volume while the hidden one is open, TRIM-pattern analysis if the
+  no-TRIM rule is broken, or the SSD's own flash), with the distinguisher
+  result and the two-image result (F3); travel mode's limits and residual
+  count for converted folders (F5); and **unpatched time**: a staged
+  security fix takes effect only at a restart the user chooses, so the row
+  gives the time from each security release to its availability to the
+  update client and says that time to restart is the user's, because
+  Optimal measures nothing on users' machines (F14).
 - Open security bugs by severity.

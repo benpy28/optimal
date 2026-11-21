@@ -133,8 +133,13 @@ gone, up to 64 MiB (or 1% of RAM, whichever is smaller) of them are kept
 per device in case it comes back; beyond that, or after the device is gone
 for 10 minutes, they are dropped, and the error stays reported on every
 file that had them. `sync` and unmount always complete. Tests (Phase 4a):
-pull a USB stick mid-write; on a present virtio-blk and NVMe device, an LBA
-that fails every write with a non-retryable status gives `EIO` on the next
+a virtio-blk device and an NVMe device behind a hotplug root port removed
+with QEMU `device_del` mid-write give `EIO` on the next `fsync` of each
+open description, keep at most min(64 MiB, 1% of RAM) of their dirty
+pages, and `sync` and unmount complete (the same with a USB stick pulled
+mid-write in Phase 6, when USB storage lands); on a present virtio-blk
+and NVMe device, an LBA that fails every write with a non-retryable
+status gives `EIO` on the next
 `fsync` of each open description, then `sync` returns and unmount
 completes, with dirty memory back to its pre-test level. (This is the
 PostgreSQL "fsyncgate" case: an error must never be silently forgotten.)
@@ -277,7 +282,10 @@ per-user, class and per-file key, using canary keys planted in each (stage
 (a swtpm state dump) plus the RAM dump, recovering the keys still needs
 the Argon2id PIN search; resume with and without the right PIN; reboot,
 replay the published PCR 8 and 9 events and try the unseal (must fail);
-resume after a TPM reset (must reach recovery).
+resume after a TPM reset (must reach recovery). The optional panic lock
+(F4 in [features.md](features.md)) wipes the same keys on a running
+machine, keeping them only encrypted under a key that the full login
+passphrase unwraps.
 
 **Per-user home volumes (Phase 5).** Each user's home is its own volume, so
 another user's files aren't readable by them even before the own file
@@ -293,7 +301,9 @@ is read after capping; the tag is checked as soon as the home key is
 unwrapped and before the home volume is mounted, and its JSON is held to
 the allow-list above. The map, stored twice,
 lists extents of 1 GiB that belong to the system volume or to one user's
-home volume; it is authenticated with HMAC-SHA-256 under a key derived by
+home volume (or to that user's optional vault or travel volume, F3 and F5
+in [features.md](features.md)); it is authenticated with HMAC-SHA-256
+under a key derived by
 HKDF from the system volume key, and parsed only after capping and after
 its tag checks. Its user count and per-user sizes are plaintext metadata
 and are listed as such on the scorecard. Each home volume is a
@@ -448,10 +458,13 @@ only". On top of that:
   cut would refuse the genuine volume). The counter is bumped only at mount
   and at resume from suspend (a hibernation resume bumps nothing, above),
   never per commit, to spare NV write endurance. A bump with the counter at
-  *c* commits *c*+1 in two consecutive generations of the root ring (below;
-  both stored copies of each), flushes, and only then increments the
-  counter, so a torn or lost newest root still falls back to a generation
-  carrying *c*+1. Mount accepts a superblock whose value is
+  *c* writes a commit carrying *c*+1 to all four superblock slots (each
+  slot write is atomic; each superblock body also carries the previous 8
+  commits' root sets, below), flushes, and only then increments the
+  counter. Every write point is safe: before the increment any slot
+  holding *c* or *c*+1 is accepted, and after it all four slots carry
+  *c*+1, so a torn newest slot still leaves three that do. Mount accepts
+  a superblock whose value is
   **at least** the counter's, so a crash between the two steps is harmless,
   and refuses a lower one: any image captured while the machine was off or
   suspended is refused once the next mount or resume has bumped the
@@ -482,7 +495,11 @@ only". On top of that:
   commits' full root sets, so the two newest slots reach back 9 commits) and
   free-block quarantine for the K = 8 commit lying-drive window below,
   the rate limit on full commits, the hibernation region and the
-  stage-1 → stage-2 migration above, a
+  stage-1 → stage-2 migration above, the optional features' needs in
+  [features.md](features.md) (a vault region outside the allocatable
+  space that is never trimmed or snapshotted, F3; a travel class whose
+  key is wrapped only by the travel passphrase, F5; removing a file from
+  every snapshot, F12), a
   per-file `fsync` intent log replayed at mount (so `fsync` of one file
   doesn't commit the whole volume; benchmarked as `fsync` latency under
   background writeback against ext4), the error policy of the block layer

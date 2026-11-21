@@ -47,7 +47,10 @@ bounded: apps start with no file, device or network grants.
 | A7 | Another local user | log in as another user, possibly an administrator | family PC |
 
 Out of scope, said out loud: chip decapping, a malicious CPU or firmware
-vendor, and cold-boot attacks on DRAM of a running, unlocked machine.
+vendor, and cold-boot attacks on DRAM of a running, unlocked machine. The
+optional panic lock (F4 in [features.md](features.md)) wipes the keys of a
+running machine at a key chord but leaves app memory and DRAM remanence,
+so it narrows that case without closing it.
 (Memory encryption, AMD SME and Intel TME, is enabled where present from
 Phase 11 at the latest, and the scorecard says whether it is on; test in
 the table below.) Rowhammer from an app or a web page (A2, A3) is in scope;
@@ -339,7 +342,9 @@ terminal that only the kernel switches to, reached by a secure-attention key
 injected input can't produce. From Phase 7 the compositor draws them in a
 layer apps can't draw over, capture or cover
 ([capabilities.md](capabilities.md)). Each prompt shows the requesting app's
-attested identity.
+attested identity. The camera, microphone and screen-capture indicators and
+their kill switches are drawn in the same layer (F1 in
+[features.md](features.md)).
 
 Input is trusted by its source, not its content. The kernel tags every input
 event with the device that produced it. The secure-attention key and every
@@ -386,9 +391,11 @@ always prompts, and Settings explains it in plain words:
   promise).
 
 Tests: each entry of the suspicious list prompts at "Only when suspicious"
-(6 for the device and network entries, 7 for the rest); each floor item
-prompts at "Almost never" (6 for devices, inbound and files + network, 7 for
-remote control and screen sharing); an app that tries to change the level,
+(5 for the executable, first-network-request and locked-or-early entries,
+6 for the USB device entries and inbound listeners, 7 for remote control);
+each floor item prompts at "Almost never" (5 for files + network, 6 for a
+new HID device and inbound access, 7 for remote control and screen
+sharing); an app that tries to change the level,
 through every portal and by writing the settings file, fails (5); the
 scripted "typical day" (install 5 apps, browse, download, plug in a known
 keyboard and a USB stick) shows at most 5 prompts after first-run at the
@@ -674,6 +681,10 @@ each row as pass, fail or not yet built, per hardware tier.
 | A3 → permission broker and portals | fuzzed, size-capped TCB service | 10^8 protocol fuzz executions, no open crash (5) |
 | A3 → D-Bus proxy and broker | fuzzed, size-capped TCB service | 10^8 protocol fuzz executions against the proxy and dbus-broker, no open crash (5) |
 | A3 → Flatpak launcher | fuzzed TCB service; `org.freedesktop.Flatpak` talk-name refused | 10^8 fuzz executions over manifests and launch requests, no open crash; `flatpak-spawn --host` fails (5) |
+| A3 → Flatpak portal | `Spawn` starts only child identities with a subset of the caller's grants; `SpawnSignal` reaches only children the caller spawned; `latest-version` and `CreateUpdateMonitor` refused ([capabilities.md](capabilities.md)) | 10^8 protocol fuzz executions over `Spawn` and `SpawnSignal`, no open crash; `Spawn` with a `sandbox-expose` path the caller doesn't hold, with network from a caller without network, and with a `usr-fd` or `app-fd` of a writable tree gives the child none of them; `SpawnSignal` to a process the caller didn't spawn fails; `latest-version` is refused (5) |
+| A3 → launch relay | system-image program the kernel runs in place of a registered launch path; it starts the app only through the launcher, under the app's own identity on a fresh pty, with the escape filter on relayed output; its stdin forwarding is a direct channel checked like any other | 10^8 fuzz executions over the relay's launcher protocol and relayed stdio, no open crash; a terminal-identity process that execs a registered test app's path gets that app under its own identity on a fresh pty with exit status and signals passed through; OSC 52, title-set and report sequences the app writes never reach the terminal; with the terminal-to-app channel refused, the app's stdin is `/dev/null` (5) |
+| A3 → Background portal | the only writer of `~/.config/autostart`, asking per the prompt level; entries an app writes inside its private home become requests, and an approved entry's `Exec` line launches under the requesting identity | 10^8 protocol fuzz executions, no open crash; a test app's direct write to `~/.config/autostart` fails; its entry written inside its private home appears only after approval; an approved entry whose `Exec` names another app's executable runs under the requesting app's identity with its grants only (5) |
+| A3 → settings portal | the only writer of the projected shared settings; accepts only the published keys and value types of each file, never an entry that names code or a file outside the shared paths | 10^8 protocol fuzz executions, no open crash; an app's direct writes to `~/.config/gtk-3.0`, `~/.config/fontconfig` and `~/.local/share/fonts` fail; through the portal, a `gtk-modules` setting, a fontconfig `<include>` or `<dir>` naming a file in the app's home, and a change to the prompt level are refused (5) |
 | A3 → user service manager | fuzzed, size-capped TCB service; control interface unreachable from app proxies | 10^8 protocol fuzz executions over D-Bus activation and unit requests, no open crash (5) |
 | A3 → store service | fuzzed, size-capped TCB service | 10^8 fuzz executions over install requests, manifests and repository metadata, no open crash (5) |
 | A3 → storage service | fuzzed, size-capped TCB service; passthrough and firmware download only with signed firmware | 10^8 protocol fuzz executions, no open crash (5) |
@@ -690,7 +701,7 @@ each row as pass, fail or not yet built, per hardware tier.
 | A3 → prompt spoofing, console | prompts on a dedicated virtual terminal reached by the secure-attention key | an app draws a fake prompt on its own terminal, injects keystrokes, and tries to switch virtual terminals; no grant is made without the secure-attention key and a keypress on the prompt terminal (5) |
 | A3 → screen, input, mic, camera | grants only through portals; prompts drawn by the compositor; keyboard and pointer emulation only to the focused surface behind a grant | prompt-spoofing test against the compositor; an app can't read another window's pixels or keys, and an app holding the virtual-input grant reaches only the focused surface (7) |
 | A3 → exfiltration | files + network is one explicit grant; first network use decided per identity; per-identity egress filter; secrets used through agents; networked deputies check grants; directional direct channels checked as one principal on every channel and every grant; the overt channels are the closed list in `design/channels.toml` | **exfiltration suite**: a canary file in a granted folder and a canary SSH key; an app (and a script run from the terminal) without the combined grant tries every overt channel (every portal and open-URI (5); sockets of every family, loopback to another identity's port, io_uring socket ops, DNS lookups through the resolver, notifications, printing, launching a networked app (6); the clipboard (7)); the canary must not reach an external sink. Grant after join: app A (files) opens a channel to B (nothing), then B asks for network; the grant prompts naming A's files, and refused, it is refused at grant time with the reason; an app holding Downloads and network does not join the terminal's component (6). In full it adds **colluding apps**: two, one holding the folder and one holding network, and a chain of three (files, nothing, network), which try every channel in `design/channels.toml` between them, including relays through PipeWire and D-Bus, a granted loopback port, a shared writable folder, drag and drop, and the grants given to the networked one at run time; the combined approval is asked again when a fourth app joins; covert-channel bandwidth is measured and published (7) |
-| A3 → network without approval | default profile has no network; first outbound use returns `ENETUNREACH` and queues one request per identity, prompted or granted by the prompt level, remembered | at "Always ask" a fresh unpackaged program's first `connect` returns `ENETUNREACH` at once and exactly one prompt appears; refused, it stays unreachable across restarts; at "Only when suspicious" an unsigned program first seen under 7 days ago prompts and a signed one older than 7 days is granted silently and logged; with a folder grant it prompts at "Almost never" (6) |
+| A3 → network without approval | default profile has no network; first outbound use returns `ENETUNREACH` and queues one request per identity, prompted or granted by the prompt level, remembered | at "Always ask" a fresh unpackaged program's first `connect` returns `ENETUNREACH` at once and exactly one prompt appears; refused, it stays unreachable across restarts; at "Only when suspicious" an unsigned program first seen under 7 days ago prompts and a signed one older than 7 days is granted silently and logged; with a folder grant it prompts at "Almost never" (5, on the loopback-only stack, where the first non-loopback `connect` already returns `ENETUNREACH`); granted, its next `connect` reaches a host on the test network, and the refusal case still holds over real interfaces (6) |
 | A3 → prompt level | the level is a TCB setting changed only on the trusted path | an app tries to change the level through every portal and by writing the settings file; all fail (5) |
 | A3 → side channels | the mitigation matrix, SMT off on affected CPUs | the PoC suite recovers zero secret bytes above chance on the shipped default for each CPU model, and app to app with opt-in SMT on (3) |
 | A3 → Rowhammer | page tables in a separate physical zone with guard rows; ECC/TRR reporting; refresh policy reported; residual risk on the scorecard | on each reference machine, a published hammering PoC run from an app for 24 h flips no page-table bit and gains no access outside the app; flips elsewhere are counted and published (3) |

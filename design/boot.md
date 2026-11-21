@@ -693,7 +693,9 @@ announced, and every machine reseals to the next key at its next update.
   or db differs from what the kernel recorded in the loader state at the
   last good boot, shows that above the code and says not to type the
   recovery key unless the user made that change. A firmware setup password
-  closes the gap, and the scorecard says so.
+  closes the gap, and the scorecard says so. The optional tamper alert (F7
+  in [features.md](features.md)) extends this comparison to PCRs 0 to 5,
+  with an S-authenticated record checked after unlock.
 - **Where the PIN or passphrase is typed.** Once Optimal Boot lands (Phase
   4b), it reads it through the UEFI text input protocol (`ConIn`, which
   works with USB keyboards through firmware) before `ExitBootServices`, and
@@ -776,8 +778,11 @@ announced, and every machine reseals to the next key at its next update.
   gives the right floor; a floor raise completes across a reboot; an
   increment after capping fails. Power is cut at every step of a raise:
   each slot write, each recovery copy, the request, the reseal and
-  test-unseal of each sealed object, each header-block write, and each
-  increment. The machine boots each time without the recovery key. A
+  trial-digest check of each sealed object (its authPolicy against a
+  trial-session policy digest, as in "When PCR 7 changes"), each
+  header-block write, and each increment. The machine boots each time
+  without the recovery key, and the boot after the raise unseals every new
+  object before capping, which is the real test. A
   raise approved by a rotated-in disk policy key passes through the
   delegation chain.
   On B2 the OS can't write the floor variable. Deleting the variable gives
@@ -858,7 +863,9 @@ announced, and every machine reseals to the next key at its next update.
   update client stages nothing until a write succeeds.
 - **User data is separate**, on the encrypted own file system. Rolling back
   the OS never rolls back anyone's documents. File system snapshots are a
-  user feature (undo for your files), not the update mechanism.
+  user feature (undo for your files, F12 in [features.md](features.md)),
+  not the update mechanism. System undo from the loader menu (F11 there)
+  restores settings and at most the previous slot, never below the floor.
 - Test (Phase 4a): a flipped block in the image is caught with `EIO`. The
   slot fallback after it is tested in Phase 4b, with the loader state.
 
@@ -885,6 +892,10 @@ announced, and every machine reseals to the next key at its next update.
   installing. So a release signed in secret (stolen key, coercion) can't be
   installed or booted without being visible. Test: an unlogged but validly
   signed release is refused by both.
+- **When updates apply.** Staging never restarts the machine: the slot
+  switch, loader trial boots and floor raises happen only at a restart the
+  user chose, and each release's changelog is in its signed metadata (F14
+  in [features.md](features.md)).
 - **Time.** Metadata expiry needs a trustworthy clock, so the time service
   uses NTS (authenticated NTP), and the clock is never accepted earlier
   than a floor: the newest metadata time the client has seen, and before
@@ -917,8 +928,11 @@ announced, and every machine reseals to the next key at its next update.
      resumes from hibernation leaves the request pending for the next
      normal boot. On B1 the kernel seals objects 1 to 3 again at floor n
      (their R values, the TOTP key and M; the AEAD ciphertexts in the
-     header block don't change). It test-unseals each new object and writes the full
-     set into the other header-block copy, so the old set stays in the
+     header block don't change). It checks each new object's authPolicy
+     against a trial-session policy digest (a real test-unseal can't run
+     after capping; the next boot's unseal before capping is the real
+     test) and writes the full set into the other header-block copy, so
+     the old set stays in the
      first. Only then does it increment the counter until counter −
      base = n and clear the request. The old copy is replaced at the next
      header-block write. On B2 the loader writes the floor variable, then
@@ -944,7 +958,9 @@ announced, and every machine reseals to the next key at its next update.
   old slot within 3 boots without any key press. Hibernating after an
   update made the other slot active resumes into the image's slot (Phase
   10, [storage.md](storage.md)). B4 has no boot counting (Interim chain,
-  above).
+  above). Each slot's config also carries a signed safe-mode entry, whose
+  boots leave tries, flags and the floor unchanged (F13 in
+  [features.md](features.md)).
 - **Recovery image.** A small signed, read-only recovery system with its
   own SVN, stored as two copies on their own partitions, so a power cut
   while one is rewritten leaves the other. The loader boots the newest valid

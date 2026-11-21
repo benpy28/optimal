@@ -96,7 +96,11 @@ thread on that CPU.
   that haven't set `sched_runtime` themselves get half the default slice
   (an earlier virtual deadline), and background apps' threads twice it; a
   slice an app sets explicitly wins. This changes *when* threads run, not
-  their fair share, so it can't starve background work.
+  their fair share, so it can't starve background work. The optional focus
+  boost (a `cpu.weight` multiplier for the focused app's group) and
+  background freezing (`cgroup.freeze` on hidden apps' groups, with
+  exemptions) are F9 in [features.md](features.md); per-app power from
+  RAPL and per-app `cpu.max` power caps are F10.
 - **Groups.** cgroup v2 `cpu.weight` and `cpu.max` are implemented with
   hierarchical fair scheduling (Phase 5, needed for milestone 6). The desktop
   puts each app in its own group, so an app with 200 threads gets one app's
@@ -268,7 +272,8 @@ explicit:
   its shootdown has completed on every CPU in the set
   ([verification.md](verification.md) target 1s: M/T at Phase 2 for the
   IPI path, re-gated at M/T in Phase 3 with PCID, lazy switch, permission
-  downgrades and teardown, and in Phase 5 with INVLPGB and THP).
+  downgrades and lazy-CPU teardown on the IPI path, and in Phase 5 with
+  INVLPGB, its lazy-CPU teardown, and THP).
 - **Huge pages** (Phase 5). Transparent huge pages for anonymous memory on
   fault where the region is aligned and large enough, plus background
   collapse; a fault never waits for compaction (if no 2 MiB frame is free it

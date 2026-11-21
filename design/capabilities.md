@@ -505,6 +505,9 @@ separate namespace, so a grant or revocation reaches live sockets:
   show the content of one send, so they appear at every prompt level.
 - Each app has its own IPC namespace (SysV IPC, POSIX message queues) and its
   own `/dev/shm`; **abstract Unix sockets are scoped per app**.
+- The optional VPN-only guard and encrypted DNS upstream of the resolver
+  are rules in this egress filter and resolver (F6 in
+  [features.md](features.md)).
 
 Tests: in Phase 5, a cross-identity loopback connection without the
 grant is refused on the loopback-only stack. In Phase 6: revoke the
@@ -581,8 +584,10 @@ promotion thresholds) or from a keyboard whose own per-device HID process
 (one process per device) passed typed-code confirmation. Bluetooth
 keyboards never count unless the user opts that keyboard in by name;
 `uinput` devices and the compositor's virtual keyboard and pointer never
-count. The polled xHCI boot-keyboard reader stops when the Phase 6 xHCI
-driver binds, and resume PIN entry uses the in-kernel paths. Ordinary
+count, and neither do events produced by the user's key remapping, which
+applies only to app surfaces (F17 in [features.md](features.md)). The
+polled xHCI boot-keyboard reader stops when the Phase 6 xHCI driver
+binds, and resume PIN entry uses the in-kernel paths. Ordinary
 input is gated too, with the mechanisms in [drivers.md](drivers.md): every
 new USB device (by class and serial or port identity) gets no driver
 binding until approved, a keyboard additionally needs the typed code,
@@ -624,7 +629,9 @@ compromised Bluetooth stack injects keys into a focused terminal; all fail
   portal decides once per the prompt level, the answer is remembered and
   can be changed in Settings, and the app gets a capability (often an fd,
   such as a PipeWire stream). Screen casting, remote desktop and input
-  capture are in the floor below.
+  capture are in the floor below. Trusted indicators for the camera,
+  microphone and screen capture, per-sensor kill switches and the privacy
+  dashboard over these grants are F1 and F2 in [features.md](features.md).
 - **Every portal** is a row of [`design/channels.toml`](channels.toml)
   with its landing phase, what it may send off the machine and its test.
 
@@ -714,7 +721,10 @@ approved, `uinput` only as the virtual-gamepad portal's gamepad-only fd,
 `fuse` for apps allowed to mount FUSE file systems inside their view, and
 `net/tun` for apps running rootless containers, which creates TUN and TAP
 devices only inside the caller's own network namespace (milestone 8,
-Phase 6, because it needs the full network stack).
+Phase 6, because it needs the full network stack). The one exception is
+the VPN app the user designates on the trusted path for the VPN-only guard,
+whose TUN interface is in the system network namespace (F6 in
+[features.md](features.md)).
 
 ## Proof and test obligations
 

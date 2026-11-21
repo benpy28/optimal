@@ -184,7 +184,10 @@ sanitizers read `/proc/self/status`, glibc reads
   the process portal's grant (`EPERM` without it). Golden test
   (Phase 5): `ps aux`, `top -b -n1` and `kill` against another app's
   process on Linux and Optimal. Kernel pointers are hidden as in the
-  lockdown table.
+  lockdown table. `/sys/class/powercap` (RAPL energy counters) is absent
+  from every app view, because fine-grained energy readings leak secrets;
+  per-app power is shown only in Settings (F10 in
+  [features.md](features.md)).
 
 ## Measuring compatibility honestly
 
