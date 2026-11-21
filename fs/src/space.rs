@@ -416,9 +416,10 @@ impl Space {
         self.free_total = (self.free_total as i64 + delta) as u64;
         self.bmps.get_mut(&i).unwrap().dirty = true;
         if let Some(a) = old_bmp
-            && a != 0 {
-                self.free(io, a, 1)?;
-            }
+            && a != 0
+        {
+            self.free(io, a, 1)?;
+        }
         Ok(())
     }
 
@@ -493,9 +494,10 @@ impl Space {
         let mut end: Option<u64> = None;
         for set in core::iter::once(&self.freed_now).chain(self.held.iter().map(|h| &h.set)) {
             if let Some((s, e)) = set.next_range_from(b)
-                && s == b {
-                    end = Some(end.map_or(e, |x| x.max(e)));
-                }
+                && s == b
+            {
+                end = Some(end.map_or(e, |x| x.max(e)));
+            }
         }
         end
     }

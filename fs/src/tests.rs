@@ -325,3 +325,93 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn kdf_for_ram_hand_worked() {
+    // memory = clamp(RAM/4, 64 MiB, 1 GiB); passes = ceil(4 GiB-passes / memory),
+    // clamped to 4..=64 (in KiB: 4194304 / mem_kib).
+    use crate::KdfParams;
+    let gib = 1u64 << 30;
+    let cases = [
+        (16 * gib, 1_048_576, 4), // capped at 1 GiB
+        (4 * gib, 1_048_576, 4),
+        (3 * gib, 786_432, 6), // 4194304 / 786432 = 5.33 -> 6
+        (2 * gib, 524_288, 8),
+        (gib, 262_144, 16),
+        (128 << 20, 65_536, 64), // RAM/4 = 32 MiB, raised to the 64 MiB floor
+        (0, 65_536, 64),
+    ];
+    for (ram, mem, it) in cases {
+        let p = KdfParams::for_ram(ram);
+        assert_eq!(
+            (p.mem_kib, p.iterations, p.lanes),
+            (mem, it, 1),
+            "ram {ram}"
+        );
+        assert!(p.meets_floor());
+    }
+    assert_eq!(KdfParams::for_ram(16 * gib), KdfParams::DEFAULT);
+    assert!(!KdfParams::INSECURE_FAST_FOR_TESTS.meets_floor());
+    // Format refuses an encrypted volume below the floor.
+    let weak = FormatOptions {
+        passphrase: Some(b"pw".to_vec()),
+        kdf: KdfParams {
+            mem_kib: 32 * 1024,
+            iterations: 4,
+            lanes: 1,
+        },
+        quarantine_min_ns: 0,
+    };
+    let r = Filesystem::format(
+        MemDevice::new(4096),
+        &weak,
+        &mut Rng::new(1),
+        Box::new(ZeroClock),
+    );
+    assert!(matches!(r, Err(crate::Error::Invalid(_))));
+}
+
+#[test]
+fn replay_bump_reaches_all_four_slots() {
+    // After bump_replay every superblock copy carries the new value: the
+    // commit is written to its own pair, flushed, then to the other pair.
+    let opts = FormatOptions {
+        passphrase: None,
+        kdf: crate::KdfParams::INSECURE_FAST_FOR_TESTS,
+        quarantine_min_ns: 0,
+    };
+    let mut fs = Filesystem::format(
+        MemDevice::new(4096),
+        &opts,
+        &mut Rng::new(1),
+        Box::new(ZeroClock),
+    )
+    .unwrap();
+    assert_eq!(fs.replay_value(), 0);
+    fs.create(ROOT_INO, b"x", 0o644).unwrap();
+    fs.commit().unwrap();
+    assert_eq!(fs.bump_replay().unwrap(), 1);
+    assert_eq!(fs.bump_replay().unwrap(), 2);
+    // An ordinary commit carries the value forward.
+    fs.create(ROOT_INO, b"y", 0o644).unwrap();
+    fs.commit().unwrap();
+    assert_eq!(fs.replay_value(), 2);
+    assert_eq!(fs.bump_replay().unwrap(), 3);
+    let g = fs.generation();
+    let mut dev = fs.into_device();
+    let cands = crate::superblock::candidates(&mut dev).unwrap();
+    assert_eq!(cands.len(), 4);
+    let sealer = crate::crypto::Sealer::new(cands[0].header.uuid, None, &mut Rng::new(2));
+    for c in &cands {
+        let b = crate::superblock::open_body(c, &sealer).unwrap();
+        assert_eq!(
+            (b.generation, b.replay_value),
+            (g, 3),
+            "slot {}",
+            c.header.slot
+        );
+        // Its history is the previous commits, newest first, with their values.
+        assert_eq!(b.history[0].replay_value, 2);
+        assert_eq!(b.history[0].generation, g - 1);
+    }
+}

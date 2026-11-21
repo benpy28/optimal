@@ -360,6 +360,8 @@ pub struct Filesystem<D: BlockDevice> {
     rewrite_all_slots: bool,
     fell_back_from: Option<u64>,
     recovery: Option<crate::recover::RecoveryStats>,
+    /// The next commit raises the replay value by one.
+    replay_bump: bool,
 }
 
 impl<D: BlockDevice> core::fmt::Debug for Filesystem<D> {
@@ -405,6 +407,14 @@ impl<D: BlockDevice> Filesystem<D> {
             salt,
             keyslots: [KeySlot::default(); KEYSLOTS],
         };
+        if opts.passphrase.is_some()
+            && !opts.kdf.meets_floor()
+            && opts.kdf != KdfParams::INSECURE_FAST_FOR_TESTS
+        {
+            return Err(Error::Invalid(
+                "key derivation below the floor (64 MiB, 4 passes)",
+            ));
+        }
         let master = match &opts.passphrase {
             None => None,
             Some(p) => {
@@ -470,6 +480,7 @@ impl<D: BlockDevice> Filesystem<D> {
             rewrite_all_slots: false,
             fell_back_from: None,
             recovery: None,
+            replay_bump: false,
         };
         let now = fs.clock.now_ns();
         let root = Attr {
@@ -603,6 +614,7 @@ impl<D: BlockDevice> Filesystem<D> {
                 rewrite_all_slots: false,
                 fell_back_from: None,
                 recovery: None,
+                replay_bump: false,
             };
             let check = if clean {
                 Ok(())
@@ -659,6 +671,26 @@ impl<D: BlockDevice> Filesystem<D> {
     /// What mount's recovery check read (None after a clean unmount).
     pub fn recovery_stats(&self) -> Option<&crate::recover::RecoveryStats> {
         self.recovery.as_ref()
+    }
+
+    /// The anti-rollback counter of the mounted commit.
+    pub fn replay_value(&self) -> u64 {
+        self.body.replay_value
+    }
+
+    /// Raises the anti-rollback counter by one in a commit written to all
+    /// four superblock slots (both pairs, each flushed), so every copy that
+    /// mount could pick carries the new value. Only after this returns may
+    /// the caller advance its TPM monotonic counter; a crash before that
+    /// leaves the old value, which the TPM still accepts. Returns the new value.
+    pub fn bump_replay(&mut self) -> Result<u64> {
+        self.check_writable()?;
+        self.replay_bump = true;
+        self.txn_dirty = true;
+        let r = self.commit();
+        self.replay_bump = false;
+        r?;
+        Ok(self.body.replay_value)
     }
 
     /// Commits any pending changes and marks the volume cleanly unmounted,
@@ -1745,7 +1777,7 @@ impl<D: BlockDevice> Filesystem<D> {
             next_deadlist: self.next_deadlist,
             latest_snap_gen: self.store.latest_snap_gen,
             commit_time_ns: now,
-            replay_value: self.body.replay_value,
+            replay_value: self.body.replay_value + self.replay_bump as u64,
             flags: self.next_flags,
             window_gen: self
                 .store
@@ -1764,9 +1796,10 @@ impl<D: BlockDevice> Filesystem<D> {
             &mut self.store.io,
             &self.header,
             &body,
-            self.rewrite_all_slots,
+            self.rewrite_all_slots || self.replay_bump,
         )?;
         self.rewrite_all_slots = false;
+        self.replay_bump = false;
         self.header.generation = generation;
         self.body = body;
         self.store.space.committed(generation, now);
