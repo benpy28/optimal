@@ -32,7 +32,8 @@ OVMF_SECBOOT=/usr/share/OVMF/OVMF_CODE_4M.secboot.fd
 #   bios              SeaBIOS, QEMU's default
 #   uefi              OVMF from the distro
 #   uefi-sb           OVMF with Secure Boot on and our test keys (build/sb/VARS.fd)
-#   ovmf=<code.fd>    a specific OVMF build (older and newer firmware)
+#   ovmf=<code.fd>    a specific OVMF build (older and newer firmware), with
+#                     the OVMF_VARS.fd beside it if there is one
 # Boots the ISO with serial output in <log>, and stops QEMU as soon as the
 # kernel reports it is done, or when the timeout runs out.
 run_qemu() {
@@ -41,7 +42,16 @@ run_qemu() {
     case "$fw" in
         bios) ;;
         uefi) fw_args=(-drive "if=pflash,format=raw,readonly=on,file=$OVMF") ;;
-        ovmf=*) fw_args=(-drive "if=pflash,format=raw,readonly=on,file=${fw#ovmf=}") ;;
+        ovmf=*)
+            # A specific OVMF build, with a fresh copy of its own variable
+            # store (OVMF_VARS.fd next to the code) when it has one.
+            local code="${fw#ovmf=}"
+            fw_args=(-drive "if=pflash,format=raw,unit=0,readonly=on,file=$code")
+            if [ -f "$(dirname "$code")/OVMF_VARS.fd" ]; then
+                cp "$(dirname "$code")/OVMF_VARS.fd" "$log.vars"
+                fw_args+=(-drive "if=pflash,format=raw,unit=1,file=$log.vars")
+            fi
+            ;;
         uefi-sb)
             # Secure Boot needs SMM so the OS can't rewrite the key store.
             machine="$machine,smm=on"

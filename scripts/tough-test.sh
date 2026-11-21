@@ -156,8 +156,11 @@ scenario "mem-129M-odd" boot "$ISO" bios pc 129M 2 30 kvm
 scenario "mem-4097M-over-hole" boot "$ISO" bios q35 4097M 2 30 kvm
 scenario "mem-split-1G-below-4G" boot "$ISO" bios q35,max-ram-below-4g=1G 6G 2 30 kvm
 has_uefi && scenario "mem-split-1G-below-4G-uefi" boot "$ISO" uefi q35,max-ram-below-4g=1G 6G 2 30 kvm
-scenario "mem-32G-large" boot "$ISO" bios q35 32G 4 30 kvm
-has_uefi && scenario "mem-32G-large-uefi" boot "$ISO" uefi q35 32G 4 30 kvm
+# 32 GiB, more than the CI host has: reserve=off lets the host back it lazily
+# (the guest only touches what it uses), so this tests a big memory map.
+big=(-object memory-backend-ram,id=big,size=32G,reserve=off)
+scenario "mem-32G-large" boot "$ISO" bios q35,memory-backend=big 32G 4 30 kvm -- "${big[@]}"
+has_uefi && scenario "mem-32G-large-uefi" boot "$ISO" uefi q35,memory-backend=big 32G 4 30 kvm -- "${big[@]}"
 dimms=(-object memory-backend-ram,id=d0,size=512M -device pc-dimm,memdev=d0
     -object memory-backend-ram,id=d1,size=256M -device pc-dimm,memdev=d1)
 scenario "mem-extra-dimms" boot "$ISO" bios q35 1G,slots=4,maxmem=8G 2 30 kvm -- "${dimms[@]}"
