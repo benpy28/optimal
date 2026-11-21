@@ -3,5 +3,12 @@
 [target.x86_64-unknown-uefi]
 rustflags = ["--cfg", 'curve25519_dalek_backend="serial"']
 
+# The conformance kernel: a plain ET_EXEC linked in the top 2 GiB by default,
+# like the real kernel. scripts/build-conformance.sh overrides these flags for
+# the position-independent variant.
 [target.x86_64-unknown-none]
-rustflags = ["--cfg", 'curve25519_dalek_backend="serial"']
+rustflags = [
+  "--cfg", 'curve25519_dalek_backend="serial"',
+  "-C", "relocation-model=static",
+  "-C", "code-model=kernel",
+]
