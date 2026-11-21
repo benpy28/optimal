@@ -1,0 +1,13 @@
+[package]
+name = "optimal-boot-core"
+description = "Pure, host-testable logic of Optimal Boot: config, signatures, ELF, memory map, page tables, Limine protocol."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+ed25519-dalek.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+ed25519-dalek = { version = "2", default-features = false, features = ["fast"] }

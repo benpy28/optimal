@@ -1,0 +1,1 @@
+- Bootloader: Optimal Boot core (Limine protocol scanner, ELF loader with KASLR relocations, memory map and page table builders, signed boot config, ACPI reader), with host tests and seeded fuzz tests in CI.
