@@ -7,6 +7,8 @@ publish = false
 [dependencies]
 # Rust bindings for the Limine boot protocol (MIT OR Apache-2.0).
 limine = "0.5"
+# Frame allocator, zones and page-table logic, tested on the host.
+optimal-mm = { path = "../crates/mm" }
 
 [features]
 # Build the in-kernel test suite into the image (CI boots this build).

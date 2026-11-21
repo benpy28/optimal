@@ -10,16 +10,17 @@
 mod arch;
 mod backtrace;
 mod boot;
+mod bootinfo;
 mod crashtest;
 #[cfg(feature = "ktest")]
 mod ktest;
+mod mm;
 mod serial;
+mod sync;
 #[cfg(feature = "ktest")]
 mod tests;
 
 use core::panic::PanicInfo;
-
-use limine::memory_map::EntryType;
 
 /// The line CI looks for to decide the kernel booted.
 pub const BOOT_OK: &str = "OPTIMAL: kernel booted";
@@ -47,10 +48,11 @@ extern "C" fn kmain() -> ! {
     if let Some(info) = boot::BOOTLOADER_INFO.get_response() {
         crate::println!("bootloader: {} {}", info.name(), info.version());
     }
-    report_memory();
+    let info = bootinfo::capture();
+    report_memory(info);
     paint_screen();
 
-    let cmdline = boot::cmdline();
+    let cmdline = info.cmdline();
     if let Some(name) = boot::arg(cmdline, "crashtest") {
         crashtest::run(name);
     }
@@ -66,20 +68,25 @@ fn on(b: bool) -> &'static str {
     if b { "on" } else { "unsupported" }
 }
 
-fn report_memory() {
-    if let Some(map) = boot::MEMORY_MAP.get_response() {
-        let usable: u64 = map
-            .entries()
-            .iter()
-            .filter(|e| e.entry_type == EntryType::USABLE)
-            .map(|e| e.length)
-            .sum();
-        crate::println!(
-            "memory: {} MiB usable in {} map entries",
-            usable / (1024 * 1024),
-            map.entries().len()
-        );
-    }
+fn report_memory(info: &bootinfo::BootInfo) {
+    let usable: u64 = info
+        .memory_map()
+        .iter()
+        .filter(|e| e.kind == bootinfo::Kind::Usable)
+        .map(|e| e.len)
+        .sum();
+    crate::println!(
+        "memory: {} MiB usable in {} map entries",
+        usable / (1024 * 1024),
+        info.memory_map().len()
+    );
+    let s = mm::frames::init(info);
+    crate::println!(
+        "frames: {} MiB free in {} zone(s), {} KiB of allocator metadata",
+        s.free_bytes / (1024 * 1024),
+        s.zones,
+        s.metadata_bytes / 1024
+    );
 }
 
 /// Fill the screen with a dark blue and draw a lighter band across the

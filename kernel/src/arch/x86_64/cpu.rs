@@ -152,3 +152,27 @@ pub fn halt_forever() -> ! {
         unsafe { asm!("cli; hlt", options(nomem, nostack)) };
     }
 }
+
+const RFLAGS_IF: u64 = 1 << 9;
+
+/// Disable interrupts on this CPU. Returns whether they were enabled.
+pub fn interrupts_disable() -> bool {
+    let flags: u64;
+    // SAFETY: reading RFLAGS and clearing IF is always valid at ring 0.
+    unsafe { asm!("pushfq", "pop {}", "cli", out(reg) flags, options(nomem, preserves_flags)) };
+    flags & RFLAGS_IF != 0
+}
+
+/// Enable interrupts on this CPU.
+pub fn interrupts_enable() {
+    // SAFETY: an IDT that handles every vector is loaded before anything can
+    // take a lock (arch::init_cpu runs first).
+    unsafe { asm!("sti", options(nomem, nostack)) };
+}
+
+pub fn interrupts_enabled() -> bool {
+    let flags: u64;
+    // SAFETY: reading RFLAGS has no side effects.
+    unsafe { asm!("pushfq", "pop {}", out(reg) flags, options(nomem, preserves_flags)) };
+    flags & RFLAGS_IF != 0
+}

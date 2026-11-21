@@ -22,4 +22,9 @@ name = "optimal-kernel"
 version = "0.0.1"
 dependencies = [
  "limine",
+ "optimal-mm",
 ]
+
+[[package]]
+name = "optimal-mm"
+version = "0.0.1"
