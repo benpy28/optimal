@@ -106,3 +106,35 @@ jobs:
           name: tough-conditions-logs
           path: build/tough-logs/
           retention-days: 14
+
+  # Memory-management logic (crates/mm): host unit tests and property tests
+  # against reference models, then Kani proofs (docs/verification.md, proof
+  # targets 1 and 2). Kani brings its own pinned toolchain; the kernel itself
+  # still builds on stable Rust.
+  mm-tests-and-proofs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: crates/mm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint
+        run: |
+          rustup component add clippy rustfmt
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+
+      - name: Unit and property tests (many more random cases than locally)
+        env:
+          PROPTEST_CASES: "50000"
+        run: cargo test --release
+
+      - name: Install Kani
+        run: |
+          cargo install --locked kani-verifier --version 0.68.0
+          cargo kani setup
+
+      - name: Kani proofs
+        run: cargo kani
