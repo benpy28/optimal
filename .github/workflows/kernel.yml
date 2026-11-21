@@ -12,6 +12,12 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same PR makes the older run moot: cancel it, so stale
+# runs don't hold runners other PRs need. Runs on main are never cancelled.
+concurrency:
+  group: kernel-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build-and-boot:
     runs-on: ubuntu-24.04

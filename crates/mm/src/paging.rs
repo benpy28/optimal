@@ -996,28 +996,50 @@ mod proofs {
     use super::*;
 
     const T: usize = 8;
+    /// Most entry writes one proof makes: a map writes at most 4 (three new
+    /// table links and the leaf), so two maps and an unmap or protect write
+    /// at most 9. A proof that wrote more would fail loudly, never silently.
+    const WRITES: usize = 12;
 
+    /// Table memory as a log of entry writes over all-zero tables, which is
+    /// exactly what fresh tables are. Reading scans the log, newest first.
+    /// This models the same memory as `[[u64; 512]; T]` but keeps the
+    /// solver's problem small: a dense array of 8 x 512 symbolic words
+    /// exhausts the solver's memory before any proof completes.
     struct Mem {
-        tables: [[u64; 512]; T],
+        log: [(u64, usize, u64); WRITES],
+        writes: usize,
         used: usize,
         limit: usize,
     }
 
+    impl Mem {
+        fn check_table(&self, t: u64, i: usize) {
+            let n = (t / 4096) as usize;
+            // Touching a table that was never allocated is a bug.
+            assert!(n != 0 && n <= self.used && t % 4096 == 0, "not a table");
+            assert!(i < 512, "index out of range");
+        }
+    }
+
     impl TableMemory for Mem {
         fn read(&self, t: u64, i: usize) -> u64 {
-            let n = (t / 4096) as usize;
-            if n == 0 || n > self.used || t % 4096 != 0 {
-                // Reading a table that was never allocated is a bug.
-                panic!("read from a non-table");
+            self.check_table(t, i);
+            let mut k = self.writes;
+            while k > 0 {
+                k -= 1;
+                let (wt, wi, v) = self.log[k];
+                if wt == t && wi == i {
+                    return v;
+                }
             }
-            self.tables[n - 1][i]
+            0
         }
         fn write(&mut self, t: u64, i: usize, v: u64) {
-            let n = (t / 4096) as usize;
-            if n == 0 || n > self.used || t % 4096 != 0 {
-                panic!("write to a non-table");
-            }
-            self.tables[n - 1][i] = v;
+            self.check_table(t, i);
+            assert!(self.writes < WRITES, "write log full: raise WRITES");
+            self.log[self.writes] = (t, i, v);
+            self.writes += 1;
         }
         fn alloc_table(&mut self) -> Option<u64> {
             if self.used >= self.limit {
@@ -1032,7 +1054,8 @@ mod proofs {
         let limit: usize = kani::any();
         kani::assume(limit >= 1 && limit <= T);
         Mem {
-            tables: [[0; 512]; T],
+            log: [(0, 0, 0); WRITES],
+            writes: 0,
             used: 0,
             limit,
         }
@@ -1063,7 +1086,7 @@ mod proofs {
     /// A successful map translates exactly as asked, at every offset in the
     /// page, and never produces a writable+executable mapping.
     #[kani::proof]
-    #[kani::unwind(6)]
+    #[kani::unwind(14)]
     fn map_then_translate() {
         let mut m = mem();
         let a = AddressSpace::new(&mut m).unwrap();
@@ -1079,9 +1102,10 @@ mod proofs {
     }
 
     /// Mapping one page never changes the translation of any address outside
-    /// it, whether the map succeeds or fails (including running out of memory).
+    /// it, whether the map succeeds or fails (including running out of memory),
+    /// and never replaces a translation inside it.
     #[kani::proof]
-    #[kani::unwind(6)]
+    #[kani::unwind(14)]
     fn map_changes_nothing_else() {
         let mut m = mem();
         let a = AddressSpace::new(&mut m).unwrap();
@@ -1097,11 +1121,16 @@ mod proofs {
         if r.is_err() || !inside {
             assert!(a.translate(&m, probe) == before);
         }
+        // And a map never replaces an existing translation: over an address
+        // that was already mapped it is refused.
+        if inside && before.is_some() {
+            assert!(r.is_err());
+        }
     }
 
     /// Unmap removes exactly the page asked for and nothing else.
     #[kani::proof]
-    #[kani::unwind(6)]
+    #[kani::unwind(14)]
     fn unmap_removes_only_that_page() {
         let mut m = mem();
         let a = AddressSpace::new(&mut m).unwrap();
@@ -1124,7 +1153,7 @@ mod proofs {
 
     /// protect never creates a writable+executable page and keeps the frame.
     #[kani::proof]
-    #[kani::unwind(6)]
+    #[kani::unwind(14)]
     fn protect_keeps_wx_and_frame() {
         let mut m = mem();
         let a = AddressSpace::new(&mut m).unwrap();

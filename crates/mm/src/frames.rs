@@ -835,32 +835,41 @@ mod tests {
     }
 }
 
-/// Kani proofs (proof target 2 in docs/verification.md). Bounded: a 16-frame
-/// zone with blocks up to 2^4 frames, every possible order and frame.
+/// Kani proofs (proof target 2 in docs/verification.md). Bounded: an 8-frame
+/// zone with blocks up to 2^3 frames (so the top order covers the whole zone,
+/// and every order has a buddy), every possible range added, order and frame.
+/// A 16-frame zone gives the solver so many paths that one proof doesn't
+/// finish in 20 minutes; the property tests cover big zones.
 #[cfg(kani)]
 mod proofs {
     use super::*;
 
-    const N: usize = 16;
+    const N: usize = 8;
+    const MAX: usize = 3;
 
-    fn any_zone(meta: &mut [FrameMeta; N]) -> Buddy<'_, 4> {
-        let mut b: Buddy<4> = Buddy::new(meta, 0);
-        let start: u64 = kani::any();
-        let count: u64 = kani::any();
-        kani::assume(start < N as u64 && count <= N as u64);
-        b.add_range(start, count);
+    /// A zone where any subset of the frames is usable memory, added one
+    /// frame at a time (so every add's loops have fixed trip counts: the
+    /// solver then never has to unroll a loop with a symbolic bound). Any
+    /// subset covers every single range too, and every fragmentation.
+    fn any_zone(meta: &mut [FrameMeta; N]) -> Buddy<'_, MAX> {
+        let mut b: Buddy<MAX> = Buddy::new(meta, 0);
+        for f in 0..N as u64 {
+            if kani::any() {
+                b.add_range(f, 1);
+            }
+        }
         b
     }
 
     /// Two allocations never overlap, and each is aligned and inside the zone.
     #[kani::proof]
-    #[kani::unwind(20)]
+    #[kani::unwind(10)]
     fn allocations_never_overlap() {
         let mut meta = [FrameMeta::RESERVED; N];
         let mut b = any_zone(&mut meta);
         let o1: usize = kani::any();
         let o2: usize = kani::any();
-        kani::assume(o1 <= 4 && o2 <= 4);
+        kani::assume(o1 <= MAX && o2 <= MAX);
         if let (Some(a), Some(c)) = (b.alloc(o1), b.alloc(o2)) {
             let (ae, ce) = (a + (1 << o1), c + (1 << o2));
             assert!(ae <= c || ce <= a, "overlap");
@@ -872,17 +881,17 @@ mod proofs {
     /// Freeing anything other than a live block of the right order is refused
     /// and changes nothing; a correct free succeeds exactly once.
     #[kani::proof]
-    #[kani::unwind(20)]
+    #[kani::unwind(10)]
     fn frees_are_checked() {
         let mut meta = [FrameMeta::RESERVED; N];
         let mut b = any_zone(&mut meta);
         let o: usize = kani::any();
-        kani::assume(o <= 4);
+        kani::assume(o <= MAX);
         if let Some(a) = b.alloc(o) {
             let before = b.free_frames();
             let f: u64 = kani::any();
             let fo: usize = kani::any();
-            kani::assume(fo <= 4);
+            kani::assume(fo <= MAX);
             if f != a || fo != o {
                 assert!(b.free(f, fo).is_err());
                 assert!(b.free_frames() == before);
@@ -894,12 +903,12 @@ mod proofs {
 
     /// After any add + alloc + free sequence of length 2, invariants hold.
     #[kani::proof]
-    #[kani::unwind(20)]
+    #[kani::unwind(10)]
     fn invariants_hold() {
         let mut meta = [FrameMeta::RESERVED; N];
         let mut b = any_zone(&mut meta);
         let o: usize = kani::any();
-        kani::assume(o <= 4);
+        kani::assume(o <= MAX);
         let a = b.alloc(o);
         assert!(b.check().is_ok());
         if let Some(a) = a {
