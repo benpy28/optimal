@@ -600,8 +600,7 @@ only". On top of that:
   XChaCha20-Poly1305 uses that nonce directly. AES-GCM, with its 96-bit
   nonce, uses a per-mount subkey D(key, prefix) and the counter,
   zero-padded to 96 bits, as its nonce; the key is the per-file key for
-  class-B files and the volume or class key otherwise. XChaCha20-Poly1305
-  volumes derive the same subkey, used only for the copy-1 key (below).
+  class-B files and the volume or class key otherwise.
   A rewound volume gets
   a new prefix at its next mount, so its new writes never reuse a
   (key, nonce) pair; if the counter would wrap, the file system draws a new
@@ -611,8 +610,8 @@ only". On top of that:
   target 12c, gated by the file system track's done-when, in two parts
   ([verification.md](verification.md)): a Kani part (the prefix and
   counter are unique per mount, a new prefix is drawn before the counter
-  wraps, and no (copy-1 key, nonce) pair repeats across mounts, with a
-  seeded bug, a copy-1 key derived without the prefix, that it must
+  wraps, and no (copy-1 key, nonce) pair repeats, across mounts included,
+  with a seeded bug, copy 1 using a fixed or reused nonce, that it must
   catch), reported "B/T, probabilistic", and a written
   birthday-bound lemma in `axioms.md` resting on target 14 (two prefixes
   under one key collide with probability at most 2^-64 per volume
@@ -857,13 +856,14 @@ differ, so a drive that deduplicates or compresses can't collapse them:
 copy 1 is copy 0 XOR a mask, with no per-block trailer. On an encrypted
 volume the mask is the keystream of (k0, n) XOR that of (k1, n): n is the
 block's nonce (unique per write), k0 the key copy 0 is encrypted under,
-and k1 = D(per-mount subkey, `optimal-copy-1`) on both ciphers, the
-per-mount subkey being D(key, prefix); both streams start where copy 0's
+and k1 = D(k0, "OptimalFS v1 copy 1 block encryption key"); n carries the
+per-mount random prefix (and on AES-GCM k0 is itself the per-mount subkey),
+so (k1, n) is unique whenever (k0, n) is; both streams start where copy 0's
 ciphertext does (AES-GCM: counter J0+1; XChaCha20: block 1). So copy 1 is
 the plaintext encrypted under (k1, n), and no (key, nonce) pair repeats
 within or across mounts. On an unencrypted volume the mask is BLAKE3 XOF
-output keyed with D(volume UUID, `optimal-copy-1`) over the block's
-logical address and birth generation; that key is public, so there the
+output under a copy-1 key derived from the volume UUID, over the block's
+36-byte associated data (kind, logical address, birth generation, UUID); that key is public, so there the
 mask only stops deduplication and compression, not an attacker. A reader
 of copy 1 unmasks it to copy 0's bytes and checks the parent pointer's
 MAC; nothing read from copy 1 is used before that check passes. A failed
