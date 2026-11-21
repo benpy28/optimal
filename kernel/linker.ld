@@ -19,12 +19,15 @@ PHDRS
 SECTIONS
 {
     . = 0xffffffff80000000;
+    __kernel_start = .;
 
     .text : {
         *(.text .text.*)
     } :text
 
     . = ALIGN(CONSTANT(MAXPAGESIZE));
+    __text_end = .;
+    __rodata_start = .;
 
     .rodata : {
         *(.rodata .rodata.*)
@@ -55,6 +58,7 @@ SECTIONS
     .got : { *(.got .got.*) } :relro
     . = ALIGN(CONSTANT(MAXPAGESIZE));
     __relro_end = .;
+    __data_start = .;
 
     .data : {
         /* Limine scans for its requests between these markers. */
@@ -69,6 +73,9 @@ SECTIONS
         *(.bss .bss.*)
         *(COMMON)
     } :data
+
+    . = ALIGN(CONSTANT(MAXPAGESIZE));
+    __kernel_end = .;
 
     /DISCARD/ : {
         *(.eh_frame*)

@@ -6,9 +6,23 @@ use core::arch::asm;
 
 use crate::println;
 
-/// A higher-half address nothing is mapped at (far beyond any RAM in the
-/// direct map).
-const UNMAPPED: u64 = 0xffff_9fff_dead_0000;
+/// A higher-half address nothing is ever mapped at.
+const UNMAPPED: u64 = crate::mm::paging::NEVER_MAPPED;
+
+/// Recurse with a 1 KiB frame until the boot stack runs into its guard page.
+#[inline(never)]
+fn recurse(depth: u64) -> u64 {
+    let mut pad = [0u8; 1024];
+    pad[0] = depth as u8;
+    let pad = core::hint::black_box(pad);
+    if core::hint::black_box(depth) == u64::MAX {
+        return 0;
+    }
+    recurse(depth + 1) + u64::from(pad[(depth % 1024) as usize])
+}
+
+/// A pointer the relocations fill in, so it lives in the RELRO region.
+static RELRO_POINTER: &u64 = &0x5eed;
 
 pub fn run(name: &str) {
     println!("OPTIMAL: crashtest {name}");
@@ -59,6 +73,26 @@ pub fn run(name: &str) {
                 asm!("mov rsp, {}", "push rax", in(reg) UNMAPPED, options(noreturn));
             }
             "panic" => panic!("deliberate panic from crashtest"),
+            "stack_overflow" => {
+                core::hint::black_box(recurse(0));
+            }
+            "write_relro" => {
+                // RELRO: relocated pointers are read-only once the kernel's
+                // own page tables are on.
+                asm!("mov qword ptr [{}], 0", in(reg) &raw const RELRO_POINTER);
+            }
+            "write_text" => {
+                // Kernel code must not be writable.
+                asm!("mov byte ptr [{}], 0xc3", in(reg) recurse as *const () as u64);
+            }
+            "execute_direct_map" => {
+                // The direct map is no-execute: put a `ret` in a fresh frame
+                // and call it through the direct map.
+                let f = crate::mm::frames::alloc(0).expect("no frame for the test");
+                let p = crate::mm::frames::phys_to_virt(f) as *mut u8;
+                p.write_volatile(0xc3);
+                asm!("call {}", in(reg) p, clobber_abi("C"));
+            }
             other => println!("OPTIMAL: unknown crashtest {other}"),
         }
     }

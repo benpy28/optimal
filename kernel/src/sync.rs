@@ -43,11 +43,6 @@ impl<T> IrqSpinLock<T> {
             were_enabled,
         }
     }
-
-    /// Whether someone holds the lock right now (for diagnostics only).
-    pub fn is_locked(&self) -> bool {
-        self.locked.load(Ordering::Relaxed)
-    }
 }
 
 pub struct IrqSpinGuard<'a, T> {

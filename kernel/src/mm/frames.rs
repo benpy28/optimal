@@ -47,20 +47,14 @@ pub struct Summary {
 /// info is captured, while Limine's HHDM is still the direct map.
 pub fn init(info: &BootInfo) -> Summary {
     DIRECT_MAP.store(info.hhdm, Ordering::Relaxed);
-    let mut usable = [Range::EMPTY; MAX_MAP_ENTRIES];
-    let mut n = 0;
-    for e in info.memory_map().iter().filter(|e| e.kind == Kind::Usable) {
-        usable[n] = Range {
-            start: e.base,
-            end: e.base.saturating_add(e.len),
-        };
-        n += 1;
-    }
-    let usable = &usable[..n];
+    let mut usable_buf = [Range::EMPTY; MAX_MAP_ENTRIES];
+    let mut later_buf = [Range::EMPTY; MAX_MAP_ENTRIES];
+    let usable = ranges_of(info, Kind::Usable, &mut usable_buf);
+    let later = ranges_of(info, Kind::BootloaderReclaimable, &mut later_buf);
 
     let mut a = FRAMES.lock();
     assert!(a.count == 0, "frame allocator initialised twice");
-    let count = match zones::plan(usable, super::LOW_MEMORY_END, &mut a.zones) {
+    let count = match zones::plan(usable, later, super::LOW_MEMORY_END, &mut a.zones) {
         Ok(c) => c,
         Err(e) => panic!("can't plan physical memory zones: {e:?}"),
     };
@@ -100,6 +94,62 @@ pub fn init(info: &BootInfo) -> Summary {
     }
 }
 
+/// The map entries of one kind, as ranges.
+fn ranges_of<'a>(
+    info: &BootInfo,
+    kind: Kind,
+    buf: &'a mut [Range; MAX_MAP_ENTRIES],
+) -> &'a [Range] {
+    let mut n = 0;
+    for e in info.memory_map().iter().filter(|e| e.kind == kind) {
+        buf[n] = Range {
+            start: e.base,
+            end: e.base.saturating_add(e.len),
+        };
+        n += 1;
+    }
+    &buf[..n]
+}
+
+/// The direct map moved (the kernel switched to its own page tables): reach
+/// every zone's metadata through the new one.
+pub fn move_direct_map(new_offset: u64) {
+    let mut a = FRAMES.lock();
+    DIRECT_MAP.store(new_offset, Ordering::Relaxed);
+    for i in 0..a.count {
+        let z = a.zones[i];
+        let ptr = phys_to_virt(z.meta.start) as *mut FrameMeta;
+        // SAFETY: the same physical metadata, now seen through the new direct
+        // map; the old view is dropped by `relocate` and never used again.
+        let meta = unsafe { core::slice::from_raw_parts_mut(ptr, z.frames as usize) };
+        a.buddies[i].as_mut().unwrap().relocate(meta);
+    }
+}
+
+/// Hand the bootloader's reclaimable memory to the allocators. Call once,
+/// after `move_direct_map`, when nothing reads Limine's responses, page
+/// tables or stack any more. Returns the bytes added.
+pub fn reclaim_bootloader_memory(info: &BootInfo) -> u64 {
+    let mut later_buf = [Range::EMPTY; MAX_MAP_ENTRIES];
+    let later = ranges_of(info, Kind::BootloaderReclaimable, &mut later_buf);
+    let mut a = FRAMES.lock();
+    let count = a.count;
+    let zones_copy = a.zones;
+    let mut added = 0;
+    zones::later_ranges(later, super::LOW_MEMORY_END, |r| {
+        let i = zones::zone_of(&zones_copy[..count], r.start)
+            .expect("reclaimable memory outside every zone");
+        let frames = (r.end - r.start) / PAGE_SIZE;
+        let n = a.buddies[i]
+            .as_mut()
+            .unwrap()
+            .add_range(r.start / PAGE_SIZE, frames);
+        assert_eq!(n, frames, "reclaimable memory added twice");
+        added += n * PAGE_SIZE;
+    });
+    added
+}
+
 impl Allocator {
     fn free_frames(&self) -> u64 {
         self.buddies[..self.count]
@@ -122,6 +172,10 @@ pub fn alloc(order: usize) -> Option<u64> {
 
 /// Free a block from `alloc(order)`. A bad free (double free, wrong order,
 /// not a block start, unknown memory) is refused and changes nothing.
+#[cfg_attr(
+    not(feature = "ktest"),
+    expect(dead_code, reason = "first user outside tests is the heap (1b2d)")
+)]
 pub fn free(phys: u64, order: usize) -> Result<(), FreeError> {
     if !phys.is_multiple_of(PAGE_SIZE) {
         return Err(FreeError::NotAllocated);
@@ -132,11 +186,16 @@ pub fn free(phys: u64, order: usize) -> Result<(), FreeError> {
     a.buddies[i].as_mut().unwrap().free(phys / PAGE_SIZE, order)
 }
 
+#[cfg_attr(
+    not(feature = "ktest"),
+    expect(dead_code, reason = "first user outside tests is the heap (1b2d)")
+)]
 pub fn free_bytes() -> u64 {
     FRAMES.lock().free_frames() * PAGE_SIZE
 }
 
 /// Check every zone's invariants (tests and debugging).
+#[cfg(feature = "ktest")]
 pub fn check() -> Result<(), &'static str> {
     let a = FRAMES.lock();
     for b in &a.buddies[..a.count] {
@@ -146,6 +205,7 @@ pub fn check() -> Result<(), &'static str> {
 }
 
 /// The planned zones (tests and diagnostics).
+#[cfg(feature = "ktest")]
 pub fn zones() -> ([Zone; MAX_ZONES], usize) {
     let a = FRAMES.lock();
     (a.zones, a.count)

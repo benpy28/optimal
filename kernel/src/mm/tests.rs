@@ -11,11 +11,14 @@ use crate::mm::frames::{self, phys_to_virt};
 
 const MAGIC: u64 = 0x0b71_3a1f_5eed_f00d;
 
+/// Memory the allocator may hand out: usable, or the bootloader's, which
+/// is reclaimed once the kernel runs on its own page tables.
 fn usable(phys: u64) -> bool {
-    bootinfo::get()
-        .memory_map()
-        .iter()
-        .any(|e| e.kind == Kind::Usable && e.base <= phys && phys - e.base < e.len)
+    bootinfo::get().memory_map().iter().any(|e| {
+        matches!(e.kind, Kind::Usable | Kind::BootloaderReclaimable)
+            && e.base <= phys
+            && phys - e.base < e.len
+    })
 }
 
 fn in_metadata(phys: u64) -> bool {
