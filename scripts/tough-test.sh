@@ -30,7 +30,10 @@ REPEAT="${REPEAT:-1}"
 # Evidence (CI, 2026-11-21): with 64 vCPUs on a 4-core runner, KVM on the
 # Ubuntu 24.04 runners now and then stops the VM with "internal-error"
 # while the firmware (SeaBIOS or OVMF) is still setting up PCI, before any
-# bootloader runs; it has failed two attempts in a row once. That matches
+# bootloader runs; it has failed two attempts in a row once. It has also
+# stopped (run 44901087659) after Limine's menu but before the kernel's
+# first line, still on the firmware's page tables (CR3 0x7f801000, RIP
+# 0x7ecffc24, firmware code selector 0x38). That matches
 # a host-side race between vCPUs and firmware memory remapping, not
 # anything in this repository, so such failures get up to 3 attempts.
 PLATFORM_ATTEMPTS="${PLATFORM_ATTEMPTS:-3}"
@@ -92,17 +95,17 @@ scenario() {
                 fi
             fi
             [ "$ok" = yes ] && break
-            # A failure is only blamed on the platform (firmware or hypervisor)
-            # when it provably happened before our bootloader ran: no Limine
-            # or kernel output at all, and the VM died with a hypervisor
-            # internal error or the CPU never even reached 64-bit mode. Such a
+            # A failure is only blamed on the platform (firmware, hypervisor
+            # or the third-party bootloader) when it provably happened before
+            # our kernel ran: no kernel output at all, and the VM died with a
+            # hypervisor internal error or the CPU never reached 64-bit mode. Such a
             # run is retried, up to PLATFORM_ATTEMPTS attempts in all; if every
             # attempt fails the scenario fails. Our code never ran on a failed
             # attempt, so a retry can't hide a kernel bug: the kernel's tests
             # still have to pass in full on the attempt that boots.
             why=$(platform_failure "$log")
             if [ "$attempt" -lt "$PLATFORM_ATTEMPTS" ] && [ -n "$why" ]; then
-                echo "PLATFORM: $name run $run attempt $attempt: $why, before the bootloader ran; retrying"
+                echo "PLATFORM: $name run $run attempt $attempt: $why; retrying"
                 platform+=("$name-run$run attempt $attempt: $why")
                 mv "$log" "$log.platform-attempt$attempt"
                 continue
@@ -117,6 +120,10 @@ scenario() {
             fail=$((fail + 1))
             failed+=("$name-run$run")
             echo "FAIL: $name run $run ($((SECONDS - start))s)"
+            # The start (firmware and Limine) and the end (the hang report)
+            # say where it died.
+            head -n 25 "$log" 2>/dev/null
+            echo "[...]"
             tail -n 40 "$log" 2>/dev/null
         fi
     done
@@ -131,11 +138,16 @@ has_uefi() { [ -n "$OVMF" ]; }
 # provably so (see the comment in scenario).
 platform_failure() {
     local log="$1"
-    if grep -qiE "limine|optimal" "$log"; then
+    # Any line from our kernel means our code ran: never the platform's fault.
+    # (Limine's own menu prints the entry name "Optimal", so that word alone
+    # is not evidence; the kernel's first line is "Optimal kernel <version>".)
+    if grep -qE "Optimal kernel|OPTIMAL:|KERNEL PANIC|EXCEPTION|KTEST" "$log"; then
         return 0
     fi
+    local where="inside the firmware"
+    grep -q "Limine" "$log" && where="inside the firmware or Limine, before the kernel ran"
     if grep -q "VM status: paused (internal-error)" "$log"; then
-        echo "hypervisor internal error inside the firmware"
+        echo "hypervisor internal error $where"
     elif grep -q "^EFER=0000000000000000" "$log"; then
         echo "firmware crashed before entering 64-bit mode"
     fi
