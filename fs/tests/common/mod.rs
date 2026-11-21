@@ -611,6 +611,7 @@ pub fn fmt_opts(enc: bool) -> FormatOptions {
         passphrase: enc.then(|| b"correct horse".to_vec()),
         kdf: KdfParams::INSECURE_FAST_FOR_TESTS,
         quarantine_min_ns: 0,
+        meta_chunk_blocks: 0,
     }
 }
 

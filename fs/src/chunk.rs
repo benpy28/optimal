@@ -451,12 +451,15 @@ impl ChunkTable {
             let k = &mut self.node(io, level + 1, parent)?.kids_mut()[(idx % TABLE_FANOUT) as usize];
             k.free = (k.free as i64 + df) as u64;
             k.mapped = (k.mapped as i64 + dm) as u64;
-            if !was_dirty && k.ptr.addr != 0 {
-                self.pending_frees.push((k.ptr.addr, k.ptr.aux));
-            }
+            let mut old = None;
             if !was_dirty {
                 // Homeless until written; counts stay meaningful.
-                k.ptr = BlockPtr::NULL;
+                old = Some(core::mem::replace(&mut k.ptr, BlockPtr::NULL));
+            }
+            if let Some(o) = old
+                && o.addr != 0
+            {
+                self.pending_frees.push((o.addr, o.aux));
             }
             idx = parent;
         }

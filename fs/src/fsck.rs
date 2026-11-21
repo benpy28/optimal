@@ -16,7 +16,10 @@ use crate::fs::{
     Attr, Extent, FileKind, Filesystem, K_DIRENT, K_EXTENT, K_INLINE, K_INODE, ROOT_INO,
     decode_dirents,
 };
+use crate::chunk::{LOGICAL, is_logical};
 use crate::ptr::BlockPtr;
+use crate::chunk::Entry;
+use crate::superblock::Body;
 use crate::snapshot::{K_DEAD, K_SNAP, decode_dead, list_records};
 use crate::space::{BITS_PER_BMP, SB_RESERVED_BACK, SB_RESERVED_FRONT};
 use crate::tree::{Child, Key, TreeId};
@@ -33,6 +36,8 @@ pub struct Report {
     pub inodes: u64,
     pub snapshots: u64,
     pub data_blocks_verified: u64,
+    /// Metadata copies that fail verification (each is also an error).
+    pub bad_copies: u64,
 }
 
 impl Report {
@@ -49,12 +54,20 @@ enum Role {
     SpaceTable,
     Bitmap,
     FreeLog,
+    Root,
+    /// A metadata chunk's copy 0 or copy 1 run.
+    ChunkCopy,
+    /// A chunk-table block (either copy).
+    ChunkMap,
 }
 
 struct Ctx {
     rep: Report,
-    /// addr -> (role, birth, mac)
+    /// addr -> (role, birth, mac). Logical (metadata) and physical
+    /// addresses share the map; logical ones have bit 63 set.
     owners: BTreeMap<u64, (Role, u64, [u8; 16])>,
+    /// Every metadata block claimed, to check both copies.
+    metas: Vec<(BlockKind, BlockPtr)>,
     total: u64,
 }
 
@@ -64,8 +77,24 @@ impl Ctx {
             self.rep.errors.push(s);
         }
     }
+    /// Claims logical metadata block `p.addr` (checked against the chunk
+    /// table later) and remembers it for the copy check.
+    fn claim_meta(&mut self, kind: BlockKind, role: Role, p: &BlockPtr) {
+        if !is_logical(p.addr) {
+            self.err(format!("{role:?} pointer {} is not a logical address", p.addr));
+            return;
+        }
+        let fresh = !self.owners.contains_key(&p.addr);
+        self.claim(p.addr, 1, role, p.birth, p.mac);
+        if fresh {
+            self.metas.push((kind, *p));
+        }
+    }
+
     fn claim(&mut self, addr: u64, len: u64, role: Role, birth: u64, mac: [u8; 16]) {
-        if addr < SB_RESERVED_FRONT
+        if is_logical(addr) {
+            // Resolved through the chunk table in the logical pass.
+        } else if addr < SB_RESERVED_FRONT
             || addr
                 .checked_add(len)
                 .is_none_or(|e| e > self.total - SB_RESERVED_BACK)
@@ -100,6 +129,7 @@ pub fn check<D: BlockDevice>(fs: &mut Filesystem<D>, verify_data: bool) -> Resul
     let mut cx = Ctx {
         rep: Report::default(),
         owners: BTreeMap::new(),
+        metas: Vec::new(),
         total: fs.store.space.total_blocks(),
     };
     let body = fs.body.clone();
@@ -153,19 +183,29 @@ pub fn check<D: BlockDevice>(fs: &mut Filesystem<D>, verify_data: bool) -> Resul
     )?;
     check_meta(fs, &mut cx, &recs, &block_sets)?;
 
-    // Space map and free log.
+    // Space map, free log and root block.
     for (kind, p) in fs.store.space.all_pointers(&mut fs.store.io)? {
         let role = if kind == BlockKind::Bitmap {
             Role::Bitmap
         } else {
             Role::SpaceTable
         };
-        cx.claim(p.addr, 1, role, p.birth, p.mac);
+        cx.claim_meta(kind, role, &p);
     }
-    for a in fs.store.space.log_addrs().to_vec() {
-        cx.claim(a, 1, Role::FreeLog, 0, [0; 16]);
+    let log = fs.store.space.log_ptrs(&mut fs.store.io, body.free_log)?;
+    if log.iter().map(|p| p.addr).collect::<Vec<_>>() != fs.store.space.log_addrs() {
+        cx.err(String::from("free log chain differs from the loaded free log"));
     }
-    cx.rep.referenced_blocks = cx.owners.len() as u64 + SB_RESERVED_FRONT + SB_RESERVED_BACK;
+    for p in &log {
+        cx.claim_meta(BlockKind::FreeLog, Role::FreeLog, p);
+    }
+    cx.claim_meta(BlockKind::Root, Role::Root, &body.root_block);
+
+    check_chunks(fs, &mut cx, &body)?;
+
+    cx.rep.referenced_blocks = cx.owners.range(..LOGICAL).count() as u64
+        + SB_RESERVED_FRONT
+        + SB_RESERVED_BACK;
     let total = cx.total;
     let reserved = |b: u64| b < SB_RESERVED_FRONT || b >= total - SB_RESERVED_BACK;
     let mut mismatches = 0u64;
@@ -177,7 +217,8 @@ pub fn check<D: BlockDevice>(fs: &mut Filesystem<D>, verify_data: bool) -> Resul
     let reserved_list = [0, 1, total - 2, total - 1];
     let in_null: Vec<u64> = cx
         .owners
-        .keys()
+        .range(..LOGICAL)
+        .map(|(b, _)| b)
         .chain(reserved_list.iter())
         .copied()
         .filter(|b| !written_set.contains(&(b / BITS_PER_BMP)))
@@ -233,6 +274,104 @@ pub fn check<D: BlockDevice>(fs: &mut Filesystem<D>, verify_data: bool) -> Resul
     Ok(cx.rep)
 }
 
+/// The chunk table: every claimed logical block resolves, each chunk's
+/// used bits are exactly its claimed blocks, quarantined logical blocks
+/// are free and unclaimed, both copies of every metadata block verify,
+/// and the chunk runs and table blocks are claimed physically.
+fn check_chunks<D: BlockDevice>(fs: &mut Filesystem<D>, cx: &mut Ctx, body: &Body) -> Result<()> {
+    let chunks = fs.store.space.chunks.all_entries(&mut fs.store.io)?;
+    let mut mapped: BTreeMap<u64, Entry> = BTreeMap::new();
+    for (id, e) in chunks {
+        let len = e.len as u64;
+        cx.claim(e.p0, len, Role::ChunkCopy, body.generation, [0; 16]);
+        cx.claim(e.p1, len, Role::ChunkCopy, body.generation, [1; 16]);
+        for off in 0..len {
+            let l = fs.store.space.chunks.join(id, off);
+            let referenced = cx.owners.contains_key(&l);
+            if e.is_used(off) != referenced {
+                cx.err(format!(
+                    "logical block {l:#x} (chunk {id} slot {off}): chunk table says {} but it is {}",
+                    if e.is_used(off) { "used" } else { "free" },
+                    if referenced { "referenced" } else { "unreferenced" }
+                ));
+            }
+        }
+        mapped.insert(id, e);
+    }
+    let (free, count) = mapped.values().fold((0, 0), |(f, c), e| (f + e.free_slots(), c + 1));
+    if (free, count)
+        != (
+            fs.store.space.chunks.free_slots(),
+            fs.store.space.chunks.mapped_chunks(),
+        )
+    {
+        cx.err(format!("chunk table totals wrong: walked {free} free / {count} mapped"));
+    }
+    let logical: Vec<u64> = cx.owners.range(LOGICAL..).map(|(&l, _)| l).collect();
+    for l in logical {
+        let ok = fs
+            .store
+            .space
+            .chunks
+            .split(l)
+            .ok()
+            .and_then(|(id, off)| mapped.get(&id).map(|e| off < e.len as u64))
+            .unwrap_or(false);
+        if !ok {
+            cx.err(format!("logical block {l:#x} is referenced but not mapped"));
+        }
+    }
+    let mut q = fs.store.space.held_lranges();
+    q.extend(fs.store.space.freed_now_l.to_vec());
+    for (s, n) in q {
+        for l in s..s + n {
+            let used = fs
+                .store
+                .space
+                .chunks
+                .split(l)
+                .ok()
+                .and_then(|(id, off)| mapped.get(&id).map(|e| e.is_used(off)))
+                .unwrap_or(false);
+            if cx.owners.contains_key(&l) || used {
+                cx.err(format!("logical block {l:#x} is in the free log but in use"));
+            }
+        }
+    }
+    // Both copies of every metadata block.
+    let metas = core::mem::take(&mut cx.metas);
+    for (kind, p) in &metas {
+        let Ok((p0, p1)) = fs.store.space.chunks.resolve(&mut fs.store.io, p.addr) else {
+            continue;
+        };
+        let (ok0, ok1) = fs.store.io.verify_copies(*kind, p, p0, p1);
+        for (ok, c, at) in [(ok0, 0, p0), (ok1, 1, p1)] {
+            if !ok {
+                cx.rep.bad_copies += 1;
+                cx.err(format!("{kind:?} {:#x}: copy {c} (block {at}) fails verification", p.addr));
+            }
+        }
+    }
+    // Chunk-table blocks: claimed physically, both copies verified.
+    for (level, p) in fs.store.space.chunks.all_node_ptrs(&mut fs.store.io)? {
+        let kind = if level == 0 {
+            BlockKind::ChunkLeaf
+        } else {
+            BlockKind::ChunkTable
+        };
+        cx.claim(p.addr, 1, Role::ChunkMap, p.birth, p.mac);
+        cx.claim(p.aux, 1, Role::ChunkMap, p.birth, p.mac);
+        let (ok0, ok1) = fs.store.io.verify_copies(kind, &p, p.addr, p.aux);
+        for (ok, c, at) in [(ok0, 0, p.addr), (ok1, 1, p.aux)] {
+            if !ok {
+                cx.rep.bad_copies += 1;
+                cx.err(format!("{kind:?} {:#x}: copy {c} (block {at}) fails verification", p.addr));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Structural walk of one tree: verifies each node and key bounds, claims blocks.
 #[allow(clippy::too_many_arguments)]
 fn walk<D: BlockDevice>(
@@ -256,7 +395,7 @@ fn walk<D: BlockDevice>(
     } else {
         Role::MetaNode
     };
-    cx.claim(p.addr, 1, role, p.birth, p.mac);
+    cx.claim_meta(BlockKind::Node, role, p);
     blocks.insert(p.addr, 1);
     let node = match fs.store.read_node(tree, p) {
         Ok(n) => n,

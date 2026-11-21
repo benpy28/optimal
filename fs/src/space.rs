@@ -22,15 +22,16 @@
 //! acknowledged flushes it never performed). The free log records the
 //! quarantine, so it survives a remount.
 
+use crate::chunk::{ChunkTable, Entry, LOGICAL, is_logical};
 use crate::codec::{Reader, Writer};
 use crate::crypto::BlockKind;
 use crate::device::{BLOCK_SIZE, BlockDevice};
 use crate::error::{Error, Result};
-use crate::io::{Io, zero_block};
+use crate::io::{Block, Io, zero_block};
 use crate::ptr::{BlockPtr, PTR_LEN};
 use crate::rangeset::RangeSet;
 use alloc::boxed::Box;
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -74,7 +75,10 @@ struct Table {
 pub struct FreedBatch {
     pub generation: u64,
     pub time_ns: i64,
+    /// Physical blocks.
     pub set: RangeSet,
+    /// Logical metadata blocks (bit 63 set).
+    pub lset: RangeSet,
 }
 
 #[derive(Debug)]
@@ -98,6 +102,16 @@ pub struct Space {
     pending_table_frees: Vec<u64>,
     cursor: u64,
     pub quarantine_min_ns: i64,
+    /// Where each logical metadata chunk's two copies live.
+    pub chunks: ChunkTable,
+    /// Logical metadata blocks freed in the transaction being built.
+    pub freed_now_l: RangeSet,
+    /// Chunk the metadata allocator is filling.
+    meta_cursor: u64,
+    /// Chunks that may have become empty (checked for release at commit).
+    maybe_empty: BTreeSet<u64>,
+    /// Chunks to move at the start of the next commit.
+    pub relocations: Vec<u64>,
 }
 
 fn span(level: u32) -> u64 {
@@ -146,8 +160,13 @@ impl Space {
         self.blocks_in(level, idx) - reserved
     }
 
-    fn empty(total: u64, levels: u32, root_ptr: BlockPtr) -> Space {
+    fn empty(total: u64, levels: u32, root_ptr: BlockPtr, chunks: ChunkTable) -> Space {
         Space {
+            chunks,
+            freed_now_l: RangeSet::new(),
+            meta_cursor: 0,
+            maybe_empty: BTreeSet::new(),
+            relocations: Vec::new(),
             total,
             levels,
             root_ptr,
@@ -166,9 +185,10 @@ impl Space {
 
     /// A fresh map for mkfs: everything free except the superblock slots.
     /// Only the paths to the first and last bitmap are materialised.
-    pub fn format(total: u64) -> Result<Space> {
+    pub fn format(total: u64, chunk_shift: u32) -> Result<Space> {
         let levels = Self::levels_for(total)?;
-        let mut s = Self::empty(total, levels, BlockPtr::NULL);
+        let chunks = ChunkTable::format(total, chunk_shift);
+        let mut s = Self::empty(total, levels, BlockPtr::NULL, chunks);
         let root = s.fresh_table(levels, 0);
         s.tables.insert((levels, 0), root);
         s.free_total = s.fresh_free(levels, 0);
@@ -212,19 +232,37 @@ impl Space {
         self.bmps.get_mut(&i).unwrap().words[(bit / 64) as usize] |= 1 << (bit % 64);
     }
 
-    /// Opens the committed map. Tables and bitmaps load on demand.
+    /// Opens a committed commit's chunk table. The map itself is attached
+    /// with [`Space::attach`] once the root block (read through the chunk
+    /// table) has given its root and free log.
     pub fn open<D: BlockDevice>(
         io: &mut Io<D>,
         total: u64,
-        root: BlockPtr,
-        log: BlockPtr,
+        chunk_shift: u32,
+        chunk_root: BlockPtr,
+        chunk_depth: u32,
     ) -> Result<Space> {
         let levels = Self::levels_for(total)?;
+        let chunks = ChunkTable::open(io, total, chunk_shift, chunk_root, chunk_depth)?;
+        Ok(Self::empty(total, levels, BlockPtr::NULL, chunks))
+    }
+
+    /// Loads the committed map's root and free log. Tables and bitmaps
+    /// load on demand.
+    pub fn attach<D: BlockDevice>(
+        &mut self,
+        io: &mut Io<D>,
+        root: BlockPtr,
+        log: BlockPtr,
+    ) -> Result<()> {
+        let levels = self.levels;
+        let total = self.total;
         if root.aux != levels as u64 || root.is_null() {
             return Err(Error::Corrupt("space map depth", root.addr));
         }
-        let mut s = Self::empty(total, levels, root);
-        let rb = io.read_sealed(BlockKind::SpaceTable, &root)?;
+        self.root_ptr = root;
+        let s = self;
+        let rb = s.read_meta(io, BlockKind::SpaceTable, &root)?;
         let t = s.decode_table(&rb[..], levels, 0, root.addr)?;
         s.free_total = t.kids.iter().map(|k| k.aux).sum();
         s.tables.insert((levels, 0), t);
@@ -236,7 +274,7 @@ impl Space {
             if guard > 1 << 24 {
                 return Err(Error::Corrupt("free log loops", p.addr));
             }
-            let b = io.read_sealed(BlockKind::FreeLog, &p)?;
+            let b = s.read_meta(io, BlockKind::FreeLog, &p)?;
             let mut r = Reader::new(&b[..], "free log", p.addr);
             if r.u32()? != LOG_MAGIC {
                 return Err(r.err());
@@ -251,7 +289,17 @@ impl Space {
                 let len = r.u64()?;
                 let generation = r.u64()?;
                 let time_ns = r.i64()?;
-                let bad = len == 0 || start.checked_add(len).is_none_or(|e| e > total);
+                // Physical ranges lie in the device; logical ones (bit 63)
+                // stay logical.
+                let logical = is_logical(start);
+                let bad = len == 0
+                    || start.checked_add(len).is_none_or(|e| {
+                        if logical {
+                            e - 1 < LOGICAL
+                        } else {
+                            e > total
+                        }
+                    });
                 let batch = match s.held.iter_mut().find(|h| h.generation == generation) {
                     Some(h) => h,
                     None => {
@@ -259,20 +307,28 @@ impl Space {
                             generation,
                             time_ns,
                             set: RangeSet::new(),
+                            lset: RangeSet::new(),
                         });
                         s.held.back_mut().unwrap()
                     }
                 };
-                if bad || batch.time_ns != time_ns || !batch.set.insert(start, len) {
+                let set = if logical {
+                    &mut batch.lset
+                } else {
+                    &mut batch.set
+                };
+                if bad || batch.time_ns != time_ns || !set.insert(start, len) {
                     return Err(Error::Corrupt("bad free log entry", p.addr));
                 }
-                s.held_blocks += len;
+                if !logical {
+                    s.held_blocks += len;
+                }
             }
             s.log_addrs.push(p.addr);
             p = next;
         }
         s.held.make_contiguous().sort_by_key(|h| h.generation);
-        Ok(s)
+        Ok(())
     }
 
     fn decode_table(&self, b: &[u8], level: u32, idx: u64, at: u64) -> Result<Table> {
@@ -323,7 +379,7 @@ impl Space {
                 t.dirty = false;
                 t
             } else {
-                let b = io.read_sealed(BlockKind::SpaceTable, &p)?;
+                let b = self.read_meta(io, BlockKind::SpaceTable, &p)?;
                 let t = self.decode_table(&b[..], level, idx, p.addr)?;
                 let sum: u64 = t.kids.iter().map(|k| k.aux).sum();
                 if sum != p.aux {
@@ -347,7 +403,7 @@ impl Space {
             let words = if p.is_null() {
                 Box::new([0u64; WORDS])
             } else {
-                let b = io.read_sealed(BlockKind::Bitmap, &p)?;
+                let b = self.read_meta(io, BlockKind::Bitmap, &p)?;
                 let mut words = Box::new([0u64; WORDS]);
                 for (w, c) in words.iter_mut().zip(b.as_chunks::<8>().0) {
                     *w = u64::from_le_bytes(*c);
@@ -471,7 +527,12 @@ impl Space {
     }
 
     /// Frees `[start, start+len)`. Every block must currently be used.
+    /// Logical (metadata) addresses free chunk slots; physical ones free
+    /// bitmap bits. Both are quarantined.
     pub fn free<D: BlockDevice>(&mut self, io: &mut Io<D>, start: u64, len: u64) -> Result<()> {
+        if is_logical(start) {
+            return self.free_meta(io, start, len);
+        }
         if len == 0
             || start < SB_RESERVED_FRONT
             || start
@@ -487,6 +548,299 @@ impl Space {
         let ok = self.freed_now.insert(start, len);
         debug_assert!(ok, "freed range already in freed_now");
         Ok(())
+    }
+
+    /// Frees logical metadata blocks `[start, start+len)` (may span chunks).
+    fn free_meta<D: BlockDevice>(&mut self, io: &mut Io<D>, start: u64, len: u64) -> Result<()> {
+        if len == 0 || start.checked_add(len).is_none() {
+            return Err(Error::Corrupt("free of a bad logical range", start));
+        }
+        let mut l = start;
+        while l < start + len {
+            let (id, off) = self.chunks.split(l)?;
+            let mut e = self.chunks.entry(io, id)?;
+            let n = (e.len as u64).saturating_sub(off).min(start + len - l);
+            if n == 0 {
+                return Err(Error::Corrupt("free of an unmapped logical block", l));
+            }
+            let bits = Entry::mask(n as u32) << off;
+            if e.used & bits != bits {
+                return Err(Error::Corrupt("double free", l));
+            }
+            e.used &= !bits;
+            self.chunks.set_entry(io, id, e)?;
+            if e.used == 0 {
+                self.maybe_empty.insert(id);
+            }
+            l += n;
+        }
+        let ok = self.freed_now_l.insert(start, len);
+        debug_assert!(ok, "freed logical range already in freed_now_l");
+        Ok(())
+    }
+
+    /// Whether logical block `l` is quarantined (freed by this transaction
+    /// or a recent commit).
+    fn lquarantined(&self, l: u64) -> bool {
+        core::iter::once(&self.freed_now_l)
+            .chain(self.held.iter().map(|h| &h.lset))
+            .any(|set| set.overlaps(l, 1))
+    }
+
+    /// Reads a metadata block through the chunk table (copy 0, falling back
+    /// to copy 1).
+    pub fn read_meta<D: BlockDevice>(
+        &mut self,
+        io: &mut Io<D>,
+        kind: BlockKind,
+        p: &BlockPtr,
+    ) -> Result<Block> {
+        let (p0, p1) = self.chunks.resolve(io, p.addr)?;
+        io.read_dup(kind, p, p0, p1)
+    }
+
+    /// Seals metadata block `l` and queues both copies.
+    pub fn write_meta<D: BlockDevice>(
+        &mut self,
+        io: &mut Io<D>,
+        kind: BlockKind,
+        l: u64,
+        birth: u64,
+        data: Block,
+        aux: u64,
+    ) -> Result<BlockPtr> {
+        let (p0, p1) = self.chunks.resolve(io, l)?;
+        Ok(io.write_dup(kind, l, p0, p1, birth, data, aux))
+    }
+
+    /// Allocates `n` logical metadata blocks, as runs of consecutive
+    /// addresses (each run inside one chunk).
+    pub fn alloc_meta<D: BlockDevice>(&mut self, io: &mut Io<D>, n: u64) -> Result<Vec<(u64, u64)>> {
+        let mut out = Vec::new();
+        let mut left = n;
+        while left > 0 {
+            let (l, k) = self.alloc_meta_run(io, left)?;
+            out.push((l, k));
+            left -= k;
+        }
+        Ok(out)
+    }
+
+    fn alloc_meta_run<D: BlockDevice>(&mut self, io: &mut Io<D>, want: u64) -> Result<(u64, u64)> {
+        // Fill existing chunks first (from the one being filled), so
+        // metadata stays compact; map a new chunk only when none has room.
+        for pass in 0..2 {
+            let mut from = if pass == 0 { self.meta_cursor } else { 0 };
+            while let Some(id) = self.chunks.find_free(io, from)? {
+                if let Some(r) = self.take_slots(io, id, want)? {
+                    return Ok(r);
+                }
+                from = id + 1;
+            }
+        }
+        let id = self.new_chunk(io)?;
+        self.take_slots(io, id, want)?
+            .ok_or(Error::Corrupt("new chunk has no free slot", id))
+    }
+
+    /// Takes the first run (up to `want`) of free, unquarantined slots of
+    /// chunk `id`, if it has one.
+    fn take_slots<D: BlockDevice>(
+        &mut self,
+        io: &mut Io<D>,
+        id: u64,
+        want: u64,
+    ) -> Result<Option<(u64, u64)>> {
+        let mut e = self.chunks.entry(io, id)?;
+        let len = e.len as u64;
+        let mut off = 0;
+        while off < len {
+            if e.is_used(off) || self.lquarantined(self.chunks.join(id, off)) {
+                off += 1;
+                continue;
+            }
+            let mut end = off + 1;
+            while end < len
+                && end - off < want
+                && !e.is_used(end)
+                && !self.lquarantined(self.chunks.join(id, end))
+            {
+                end += 1;
+            }
+            e.used |= Entry::mask((end - off) as u32) << off;
+            self.chunks.set_entry(io, id, e)?;
+            self.meta_cursor = id;
+            return Ok(Some((self.chunks.join(id, off), end - off)));
+        }
+        Ok(None)
+    }
+
+    /// Maps the lowest free chunk id to two fresh physical runs.
+    fn new_chunk<D: BlockDevice>(&mut self, io: &mut Io<D>) -> Result<u64> {
+        let id = loop {
+            match self.chunks.find_unmapped(io)? {
+                Some(id) => break id,
+                None => self.chunks.grow()?,
+            }
+        };
+        let (p0, p1, len) = self.alloc_chunk_runs(io, self.chunks.chunk_blocks(), true)?;
+        self.chunks.set_entry(
+            io,
+            id,
+            Entry {
+                p0,
+                p1,
+                used: 0,
+                len: len as u32,
+            },
+        )?;
+        Ok(id)
+    }
+
+    /// Allocates two runs of `len` blocks for a chunk's copies, copy 1 in
+    /// the other half of the device where possible. With `shrink`, a
+    /// fragmented device gets shorter runs (down to one block) rather
+    /// than failing while any two blocks are free.
+    fn alloc_chunk_runs<D: BlockDevice>(
+        &mut self,
+        io: &mut Io<D>,
+        len: u64,
+        shrink: bool,
+    ) -> Result<(u64, u64, u64)> {
+        let mut len = len;
+        loop {
+            if let Some(p0) = self.find_exact(io, self.cursor, len)? {
+                self.set_range(io, p0, len, true)?;
+                let far = self.far_from(p0);
+                if let Some(p1) = self.find_exact(io, far, len)? {
+                    self.set_range(io, p1, len, true)?;
+                    self.cursor = if p0 + len >= self.total - SB_RESERVED_BACK {
+                        SB_RESERVED_FRONT
+                    } else {
+                        p0 + len
+                    };
+                    return Ok((p0, p1, len));
+                }
+                // Never written, so it can be handed back at once.
+                self.set_range(io, p0, len, false)?;
+            }
+            if !shrink || len == 1 {
+                return Err(Error::NoSpace);
+            }
+            len /= 2;
+        }
+    }
+
+    /// Two single blocks for a chunk-table node's copies.
+    fn alloc_pair<D: BlockDevice>(&mut self, io: &mut Io<D>) -> Result<(u64, u64)> {
+        let (p0, p1, _) = self.alloc_chunk_runs(io, 1, false)?;
+        Ok((p0, p1))
+    }
+
+    /// The block half a device away from `b` (wrapping inside the usable area).
+    fn far_from(&self, b: u64) -> u64 {
+        let usable = self.total - SB_RESERVED_FRONT - SB_RESERVED_BACK;
+        SB_RESERVED_FRONT + (b - SB_RESERVED_FRONT + usable / 2) % usable
+    }
+
+    /// The first run of exactly `len` free, unquarantined blocks at or
+    /// after `from` (wrapping around once). Does not mark it.
+    fn find_exact<D: BlockDevice>(
+        &mut self,
+        io: &mut Io<D>,
+        from: u64,
+        len: u64,
+    ) -> Result<Option<u64>> {
+        if self.allocatable_blocks() < len {
+            return Ok(None);
+        }
+        for (lo, hi) in [(from, self.total), (SB_RESERVED_FRONT, from)] {
+            let mut b = lo;
+            while b < hi {
+                let Some(i) = self.next_free_bmp(io, b / BITS_PER_BMP)? else {
+                    break;
+                };
+                let end = ((i + 1) * BITS_PER_BMP).min(hi);
+                let mut x = b.max(i * BITS_PER_BMP);
+                while x < end {
+                    match self.find_in(io, i, x, len)? {
+                        Some((s, l)) if s < end => {
+                            if l == len && s + len <= hi {
+                                return Ok(Some(s));
+                            }
+                            x = s + l;
+                        }
+                        _ => break,
+                    }
+                }
+                b = (i + 1) * BITS_PER_BMP;
+            }
+        }
+        Ok(None)
+    }
+
+    /// Releases chunks that are empty and have no quarantined slot (so no
+    /// commit in the window still reads them through this mapping). Their
+    /// physical runs go through the normal quarantine.
+    fn release_empty_chunks<D: BlockDevice>(&mut self, io: &mut Io<D>) -> Result<()> {
+        for id in core::mem::take(&mut self.maybe_empty) {
+            let e = self.chunks.entry(io, id)?;
+            if !e.mapped() || e.used != 0 {
+                continue;
+            }
+            let first = self.chunks.join(id, 0);
+            let held = core::iter::once(&self.freed_now_l)
+                .chain(self.held.iter().map(|h| &h.lset))
+                .any(|set| set.overlaps(first, e.len as u64));
+            if held || id == self.meta_cursor {
+                // Look again once its quarantine ends (see `committed`).
+                if id != self.meta_cursor {
+                    self.maybe_empty.insert(id);
+                }
+                continue;
+            }
+            self.chunks.set_entry(io, id, Entry::default())?;
+            self.free(io, e.p0, e.len as u64)?;
+            self.free(io, e.p1, e.len as u64)?;
+        }
+        Ok(())
+    }
+
+    /// Moves chunk `id` to fresh physical runs: its used blocks are copied
+    /// byte for byte (sealed bytes don't depend on where they sit), the
+    /// entry is changed, and the old runs are freed into quarantine, so
+    /// commits that still map the chunk the old way read it intact.
+    /// Must run before anything else is queued in the transaction.
+    pub fn relocate_chunk<D: BlockDevice>(&mut self, io: &mut Io<D>, id: u64) -> Result<()> {
+        let e = self.chunks.entry(io, id)?;
+        if !e.mapped() {
+            return Err(Error::Invalid("chunk is not mapped"));
+        }
+        let len = e.len as u64;
+        // Read everything first, so a failed read changes nothing.
+        let mut copies = Vec::new();
+        for off in (0..len).filter(|&o| e.is_used(o)) {
+            for p in [e.p0, e.p1] {
+                let mut b = zero_block();
+                io.read_raw(p + off, &mut b[..])?;
+                copies.push((off, p == e.p0, b));
+            }
+        }
+        let (q0, q1, _) = self.alloc_chunk_runs(io, len, false)?;
+        for (off, first, b) in copies {
+            io.queue(if first { q0 } else { q1 } + off, b);
+        }
+        self.chunks.set_entry(
+            io,
+            id,
+            Entry {
+                p0: q0,
+                p1: q1,
+                ..e
+            },
+        )?;
+        self.free(io, e.p0, len)?;
+        self.free(io, e.p1, len)
     }
 
     /// End of the quarantined range starting exactly at `b`, if any.
@@ -603,39 +957,26 @@ impl Space {
         Ok(None)
     }
 
-    /// Allocates exactly `n` blocks, possibly as several runs.
-    pub fn alloc_many<D: BlockDevice>(
-        &mut self,
-        io: &mut Io<D>,
-        n: u64,
-    ) -> Result<Vec<(u64, u64)>> {
-        let mut out = Vec::new();
-        let mut left = n;
-        while left > 0 {
-            let (s, l) = self.alloc_run(io, left)?;
-            out.push((s, l));
-            left -= l;
-        }
-        Ok(out)
-    }
-
-    /// Writes the space map and free log for commit `generation` into the
-    /// write batch. Returns the new (space root, free log head) pointers.
+    /// Writes the space map, the chunk table and the free log for commit
+    /// `generation` into the write batch. Returns the new (space root, free
+    /// log head, chunk table root) pointers.
     ///
-    /// Allocating new homes for the map's own blocks changes the map, so this
-    /// loops until nothing new needs a home. It converges because each round
-    /// only relocates blocks that were clean in the previous round.
+    /// Allocating new homes for these blocks changes the map and the chunk
+    /// table, so this loops until nothing new needs a home. It converges
+    /// because each block gets a home at most once per commit.
     pub fn write<D: BlockDevice>(
         &mut self,
         io: &mut Io<D>,
         generation: u64,
         now_ns: i64,
-    ) -> Result<(BlockPtr, BlockPtr)> {
+    ) -> Result<(BlockPtr, BlockPtr, BlockPtr)> {
+        self.release_empty_chunks(io)?;
         for a in core::mem::take(&mut self.log_addrs) {
             self.free(io, a, 1)?;
         }
         let mut bmp_addr: BTreeMap<u64, u64> = BTreeMap::new();
         let mut table_addr: BTreeMap<(u32, u64), u64> = BTreeMap::new();
+        let mut chunk_homes: BTreeMap<(u32, u64), (u64, u64)> = BTreeMap::new();
         let mut log_blocks: Vec<u64> = Vec::new();
         loop {
             let mut changed = false;
@@ -643,10 +984,20 @@ impl Space {
                 self.free(io, a, 1)?;
                 changed = true;
             }
+            for (a, b) in core::mem::take(&mut self.chunks.pending_frees) {
+                self.free(io, a, 1)?;
+                self.free(io, b, 1)?;
+                changed = true;
+            }
             let entries = self.freed_now.range_count()
-                + self.held.iter().map(|h| h.set.range_count()).sum::<usize>();
+                + self.freed_now_l.range_count()
+                + self
+                    .held
+                    .iter()
+                    .map(|h| h.set.range_count() + h.lset.range_count())
+                    .sum::<usize>();
             while log_blocks.len() < entries.div_ceil(LOG_PER_BLOCK) {
-                log_blocks.push(self.alloc_run(io, 1)?.0);
+                log_blocks.push(self.alloc_meta(io, 1)?[0].0);
                 changed = true;
             }
             let dirty: Vec<u64> = self
@@ -657,7 +1008,7 @@ impl Space {
                 .collect();
             for i in dirty {
                 bmp_addr.insert(i, u64::MAX);
-                let a = self.alloc_run(io, 1)?.0;
+                let a = self.alloc_meta(io, 1)?[0].0;
                 bmp_addr.insert(i, a);
                 changed = true;
             }
@@ -669,9 +1020,16 @@ impl Space {
                 .collect();
             for k in dirty {
                 table_addr.insert(k, u64::MAX);
-                let a = self.alloc_run(io, 1)?.0;
+                let a = self.alloc_meta(io, 1)?[0].0;
                 table_addr.insert(k, a);
                 changed = true;
+            }
+            for k in self.chunks.dirty_nodes() {
+                if !chunk_homes.contains_key(&k) {
+                    let pair = self.alloc_pair(io)?;
+                    chunk_homes.insert(k, pair);
+                    changed = true;
+                }
             }
             if !changed {
                 break;
@@ -691,7 +1049,7 @@ impl Space {
                 *c = w.to_le_bytes();
             }
             let free = self.bmp_ptr(io, i)?.aux;
-            let p = io.write_sealed(BlockKind::Bitmap, a, generation, b, free);
+            let p = self.write_meta(io, BlockKind::Bitmap, a, generation, b, free)?;
             self.table(io, 1, i / FANOUT)?.kids[(i % FANOUT) as usize] = p;
             self.bmps.get_mut(&i).unwrap().dirty = false;
         }
@@ -716,11 +1074,12 @@ impl Space {
                 k.encode(&mut w);
             }
             if level == self.levels {
+                let levels = self.levels as u64;
                 self.root_ptr =
-                    io.write_sealed(BlockKind::SpaceTable, a, generation, b, self.levels as u64);
+                    self.write_meta(io, BlockKind::SpaceTable, a, generation, b, levels)?;
                 debug_assert_eq!(sum, self.free_total);
             } else {
-                let p = io.write_sealed(BlockKind::SpaceTable, a, generation, b, sum);
+                let p = self.write_meta(io, BlockKind::SpaceTable, a, generation, b, sum)?;
                 self.tables
                     .get_mut(&(level + 1, idx / FANOUT))
                     .unwrap()
@@ -732,13 +1091,13 @@ impl Space {
         // Free log, written back to front so each block can point at the next.
         let mut entries: Vec<(u64, u64, u64, i64)> = Vec::new();
         for h in &self.held {
-            entries.extend(h.set.ranges().map(|(s, l)| (s, l, h.generation, h.time_ns)));
+            for set in [&h.set, &h.lset] {
+                entries.extend(set.ranges().map(|(s, l)| (s, l, h.generation, h.time_ns)));
+            }
         }
-        entries.extend(
-            self.freed_now
-                .ranges()
-                .map(|(s, l)| (s, l, generation, now_ns)),
-        );
+        for set in [&self.freed_now, &self.freed_now_l] {
+            entries.extend(set.ranges().map(|(s, l)| (s, l, generation, now_ns)));
+        }
         let mut next = BlockPtr::NULL;
         for (k, &a) in log_blocks.iter().enumerate().rev() {
             let chunk = entries.chunks(LOG_PER_BLOCK).nth(k).unwrap_or(&[]);
@@ -753,10 +1112,14 @@ impl Space {
                 w.u64(g);
                 w.i64(t);
             }
-            next = io.write_sealed(BlockKind::FreeLog, a, generation, b, 0);
+            next = self.write_meta(io, BlockKind::FreeLog, a, generation, b, 0)?;
         }
         self.log_addrs = log_blocks;
-        Ok((self.root_ptr, next))
+        // The chunk table last: everything above resolved through it, and
+        // nothing after this changes an entry.
+        let chunk_root = self.chunks.write(io, generation, &chunk_homes)?;
+        debug_assert!(self.chunks.dirty_nodes().is_empty());
+        Ok((self.root_ptr, next, chunk_root))
     }
 
     /// Called once commit `generation` is durable. This commit's frees join
@@ -764,12 +1127,14 @@ impl Space {
     /// [`QUARANTINE_COMMITS`] commits and `quarantine_min_ns` old leave it.
     pub fn committed(&mut self, generation: u64, now_ns: i64) {
         let set = core::mem::take(&mut self.freed_now);
+        let lset = core::mem::take(&mut self.freed_now_l);
         self.held_blocks += set.len();
-        if set.len() > 0 {
+        if set.len() > 0 || lset.len() > 0 {
             self.held.push_back(FreedBatch {
                 generation,
                 time_ns: now_ns,
                 set,
+                lset,
             });
         }
         // A clock that went backwards proves nothing about elapsed time:
@@ -784,6 +1149,14 @@ impl Space {
             let long_enough = now_ns - h.time_ns >= self.quarantine_min_ns;
             if old_enough && long_enough {
                 self.held_blocks -= h.set.len();
+                // Chunks whose last slots leave quarantine may now be released.
+                for (l, n) in h.lset.ranges() {
+                    if let (Ok((a, _)), Ok((b, _))) =
+                        (self.chunks.split(l), self.chunks.split(l + n - 1))
+                    {
+                        self.maybe_empty.extend(a..=b);
+                    }
+                }
                 self.held.pop_front();
             } else {
                 break;
@@ -793,6 +1166,7 @@ impl Space {
     }
 
     pub(crate) fn evict_clean(&mut self) {
+        self.chunks.evict_clean();
         if self.bmps.len() > CLEAN_CACHE {
             let clean: Vec<u64> = self
                 .bmps
@@ -923,5 +1297,27 @@ impl Space {
     /// All quarantined blocks from earlier commits (for fsck).
     pub fn held_ranges(&self) -> Vec<(u64, u64)> {
         self.held.iter().flat_map(|h| h.set.to_vec()).collect()
+    }
+
+    /// The pointers of every block of the free log starting at `head`.
+    pub fn log_ptrs<D: BlockDevice>(&mut self, io: &mut Io<D>, head: BlockPtr) -> Result<Vec<BlockPtr>> {
+        let mut out = Vec::new();
+        let mut p = head;
+        while !p.is_null() {
+            if out.len() > 1 << 24 {
+                return Err(Error::Corrupt("free log loops", p.addr));
+            }
+            out.push(p);
+            let b = self.read_meta(io, BlockKind::FreeLog, &p)?;
+            let mut r = Reader::new(&b[..], "free log", p.addr);
+            r.skip(8)?;
+            p = BlockPtr::decode(&mut r)?;
+        }
+        Ok(out)
+    }
+
+    /// All quarantined logical blocks from earlier commits (for fsck).
+    pub fn held_lranges(&self) -> Vec<(u64, u64)> {
+        self.held.iter().flat_map(|h| h.lset.to_vec()).collect()
     }
 }

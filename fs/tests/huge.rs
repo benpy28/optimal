@@ -9,6 +9,7 @@ fn opts() -> FormatOptions {
         passphrase: None,
         kdf: KdfParams::INSECURE_FAST_FOR_TESTS,
         quarantine_min_ns: 0,
+        meta_chunk_blocks: 0,
     }
 }
 

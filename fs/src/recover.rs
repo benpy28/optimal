@@ -27,6 +27,11 @@ pub struct RecoveryStats {
     pub nodes: u64,
     pub data_blocks: u64,
     pub space_blocks: u64,
+    /// Chunk-table blocks read (both copies each).
+    pub chunk_blocks: u64,
+    /// Metadata copies that failed while the other copy was good; each is
+    /// rewritten at the next commit (unless mounted read-only).
+    pub bad_copies: u64,
     /// Files with a recent extent that failed to verify: (inode, extent's
     /// first block). Only filled when no candidate commit verified fully
     /// and mount settled for the newest one whose metadata is whole. Reads
@@ -88,7 +93,15 @@ pub(crate) fn verify_since<D: BlockDevice>(
         }
     }
     st.space_blocks = fs.store.space.verify_since(&mut fs.store.io, min_birth)?;
-    // The free log is read in full by every mount already.
+    st.chunk_blocks = fs
+        .store
+        .space
+        .chunks
+        .verify_since(&mut fs.store.io, min_birth)?;
+    // The free log and the root block are read (both copies) by every
+    // unclean mount already, in `open_commit`.
     let _ = BlockKind::FreeLog;
+    // Counted since this mount attempt began (root block and tables too).
+    st.bad_copies = fs.store.io.stats.bad_copies;
     Ok(st)
 }

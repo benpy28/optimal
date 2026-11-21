@@ -13,6 +13,7 @@
 
 extern crate alloc;
 
+pub mod chunk;
 mod codec;
 pub mod crypto;
 pub mod device;
@@ -39,8 +40,9 @@ pub use device::FileDevice;
 pub use device::{BLOCK_SIZE, BlockDevice, IoError, MemDevice};
 pub use error::{Error, Result};
 pub use fs::{
-    Attr, Clock, DirEntry, FileKind, Filesystem, FormatOptions, MountOptions, ROOT_INO, SetAttr,
+    auto_chunk_blocks, Attr, Clock, DirEntry, FileKind, Filesystem, FormatOptions, MountOptions, ROOT_INO, SetAttr,
     StatFs, ZeroClock,
 };
+pub use io::IoStats;
 pub use recover::RecoveryStats;
 pub use snapshot::SnapshotInfo;
