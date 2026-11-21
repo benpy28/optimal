@@ -6,12 +6,17 @@
 //! opposite ends of the device. Mount picks the newest copy that verifies.
 //!
 //! Layout (4096 bytes):
-//! - `0..512` header, in the clear: identity, geometry, cipher suite, KDF
-//!   parameters and key slots (needed before any key is known).
-//! - `512..536` body nonce, `536..552` body MAC.
-//! - `552..4064` body: the commit's root pointers and counters. Sealed as a
-//!   block of kind `Superblock` (encrypted on encrypted volumes), with the
-//!   header's BLAKE3 hash inside it, so the header is authenticated too.
+//! - `0..512` header, in the clear: identity, geometry, cipher suite,
+//!   feature bits, KDF parameters and key slots (needed before any key is
+//!   known). Identical in every slot and every commit; it changes only when
+//!   a key slot does. Fields end at 424; 424..512 is reserved, zero.
+//! - `512..528` trailer, in the clear: slot number (u32), zero (u32) and
+//!   generation (u64). Authenticated as the body's associated data.
+//! - `528..552` body nonce, `552..568` body MAC.
+//! - `568..4064` body: the commit's root pointers, counters and history
+//!   ring. Sealed as a block of kind `Superblock` (encrypted on encrypted
+//!   volumes), with the header's BLAKE3 hash inside it, so the header is
+//!   authenticated too.
 //! - `4064..4096` BLAKE3 of bytes `0..4064`, unkeyed: detects torn or
 //!   garbage copies before any key is tried.
 
@@ -28,7 +33,13 @@ use alloc::vec::Vec;
 pub const MAGIC: [u8; 8] = *b"OPTMLFS\x01";
 pub const VERSION: u32 = 1;
 pub const HEADER_LEN: usize = 512;
-const BODY_OFF: usize = 552;
+/// Per-slot cleartext trailer: slot number and generation (authenticated
+/// as the body's associated data). Kept out of the header so the header
+/// bytes are identical in every slot and every commit.
+const TRAILER_OFF: usize = HEADER_LEN;
+const NONCE_OFF: usize = TRAILER_OFF + 16;
+const MAC_OFF: usize = NONCE_OFF + NONCE_LEN;
+const BODY_OFF: usize = MAC_OFF + MAC_LEN;
 const SUM_OFF: usize = BLOCK_SIZE - 32;
 const BODY_LEN: usize = SUM_OFF - BODY_OFF;
 pub const KEYSLOTS: usize = 4;
@@ -49,6 +60,13 @@ pub struct Header {
     pub uuid: [u8; 16],
     pub total_blocks: u64,
     pub suite: u8,
+    /// Feature bits: unknown compatible ones are ignored, unknown
+    /// read-only-compatible ones allow only read-only mounts, and unknown
+    /// incompatible ones refuse the mount. Version 1 defines none.
+    pub compat: u32,
+    pub ro_compat: u32,
+    pub incompat: u32,
+    /// Not part of the header bytes: from the slot's trailer.
     pub generation: u64,
     pub slot: u32,
     pub kdf: KdfParams,
@@ -91,8 +109,11 @@ pub struct Body {
 
 /// The volume was unmounted cleanly at this commit.
 pub const FLAG_CLEAN: u64 = 1;
-/// Commits recorded in each superblock's history ring (K - 1).
-pub const HISTORY: usize = 7;
+/// Commits recorded in each superblock's history ring: K, so the newest
+/// commit that landed always lists the last commit before a lying drive's
+/// drop point, even if every later superblock write landed and nothing
+/// else did. Each entry ends up in up to K bodies, so in all four slots.
+pub const HISTORY: usize = 8;
 
 pub fn slot_addr(slot: u32, total: u64) -> u64 {
     match slot {
@@ -112,14 +133,15 @@ impl Header {
     fn encode(&self, w: &mut Writer) {
         w.bytes(&MAGIC);
         w.u32(VERSION);
-        w.u32(0); // incompatible feature flags: none defined
+        w.u32(self.incompat);
         w.bytes(&self.uuid);
         w.u64(self.total_blocks);
         w.u32(BLOCK_SIZE as u32);
         w.u8(self.suite);
         w.zeros(3);
-        w.u64(self.generation);
-        w.u32(self.slot);
+        w.u32(self.compat);
+        w.u32(self.ro_compat);
+        w.zeros(4);
         w.u32(self.kdf.mem_kib);
         w.u32(self.kdf.iterations);
         w.u32(self.kdf.lanes);
@@ -141,7 +163,8 @@ impl Header {
         if r.u32()? != VERSION {
             return Err(Error::Unsupported("superblock version"));
         }
-        if r.u32()? != 0 {
+        let incompat = r.u32()?;
+        if incompat != 0 {
             return Err(Error::Unsupported("incompatible feature flags"));
         }
         let uuid = r.array()?;
@@ -154,8 +177,11 @@ impl Header {
             return Err(Error::Unsupported("cipher suite"));
         }
         r.skip(3)?;
-        let generation = r.u64()?;
-        let slot = r.u32()?;
+        let compat = r.u32()?;
+        let ro_compat = r.u32()?;
+        if r.u32()? != 0 {
+            return Err(r.err());
+        }
         let kdf = KdfParams {
             mem_kib: r.u32()?,
             iterations: r.u32()?,
@@ -180,8 +206,11 @@ impl Header {
             uuid,
             total_blocks,
             suite,
-            generation,
-            slot,
+            compat,
+            ro_compat,
+            incompat,
+            generation: 0,
+            slot: 0,
             kdf,
             salt,
             keyslots,
@@ -349,6 +378,12 @@ pub fn encode(header: &Header, body: &Body, slot: u32, sealer: &mut Sealer) -> c
         let mut w = Writer::new(&mut b[..HEADER_LEN]);
         h.encode(&mut w);
     }
+    {
+        let mut w = Writer::new(&mut b[TRAILER_OFF..NONCE_OFF]);
+        w.u32(slot);
+        w.u32(0);
+        w.u64(body.generation);
+    }
     let hh = *blake3::hash(&b[..HEADER_LEN]).as_bytes();
     {
         let mut w = Writer::new(&mut b[BODY_OFF..SUM_OFF]);
@@ -360,8 +395,8 @@ pub fn encode(header: &Header, body: &Body, slot: u32, sealer: &mut Sealer) -> c
         body.generation,
         &mut b[BODY_OFF..SUM_OFF],
     );
-    b[HEADER_LEN..HEADER_LEN + NONCE_LEN].copy_from_slice(&nonce);
-    b[HEADER_LEN + NONCE_LEN..BODY_OFF].copy_from_slice(&mac);
+    b[NONCE_OFF..MAC_OFF].copy_from_slice(&nonce);
+    b[MAC_OFF..BODY_OFF].copy_from_slice(&mac);
     let sum = *blake3::hash(&b[..SUM_OFF]).as_bytes();
     b[SUM_OFF..].copy_from_slice(&sum);
     b
@@ -384,6 +419,7 @@ pub fn candidates<D: BlockDevice>(dev: &mut D) -> Result<Vec<Candidate>> {
     }
     let mut out: Vec<Candidate> = Vec::new();
     let mut any_io_ok = false;
+    let mut unsupported = None;
     for slot in 0..4u32 {
         let addr = slot_addr(slot, total);
         let mut b = zero_block();
@@ -395,9 +431,20 @@ pub fn candidates<D: BlockDevice>(dev: &mut D) -> Result<Vec<Candidate>> {
         if !crypto::ct_eq(sum.as_bytes(), &b[SUM_OFF..]) {
             continue;
         }
-        let Ok(h) = Header::decode(&b[..HEADER_LEN], addr) else {
+        let mut h = match Header::decode(&b[..HEADER_LEN], addr) {
+            Ok(h) => h,
+            Err(e @ Error::Unsupported(_)) => {
+                unsupported = Some(e);
+                continue;
+            }
+            Err(_) => continue,
+        };
+        let mut r = Reader::new(&b[TRAILER_OFF..NONCE_OFF], "superblock trailer", addr);
+        let (Ok(s), Ok(0), Ok(g)) = (r.u32(), r.u32(), r.u64()) else {
             continue;
         };
+        h.slot = s;
+        h.generation = g;
         // A copy found in the wrong place, or for a different-sized device, is not trusted.
         if h.slot != slot || h.total_blocks != total {
             continue;
@@ -411,6 +458,12 @@ pub fn candidates<D: BlockDevice>(dev: &mut D) -> Result<Vec<Candidate>> {
     if !any_io_ok {
         return Err(Error::Io(crate::device::IoError::Failed));
     }
+    // An intact copy from a newer format version: say so, don't guess.
+    if out.is_empty()
+        && let Some(e) = unsupported
+    {
+        return Err(e);
+    }
     out.sort_by_key(|c| core::cmp::Reverse(c.header.generation));
     Ok(out)
 }
@@ -418,8 +471,8 @@ pub fn candidates<D: BlockDevice>(dev: &mut D) -> Result<Vec<Candidate>> {
 /// Verifies (and decrypts) a candidate's body with `sealer`.
 pub fn open_body(c: &Candidate, sealer: &Sealer) -> Result<Body> {
     let mut b = c.raw.clone();
-    let nonce: [u8; NONCE_LEN] = b[HEADER_LEN..HEADER_LEN + NONCE_LEN].try_into().unwrap();
-    let mac: [u8; MAC_LEN] = b[HEADER_LEN + NONCE_LEN..BODY_OFF].try_into().unwrap();
+    let nonce: [u8; NONCE_LEN] = b[NONCE_OFF..MAC_OFF].try_into().unwrap();
+    let mac: [u8; MAC_LEN] = b[MAC_OFF..BODY_OFF].try_into().unwrap();
     sealer.open(
         BlockKind::Superblock,
         c.header.slot as u64,

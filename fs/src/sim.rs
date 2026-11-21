@@ -172,11 +172,25 @@ impl CrashDevice {
     /// durable content). Nothing is torn: a lying cache loses whole writes.
     /// Tearing is covered by [`CrashDevice::crash_image`].
     pub fn lost_writes_image(&mut self) -> Vec<u8> {
+        self.lost_writes_image_steered(&[], &[])
+    }
+
+    /// [`CrashDevice::lost_writes_image`], except that the newest version
+    /// written to each block in `land` always landed and every write to a
+    /// block in `lose` was lost (superblock slots, to force the hardest
+    /// fallback cases).
+    pub fn lost_writes_image_steered(&mut self, land: &[u64], lose: &[u64]) -> Vec<u8> {
         let mut img = self.durable.clone();
         let volatile = core::mem::take(&mut self.volatile);
         for (block, versions) in volatile {
             let off = block as usize * BLOCK_SIZE;
-            let pick = self.rng.below(versions.len() as u64 + 1) as usize;
+            let pick = if land.contains(&block) {
+                versions.len()
+            } else if lose.contains(&block) {
+                0
+            } else {
+                self.rng.below(versions.len() as u64 + 1) as usize
+            };
             if pick > 0 {
                 img[off..off + BLOCK_SIZE].copy_from_slice(&versions[pick - 1]);
             }

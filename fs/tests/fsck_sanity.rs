@@ -22,7 +22,9 @@ fn fsck_reports_and_detects() {
     assert!(r.data_blocks_verified >= 10, "{r:?}");
     assert_eq!(r.snapshots, 1);
     // Corrupt every block that holds file data and check fsck notices.
-    let mut dev = fs.into_device();
+    // (Clean unmount, so mount skips its recovery check, which would
+    // otherwise fall back to a commit from before the data was written.)
+    let mut dev = fs.unmount().unwrap();
     let img = dev.image_mut();
     let mut hits = 0;
     for b in 0..4096 {
@@ -35,6 +37,7 @@ fn fsck_reports_and_detects() {
     assert!(hits > 0);
     let mut fs =
         Filesystem::mount(dev, &MountOptions::default(), &mut rng, Box::new(ZeroClock)).unwrap();
+    assert_eq!(fs.fell_back_from(), None);
     let r = fsck::check(&mut fs, true).unwrap();
     println!("{:?}", r.errors);
     assert!(!r.ok());

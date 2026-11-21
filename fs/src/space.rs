@@ -160,7 +160,7 @@ impl Space {
             log_addrs: Vec::new(),
             pending_table_frees: Vec::new(),
             cursor: SB_RESERVED_FRONT,
-            quarantine_min_ns: 30_000_000_000,
+            quarantine_min_ns: 0,
         }
     }
 

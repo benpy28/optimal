@@ -299,7 +299,7 @@ pub struct MountOptions {
     /// Freed blocks are not reused until they are both
     /// [`crate::space::QUARANTINE_COMMITS`] commits and this many
     /// nanoseconds old, so a drive that silently dropped recent flushes
-    /// still finds an intact older tree. Tests with a frozen clock set 0.
+    /// still finds an intact older tree. See [`DEFAULT_QUARANTINE_NS`].
     pub quarantine_min_ns: i64,
     /// After an unclean shutdown, also read back file data written inside
     /// the quarantine window (metadata in the window is always checked), so
@@ -310,9 +310,12 @@ pub struct MountOptions {
     pub fsck_on_mount: bool,
 }
 
-/// 30 seconds: covers drives that hold writes in a volatile cache across
-/// several flush requests.
-pub const DEFAULT_QUARANTINE_NS: i64 = 30_000_000_000;
+/// No extra time hold by default: the storage design promises fallback
+/// within K = 8 commits, and the VFS rate-limits full commits (fsync bursts
+/// go to the intent log), so 8 commits already span several seconds. A
+/// non-zero value adds a minimum age on top, for drives known to cache
+/// writes for longer; it costs free space while blocks wait.
+pub const DEFAULT_QUARANTINE_NS: i64 = 0;
 
 impl Default for MountOptions {
     fn default() -> Self {
@@ -401,6 +404,9 @@ impl<D: BlockDevice> Filesystem<D> {
             uuid,
             total_blocks: total,
             suite: SUITE_PLAIN,
+            compat: 0,
+            ro_compat: 0,
+            incompat: 0,
             generation: 0,
             slot: 0,
             kdf: opts.kdf,
@@ -527,6 +533,11 @@ impl<D: BlockDevice> Filesystem<D> {
         let mut commits: Vec<(Body, Header, Option<SecretKey>, bool)> = Vec::new();
         let mut floor = 0u64;
         for c in &cands {
+            if c.header.ro_compat != 0 && !opts.read_only {
+                last_err =
+                    Error::Unsupported("unknown read-only-compatible features: mount read-only");
+                continue;
+            }
             let master = if c.header.suite == SUITE_PLAIN {
                 None
             } else {
@@ -569,8 +580,23 @@ impl<D: BlockDevice> Filesystem<D> {
         commits.sort_by_key(|(b, _, _, hist)| (core::cmp::Reverse(b.generation), *hist));
         commits.dedup_by_key(|(b, _, _, _)| b.generation);
 
+        // Pass 0 needs every block born in a candidate's window, data
+        // included, to verify: recent blocks that fail after an unclean
+        // shutdown are lost writes, so an older commit is the right answer.
+        // If no candidate passes, pass 1 accepts the newest one whose
+        // metadata verifies and reports the files with lost data.
         let mut dev = Some(dev);
-        for (body, header, master, from_history) in commits {
+        let passes: &[bool] = if opts.verify_recent_data {
+            &[true, false]
+        } else {
+            &[false]
+        };
+        for (body, header, master, from_history, strict) in passes.iter().flat_map(|&p| {
+            commits
+                .iter()
+                .cloned()
+                .map(move |(b, h, m, f)| (b, h, m, f, p))
+        }) {
             let sealer = Sealer::new(header.uuid, master.as_ref(), rng);
             let mut io = Io::new(dev.take().unwrap(), sealer);
             let (mut space, fs_tree, meta) = match Self::open_commit(&mut io, &header, &body) {
@@ -620,7 +646,7 @@ impl<D: BlockDevice> Filesystem<D> {
                 Ok(())
             } else {
                 let min_birth = fs.body.window_gen;
-                crate::recover::verify_since(&mut fs, min_birth, opts.verify_recent_data)
+                crate::recover::verify_since(&mut fs, min_birth, opts.verify_recent_data, strict)
                     .map(|st| fs.recovery = Some(st))
             };
             let check = check.and_then(|()| {

@@ -81,7 +81,19 @@ fn lie_and_check(
     let mut went_deeper = false;
     for img_no in 0..images {
         let mut d = dev.clone();
-        let img = d.lost_writes_image();
+        // Steered images force the hardest superblock outcomes: all
+        // superblock writes landed, or only the newest commit's pair did and
+        // the other pair kept its pre-drop content. Either way the trees of
+        // the lost commits are random, so mount must walk the history ring
+        // back to the drop point (K entries deep in the second case).
+        let n = d.num_blocks();
+        let own = [(newest % 2), n - 1 - (newest % 2)];
+        let other = [1 - (newest % 2), n - 2 + (newest % 2)];
+        let img = match img_no % 3 {
+            0 => d.lost_writes_image_steered(&[0, 1, n - 2, n - 1], &[]),
+            1 => d.lost_writes_image_steered(&own, &other),
+            _ => d.lost_writes_image(),
+        };
         let crashed = optimalfs::sim::CrashDevice::from_image(img, seed ^ img_no);
         let fs = Filesystem::mount(
             crashed,
@@ -94,7 +106,7 @@ fn lie_and_check(
         });
         let g = fs.generation();
         assert!(
-            g + 1 >= honest && g <= newest,
+            g >= honest && g <= newest,
             "seed {seed:#x} lies {lies}: mounted generation {g}, honest {honest}, newest {newest}"
         );
         if g < newest {

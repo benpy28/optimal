@@ -415,3 +415,83 @@ fn replay_bump_reaches_all_four_slots() {
         assert_eq!(b.history[0].generation, g - 1);
     }
 }
+
+#[test]
+fn header_bytes_identical_in_every_slot_and_commit() {
+    // The plaintext header (bytes 0..512) must not change per slot or per
+    // commit: the volume tag and the pre-cap reader rely on fixed bytes.
+    // It changes only when a key slot does.
+    let opts = FormatOptions {
+        passphrase: Some(b"pw".to_vec()),
+        kdf: crate::KdfParams::INSECURE_FAST_FOR_TESTS,
+        quarantine_min_ns: 0,
+    };
+    let mut fs = Filesystem::format(
+        MemDevice::new(4096),
+        &opts,
+        &mut Rng::new(1),
+        Box::new(ZeroClock),
+    )
+    .unwrap();
+    let headers = |fs: &mut Filesystem<MemDevice>| -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
+        let img = fs.device_mut().image_mut();
+        [0usize, 1, 4094, 4095]
+            .iter()
+            .map(|&b| img[b * 4096..b * 4096 + 512].to_vec())
+            .collect()
+    };
+    for i in 0..5u8 {
+        fs.create(ROOT_INO, &[b'a' + i], 0o644).unwrap();
+        fs.commit().unwrap();
+    }
+    let h1 = headers(&mut fs);
+    assert!(h1.iter().all(|h| *h == h1[0]), "slots differ");
+    // Bytes 424..512 are reserved and zero.
+    assert!(h1[0][424..].iter().all(|&x| x == 0));
+    fs.create(ROOT_INO, b"z", 0o644).unwrap();
+    fs.commit().unwrap();
+    assert_eq!(headers(&mut fs)[0], h1[0], "a commit changed the header");
+}
+
+#[test]
+fn feature_bits_hand_worked() {
+    // Unknown read-only-compatible bit: read-only mount works, read-write
+    // is refused. Unknown incompatible bit: refused, reported as such.
+    let opts = FormatOptions {
+        passphrase: None,
+        kdf: crate::KdfParams::INSECURE_FAST_FOR_TESTS,
+        quarantine_min_ns: 0,
+    };
+    for (ro, inc) in [(1u32, 0u32), (0, 1)] {
+        let mut fs = Filesystem::format(
+            MemDevice::new(4096),
+            &opts,
+            &mut Rng::new(1),
+            Box::new(ZeroClock),
+        )
+        .unwrap();
+        fs.header.ro_compat = ro;
+        fs.header.incompat = inc;
+        fs.mark_dirty();
+        fs.commit().unwrap();
+        fs.mark_dirty();
+        fs.commit().unwrap(); // both pairs carry the bit
+        let dev = fs.into_device();
+        let rw = crate::MountOptions {
+            quarantine_min_ns: 0,
+            ..Default::default()
+        };
+        let ro_opts = crate::MountOptions {
+            read_only: true,
+            ..rw.clone()
+        };
+        let r = Filesystem::mount(dev.clone(), &rw, &mut Rng::new(2), Box::new(ZeroClock));
+        assert!(
+            matches!(r, Err(crate::Error::Unsupported(_))),
+            "{:?}",
+            r.err()
+        );
+        let r = Filesystem::mount(dev, &ro_opts, &mut Rng::new(2), Box::new(ZeroClock));
+        assert_eq!(r.is_ok(), inc == 0, "{:?}", r.err());
+    }
+}
