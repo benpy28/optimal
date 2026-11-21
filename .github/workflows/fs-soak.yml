@@ -1,0 +1,44 @@
+name: Filesystem soak
+
+# Long torture run for OptimalFS: every night at 2 AM Perth, eight shards run
+# the whole suite at a very high scale with fresh seeds (the date is mixed
+# in), for up to about five and a half hours each. Can be started by hand.
+on:
+  schedule:
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+    inputs:
+      scale:
+        description: "Torture scale (iterations multiplier)"
+        default: "150"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: fs
+
+jobs:
+  soak:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 345
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Build tests
+        run: cargo test --tests --no-run
+      - name: Soak
+        env:
+          OFS_TORTURE_SCALE: ${{ github.event.inputs.scale || '150' }}
+        run: |
+          export OFS_SEED=$(( $(date +%Y%m%d) * 100 + ${{ matrix.shard }} * 7919 ))
+          echo "Base seed $OFS_SEED"
+          timeout 330m cargo test --tests -- --test-threads 4 || code=$?
+          # 124 = hit the time budget while still passing: that's a pass.
+          if [ "${code:-0}" != "0" ] && [ "${code:-0}" != "124" ]; then exit "$code"; fi

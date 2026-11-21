@@ -1,0 +1,1 @@
+Added OptimalFS, Optimal's own filesystem (`fs/`): copy-on-write B+tree, checksums or XChaCha20-Poly1305 on every block, atomic commits, snapshots and rollback, fsck, and a torture suite (model-based tests, power cut at every write point, damaged-image fuzzing).
