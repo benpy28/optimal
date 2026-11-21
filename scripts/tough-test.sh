@@ -27,12 +27,22 @@ cd "$(dirname "$0")/.."
 source scripts/qemu.sh
 
 REPEAT="${REPEAT:-1}"
+# Evidence (CI, 2026-11-21): with 64 vCPUs on a 4-core runner, KVM on the
+# Ubuntu 24.04 runners now and then stops the VM with "internal-error"
+# while the firmware (SeaBIOS or OVMF) is still setting up PCI, before any
+# bootloader runs; it has failed two attempts in a row once. That matches
+# a host-side race between vCPUs and firmware memory remapping, not
+# anything in this repository, so such failures get up to 3 attempts.
+PLATFORM_ATTEMPTS="${PLATFORM_ATTEMPTS:-3}"
 ONLY="${ONLY:-.}"
 LOGDIR=build/tough-logs
 mkdir -p "$LOGDIR"
 ISO=build/optimal-ktest.iso
 KVM=no
 if [ -w /dev/kvm ]; then KVM=yes; fi
+
+# Record the host, so platform failures can be matched to runner types.
+echo "host: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//'), $(nproc) cores, kernel $(uname -r), $(qemu-system-x86_64 --version | head -1)"
 
 pass=0
 fail=0
@@ -67,7 +77,7 @@ scenario() {
     for run in $(seq 1 "$REPEAT"); do
         log="$LOGDIR/$name-run$run.log"
         local start=$SECONDS
-        for attempt in 1 2; do
+        for attempt in $(seq 1 "$PLATFORM_ATTEMPTS"); do
             run_qemu "$iso" "$log" "$fw" "$machine" "$mem" "$smp" "$timeout"
             ok=no
             if [ "$expect" = boot ]; then
@@ -86,12 +96,15 @@ scenario() {
             # when it provably happened before our bootloader ran: no Limine
             # or kernel output at all, and the VM died with a hypervisor
             # internal error or the CPU never even reached 64-bit mode. Such a
-            # run gets one retry; failing twice fails the scenario anyway.
+            # run is retried, up to PLATFORM_ATTEMPTS attempts in all; if every
+            # attempt fails the scenario fails. Our code never ran on a failed
+            # attempt, so a retry can't hide a kernel bug: the kernel's tests
+            # still have to pass in full on the attempt that boots.
             why=$(platform_failure "$log")
-            if [ "$attempt" = 1 ] && [ -n "$why" ]; then
-                echo "PLATFORM: $name run $run: $why, before the bootloader ran; retrying once"
-                platform+=("$name-run$run: $why")
-                mv "$log" "$log.platform-attempt1"
+            if [ "$attempt" -lt "$PLATFORM_ATTEMPTS" ] && [ -n "$why" ]; then
+                echo "PLATFORM: $name run $run attempt $attempt: $why, before the bootloader ran; retrying"
+                platform+=("$name-run$run attempt $attempt: $why")
+                mv "$log" "$log.platform-attempt$attempt"
                 continue
             fi
             break
