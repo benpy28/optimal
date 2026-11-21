@@ -220,8 +220,8 @@ kernel parses only the fixed-format Optimal header block of the system
 volume (the last 16 KiB before the 16 MiB LUKS2 data offset, two 8 KiB
 copies with version and CRC-32C, layout in [boot.md](boot.md)). It holds
 the sealed blobs, every wrapped copy of the volume key that Optimal opens
-(the TPM key-slot key's, the passphrase's and the recovery key's) and the
-volume tags. The header block and its passphrase and recovery-key wraps
+(the TPM wrap, the passphrase wrap and the recovery-key wrap), S wrapped
+under the recovery key, and the volume tags. The header block and its passphrase and recovery-key wraps
 exist from Phase 4a, so no Optimal boot path in any phase, the first boot
 and recovery-key boots included, reads a LUKS2 key slot; Phase 4b adds the
 sealed blobs, the TPM wrap and capping (test, Phase 4b: a volume created
@@ -277,6 +277,22 @@ the power-cut emulation of the crash-state model below); `luksAddKey` from
 the pinned Linux, then a recovery-key boot re-tags and the next boot opens
 with the PIN (Phase 4b).
 
+**Changing the volume key.** A recovery-key rotation re-wraps the same
+volume key, so an old header backup still opens with the old recovery
+key. Settings therefore offers optional online re-encryption to a new
+volume key: the kernel draws a new key and re-encrypts the volume's
+extents in place while it stays mounted, one 1 GiB extent at a time. The
+progress record (the new key wrapped under the old one, and the boundary
+between re-encrypted and old extents) is kept in the volume map below,
+which is parsed only after capping, and rewritten and flushed after each
+extent, so a power cut resumes at that boundary. At the end the kernel
+replaces the volume-key wraps in each header-block copy in turn, rewrites
+both LUKS2 copies in the tag order above, removes the record and wipes
+the old key. After it, old header backups and old recovery keys open nothing
+([boot.md](boot.md) "Changing credentials"). Test (Phase 5, with the
+volume map): a power cut at every extent boundary resumes and finishes; the old header backup and
+the old recovery key then open nothing.
+
 **KDF (one rule everywhere).** Every human secret (PIN, passphrase, fTPM
 passphrase, LUKS2 key slots, the own file system's slots) is stretched with
 Argon2id, 4 lanes, memory = min(1 GiB, RAM/4) but at least 64 MiB, at least
@@ -289,7 +305,7 @@ the scorecard says "disk not encrypted: under 256 MiB RAM". The 256-bit
 random recovery key is exempt, because its input is already high-entropy
 and a second slow KDF would only add seconds to every unlock: its LUKS2
 slot uses PBKDF2-SHA-256 at the LUKS2 minimum of 1,000 iterations (the
-header block's TPM key-slot wrap is likewise unstretched, its input being
+header block's TPM wrap is likewise unstretched, its input being
 the TPM-released disk secret already mixed with the stretched PIN;
 [boot.md](boot.md)). Tests (Phase 4a): a human-secret slot below the
 floor for its machine's RAM is refused by the installer, the key-slot
@@ -341,9 +357,19 @@ per volume and class).
 | Class C key (stage 2) | wiped after eviction | wiped after eviction (suspend locks first) | wiped | wiped after eviction | wiped |
 | Hibernation image key | none | none | none | sealed as R plus a PIN-keyed blob in the header block | none (any normal mount erases the blob) |
 | Resume object's R | none | sealed; plaintext wiped | none | none | none |
+| Agents' keys (SSH agent, GPG agent, secret service), in kernel-registered secret memory | kept | kept (RAM only, never in swap or the page cache) | wiped by the kernel | not in the image | wiped |
+| F4 panic key P (from login, while panic lock is enabled) | kept, held under HKDF(S, `optimal-held`), plus a blob of P wrapped under the stretched login passphrase in RAM | wrapped with S | wiped; its passphrase-wrapped blob kept | panic hibernate: wrapped under the stretched passphrase in header-block slot 15 | wiped |
 
 ¹ Kept only encrypted under a key that the full login passphrase unwraps
-([features.md](features.md) F4).
+(the panic key P, [features.md](features.md) F4).
+
+Two header-block slots ([boot.md](boot.md)) hold copies outside the
+table's stages: S (with the lockout secret) wrapped under the recovery
+key, so a recovery-key boot reopens S and only a TPM clear recreates the
+service key; and slot 15, F4's panic-hibernate key wrapped under the
+passphrase. While panic lock is enabled, dirty pages of encrypted volumes
+are capped at the writeback bound times the device's measured write
+bandwidth, and the Argon2id unlock memory (up to 1 GiB) stays reserved.
 
 Tests (Phase 10): suspend, then scan memory for every canary of the
 suspend column; with the TPM's seeds extracted (a swtpm state dump) plus
@@ -377,8 +403,10 @@ LUKS2 volume with its own volume key and key slots, unwrapped at that
 user's login. Its passphrase wrap alone opens it; on B1 it also has a TPM
 wrap through the post-cap `PolicySecret` path in [boot.md](boot.md),
 which every reseal and clear recovery covers. If that wrap fails (a TPM
-clear, a new service key), the login opens the home from the passphrase
-wrap and reseals the TPM wrap, so no home is lost with the TPM. Tests
+clear, which recreates the service key; a recovery-key boot alone
+doesn't, because S is also wrapped under the recovery key), the login
+opens the home from its passphrase wrap alone and reseals the TPM wrap at
+that login, so no home is lost with the TPM. Tests
 (Phase 5): a second user logs in long after capping on B1; after a TPM
 clear and recovery, each user's next login opens their home and reseals.
 The home volume holds an ext4 created by Optimal's
@@ -563,8 +591,9 @@ only". On top of that:
   volume can't bump it. The counter, its base and every home-volume TPM
   wrap are on the list that every reseal and every clear recovery covers
   ([boot.md](boot.md)). A clear recovery (a recovery-key boot after a TPM
-  clear or a new service key) first shows the volume's last authenticated
-  commit time and generation and asks the user to accept them, because
+  clear) first shows the volume's last authenticated
+  commit time and generation and asks the user to accept them on the
+  trusted path, because
   replay protection restarts there; it then defines the new counter and
   writes the base as the counter's value minus the volume's replay value,
   so the value carries on. A drive that lost the flushed superblock looks

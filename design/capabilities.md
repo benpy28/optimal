@@ -324,7 +324,11 @@ produces them for removed devices and network file systems.
   each as its own row. The graph crate is proof target 18 in
   [verification.md](verification.md) (B/T at Phase 5, P/T at Phase 7): no
   networked identity's upstream data set is outside a combined approval
-  after any sequence of channel opens, grants and approvals.
+  after any sequence of channel opens, grants and approvals; two seeded
+  bugs (dropping the downstream search, treating edges as undirected)
+  must each fail the proof. F9's background freezing
+  ([features.md](features.md)) reads the same graph: an identity with a
+  live direct channel from an unfrozen app identity is never frozen.
 - **Apps that launch apps.** A launcher like Steam can start children under a
   **child identity** (`steam/<game id>`): the child gets its own capability
   set and file view (by default its own private home and the folders the
@@ -743,7 +747,8 @@ seen.
    (inbound in 6, the rest in 7);
 4. a new USB device of network or storage class, or a new HID interface
    without keyboard/keypad or system-control usages (mice, gamepads,
-   consumer-control-only headset buttons, FIDO keys) (6);
+   consumer-control-only headset buttons, FIDO keys; [drivers.md](drivers.md)
+   "Device authorization") (6);
 5. a device presenting a different class than it did last time (6);
 6. any grant requested while the screen is locked, or requested before any
    user input to the identity's own surfaces (5).
@@ -754,7 +759,8 @@ by entries 1 to 5, never by entry 6.
 The **floor** prompts at every level: inbound access, remote control,
 screen sharing and screenshots (every grant in entry 3, and the
 screenshot portal); a new HID interface with keyboard/keypad or
-system-control usages (the typed code, [drivers.md](drivers.md)); any
+system-control usages (the typed code, [drivers.md](drivers.md) "Device
+authorization"); any
 PCIe device or tunnel added after boot on any hotplug port, refused while
 locked; a desktop launch of a downloaded executable; and data + network
 for one identity or component (every combined approval). It is the
@@ -769,12 +775,13 @@ hot-added PCIe device and Thunderbolt tunnel each prompting (Phase 6); an
 app's attempt to change the level (D-Bus, settings files, input
 injection) fails (5, with the entries in their phases above). Prompt
 budget (Phase 7): a pinned typical-day script at the default level
-(Firefox, Steam, a chat app, an editor, a media player, an AppImage, a
-cargo project, a video call, a new Wi-Fi network, plugging a new mouse, a
-headset and a gamepad, a known keyboard and a USB stick, browsing and one
-download) counts every prompt kind after first run, install approvals
-included; the target is at most 5, and the measured count is published as
-the scorecard row "prompts per typical day".
+(the one pinned in the scorecard row "prompts per typical day" in
+[benchmarks.md](benchmarks.md): Firefox with browsing and one download,
+Steam, a chat app, an editor, a media player, an AppImage, a cargo
+project, a video call, a new Wi-Fi network, plugging in a new mouse, a
+headset and a gamepad) counts every prompt kind, install approvals
+included; the target is at most 5 at the default level, and the measured
+count is published in that row.
 
 **Settings before Phase 12.** Until the Settings app lands, every
 "Settings" screen named in this file is a trusted-path **settings

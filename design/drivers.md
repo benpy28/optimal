@@ -230,17 +230,26 @@ address; a tier-3 driver sees only IOVAs in its own domain.
   PHMBASE/PHMLIMIT and checks that every page the kernel and the loader
   occupy lies inside them (EDK2, for example, leaves its DMA buffer pool
   outside them, so a loader page there is a hole). (b) Optimal Boot
-  (Phase 4b), which works in this order: a deny-all IOMMU root table first,
-  before the PIN prompt and before any unseal (TPM CRB and TIS access is
-  MMIO and needs no DMA); then the PIN through `ConIn`, the unseals
-  (including the object 3 TOTP key and M) and the remaining firmware I/O
-  (disk reads); then `ExitBootServices`; then it re-checks the IOMMU (Intel
+  (Phase 4b), which works in this order ([boot.md](boot.md) "DMA before
+  the kernel"): a deny-all IOMMU root table first, before the PIN prompt
+  and before any unseal (TPM CRB and TIS access is MMIO and needs no DMA);
+  then the config, kernel and module reads, after which their pages are
+  removed from both controller exceptions' maps (with an IOTLB
+  invalidation) before they are checked and measured; then the object 3
+  unseal (TOTP key and M), the PIN through `ConIn` and the remaining
+  firmware I/O (loader-state writes, the platform-hierarchy disable); then
+  `ExitBootServices`; then it re-checks the IOMMU (Intel
   GSTS.TES and the root-table address, AMD IommuEn and the device-table
   base) and re-arms it if a firmware `ExitBootServices` handler turned it
   off (EDK2's `IntelVTdDxe` does by default), before handing over. The
   deny-all exceptions are one list, the same in [boot.md](boot.md): the
-  RMRRs, the firmware framebuffer read-only, and the DMA paths of the boot
-  disk controller and of the console keyboard controller. Where the loader
+  RMRR/IVMD ranges, the firmware framebuffer read-only, and, until
+  `ExitBootServices`, the boot disk controller and the console keyboard
+  controller, each with an identity map of all memory except the pages
+  the loader allocates for the PIN and every value it unseals. A PMR-only
+  boot that reads the PIN also names a "pre-loader secret DMA window",
+  because a USB keyboard's firmware transfer buffers lie outside the PMRs.
+  Where the loader
   has no usable IOMMU to program, the boot is D2 and the boot log, Settings
   and the scorecard name a "pre-loader secret DMA window"; the loader still
   sets the PMRs, where they exist, over one low and one high range holding
@@ -449,7 +458,8 @@ address; a tier-3 driver sees only IOVAs in its own domain.
   kernel data, and only streaming maps are bounced into it, because a ring
   or context the device reads continuously can't be bounced. With the typed
   descriptor rules above, tier-1 and tier-2 driver bugs still can't aim DMA
-  at kernel data; a malicious device, or its firmware, can.
+  at kernel data; a malicious device, or its firmware, can. The panic lock
+  (F4 in [features.md](features.md)) zeroes this region.
   GPUs follow the same rule: every GPU page-table entry (GPUVM, GTT,
   PPGTT) is built by the GPU core only from a `DmaBuffer`, `Iova` or
   `VramBuffer` handle, never from a raw address (target 13, which covers D2
@@ -803,8 +813,8 @@ the one definition; [threat-model.md](threat-model.md) and
     revoked (the driver is stopped and the identity forgotten).
   - The optional camera and microphone kill switches deauthorize the
     sensor's interfaces here and stop their drivers, keeping the identity;
-    on DSP audio machines the microphone kill stops the DSP capture pipeline
-    (F1 in [features.md](features.md)). The USB portal never gives an app
+    on DSP audio machines the microphone kill stops every DSP capture
+    pipeline and refuses new ones (F1 in [features.md](features.md)). The USB portal never gives an app
     raw access to an audio (class 0x01) or video (class 0x0E) interface;
     those go through PipeWire, where F1's indicators apply
     ([capabilities.md](capabilities.md)).
@@ -1013,7 +1023,9 @@ hundreds of driver-specific ioctls for Mesa, and hangs routinely. It is split:
   space or CPU mapping; the mapping waits on the clear's fence. GTT objects
   backed by system memory come from the frame allocator already zeroed.
   The clear's cost (allocation latency and throughput per buffer size) is
-  benchmarked and on the scorecard.
+  benchmarked and on the scorecard. The panic lock (F4 in
+  [features.md](features.md)) clears VRAM the same way, by copy engine in
+  power-off mode.
 - **Display and power programming (tier 2):** display engine programming
   and power and clock sequencing run under the tier-2 framework, and a fault
   in this part uses the sub-function stop ("Stopping part of a split

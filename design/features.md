@@ -79,7 +79,9 @@ PipeWire's per-app permissions in [threat-model.md](threat-model.md)):
   of every screen cast.
 - *Lit from the trusted source, before the data flows.* Apps never hold a
   camera or microphone device; PipeWire does, and hands streams to apps
-  through the portal. The USB portal refuses raw access to audio (class
+  through the portal (the camera portal, and for the microphone
+  `org.optimal.portal.Microphone`, Phase 7, in
+  [`channels.toml`](channels.toml)). The USB portal refuses raw access to audio (class
   0x01) and video (class 0x0E) interfaces ([capabilities.md](capabilities.md)),
   so no USB camera or microphone reaches an app around PipeWire. PipeWire's permission layer tells the compositor when
   it is about to deliver a stream's first buffer to an identity, and holds
@@ -365,6 +367,12 @@ user turns it on knowingly; first-run setup offers it.
 **What the user sees.** A chord the user picks (default Ctrl+Alt+Shift+
 Backspace held for 0.5 s) locks the screen at once. Unlocking needs the
 user's full login passphrase; the PIN is refused until the next boot.
+(Outside a panic, the lock screen checks the PIN through the lock-screen
+PIN object in [boot.md](boot.md) "TPM use after capping": `PolicySecret`
+against the service key plus `PolicyAuthValue` with the stretched PIN
+half, without `noDA`, so lock-screen failures share the TPM's 32-try
+dictionary-attack budget; after 10 failed unlocks only the passphrase is
+accepted; without a TPM, persistent exponential back-off on disk.)
 Settings offers three modes: **freeze** (the default: apps are frozen and
 resume after unlock), **panic hibernate** (Phase 10: an encrypted image is
 written, then power off) and **panic power-off**. Settings also says that
@@ -417,8 +425,9 @@ fails closed and the in-kernel input paths in
   can't release anything again before a reboot. At login the kernel draws
   a random 256-bit panic key P and keeps a blob of P wrapped under the
   user's stretched login passphrase (XChaCha20-Poly1305 under HKDF); P is
-  held like the other post-cap secrets. At panic the volume, home and
-  class keys are encrypted under P into a blob in RAM, then P is wiped.
+  held like the other post-cap secrets. At panic the keys the key inventory
+  marks ¹ (the volume key, S, the held PIN half, home, class A and class-B
+  per-file keys) are encrypted under P into a blob in RAM, then P is wiped.
   While panic lock is enabled the memory for the unlock KDF (Argon2id at
   the user's parameters, up to 1 GiB) stays reserved, so unlock works
   under any memory pressure. Unlock stretches the typed passphrase (about
@@ -455,7 +464,9 @@ timeout. DRAM keeps its contents for seconds to minutes after power-off
 after a panic power-off can still find what the zeroing didn't reach, and
 in freeze mode finds the apps' memory; memory encryption (AMD SME, Intel
 TME), where it is on, defeats moving the modules, not an attack on the
-running machine. Non-mapped writes still dirty after the writeback bound
+running machine. The swap key is kept at panic (key inventory in
+[storage.md](storage.md)), because swap holds the frozen apps' memory.
+Non-mapped writes still dirty after the writeback bound
 can be lost. Someone who already controls the running system before the
 chord (malware, a compromised kernel) is not stopped.
 
@@ -604,8 +615,8 @@ area says so. "Encrypted DNS" with a provider chosen from a shipped list
   network stack brings no interface up until the egress filter holds it,
   so nothing leaks before the VPN app starts.
 - *The VPN app* is designated on the trusted path, never by a request,
-  and Settings says it sees all traffic. It holds no `CAP_*`: a VPN portal
-  in the network service sets addresses, routes, fwmark rules, WireGuard
+  and Settings says it sees all traffic. It holds no `CAP_*`: the VPN portal
+  (`org.optimal.portal.Vpn`, Phase 6) in the network service sets addresses, routes, fwmark rules, WireGuard
   netlink settings and DNS on its designated TUN interface only, and
   refuses any change to another interface or the main routing table. The
   VPN identity can update its server endpoints through the portal at any

@@ -256,8 +256,8 @@ and verified-image state is the shipped one.
 - **Noise ceiling.** Each metric must have a run-to-run coefficient of
   variation of at most 1% and a between-boot coefficient of variation (of
   per-boot means) of at most 0.4% on its machine. A tail metric at P99 or
-  below (storage tails included) has a per-boot value with at most 5%
-  between-boot coefficient of variation; a P99.9 has no per-boot ceiling
+  below has a per-boot value with at most 5% between-boot coefficient of
+  variation (for storage tails this is the **storage tail noise ceiling**); a P99.9 has no per-boot ceiling
   (a few thousand events per boot leave it set by its 5 largest samples)
   and is judged only on the pooled window, with at least 10^5 pooled
   events. If the harness can't get
@@ -498,7 +498,10 @@ compared against Linux runs the same binary on both (a static binary in
 within 10% of matched Linux": the worse end of its Holm-corrected 95%
 confidence interval, over at least 20 boots per kernel, against both
 matched LTS and matched stable. Storage tail metrics follow the tail rule
-and its noise ceiling.
+and are judged against the storage tail noise ceiling ("Noise ceiling",
+above). The two replay-log entries (1 MiB sequential `O_DIRECT` write at
+QD32, page-rewrite microbenchmark) run on a real VWC=1 NVMe drive, and the
+number of flushes the full log forced is published with each result.
 
 | Benchmark | Against Linux | Time | From |
 |---|---|---|---|
@@ -577,6 +580,9 @@ is on in the image people actually download:
   "B4: no automatic rollback, no floor" until Optimal Boot's BIOS stage
   lands ([boot.md](boot.md)), and "after a security update there is no
   older release to fall back to" (F11).
+- The boot-time cost of `MemoryOverwriteRequestControl` per reference
+  machine, set only while a panic mode is enabled (F4,
+  [boot.md](boot.md)).
 - Disk encryption stage per machine, and "stage 2: new installs only"
   until the per-user stage 1 to stage 2 migration lands
   ([storage.md](storage.md)).
@@ -597,9 +603,9 @@ is on in the image people actually download:
   suspicious"; the measured count is published, counted by the
   threat-model test ([threat-model.md](threat-model.md),
   [capabilities.md](capabilities.md)), from Phase 7.
-- The Argon2id parameters chosen on each reference machine, and the TPM
-  keyslot's PBKDF2 iteration count (exempt from the Argon2id floor: its
-  input is high-entropy, [storage.md](storage.md)).
+- The Argon2id parameters chosen on each reference machine, and the
+  recovery-key LUKS2 slot's PBKDF2 iteration count (exempt from the
+  Argon2id floor: its input is high-entropy, [storage.md](storage.md)).
 - Measured bandwidth of each covert channel between apps (covert channels
   are out of scope; the overt-channel list is tested,
   [threat-model.md](threat-model.md)).
