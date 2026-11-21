@@ -1,0 +1,37 @@
+name: Bootloader
+
+# Optimal Boot, our own UEFI bootloader (see bootloader/DESIGN.md).
+# Lints and runs the host test suite of the pure-logic core, including the
+# seeded fuzz tests of every parser, in release mode so they cover more cases.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: bootloader
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (version pinned in bootloader/rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Lint
+        run: |
+          cargo fmt --all --check
+          cargo clippy -p optimal-boot-core --all-targets -- -D warnings
+          cargo clippy -p optimal-boot-core --target x86_64-unknown-uefi -- -D warnings
+
+      - name: Core tests (debug, with overflow checks)
+        run: cargo test -p optimal-boot-core
+
+      - name: Core tests (release)
+        run: cargo test -p optimal-boot-core --release
