@@ -5,9 +5,11 @@ ENTRY(kmain)
 
 PHDRS
 {
-    text    PT_LOAD;
-    rodata  PT_LOAD;
-    data    PT_LOAD;
+    /* Explicit permissions so Limine maps the kernel W^X:
+       code is read+execute, rodata read-only, data read+write. */
+    text    PT_LOAD FLAGS(5);
+    rodata  PT_LOAD FLAGS(4);
+    data    PT_LOAD FLAGS(6);
 }
 
 SECTIONS
@@ -22,6 +24,12 @@ SECTIONS
 
     .rodata : {
         *(.rodata .rodata.*)
+    } :rodata
+
+    .ktests : {
+        __ktests_start = .;
+        KEEP(*(.ktests))
+        __ktests_end = .;
     } :rodata
 
     . = ALIGN(CONSTANT(MAXPAGESIZE));

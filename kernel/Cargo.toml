@@ -8,6 +8,10 @@ publish = false
 # Rust bindings for the Limine boot protocol (MIT OR Apache-2.0).
 limine = "0.5"
 
+[features]
+# Build the in-kernel test suite into the image (CI boots this build).
+ktest = []
+
 [profile.dev]
 panic = "abort"
 

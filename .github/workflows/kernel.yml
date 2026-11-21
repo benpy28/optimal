@@ -40,8 +40,11 @@ jobs:
           cargo fmt --check
           cargo clippy --release -- -D warnings
 
-      - name: Build kernel and ISO
+      - name: Build kernel and ISOs
         run: ./scripts/build-iso.sh
+
+      - name: In-kernel tests and crash tests (BIOS + UEFI, 1 and 4 cores)
+        run: ./scripts/kernel-tests.sh
 
       - name: Boot test matrix in QEMU (64 virtual PCs, each booted 3 times)
         env:
@@ -55,4 +58,5 @@ jobs:
           path: |
             build/optimal.iso
             build/boot-logs/
+            build/test-logs/
           retention-days: 14

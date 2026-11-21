@@ -33,8 +33,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends qemu-system-x86 xorriso ovmf
 
-      - name: Build kernel and ISO
+      - name: Build kernel and ISOs
         run: ./scripts/build-iso.sh
+
+      - name: In-kernel tests and crash tests
+        run: ./scripts/kernel-tests.sh
 
       - name: Soak boot matrix
         env:
@@ -45,5 +48,7 @@ jobs:
         if: failure()
         with:
           name: soak-failure-logs
-          path: build/boot-logs/
+          path: |
+            build/boot-logs/
+            build/test-logs/
           retention-days: 14

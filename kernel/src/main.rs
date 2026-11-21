@@ -1,48 +1,25 @@
 //! Optimal kernel.
 //!
-//! Phase 0: boot through Limine on UEFI or BIOS, say hello over serial, show
-//! that we own the screen, report how much memory the firmware handed us, then
-//! halt cleanly. Everything else in ROADMAP.md is built on top of this.
+//! Boot order: serial (so we can report anything), CPU tables and exception
+//! handling, hardware protections, then whatever the command line asks for:
+//! the normal boot, the in-kernel test suite, or a deliberate crash test.
 
 #![no_std]
 #![no_main]
 
+mod arch;
+mod backtrace;
+mod boot;
+mod crashtest;
+#[cfg(feature = "ktest")]
+mod ktest;
 mod serial;
+#[cfg(feature = "ktest")]
+mod tests;
 
-use core::arch::asm;
 use core::panic::PanicInfo;
 
-use limine::BaseRevision;
 use limine::memory_map::EntryType;
-use limine::request::{
-    BootloaderInfoRequest, FramebufferRequest, MemoryMapRequest, RequestsEndMarker,
-    RequestsStartMarker,
-};
-
-// Limine reads these requests out of the kernel file before jumping to kmain.
-#[used]
-#[unsafe(link_section = ".requests")]
-static BASE_REVISION: BaseRevision = BaseRevision::new();
-
-#[used]
-#[unsafe(link_section = ".requests")]
-static BOOTLOADER_INFO: BootloaderInfoRequest = BootloaderInfoRequest::new();
-
-#[used]
-#[unsafe(link_section = ".requests")]
-static FRAMEBUFFER: FramebufferRequest = FramebufferRequest::new();
-
-#[used]
-#[unsafe(link_section = ".requests")]
-static MEMORY_MAP: MemoryMapRequest = MemoryMapRequest::new();
-
-#[used]
-#[unsafe(link_section = ".requests_start_marker")]
-static _START_MARKER: RequestsStartMarker = RequestsStartMarker::new();
-
-#[used]
-#[unsafe(link_section = ".requests_end_marker")]
-static _END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 
 /// The line CI looks for to decide the kernel booted.
 pub const BOOT_OK: &str = "OPTIMAL: kernel booted";
@@ -50,48 +27,72 @@ pub const BOOT_OK: &str = "OPTIMAL: kernel booted";
 #[unsafe(no_mangle)]
 extern "C" fn kmain() -> ! {
     serial::init();
-    println!();
-    println!("Optimal kernel {}", env!("CARGO_PKG_VERSION"));
+    crate::println!();
+    crate::println!("Optimal kernel {}", env!("CARGO_PKG_VERSION"));
 
-    if !BASE_REVISION.is_supported() {
-        panic!("bootloader does not support Limine base revision we need");
+    // SAFETY: first thing on the boot CPU, interrupts are still disabled.
+    let hardening = unsafe { arch::init_cpu() };
+    crate::println!(
+        "cpu: tables loaded; NX {} WP {} SMEP {} SMAP {} UMIP {}",
+        on(hardening.nx),
+        on(hardening.wp),
+        on(hardening.smep),
+        on(hardening.smap),
+        on(hardening.umip)
+    );
+
+    if !boot::BASE_REVISION.is_supported() {
+        panic!("bootloader does not support the Limine base revision we need");
+    }
+    if let Some(info) = boot::BOOTLOADER_INFO.get_response() {
+        crate::println!("bootloader: {} {}", info.name(), info.version());
+    }
+    report_memory();
+    paint_screen();
+
+    let cmdline = boot::cmdline();
+    if let Some(name) = boot::arg(cmdline, "crashtest") {
+        crashtest::run(name);
     }
 
-    if let Some(info) = BOOTLOADER_INFO.get_response() {
-        println!("bootloader: {} {}", info.name(), info.version());
-    }
+    #[cfg(feature = "ktest")]
+    ktest::run_all();
 
-    if let Some(map) = MEMORY_MAP.get_response() {
+    crate::println!("{BOOT_OK}");
+    arch::cpu::halt_forever();
+}
+
+fn on(b: bool) -> &'static str {
+    if b { "on" } else { "unsupported" }
+}
+
+fn report_memory() {
+    if let Some(map) = boot::MEMORY_MAP.get_response() {
         let usable: u64 = map
             .entries()
             .iter()
             .filter(|e| e.entry_type == EntryType::USABLE)
             .map(|e| e.length)
             .sum();
-        println!(
+        crate::println!(
             "memory: {} MiB usable in {} map entries",
             usable / (1024 * 1024),
             map.entries().len()
         );
     }
-
-    if let Some(fb) = FRAMEBUFFER
-        .get_response()
-        .and_then(|r| r.framebuffers().next())
-    {
-        println!("screen: {}x{} @ {} bpp", fb.width(), fb.height(), fb.bpp());
-        paint_screen(&fb);
-    } else {
-        println!("screen: none (headless)");
-    }
-
-    println!("{BOOT_OK}");
-    halt_forever();
 }
 
 /// Fill the screen with a dark blue and draw a lighter band across the
 /// middle, so a real PC visibly shows the kernel is in control.
-fn paint_screen(fb: &limine::framebuffer::Framebuffer) {
+fn paint_screen() {
+    let Some(fb) = boot::FRAMEBUFFER
+        .get_response()
+        .and_then(|r| r.framebuffers().next())
+    else {
+        crate::println!("screen: none (headless)");
+        return;
+    };
+    crate::println!("screen: {}x{} @ {} bpp", fb.width(), fb.height(), fb.bpp());
     if fb.bpp() != 32 {
         return;
     }
@@ -105,19 +106,20 @@ fn paint_screen(fb: &limine::framebuffer::Framebuffer) {
         };
         for x in 0..w {
             let offset = (y * pitch + x * 4) as usize;
+            // SAFETY: (x, y) is inside the framebuffer Limine gave us, and each
+            // pixel is 4 bytes at `pitch` bytes per row.
             unsafe { base.add(offset).cast::<u32>().write_volatile(colour) };
         }
     }
 }
 
-fn halt_forever() -> ! {
-    loop {
-        unsafe { asm!("cli; hlt", options(nomem, nostack)) };
-    }
-}
-
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    println!("OPTIMAL: KERNEL PANIC: {info}");
-    halt_forever();
+    #[cfg(feature = "ktest")]
+    if let Some(test) = ktest::current_name() {
+        crate::println!("KTEST FAIL {test}");
+    }
+    crate::println!("OPTIMAL: KERNEL PANIC: {info}");
+    backtrace::print_here();
+    arch::cpu::halt_forever();
 }
