@@ -828,7 +828,11 @@ impl Space {
     #[cfg(test)]
     pub(crate) fn shape(&self) -> (usize, usize, Vec<u64>) {
         let root = &self.tables[&(self.levels, 0)];
-        (self.tables.len(), self.bmps.len(), root.kids.iter().map(|k| k.aux).collect())
+        (
+            self.tables.len(),
+            self.bmps.len(),
+            root.kids.iter().map(|k| k.aux).collect(),
+        )
     }
 
     /// Every on-disk table and bitmap pointer (for fsck). Loads them all.
@@ -883,15 +887,6 @@ impl Space {
     /// The oldest generation whose frees are still quarantined, if any.
     pub fn oldest_held(&self) -> Option<u64> {
         self.held.front().map(|h| h.generation)
-    }
-
-    /// Renumbers quarantined batches by `delta` generations, after mount
-    /// fell back to an older commit and new commits skip ahead: quarantine
-    /// then still counts real commits.
-    pub fn rebase_held(&mut self, delta: u64) {
-        for h in self.held.iter_mut() {
-            h.generation += delta;
-        }
     }
 
     pub fn log_addrs(&self) -> &[u64] {

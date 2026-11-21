@@ -5,7 +5,7 @@
 
 use optimalfs::sim::{CrashDevice, Rng};
 use optimalfs::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const LINK_MAX: u32 = 65000;
 pub const NAME_MAX: usize = 255;
@@ -693,10 +693,12 @@ impl Harness {
     fn record(&mut self, before: u64, states: &[Model]) {
         let after = self.fs.as_ref().unwrap().generation();
         let n = (after - before) as usize;
+        // Making room can cycle up to QUARANTINE_COMMITS + 1 empty commits
+        // before the op changes anything; those hold the pre-op state.
         assert!(
-            n <= states.len().max(2),
+            n <= states.len().max(2) + 9,
             "op committed {n} times, expected at most {}",
-            states.len()
+            states.len() + 9
         );
         for (i, g) in (before + 1..=after).enumerate() {
             let idx = states.len() as isize - n as isize + i as isize;
@@ -937,15 +939,20 @@ impl Harness {
 
     /// Full comparison of the mounted filesystem against `m` (live tree and snapshots).
     pub fn verify(&mut self, m: &Model) {
+        self.verify_skip(m, &BTreeSet::new());
+    }
+
+    /// [`Harness::verify`], with files in `damaged` required to fail reads.
+    pub fn verify_skip(&mut self, m: &Model, damaged: &BTreeSet<u64>) {
         let seed = self.seed;
         let fs = self.fs.as_mut().unwrap();
-        compare_tree(fs, &m.live, seed, "live");
+        compare_tree_skip(fs, &m.live, seed, "live", damaged);
         let ids: Vec<u64> = fs.snapshot_list().unwrap().iter().map(|s| s.id).collect();
         let want: Vec<u64> = m.snaps.keys().copied().collect();
         assert_eq!(ids, want, "seed {seed:#x}: snapshot list");
         for (id, snap) in &m.snaps {
             fs.with_snapshot(*id, |fs| {
-                compare_tree(fs, snap, seed, "snapshot");
+                compare_tree_skip(fs, snap, seed, "snapshot", damaged);
                 Ok(())
             })
             .unwrap();
@@ -964,7 +971,30 @@ impl Harness {
 }
 
 pub fn compare_tree<D: BlockDevice>(fs: &mut Filesystem<D>, m: &MFs, seed: u64, what: &str) {
+    compare_tree_skip(fs, m, seed, what, &BTreeSet::new());
+}
+
+/// Like [`compare_tree`], but files in `damaged` must fail to read instead.
+pub fn compare_tree_skip<D: BlockDevice>(
+    fs: &mut Filesystem<D>,
+    m: &MFs,
+    seed: u64,
+    what: &str,
+    damaged: &BTreeSet<u64>,
+) {
     for (&ino, n) in &m.nodes {
+        if damaged.contains(&ino) && n.kind == FileKind::File {
+            // Recovery reported a lost extent here: a read must fail or be
+            // exactly right (the extent may belong to another tree's version).
+            let mut buf = vec![0u8; n.data.len() + 10];
+            if let Ok(r) = fs.read(ino, 0, &mut buf) {
+                assert!(
+                    r == n.data.len() && buf[..r] == n.data[..],
+                    "seed {seed:#x} {what}: damaged inode {ino} returned wrong data"
+                );
+            }
+            continue;
+        }
         let a = fs
             .getattr(ino)
             .unwrap_or_else(|e| panic!("seed {seed:#x} {what}: getattr({ino}) failed: {e:?}"));

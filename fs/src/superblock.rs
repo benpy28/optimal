@@ -236,7 +236,12 @@ impl Body {
     /// The commit-state fields shared by a body and its history entries.
     fn encode_core(&self, w: &mut Writer) {
         w.u64(self.generation);
-        for p in [&self.fs_root, &self.meta_root, &self.space_root, &self.free_log] {
+        for p in [
+            &self.fs_root,
+            &self.meta_root,
+            &self.space_root,
+            &self.free_log,
+        ] {
             p.encode(w);
         }
         w.u64(self.next_ino);
@@ -326,7 +331,11 @@ impl Body {
 
     /// This commit's state without its history (a history entry).
     pub fn core(&self) -> Body {
-        Body { history: Vec::new(), log_root: BlockPtr::NULL, ..self.clone() }
+        Body {
+            history: Vec::new(),
+            log_root: BlockPtr::NULL,
+            ..self.clone()
+        }
     }
 }
 

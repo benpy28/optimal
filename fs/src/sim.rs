@@ -95,6 +95,9 @@ pub struct CrashDevice {
     pub cut_at: Option<u64>,
     powered: bool,
     pub faults: Faults,
+    /// A lying drive: flushes report success but make nothing durable, so
+    /// writes from many "flushed" commits pile up in the volatile cache.
+    pub lying_flush: bool,
     rng: Rng,
 }
 
@@ -110,6 +113,7 @@ impl CrashDevice {
             cut_at: None,
             powered: true,
             faults: Faults::default(),
+            lying_flush: false,
             rng: Rng::new(seed),
         }
     }
@@ -162,6 +166,24 @@ impl CrashDevice {
         }
         img
     }
+    /// What the platters hold after a lying drive loses power: every write
+    /// it claimed to have flushed or still had cached independently either
+    /// landed (any version written to that block) or was lost (the block's
+    /// durable content). Nothing is torn: a lying cache loses whole writes.
+    /// Tearing is covered by [`CrashDevice::crash_image`].
+    pub fn lost_writes_image(&mut self) -> Vec<u8> {
+        let mut img = self.durable.clone();
+        let volatile = core::mem::take(&mut self.volatile);
+        for (block, versions) in volatile {
+            let off = block as usize * BLOCK_SIZE;
+            let pick = self.rng.below(versions.len() as u64 + 1) as usize;
+            if pick > 0 {
+                img[off..off + BLOCK_SIZE].copy_from_slice(&versions[pick - 1]);
+            }
+        }
+        img
+    }
+
     /// The image if every in-flight write had landed in order (no crash).
     pub fn clean_image(&self) -> Vec<u8> {
         let mut img = self.durable.clone();
@@ -243,6 +265,9 @@ impl BlockDevice for CrashDevice {
         if self.faults.flush_error_one_in > 0 && self.rng.chance(1, self.faults.flush_error_one_in)
         {
             return Err(IoError::Failed);
+        }
+        if self.lying_flush {
+            return Ok(());
         }
         let volatile = core::mem::take(&mut self.volatile);
         for (block, versions) in volatile {

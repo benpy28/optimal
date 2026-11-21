@@ -112,7 +112,12 @@ fn fresh_volume_space_hand_worked() {
     let mut fs =
         Filesystem::format(MemDevice::new(4096), &opts, &mut rng, Box::new(ZeroClock)).unwrap();
     assert_eq!(fs.statfs().free_blocks, 4096 - 7);
-    assert!(fs.store.space.held.is_empty(), "{:?} gen {}", fs.store.space.held, fs.generation());
+    assert!(
+        fs.store.space.held.is_empty(),
+        "{:?} gen {}",
+        fs.store.space.held,
+        fs.generation()
+    );
     // Writing 10000 bytes adds ceil(10000/4096) = 3 data blocks. The commit
     // rewrites the leaf, the bitmap and the root table (old copies freed but
     // quarantined) and writes 1 free-log block recording those 3 frees.
@@ -177,7 +182,10 @@ fn quarantine_time_window_hand_worked() {
         if expect_release_at != 0 {
             assert_eq!(released, expect_release_at);
         } else {
-            assert!(released > 8, "time window must hold past 8 commits, got {released}");
+            assert!(
+                released > 8,
+                "time window must hold past 8 commits, got {released}"
+            );
         }
     }
 }

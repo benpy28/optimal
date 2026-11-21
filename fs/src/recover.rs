@@ -69,7 +69,9 @@ pub(crate) fn verify_since<D: BlockDevice>(
                     let e = Extent::decode(v, k.obj)?;
                     if data && e.birth >= min_birth {
                         st.data_blocks += e.len;
-                        if fs.verify_extent(k.obj, &e).is_err() && !st.damaged.contains(&(k.obj, e.phys)) {
+                        if fs.verify_extent(k.obj, &e).is_err()
+                            && !st.damaged.contains(&(k.obj, e.phys))
+                        {
                             st.damaged.push((k.obj, e.phys));
                         }
                     }

@@ -624,10 +624,14 @@ impl<D: BlockDevice> Filesystem<D> {
                 Ok(()) => {
                     if generation < floor {
                         // Newer commits exist on disk but did not fully land.
-                        // Number new commits above them, keep quarantine
-                        // counting real commits, and overwrite every slot.
+                        // Number new commits above them so they never outrank
+                        // ours. Their blocks are free in this commit's map and
+                        // will be reused; that is safe because every block they
+                        // could still need was born inside their window, which
+                        // mount verifies (a reused block fails its MAC). As
+                        // defence in depth the first commit also overwrites
+                        // every superblock slot, so no stale copy lingers.
                         fs.gen_floor = floor;
-                        fs.store.space.rebase_held(floor - generation);
                         fs.rewrite_all_slots = true;
                         fs.fell_back_from = Some(floor);
                     }
@@ -1749,7 +1753,12 @@ impl<D: BlockDevice> Filesystem<D> {
                 .take(superblock::HISTORY)
                 .collect(),
         };
-        superblock::commit(&mut self.store.io, &self.header, &body, self.rewrite_all_slots)?;
+        superblock::commit(
+            &mut self.store.io,
+            &self.header,
+            &body,
+            self.rewrite_all_slots,
+        )?;
         self.rewrite_all_slots = false;
         self.header.generation = generation;
         self.body = body;
