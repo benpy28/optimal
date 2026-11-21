@@ -40,6 +40,52 @@ pub struct Report {
     /// repair from the good copy is already queued (`repairs_pending`).
     pub bad_copies: u64,
     pub repairs_pending: u64,
+    /// Every metadata block: (kind, pointer, copy 0, copy 1).
+    metas: Vec<(BlockKind, BlockPtr, u64, u64)>,
+}
+
+/// What [`scrub_metadata`] found and fixed.
+#[derive(Debug, Clone, Default)]
+pub struct ScrubReport {
+    /// Metadata blocks whose two copies were both read.
+    pub blocks: u64,
+    /// Copies that failed while the other was good.
+    pub bad_copies: u64,
+    /// Copies rewritten from the good one (in one commit).
+    pub repaired: u64,
+    /// Blocks with no good copy (also in `check.errors`).
+    pub unreadable: u64,
+    /// The full check run first.
+    pub check: Report,
+}
+
+/// Reads both copies of every metadata block of the committed state and
+/// rewrites each bad copy from the good one in a single commit.
+pub fn scrub_metadata<D: BlockDevice>(fs: &mut Filesystem<D>) -> Result<ScrubReport> {
+    let check = check(fs, false)?;
+    let mut out = ScrubReport {
+        blocks: check.metas.len() as u64,
+        ..Default::default()
+    };
+    let io = &mut fs.store.io;
+    let (mode, before) = (io.copy_mode, io.stats.bad_copies);
+    io.copy_mode = crate::io::CopyMode::Both;
+    for (kind, p, p0, p1) in &check.metas {
+        if io.read_dup(*kind, p, *p0, *p1).is_err() {
+            out.unreadable += 1;
+        }
+    }
+    io.copy_mode = mode;
+    out.bad_copies = io.stats.bad_copies - before;
+    let pending = io.pending_repairs() as u64;
+    out.check = check;
+    if pending > 0 {
+        fs.mark_dirty();
+        let r0 = fs.store.io.stats.copies_repaired;
+        fs.commit()?;
+        out.repaired = fs.store.io.stats.copies_repaired - r0;
+    }
+    Ok(out)
 }
 
 impl Report {
@@ -70,6 +116,7 @@ struct Ctx {
     owners: BTreeMap<u64, (Role, u64, [u8; 16])>,
     /// Every metadata block claimed, to check both copies.
     metas: Vec<(BlockKind, BlockPtr)>,
+    metas_out: Vec<(BlockKind, BlockPtr, u64, u64)>,
     total: u64,
 }
 
@@ -132,6 +179,7 @@ pub fn check<D: BlockDevice>(fs: &mut Filesystem<D>, verify_data: bool) -> Resul
         rep: Report::default(),
         owners: BTreeMap::new(),
         metas: Vec::new(),
+        metas_out: Vec::new(),
         total: fs.store.space.total_blocks(),
     };
     let body = fs.body.clone();
@@ -273,6 +321,7 @@ pub fn check<D: BlockDevice>(fs: &mut Filesystem<D>, verify_data: bool) -> Resul
             }
         }
     }
+    cx.rep.metas = core::mem::take(&mut cx.metas_out);
     Ok(cx.rep)
 }
 
@@ -346,6 +395,7 @@ fn check_chunks<D: BlockDevice>(fs: &mut Filesystem<D>, cx: &mut Ctx, body: &Bod
         let Ok((p0, p1)) = fs.store.space.chunks.resolve(&mut fs.store.io, p.addr) else {
             continue;
         };
+        cx.metas_out.push((*kind, *p, p0, p1));
         let (ok0, ok1) = fs.store.io.verify_copies(*kind, p, p0, p1);
         for (ok, c, at) in [(ok0, 0, p0), (ok1, 1, p1)] {
             if !ok {
@@ -362,6 +412,7 @@ fn check_chunks<D: BlockDevice>(fs: &mut Filesystem<D>, cx: &mut Ctx, body: &Bod
         };
         cx.claim(p.addr, 1, Role::ChunkMap, p.birth, p.mac);
         cx.claim(p.aux, 1, Role::ChunkMap, p.birth, p.mac);
+        cx.metas_out.push((kind, p, p.addr, p.aux));
         let (ok0, ok1) = fs.store.io.verify_copies(kind, &p, p.addr, p.aux);
         for (ok, c, at) in [(ok0, 0, p.addr), (ok1, 1, p.aux)] {
             if !ok {

@@ -29,6 +29,8 @@ mod snapshot;
 mod space;
 mod superblock;
 #[cfg(test)]
+mod dup_tests;
+#[cfg(test)]
 mod tests;
 mod tree;
 

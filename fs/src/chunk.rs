@@ -559,12 +559,14 @@ impl ChunkTable {
         Ok(None)
     }
 
-    /// Dirty nodes, children before parents (the order they must be written).
+    /// Dirty nodes that will be written, children before parents. A
+    /// non-root node with nothing mapped below is not written: its parent
+    /// gets a null pointer (the only form an empty subtree has on disk).
     pub fn dirty_nodes(&self) -> Vec<(u32, u64)> {
         let mut v: Vec<(u32, u64)> = self
             .nodes
             .iter()
-            .filter(|(_, n)| n.dirty)
+            .filter(|(k, n)| n.dirty && (**k == (self.depth, 0) || n.sums().1 > 0))
             .map(|(&k, _)| k)
             .collect();
         v.sort();
@@ -579,6 +581,19 @@ impl ChunkTable {
         generation: u64,
         homes: &BTreeMap<(u32, u64), (u64, u64)>,
     ) -> Result<BlockPtr> {
+        // Empty dirty subtrees disappear (their old copies were already
+        // queued for freeing when they were first changed).
+        let empty: Vec<(u32, u64)> = self
+            .nodes
+            .iter()
+            .filter(|(k, n)| n.dirty && **k != (self.depth, 0) && n.sums().1 == 0)
+            .map(|(&k, _)| k)
+            .collect();
+        for (level, idx) in empty {
+            self.nodes.remove(&(level, idx));
+            let parent = self.node(io, level + 1, idx / TABLE_FANOUT)?;
+            parent.kids_mut()[(idx % TABLE_FANOUT) as usize] = Kid::NULL;
+        }
         for (level, idx) in self.dirty_nodes() {
             let (p0, p1) = homes[&(level, idx)];
             let n = self.nodes.get_mut(&(level, idx)).unwrap();
