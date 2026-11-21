@@ -273,6 +273,8 @@ pub struct FormatOptions {
     /// Encrypts the volume when set.
     pub passphrase: Option<Vec<u8>>,
     pub kdf: KdfParams,
+    /// Minimum age before freed blocks may be reused (see [`MountOptions`]).
+    pub quarantine_min_ns: i64,
 }
 
 impl Default for FormatOptions {
@@ -280,6 +282,7 @@ impl Default for FormatOptions {
         FormatOptions {
             passphrase: None,
             kdf: KdfParams::DEFAULT,
+            quarantine_min_ns: DEFAULT_QUARANTINE_NS,
         }
     }
 }
@@ -293,7 +296,16 @@ pub struct MountOptions {
     /// Dirty file data kept in memory before it is written out early
     /// (still committed atomically with everything else).
     pub dirty_limit_bytes: usize,
+    /// Freed blocks are not reused until they are both
+    /// [`crate::space::QUARANTINE_COMMITS`] commits and this many
+    /// nanoseconds old, so a drive that silently dropped recent flushes
+    /// still finds an intact older tree. Tests with a frozen clock set 0.
+    pub quarantine_min_ns: i64,
 }
+
+/// 30 seconds: covers drives that hold writes in a volatile cache across
+/// several flush requests.
+pub const DEFAULT_QUARANTINE_NS: i64 = 30_000_000_000;
 
 impl Default for MountOptions {
     fn default() -> Self {
@@ -302,6 +314,7 @@ impl Default for MountOptions {
             read_only: false,
             cache_nodes: 8192,
             dirty_limit_bytes: 64 << 20,
+            quarantine_min_ns: DEFAULT_QUARANTINE_NS,
         }
     }
 }
@@ -389,7 +402,8 @@ impl<D: BlockDevice> Filesystem<D> {
             dev.write(superblock::slot_addr(slot, total), &zero[..])?;
         }
         let sealer = Sealer::new(uuid, master.as_ref(), rng);
-        let space = Space::format(total)?;
+        let mut space = Space::format(total)?;
+        space.quarantine_min_ns = opts.quarantine_min_ns;
         let store = Store {
             io: Io::new(dev, sealer),
             space,
@@ -498,7 +512,8 @@ impl<D: BlockDevice> Filesystem<D> {
             let (dev, _) = store_opt.take().unwrap();
             let mut io = Io::new(dev, sealer);
             match Self::open_commit(&mut io, &c.header, &body) {
-                Ok((space, fs_tree, meta)) => {
+                Ok((mut space, fs_tree, meta)) => {
+                    space.quarantine_min_ns = opts.quarantine_min_ns;
                     let store = Store {
                         io,
                         space,
@@ -634,19 +649,23 @@ impl<D: BlockDevice> Filesystem<D> {
         if self.store.space.allocatable_blocks() >= need(self) {
             return Ok(());
         }
-        // Quarantined blocks become usable after two commits.
+        // Quarantined blocks become usable once they are QUARANTINE_COMMITS
+        // commits and the minimum time old. Cycle commits while that could
+        // still help; past the time window the caller must wait and retry.
         if self.txn_dirty {
             self.commit()?;
-            if self.store.space.allocatable_blocks() >= need(self) {
-                return Ok(());
+        }
+        let mut cycles = 0;
+        while self.store.space.allocatable_blocks() < need(self) {
+            let could =
+                self.store.space.allocatable_blocks() + self.store.space.quarantined_blocks();
+            if could < need(self) || cycles > crate::space::QUARANTINE_COMMITS {
+                return Err(Error::NoSpace);
             }
+            self.commit_forced()?;
+            cycles += 1;
         }
-        self.commit_forced()?;
-        if self.store.space.allocatable_blocks() >= need(self) {
-            Ok(())
-        } else {
-            Err(Error::NoSpace)
-        }
+        Ok(())
     }
 
     // ---- inode helpers ----
@@ -1556,7 +1575,11 @@ impl<D: BlockDevice> Filesystem<D> {
         let fs_root = self.fs_tree.write(&mut self.store, generation)?;
         crate::snapshot::flush_deadlist(self)?;
         let meta_root = self.meta.write(&mut self.store, generation)?;
-        let (space_root, free_log) = self.store.space.write(&mut self.store.io, generation)?;
+        let now = self.clock.now_ns();
+        let (space_root, free_log) = self
+            .store
+            .space
+            .write(&mut self.store.io, generation, now)?;
         self.store.io.write_batch()?;
         let body = Body {
             generation,
@@ -1569,12 +1592,12 @@ impl<D: BlockDevice> Filesystem<D> {
             live_deadlist: self.live_deadlist,
             next_deadlist: self.next_deadlist,
             latest_snap_gen: self.store.latest_snap_gen,
-            commit_time_ns: self.clock.now_ns(),
+            commit_time_ns: now,
         };
         superblock::commit(&mut self.store.io, &self.header, &body)?;
         self.header.generation = generation;
         self.body = body;
-        self.store.space.committed();
+        self.store.space.committed(generation, now);
         self.txn_dirty = false;
         Ok(())
     }

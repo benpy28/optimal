@@ -7,6 +7,7 @@ fn fsck_reports_and_detects() {
     let opts = FormatOptions {
         passphrase: None,
         kdf: KdfParams::INSECURE_FAST_FOR_TESTS,
+        quarantine_min_ns: 0,
     };
     let mut fs =
         Filesystem::format(MemDevice::new(4096), &opts, &mut rng, Box::new(ZeroClock)).unwrap();

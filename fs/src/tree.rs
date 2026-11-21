@@ -203,7 +203,7 @@ impl Node {
             return Err(bad());
         }
         let level = r.u8()?;
-        if level > MAX_LEVEL || level as u32 != ptr.aux || r.u8()? != tree as u8 {
+        if level > MAX_LEVEL || level as u64 != ptr.aux || r.u8()? != tree as u8 {
             return Err(bad());
         }
         let n = r.u16()? as usize;
@@ -230,7 +230,7 @@ impl Node {
                 node.items.push((k, r.bytes(len)?.to_vec()));
             } else {
                 let p = BlockPtr::decode(&mut r)?;
-                if p.is_null() || p.aux != level as u32 - 1 || p.birth > ptr.birth {
+                if p.is_null() || p.aux != level as u64 - 1 || p.birth > ptr.birth {
                     return Err(bad());
                 }
                 node.kids.push((k, Child::Clean(p)));
@@ -350,7 +350,7 @@ pub struct Tree {
 
 impl Tree {
     pub fn new(id: TreeId, root: BlockPtr) -> Result<Tree> {
-        if !root.is_null() && root.aux > MAX_LEVEL as u32 {
+        if !root.is_null() && root.aux > MAX_LEVEL as u64 {
             return Err(Error::Corrupt("tree root level", root.addr));
         }
         Ok(Tree {
@@ -692,7 +692,7 @@ fn write_rec<D: BlockDevice>(
     let addr = addrs.next().expect("allocated too few node blocks");
     let b = node.encode(tree, generation);
     let p =
-        s.io.write_sealed(BlockKind::Node, addr, generation, b, node.level as u32);
+        s.io.write_sealed(BlockKind::Node, addr, generation, b, node.level as u64);
     let node = core::mem::take(&mut **node);
     s.cache.put(p, Arc::new(node));
     *c = Child::Clean(p);

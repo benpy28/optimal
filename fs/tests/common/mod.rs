@@ -610,6 +610,7 @@ pub fn fmt_opts(enc: bool) -> FormatOptions {
     FormatOptions {
         passphrase: enc.then(|| b"correct horse".to_vec()),
         kdf: KdfParams::INSECURE_FAST_FOR_TESTS,
+        quarantine_min_ns: 0,
     }
 }
 
@@ -618,6 +619,7 @@ pub fn mount_opts(enc: bool) -> MountOptions {
         passphrase: enc.then(|| b"correct horse".to_vec()),
         cache_nodes: 512,
         dirty_limit_bytes: 256 * 1024,
+        quarantine_min_ns: 0,
         ..Default::default()
     }
 }

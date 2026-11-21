@@ -47,12 +47,27 @@ fn superblock_slots_hand_worked() {
 
 #[test]
 fn space_shape_hand_worked() {
-    // 100000 blocks need ceil(100000 / 32768) = 4 bitmap blocks, all in one
-    // level-1 table. Free = 100000 - 4 superblock slots = 99996.
-    let s = crate::space::Space::format(100_000).unwrap();
+    // 100000 blocks need ceil(100000 / 32768) = 4 bitmaps, which fit under
+    // one level-1 table (64 bitmaps = 2^21 blocks), so depth is 1. Only the
+    // bitmaps holding superblock slots are materialised: bitmap 0 (blocks
+    // 0, 1) and bitmap 3 (99998 / 32768 = 3, blocks 99998, 99999).
+    // Root free counts: 32768-2, 32768, 32768, 100000-3*32768-2 = 1694,
+    // then zero for the 60 bitmaps past the end. Sum 99996 = 100000 - 4.
+    use crate::space::Space;
+    let s = Space::format(100_000).unwrap();
     assert_eq!(s.free_blocks(), 99_996);
-    assert_eq!(s.tables().2.len(), 4);
-    assert_eq!(s.tables().1.len(), 1);
+    assert_eq!(s.levels(), 1);
+    let (tables, bmps, kids) = s.shape();
+    assert_eq!((tables, bmps), (1, 2));
+    assert_eq!(&kids[..5], &[32_766, 32_768, 32_768, 1_694, 0]);
+    assert!(kids[5..].iter().all(|&k| k == 0));
+    // Depth by size: one level covers 2^21 blocks (8 GiB), each extra level 64x.
+    assert_eq!(Space::levels_for(1 << 21).unwrap(), 1);
+    assert_eq!(Space::levels_for((1 << 21) + 1).unwrap(), 2);
+    assert_eq!(Space::levels_for(1 << 32).unwrap(), 3); // 16 TiB
+    assert_eq!(Space::levels_for(1 << 37).unwrap(), 4); // 512 TiB
+    assert_eq!(Space::levels_for(1 << 45).unwrap(), 5); // 128 PiB
+    assert!(Space::levels_for((1 << 45) + 1).is_err());
 }
 
 #[test]
@@ -84,29 +99,87 @@ fn extent_slice_hand_worked() {
 
 #[test]
 fn fresh_volume_space_hand_worked() {
-    // A fresh 4096-block volume uses: 4 superblock slots + 1 space root
-    // table + 1 level-1 table + 1 bitmap (4096 < 32768) + 1 tree leaf
-    // (the root inode) = 8 blocks. The meta tree is empty and nothing was
-    // freed, so there is no free log.
+    // A fresh 4096-block volume needs one bitmap (4096 < 32768) directly
+    // under the root table (depth 1). It uses 4 superblock slots + 1 root
+    // table + 1 bitmap + 1 tree leaf (the root inode) = 7 blocks. The meta
+    // tree is empty and nothing was freed, so there is no free log.
     let mut rng = Rng::new(3);
     let opts = FormatOptions {
         passphrase: None,
         kdf: crate::KdfParams::INSECURE_FAST_FOR_TESTS,
+        quarantine_min_ns: 0,
     };
     let mut fs =
         Filesystem::format(MemDevice::new(4096), &opts, &mut rng, Box::new(ZeroClock)).unwrap();
-    assert_eq!(fs.statfs().free_blocks, 4096 - 8);
+    assert_eq!(fs.statfs().free_blocks, 4096 - 7);
+    assert!(fs.store.space.held.is_empty(), "{:?} gen {}", fs.store.space.held, fs.generation());
     // Writing 10000 bytes adds ceil(10000/4096) = 3 data blocks. The commit
-    // rewrites the leaf, the bitmap, the L1 table and the root table (their
-    // old copies are freed but quarantined) and writes 1 free-log block for
-    // those frees. Used: 4 + 3 tables/bitmap + 1 leaf + 3 data + 1 log = 12.
+    // rewrites the leaf, the bitmap and the root table (old copies freed but
+    // quarantined) and writes 1 free-log block recording those 3 frees.
+    // Used: 4 + 2 + 1 leaf + 3 data + 1 log = 11.
     let f = fs.create(ROOT_INO, b"f", 0o644).unwrap();
     fs.write(f, 0, &[5u8; 10_000]).unwrap();
     fs.commit().unwrap();
-    assert_eq!(fs.statfs().free_blocks, 4096 - 12);
-    // Quarantine: the 4 freed blocks can't be allocated until the next commit.
-    let st = fs.statfs();
-    assert_eq!(fs.store.space.allocatable_blocks(), st.free_blocks - 4);
+    let g = fs.generation();
+    assert_eq!(fs.statfs().free_blocks, 4096 - 11);
+    assert_eq!(fs.store.space.allocatable_blocks(), 4096 - 11 - 3);
+    let first = fs.store.space.held.front().unwrap().clone();
+    assert_eq!((first.generation, first.set.len()), (g, 3));
+    // The batch from commit g stays held through commits g+1 .. g+7 and is
+    // released by commit g+8 (QUARANTINE_COMMITS = 8).
+    for k in 1..=8u64 {
+        fs.mark_dirty();
+        fs.commit().unwrap();
+        assert_eq!(fs.generation(), g + k);
+        let still = fs.store.space.held.iter().any(|h| h.generation == g);
+        assert_eq!(still, k < 8, "after commit g+{k}");
+        // Every held batch is younger than 8 commits.
+        assert!(fs.store.space.held.iter().all(|h| g + k - h.generation < 8));
+    }
+}
+
+#[test]
+fn quarantine_time_window_hand_worked() {
+    // A clock that ticks 10 s per reading, with a 30 s window: a batch
+    // freed at commit g (time t) needs both g+8 commits and t+30 s. Commits
+    // are > 10 s apart here, so the commit count is the binding limit; with
+    // a 200 s window the time is, and the batch must outlive commit g+8.
+    struct Tick(i64);
+    impl crate::fs::Clock for Tick {
+        fn now_ns(&mut self) -> i64 {
+            self.0 += 10_000_000_000;
+            self.0
+        }
+    }
+    for (window_s, expect_release_at) in [(30i64, 8u64), (200, 0)] {
+        let mut rng = Rng::new(4);
+        let opts = FormatOptions {
+            passphrase: None,
+            kdf: crate::KdfParams::INSECURE_FAST_FOR_TESTS,
+            quarantine_min_ns: window_s * 1_000_000_000,
+        };
+        let mut fs =
+            Filesystem::format(MemDevice::new(4096), &opts, &mut rng, Box::new(Tick(0))).unwrap();
+        let f = fs.create(ROOT_INO, b"f", 0o644).unwrap();
+        fs.write(f, 0, &[1u8; 100]).unwrap();
+        fs.commit().unwrap();
+        let g = fs.generation();
+        let t0 = fs.body.commit_time_ns;
+        let mut released = 0;
+        for k in 1..=30u64 {
+            fs.mark_dirty();
+            fs.commit().unwrap();
+            if released == 0 && !fs.store.space.held.iter().any(|h| h.generation == g) {
+                released = k;
+                assert!(fs.body.commit_time_ns - t0 >= window_s * 1_000_000_000);
+            }
+        }
+        if expect_release_at != 0 {
+            assert_eq!(released, expect_release_at);
+        } else {
+            assert!(released > 8, "time window must hold past 8 commits, got {released}");
+        }
+    }
 }
 
 #[test]
@@ -195,7 +268,7 @@ fn tree_shrinks_after_mass_delete() {
     }
 }
 
-fn ptr_level(level: u32) -> BlockPtr {
+fn ptr_level(level: u64) -> BlockPtr {
     BlockPtr {
         addr: 5,
         birth: 3,
@@ -209,7 +282,7 @@ proptest! {
     #![proptest_config(ProptestConfig { cases: 2000, ..ProptestConfig::default() })]
 
     #[test]
-    fn decoders_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..4200), level in 0u32..20) {
+    fn decoders_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..4200), level in 0u64..20) {
         let _ = Node::decode(&bytes, TreeId::Fs, &ptr_level(level));
         let _ = Node::decode(&bytes, TreeId::Meta, &ptr_level(level));
         let _ = Extent::decode(&bytes, 1);

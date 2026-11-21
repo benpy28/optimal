@@ -74,7 +74,7 @@ impl<D: BlockDevice> Io<D> {
         addr: u64,
         birth: u64,
         mut data: Block,
-        aux: u32,
+        aux: u64,
     ) -> BlockPtr {
         let (nonce, mac) = self.sealer.seal(kind, addr, birth, &mut data[..]);
         self.queue(addr, data);
