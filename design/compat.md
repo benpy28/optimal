@@ -25,6 +25,12 @@ gamed. Security rules that shape the ABI are in
   32-bit vDSO `clock_gettime` benchmark runs beside the 64-bit one. Every
   syscall handler and every `ioctl` declares its 32-bit layout when it is
   written; an `ioctl` without one fails CI.
+- **The system image carries an i386 multiarch userland by Phase 7:**
+  `ld-linux.so.2`, 32-bit glibc (with `libstdc++` and `libgcc_s`), 32-bit
+  Mesa GL and Vulkan drivers with their ICD JSON files, and their entries
+  in `ld.so.cache`, because pressure-vessel imports the host's graphics
+  stack and Steam's i386 client and Proton need them. Test (Phase 7): a
+  32-bit Vulkan triangle renders under pressure-vessel.
 - **16-bit stack segments from `modify_ldt` don't leak kernel bits.**
   Linux lets `modify_ldt` install a 16-bit SS, and `IRET` to a 16-bit stack
   restores only RSP[15:0], leaving RSP[31:16] of the kernel stack visible.
@@ -33,7 +39,8 @@ gamed. Security rules that shape the ABI are in
   unrelated to any kernel address; on return to a 16-bit SS the kernel
   writes the `IRET` frame through a writable alias and runs `IRET` from the
   espfix stack, so the leaked bits carry nothing. It lands with
-  `modify_ldt` in milestone 13 (Phase 9); A3 row test: a 16-bit-SS
+  `modify_ldt` in milestone 3 (Phase 5), because the Phase 5 Wine
+  first-run test needs `modify_ldt`; A3 row test (Phase 5): a 16-bit-SS
   `IRET` leak program recovers 0 bits of any kernel address. x32 (the ILP32 ABI on 64-bit) is not supported; it is
   almost unused and Linux distributions have dropped it.
 - **Kernel identity.** `uname` reports the newest Linux release whose
@@ -127,17 +134,17 @@ on the scorecard, measured as described below. The phase column is the one
 |---|---|---|---|---|
 | 1 | ELF execution | 3 | loader, auxv, vDSO, 64- and 32-bit entry, signal frames | static glibc and static musl binaries (64 and 32 bit), static coreutils, the single-threaded subset of gVisor's syscall tests for the implemented calls (multi-threaded tests join milestone 2) |
 | 2 | Processes and threads | 5 (starts in 3) | `fork`, `clone`, `wait*`, futexes including `FUTEX_LOCK_PI` and `futex_waitv`, `membarrier`, scheduling policies and affinity ([scheduler.md](scheduler.md)), `pidfd`, `prctl` basics | LTP process and thread tests, kselftest futex, glibc nptl tests, pthread stress |
-| 3 | Memory and signals | 5 (starts in 3) | `mmap` semantics, COW, `mremap`, `madvise`, `userfaultfd` (later), per-thread signal masks, `tgkill`, `sigaltstack`, `SA_RESTART`, `signalfd` | LTP mm and signal tests, glibc and musl test suites, kselftest mm |
+| 3 | Memory and signals | 5 (starts in 3) | `mmap` semantics, COW, `mremap`, `madvise`, `userfaultfd` (later), `modify_ldt` with espfix64, per-thread signal masks, `tgkill`, `sigaltstack`, `SA_RESTART`, `signalfd` | LTP mm and signal tests, glibc and musl test suites, kselftest mm, kselftest x86 `ldt_gdt` and `sigreturn` (16-bit SS) |
 | 4 | Files, `/proc` and `/sys` | 5 (starts in 4a) | VFS semantics, durability contract ([storage.md](storage.md)), `inotify`, `fanotify` (read-only uses), `/proc` and `/sys` per the contract below, per-app private homes ([capabilities.md](capabilities.md)) | LTP fs tests, xfstests subset, SQLite crash tests, BusyBox, Python, GCC and git test suites |
-| 5 | Desktop IPC and async I/O | 5 | io_uring, `AF_UNIX` with `SCM_RIGHTS` and `SCM_CREDENTIALS`, abstract sockets scoped per app, `memfd_create` with seals, `eventfd`, `timerfd`, `epoll`, pipes, pseudo-terminals, a loopback-only TCP and UDP stack (`AF_INET` and `AF_INET6` on `127.0.0.0/8` and `::1`) with the per-identity loopback rule ([capabilities.md](capabilities.md)), which milestone 4's Python and git suites need | dbus-daemon tests, Wayland's test suite (protocol layer), LTP ipc tests |
+| 5 | Desktop IPC and async I/O | 5 | io_uring, `AF_UNIX` with `SCM_RIGHTS` and `SCM_CREDENTIALS`, abstract sockets scoped per app, `memfd_create` with seals, `eventfd`, `timerfd`, `epoll`, pipes, pseudo-terminals, a loopback-only TCP and UDP stack (`AF_INET` and `AF_INET6` on `127.0.0.0/8` and `::1`) with the per-identity loopback rule and the system resolver with a fake upstream ([capabilities.md](capabilities.md)), which milestone 4's Python and git suites need | dbus-daemon tests, Wayland's test suite (protocol layer), LTP ipc tests |
 | 6 | Containers and sandboxes | 5 | user, mount, PID, network, UTS and IPC namespaces (unprivileged user namespaces included), `pivot_root`, bind mounts, `seccomp` with classic BPF and `RET_ERRNO`/`RET_TRAP`/`RET_USER_NOTIF`, `no_new_privs`, cgroup v2 subset (cpu, memory, pids, io), the FUSE protocol (`/dev/fuse`, the broker's `fusermount3` replacement, the document portal), the Flatpak launcher and `org.freedesktop.portal.Flatpak` ([capabilities.md](capabilities.md)) | `bwrap` running a Steam Runtime container, pressure-vessel under `/.flatpak-info` starting one through `Spawn`, Chromium's and Firefox's sandbox self-tests (headless Chromium also in Flatpak mode), kselftest seccomp and namespaces, libfuse's tests and the FUSE protocol fuzzed with 10^8 executions, rootless `podman run --network=none` and with a loopback-only network namespace, the Flatpak launcher's own conformance tests plus upstream Flatpak's `flatpak run` tests and the `~/.var/app` migration test |
 | 7 | Debugging and profiling | 5 | `ptrace` (policy in [capabilities.md](capabilities.md)), `perf_event_open` (own process or one held with a debug capability, user-space counters only), core dumps (local only) | gdb test suite subset, strace's tests, rr's tests where the CPU supports it |
-| 8 | Networking | 6 | sockets (TCP, UDP, ICMP for unprivileged ping) over real interfaces, `netlink` route and uevent basics, `getaddrinfo` paths, `/dev/net/tun` per user namespace | LTP net tests, curl and OpenSSH test suites, a browser's network tests, rootless podman with pasta and with slirp4netns networking |
+| 8 | Networking | 6 | sockets (TCP, UDP, ICMP for unprivileged ping) over real interfaces, `netlink` route and uevent basics, `getaddrinfo` paths, `/dev/net/tun` per user namespace, the VPN portal for the designated VPN app ([capabilities.md](capabilities.md)) | LTP net tests, curl and OpenSSH test suites, a browser's network tests, rootless podman with pasta and with slirp4netns networking |
 | 9 | Input and devices | 6 | evdev (`/dev/input/event*`), uevent netlink and the `/sys/class` and `/sys/dev/char` layout libudev expects, `hidraw` and `usbfs` for approved devices, `uinput` (input service and compositor; gamepad codes only through the virtual-gamepad portal; keyboard and pointer emulation through the compositor's virtual keyboard and pointer) | libinput test suite, SDL gamepad tests, libusb tests |
 | 10 | Audio | 6 | ALSA PCM, control and timer interfaces including mmap mode; real-time scheduling for PipeWire through the rtkit portal | alsa-lib tests, PipeWire tests, underrun counts from the benchmark |
 | 11 | Graphics | 8 (starts in 7 with virtio-gpu) | DRM/KMS, GEM, render nodes, dma-buf, `sync_file`, timeline syncobj, the per-driver uAPI of the chosen GPU family, DRM master handed out by the seat service | Mesa's tests, piglit, the pinned Vulkan Conformance Test Suite subset, IGT subset (each at the 90% target below) |
 | 12 | Wayland desktop | 7 | milestones 1 to 10, milestone 11's Phase 7 part (KMS, GEM, dma-buf and sync objects on virtio-gpu and simple framebuffers) and the seat service, so a compositor, GTK and Qt apps and a browser run | compositor plus GTK and Qt test apps, a browser's test suite |
-| 13 | Wine and Proton | 9 | everything above, 32-bit in full, Steam's child identities with their declared shared channels and the virtual-gamepad portal ([capabilities.md](capabilities.md)), `modify_ldt`, `/dev/ntsync` (the NT synchronisation driver current Proton uses), `RLIMIT_NOFILE` soft 1024 and hard 524,288 by default (soft stays at 1024 so `select()` users keep working; Proton raises its own soft limit for esync), the futex and fd-heavy patterns Proton uses | Wine's conformance tests, the published game list |
+| 13 | Wine and Proton | 9 | everything above, 32-bit in full (the i386 userland from Phase 7), Steam's child identities with their declared shared channels and the virtual-gamepad portal ([capabilities.md](capabilities.md)), `/dev/ntsync` (the NT synchronisation driver current Proton uses), `RLIMIT_NOFILE` soft 1024 and hard 524,288 by default (soft stays at 1024 so `select()` users keep working; Proton raises its own soft limit for esync), the futex and fd-heavy patterns Proton uses | Wine's conformance tests, the published game list |
 
 Anti-cheat, precisely: **kernel-level** anti-cheat (Valorant's Vanguard, some
 Call of Duty and EA titles) is a Windows kernel driver and won't run; the game
@@ -249,11 +256,14 @@ sanitizers read `/proc/self/status`, glibc reads
   from another identity, `TIOCSTI` returning `EPERM` and `TIOCLINUX`
   absent, wildcard sockets receiving only loopback without an inbound
   grant, no network in the default profile until the first-use request is
-  answered, the per-app private home, `SO_PEERCRED` giving pid 0 for a peer
+  answered (a name lookup or `connect` that needs a human waits up to 30 s,
+  then gets `EAI_AGAIN` or `ENETUNREACH` if refused), the per-app private
+  home, `SO_PEERCRED` giving pid 0 for a peer
   in another app's PID namespace (as Linux does for a pid outside the
   receiver's namespace), the terminal's portal-backed `/proc` and its
   limited signals to other identities (above), a registered app run from a
-  shell running under its own identity behind the launch relay, autostart
+  shell running under its own identity behind the launch relay (path
+  arguments and cwd rewritten to one-use document-portal paths), autostart
   and desktop entries written inside a private home becoming Background
   and launcher portal requests (nothing appears until approved; Phase 5
   test, and Steam's shortcuts in milestone 13), the Flatpak portal's

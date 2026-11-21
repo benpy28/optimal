@@ -129,10 +129,13 @@ tests):
   for each `unsafe` it contains) gate every change. Kernel crates may not
   depend on crates with `build.rs` scripts or procedural macros unless the
   crate is vendored and audited, because both run arbitrary code at build
-  time. Verus's `verus_builtin` and `builtin_macros` crates are vendored
-  and audited on this rule; `vstd` is used only in Verus builds and a CI
-  check keeps it out of every shipping `cargo tree`
-  ([verification.md](verification.md)).
+  time. Verus's `verus_builtin` and `builtin_macros` crates and the exec
+  subset of `vstd` the shipping kernel uses (`atomic`, `simple_pptr`,
+  `cell`) are vendored, pinned and audited on this rule; their ghost code
+  erases in non-Verus builds, and a CI check fails if any shipping
+  `cargo tree` contains `vstd` other than as that subset at its pinned hash
+  ([verification.md](verification.md)). The subset counts as a tier-0
+  dependency: inventoried and inside the 15,000-line cap.
 
 ## The bootloader workspace
 

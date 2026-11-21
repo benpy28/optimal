@@ -30,7 +30,9 @@ audio keeps up under load. This file is the design that the targets in
   inventory; lockdown permits only the two precompiled states. Its cost when
   off is at most 0.5% on the
   syscall round-trip microbenchmark against a build with the tracer compiled
-  out, a Phase 3 gate ([benchmarks.md](benchmarks.md)). The tracer reads the
+  out, both built with the fixed code alignment of
+  [benchmarks.md](benchmarks.md) so the gate measures the trace points, not
+  link layout, a Phase 3 gate. The tracer reads the
   SMI count (`MSR_SMI_COUNT` on Intel, the SMIs-received PMC event on AMD) at
   the entry and exit of each section; sections an SMI overlapped are
   firmware time, so they are reported separately with their count published
@@ -40,8 +42,9 @@ audio keeps up under load. This file is the design that the targets in
   interrupt until the read completes, whatever the interrupt flag says, so
   a surprise-removed device stalls that CPU for its whole Completion
   Timeout. Three rules bound it ([drivers.md](drivers.md)): Completion
-  Timeout is set to the 50 to 100 µs sub-range of range A on every device
-  that supports it (else range A, at most 10 ms); no MMIO read happens in
+  Timeout defaults to the 1 to 10 ms range, and is set to 50 to 100 µs
+  only on devices measured safe with ASPM L1 substates off (a 24-hour soak
+  with 0 spurious timeouts gates each one); no MMIO read happens in
   any non-preemptible section (spinlock held, preemption or interrupts
   off), so hard-IRQ handlers only write; and handler threads of
   hot-removable devices (behind a hotplug-capable or Thunderbolt/USB4 port)
@@ -191,10 +194,18 @@ thread on that CPU.
   design, not Phase 10: timers are kept in per-CPU structures with
   nanosecond expiry on the timer event source above, and an idle CPU takes
   no periodic tick. A CPU running one thread also stops its tick
-  (single-thread tick stop, Phase 2), keeping one timer for that thread's
-  slice end and RT throttle; a Phase 2 test runs one spinning thread on a
-  CPU for 10 s and requires at most 10 timer interrupts there. Phase 10
-  only tunes it.
+  (single-thread tick stop, Phase 2) and arms no slice timer: a thread
+  alone on its CPU has no one to yield to, so when a second thread is
+  queued there the enqueuing CPU sends an IPI and the target re-arms the
+  slice timer. The clocksource watchdog, RT-throttle bookkeeping and RAPL
+  sampling run only on housekeeping CPUs (the boot CPU, or the
+  non-isolated CPUs), so a tick-stopped CPU arms only timers its own
+  thread asked for and, from Phase 5, the `cpu.max` quota-expiry timer of
+  its thread's group (one per period while the group has a quota, which
+  the bound counts). A Phase 2 test runs one spinning thread on a CPU for
+  10 s, logs every interrupt there by source, and requires at most 10
+  timer interrupts (with a `cpu.max` quota from Phase 5: at most 10 plus
+  one per quota period). Phase 10 only tunes it.
 - **Frequency control** (Phase 2). Optimal drives hardware P-states (Intel
   HWP, AMD CPPC) from Phase 2; it is a precondition of every comparison
   with Linux, from the Phase 4a storage set on. Otherwise a comparison
@@ -250,9 +261,11 @@ explicit:
   that address space has a generation older than the change, so reloading
   it flushes. Tests: a QEMU test forks while other threads of the parent
   write continuously and checks no write lands in a page the child sees
-  (Phase 3); a QEMU test tears down an address space with lazy CPUs on
-  each path and checks no CPU holds its freed top-level table in CR3
-  (Phase 3 IPI path, Phase 5 INVLPGB path).
+  (Phase 3); a teardown test tears down an address space with lazy CPUs
+  and checks no CPU holds its freed top-level table in CR3: the IPI path
+  in QEMU (Phase 3), the INVLPGB path on the bare-metal reference AMD
+  desktop (Zen 3 or later; QEMU and KVM don't offer INVLPGB to guests),
+  with the INVLPGB shootdown tests, a Phase 5 done-when item.
 - **TLB: shootdown paths.** Remote shootdowns are batched per unmap
   operation. The IPI path lands in Phase 2 and the INVLPGB path in Phase 5.
   Without INVLPGB, the initiator sends an IPI to every other CPU in the set
@@ -352,7 +365,8 @@ a loop inside a core call).
 - Phase 2 tests: priority-inheritance chains (nested and across classes),
   capacity-aware placement on a simulated hybrid topology, tickless idle
   (no periodic tick on an idle CPU over 10 s), single-thread tick stop and
-  isolated-CPU interrupt counts (above), timer expiry accuracy, and the
+  isolated-CPU interrupt counts (above, each logging every interrupt by
+  source), timer expiry accuracy, and the
   bare-metal PPS drift test.
 - The latency tracer and the stress suite run in every functional CI boot
   from Phase 2 (report-only in VMs) and in the bare-metal stress boots,

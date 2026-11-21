@@ -43,9 +43,14 @@ rig VLAN (same checksummed records), reset by a relay that disconnects the
 internal battery and the AC adapter together, power-on by a second relay
 across the power-button contacts. Until then it runs functional tests by
 hand only. Only commits
-a maintainer has approved run on the rig; the
-rig sits on an isolated VLAN with no route to anything else and holds no
-secrets (no signing keys, no tokens with write access).
+a maintainer has approved run on the rig. The machines under test sit on
+an isolated rig VLAN; the controller is the only host on both the VLAN and
+the outside network (it reaches GitHub as a runner), with IP forwarding off
+and no route between them. The rig holds no release secrets (no release
+signing keys, no tokens with write access): rig builds are signed with a
+rig-only test key enrolled in each machine's Secure Boot db and verified
+through the shipped verification path, so their Secure Boot, measured-boot
+and verified-image state is the shipped one.
 
 ## The regression gate
 
@@ -54,7 +59,8 @@ secrets (no signing keys, no tokens with write access).
   setting, SMT state (the shipped default per CPU model,
   [scheduler.md](scheduler.md)), THP mode, the isolated cores, the latency
   tracer state (off in every benchmark boot; its enforcing stress boots
-  have their own slot below), and the exact kernel builds. Microbenchmarks (the per-change tier) run with turbo off,
+  have their own slot below), the Secure Boot and verified-image state, and
+  the exact kernel builds. Microbenchmarks (the per-change tier) run with turbo off,
   HWP or CPPC minimum = maximum = 80% of guaranteed performance, and the
   `isolcpus=` set from [scheduler.md](scheduler.md), on both kernels. Every
   desktop, real-time-latency and throughput metric runs on the default boot:
@@ -64,6 +70,14 @@ secrets (no signing keys, no tokens with write access).
   Linux, from the Phase 4a storage set on. KASLR stays on in benchmark
   builds (the shipped configuration); the between-boot variance it adds is
   part of the measured noise.
+- **Code layout is fixed.** Moving a function across a 64-byte or 32-byte
+  boundary shifts syscall and fault microbenchmarks by 1 to 5%, the same in
+  every boot of a build, and KASLR's 2 MiB granularity doesn't randomise
+  it. Every Optimal kernel (benchmarked and shipped alike) is built with
+  functions and loop headers aligned to 64 bytes (LLVM
+  `-align-all-functions=6`, `-align-loops=64`) and with branches kept off
+  32-byte boundaries (`-x86-branches-within-32B-boundaries`, the JCC
+  erratum option). The A/A runs below measure what layout effect is left.
 - **SMIs are counted.** Every run reads the SMI count before and after
   (`MSR_SMI_COUNT` on Intel; the SMIs-received core PMC event on AMD).
   Microbenchmark runs during which an SMI arrived are discarded and rerun,
@@ -106,10 +120,21 @@ secrets (no signing keys, no tokens with write access).
   least 20 boots per kernel, and a P99.9 at least 10^5 pooled events.
   Nightly boots accumulate in rolling windows: each night adds boots and
   the gate judges the last N nights (N = 5 for the nightly block, N = 4 for
-  the extended microbenchmark block, below). A window spans up to N nightly
-  builds; when one fails, its builds are rerun one at a time in the rerun
-  slot to find the change. Tail metrics are in no geometric mean; their
-  margins are per metric (release rule).
+  the extended block's tail metrics, below). A window spans up to N nightly
+  builds, so each night also runs a change-point test inside it: the newest
+  2 nights' candidate boots against the older nights' (3, or 2 for N = 4),
+  by the same cluster bootstrap, a hit being a one-sided 95% bound beyond
+  2% worse; a hit starts bisection of the
+  newest 2 builds at once, without waiting for the window to fill. A
+  window failure is bisected by binary search over its builds, at most 3
+  steps, each step booting the middle build 20 times against the last
+  passing build, from the bisection budget below. Once the offending
+  change is reverted, the boots of the builds that carried it leave the
+  window. The extended block's non-tail metrics (core-count sweeps,
+  schbench and hackbench means, fork+exec) are trend lines nightly and are
+  judged only at release, where the release block gives 20 boots per
+  build. Tail metrics are in no geometric mean; their margins are per
+  metric (release rule).
 - **Per-change metric list** (the per-change tier, run on the `isolcpus`
   boot): 20 metrics, each 7 runs of 0.4 s (2.8 s per metric, 56 s per boot,
   plus 4 s setup), means or medians only, no tails. Syscall round trip;
@@ -131,8 +156,11 @@ secrets (no signing keys, no tokens with write access).
   units; every comparison runs all its builds on one unit. Steady state
   (from Phase 7; earlier phases run subsets):
   - Unit 1 (gate), per week. Per-change tier per merge batch (the changes
-    merged since the last gate run; a failing batch is bisected in the
-    rerun slot): 40 boots of at most 90 s (POST and netboot at most 30 s,
+    merged since the last gate run; the tier runs after merge, so a failing
+    batch is bisected by binary search and the offending change reverted
+    automatically within 24 h of the failure; if bisection can't finish in
+    24 h the whole batch is reverted and its changes re-queued one per
+    batch): 40 boots of at most 90 s (POST and netboot at most 30 s,
     measured and recorded, plus the 60 s list above), at most 10 batches a
     day, 70 h. Nightly, 7 h 55 min a day, 55 h 25 min: the nightly block,
     16 boots of 22.5 min (8 candidate, 4 matched LTS, 4 matched stable;
@@ -144,25 +172,35 @@ secrets (no signing keys, no tokens with write access).
     candidate, 5 last release: core-count sweeps, schbench, hackbench, the
     cyclictest equivalent, timer and interrupt latency tails, fork+exec at
     10^4 and 10^5 fds), 1 h 55 min. Latency-tracer stress boots, 1 h a
-    day, 7 h. Total 132 h 25 min; rerun and bisection slot 35 h 35 min.
+    day, 7 h. Total 132 h 25 min. The remaining 35 h 35 min: the
+    **bisection budget**, 26 h (one 3-step nightly search of 20 boots of
+    22.5 min per step, 22 h 30 min, and 3 h 30 min of per-change steps of
+    40 boots of 90 s); A/A runs, 2 h 8 min a week on average (8 h 30 min a
+    cycle, below); automatic reruns, 7 h 27 min. Phase done-when gates and,
+    until unit 2 arrives, the release tier use bisection budget a week
+    leaves unused, and wait for it.
   - Unit 2 (long runs and release tier), per release cycle (672 h). Audio:
-    128 frames idle and under load, 48 h a week; 64 and 256 frames in
-    alternate weeks, 48 h a week, which in the release week runs matched
-    Linux at 128 frames instead; 384 h. Release block, one boot of
-    122.5 min (the extended microbenchmark block, the nightly block's
-    runs, the storage set 30 min, the throughput set 20 min, browser
-    10 min, network 10 min from Phase 6 against a peer on the rig VLAN,
-    games 20 min from Phase 8, boot 1.5 min): candidate and last release,
-    20 boots each, 81 h 40 min; matched LTS and matched stable, 20 boots
-    each without the nightly block's runs (101.5 min), 67 h 40 min;
-    memory-pressure boots (8 GiB usable, 15 min: idle reference, then
-    pressure) for those four, 20 each, 20 h; context columns (stock LTS,
-    stock stable, the C1-limited column), 5 boots each of the full block,
-    published with their achieved SE and never used for a claim,
-    30 h 38 min; drive preconditioning, 4 h; soak, 24 h; power runs,
-    12 h. Release tier 239 h 58 min; total 623 h 58 min; rerun slot
-    48 h 2 min. Until unit 2 arrives (Phase 6) the release tier uses unit
-    1's rerun slot and a release waits for it.
+    128 frames idle and under load, 48 h a week, 192 h; 64 and 256 frames
+    under load, 24 h each, 48 h; matched Linux at 128 frames idle and
+    under load, 48 h; 288 h. Release block, one boot of 92.5 min (the
+    extended microbenchmark block, the nightly block's runs, the
+    throughput set 20 min, browser 10 min, network 10 min from Phase 6
+    against a peer on the rig VLAN, games 20 min from Phase 8, boot
+    1.5 min): candidate and last release, 20 boots each, 61 h 40 min;
+    matched LTS and matched stable, 20 boots each without the nightly
+    block's runs (71.5 min), 47 h 40 min. Storage boots (65.5 min: boot
+    1.5 min, drive preconditioning 10 min, restore of the 64 GiB partition
+    2 min, the storage set on the system volume 25 min, restore 2 min, the
+    set on a home volume 25 min; per-entry times in "Storage set") for
+    those four, 20 each, 87 h 20 min. Memory-pressure boots (8 GiB usable,
+    15 min: idle reference, then pressure) for those four, 20 each, 20 h.
+    Context columns (stock LTS, stock stable, the C1-limited column), 5
+    release-block boots each, published with their achieved SE and never
+    used for a claim, 23 h 8 min. A/A: 20 more last-release boots of the
+    release block and of the storage boots, 52 h 40 min. Soak, 24 h;
+    power runs, 12 h. Release tier 328 h 28 min; total 616 h 28 min;
+    rerun slot 55 h 32 min. Until unit 2 arrives (Phase 6) the release
+    tier runs on unit 1 as above and a release waits for it.
   - The other reference machines run the release tier only, each under the
     same 168 h a week cap. If the budget caps a metric's runs before it
     reaches its SE target, its achieved power is published as below target.
@@ -186,26 +224,43 @@ secrets (no signing keys, no tokens with write access).
   non-tail metric's margin is 3% (SE(diff) ≤ 0.91%); the geometric mean
   needs SE ≤ 0.15% (95.4%), and the release block's boots are budgeted for
   it, with boots added from the rerun slot when the achieved SE is higher;
-  a tail metric's margin is max(3%, 3.29 × its SE(diff) over the previous
-  release's runs), fixed and published before the comparison runs. Each
-  metric's pass probability at a true 0% difference and power at 2% are
-  published. (A point-estimate "not worse at all" rule would fail about
-  half the time on two equal kernels.)
+  a tail metric's margin is also 3%, with the same SE target. No margin
+  ever grows with SE: when a metric's achieved SE is above its target,
+  boots are added from the rerun slot until it is met, and if the budget
+  runs out first the entry is published as "below target power" and is
+  judged at the same margin. Each metric's pass probability at a true 0%
+  difference and power at 2% are published. (A point-estimate "not worse
+  at all" rule would fail about half the time on two equal kernels.)
+- **A/A runs** check the statistics instead of assuming them. Each release
+  cycle the gates run with the candidate identical to the base: the
+  per-change tier (40 boots, unit 1), the nightly block's tail rule with
+  matched LTS against itself (20 extra LTS boots, unit 1), and the release
+  rule with the last release against itself on the release block and the
+  storage boots (unit 2). The false-fail rate per metric (over the run's
+  metrics and, per metric, over the last 12 cycles) is published. A rate
+  above 5% for the release rule and the nightly tail rule, or above the
+  Holm level for the per-change tier, is a harness failure: the harness
+  is fixed and the A/A run repeated before the next scorecard release,
+  which waits for it.
 - **Which runs gate what.** Each change: the per-change metric list.
   Nightly (rolling windows): the nightly block (input latency and its
   ratios, frame time, the real-time wake-up target, app launch) and the
-  extended microbenchmark block. Weekly and each release: the 24-hour
+  extended block's tail metrics. Weekly and each release: the 24-hour
   zero-event runs (audio underruns). Each release: the release block
   (release rule and every Linux column outside the nightly block), memory
   pressure, power, battery and the long soak. A nightly, weekly or release
   failure blocks the next release until it is fixed or the change is
-  reverted. Phase done-when gates run as their own comparison of at least
+  reverted; a per-change failure is reverted automatically (budget
+  above). Phase done-when gates run as their own comparison of at least
   20 boots per kernel, under "How a target is decided" below.
 - **Noise ceiling.** Each metric must have a run-to-run coefficient of
   variation of at most 1% and a between-boot coefficient of variation (of
-  per-boot means) of at most 0.4% on its machine; a tail metric's per-boot
-  value at most 5% between boots, with at least 10^5 pooled events for a
-  P99.9. If the harness can't get
+  per-boot means) of at most 0.4% on its machine. A tail metric at P99 or
+  below (storage tails included) has a per-boot value with at most 5%
+  between-boot coefficient of variation; a P99.9 has no per-boot ceiling
+  (a few thousand events per boot leave it set by its 5 largest samples)
+  and is judged only on the pooled window, with at least 10^5 pooled
+  events. If the harness can't get
   under that, the harness gets fixed; the gate is never widened to fit the
   noise.
 - **Input latency.** The rig sends one event every 50 to 70 ms (uniformly
@@ -287,9 +342,9 @@ secrets (no signing keys, no tokens with write access).
   95% probability only if margin ≥ (c + 1.96) × SE, where c is the
   strictest Holm critical value of the set (3.17 for 10 metrics at 20
   boots), so a non-tail metric's margin is 2% and its SE target 2% / (c +
-  1.96), 0.39% for 10 metrics; a tail metric's margin is max(2%, (c +
-  1.96) × its SE), fixed from the previous release's runs and published
-  before the comparison. Better: that corrected interval lies entirely on
+  1.96), 0.39% for 10 metrics; a tail metric's margin is also 2%, with
+  the same SE target, boots added or the entry marked "below target power"
+  as in the release rule. Better: that corrected interval lies entirely on
   the better side of zero. Winning "most" metrics doesn't count.
 - On server-style throughput the aim is that the worse end of each
   corrected interval is within 5% of matched Linux, and the scorecard says
@@ -303,7 +358,11 @@ secrets (no signing keys, no tokens with write access).
   GPU whose exact model is fixed and recorded before the desktop set
   freezes (before Phase 5), so the locked machine state doesn't change
   afterwards; the Phase 8 GPU driver targets that model.
-- **Reference AMD desktop:** dual-CCD X3D CPU (tests the cache-die policy).
+- **Reference AMD desktop:** dual-CCD X3D CPU, Zen 4 or later (tests the
+  cache-die policy, and runs the Phase 5 INVLPGB teardown and shootdown
+  tests, which no VM offers, [scheduler.md](scheduler.md)).
+- **Reference vPro machine:** an Intel machine with AMT provisioned, for
+  the out-of-band management detection test ([drivers.md](drivers.md)).
 - **Reference laptop:** mainstream, on battery, with a TPM and IOMMU; on
   the rig from Phase 6 (USB Ethernet results, battery-disconnect reset).
 - **Dedicated KVM host** (Phase 1): an x86-64 machine with KVM that runs
@@ -349,8 +408,9 @@ their own bounds, above). Intervals are t over per-boot means for
 non-tail metrics and BCa cluster bootstraps over boots for tail metrics.
 Every threshold relative to Linux must hold against both matched LTS and
 matched stable. "No worse than matched Linux" means the bound of
-Optimal/Linux is at most 1 + max(2%, 3.29 × SE) (one-sided), because two equal
-kernels can't show a bound at or below exactly 1. A count target (OOM
+Optimal/Linux is at most 1.02 (one-sided; SE target 2% / 3.29 = 0.61%,
+boots added or the entry marked "below target power" as in the release
+rule), because two equal kernels can't show a bound at or below exactly 1. A count target (OOM
 kills, underruns) is zero observed over every boot of the run, with the
 zero-event rule for rates. Every gate uses at least 20 boots per kernel;
 the sample column gives the rest.
@@ -359,7 +419,7 @@ the sample column gives the rest.
 |---|---|---|---|
 | Wake-up latency of a real-time thread with all cores saturated (default boot, no isolated CPUs). Load in Phase 2: a spinning thread per CPU plus IPI and timer storms; at 4a also storage load (the latency gate of [storage.md](storage.md)); from Phase 5: hackbench, a pinned compile, fio on NVMe and memory pressure together | P99 < 50 µs, P99.9 < 100 µs | 20 boots, 4 min at 1 kHz each (2.4 × 10^5 wake-ups per boot) | 2 (re-gated at 4a, 5 and 7, then nightly) |
 | Longest preempt-off or IRQ-off section, excluding SMI-overlapped sections (counted and published) | < 50 µs (20 µs from Phase 10): no section above it in any stress boot | every stress boot (at least 20 per gate) | 2 |
-| Audio underruns at 128 frames, 48 kHz, under full CPU and I/O load | 0 observed in ≥ 24 h, 95% upper bound ≤ 0.125 per hour (also reported at 64 and 256 frames) | 24 h per buffer size and load condition | 6 |
+| Audio underruns at 128 frames, 48 kHz, under full CPU and I/O load | 0 observed in ≥ 24 h, 95% upper bound ≤ 0.125 per hour (also reported at 64 and 256 frames, under load) | 24 h per buffer size and load condition | 6 |
 | Input-to-display latency under full CPU load | P99 no more than 1.5 times its idle P99 (nightly gate); P99.9 no more than 1.5 times its idle P99.9 (release gate); both no worse than matched Linux | one nightly window: 40 boots Optimal, 20 per Linux kernel, 5,000 events per condition per boot | 7 |
 | Frame time P99 in the frame-pacing test at 60 Hz (bare metal, llvmpipe over simple framebuffer, against Linux booted `nomodeset` with simpledrm and llvmpipe; virtio-gpu trend-only) | ≤ refresh period + 1 ms | 20 boots, 5 min (18,000 frames) per boot | 7 |
 | Frame time P99 at 144 Hz on the reference discrete GPU | ≤ refresh period + 1 ms | 20 boots, 5 min (43,200 frames) per boot | 8 |
@@ -368,19 +428,19 @@ the sample column gives the rest.
 | Boot time, firmware handoff to kernel ready | mean < 300 ms (a Phase 1 done-when item) | 20 boots | 1 |
 | Total OS memory at an idle desktop (Phase 7 done-when) | ≤ 60% of the lightest mainstream Linux desktop on the same machine | 20 boots per OS | 7 |
 | Idle CPU over the defined window (Phase 7 done-when) | < 0.5% and no worse than matched Linux | 20 boots, one window each | 7 |
-| Latency tracer cost when off, on the syscall round-trip microbenchmark | ≤ 0.5% against a build with the tracer compiled out | 40 boots per build, 7 runs each (SE ≤ 0.15%) | 3 |
+| Latency tracer cost when off, on the syscall round-trip microbenchmark | ≤ 0.5% against a build with the tracer compiled out, both with the fixed code layout | 40 boots per build, 7 runs each (SE ≤ 0.15%) | 3 |
 | Storage set entries compared against Linux | each within 10% of matched Linux | 20 boots, at least 3 runs per entry per boot | 4a, 5 |
 | Context switch and fork+exec against Linux (Core kernel costs) | each within 10% of matched Linux | 20 boots, 7 runs per boot | 5 |
 | Storage set on a per-user home volume | each entry within 10% of the same entry on the system volume path | 20 boots, 3 runs per entry per boot | 5 |
 | Large TCP download over the named NIC | ≥ 95% of Linux's measured goodput on the same link | 20 boots, 3 downloads of 60 s per boot | 6 |
 | Games from the game list, average and 1% low frame rate | each within 15% of Linux | 20 boots, 3 runs of a pinned 60 s scene per title per boot (at least 5 titles) | 8 |
 | Battery life, each of the three workloads | no worse than matched Linux | 20 runs per workload, each the mean discharge power over 1 h at fixed brightness | 10 |
-| Panic lock (F4 in [features.md](features.md)): chord to keys wiped, writeback bound 0 | ≤ 200 ms | 20 boots, 10 chords each | 5 |
+| Panic lock (F4 in [features.md](features.md)): chord to keys wiped, writeback bound 0, with 8 GiB of page cache of encrypted volumes | ≤ 200 ms, each step's time published | 20 boots, 10 chords each | 5 |
 | VPN-only guard on (F6): large TCP download through the tunnel | ≥ 99% of the same with the guard off | 20 boots, 3 downloads of 60 s per boot | 6 |
 | Game mode overlay (F8), 144 Hz direct scanout on the reference discrete GPU | CPU cost ≤ 0.5%; input-to-display P99 and frame time P99 no worse than overlay off; per-frame agreement with the input-latency rig within 0.5 ms at P99 | 20 boots per condition, 5 min per boot | 8 |
 | Focus boost ×4 (F9): 60 Hz frame-pacing app in focus while a pinned compile runs | frame time P99 ≤ refresh period + 1 ms; compile wall time ≤ 1.5 times its time with the boost off | 20 boots per condition | 10 |
 | Background freezing (F9): a frozen app shown again | first new frame presented ≤ 100 ms after it becomes visible | 20 boots, 20 thaws each | 10 |
-| Power meter (F10): attribution error of each of two loads run together | within 10% of its solo increment; meter cost ≤ 0.1% CPU; a 10 W cap held at ≤ 11 W over 60 s | 20 runs per load level | 10 |
+| Power meter (F10): two loads run together, one on a P-core and one on an E-core, energy split by unhalted cycles weighted per core type (per-type energy-per-cycle calibration); meter cost on context switch, pipe ping-pong and futex ping-pong, meter on against off | each load's attributed energy within 10% of its solo increment; each cost metric ≤ 1% worse; a 10 W cap held at ≤ 11 W over 60 s | 20 runs per load level; cost: 20 boots per condition, 7 runs each | 10 |
 | Privacy dashboard recording (F2): TCP connect rate and 64-byte UDP send rate | each ≥ 99% of recording off | 20 boots, 3 runs each | 12 |
 | Browser blocking (F15), EasyList and EasyPrivacy loaded | per-request match ≤ 10 µs at P99; page load over the 50-page corpus no worse than blocking off | 20 boots, the corpus once per boot | browser engine track |
 
@@ -390,7 +450,7 @@ the sample column gives the rest.
 |---|---|---|---|
 | Input-to-display latency | P50, P99, P99.9 | how quickly a key press or mouse move reaches the screen | 7 |
 | Frame time | P50, P99, variance | consistency of frame pacing, idle and under load | 7 (60 Hz, bare metal llvmpipe over simple framebuffer), 8 (144 Hz, discrete GPU) |
-| Audio underruns | count and 95% upper bound per hour at 64, 128 and 256 frames (48 kHz), idle and under load | real-time scheduling quality | 6 |
+| Audio underruns | count and 95% upper bound per hour at 128 frames (48 kHz) idle and under load, and at 64 and 256 frames under load | real-time scheduling quality | 6 |
 | Scheduling latency under saturation | P99, P99.9 wake-up latency of a real-time thread | whether interactive work cuts through a full system | 2 |
 | Foreground responsiveness during background I/O | input latency and app launch time while a large copy or compile runs | whether background work makes the desktop feel slow | 7 |
 | Memory pressure | input latency P99, frame time and OOM kills with 8 GiB usable RAM, 50 pages from a pinned offline corpus and a pinned compile ([scheduler.md](scheduler.md)); target above | the biggest real cause of stutter | 7 |
@@ -424,35 +484,42 @@ the sample column gives the rest.
 ## Storage set
 
 The one list of storage benchmarks; [storage.md](storage.md) links here and
-sets the conditions (aged images restored per run, drive preconditioning,
-encryption on for both: LUKS2 on Optimal, dm-crypt LUKS2 with the same
-cipher on Linux, ext4 default mount options). Every entry compared
-against Linux runs the same binary on both (a static binary in 4a). The
-Phase 4a done-when is "every 4a entry compared against Linux is within 10%
-of matched Linux": the worse end of its Holm-corrected 95% confidence
-interval, over at least 20 boots per kernel, against both matched LTS and
-matched stable.
+sets the conditions (aged file-system images, encryption on for both: LUKS2
+on Optimal, dm-crypt LUKS2 with the same cipher on Linux, ext4 default
+mount options). Each storage boot preconditions the drive once (SNIA PTS
+method, at most 10 min; a boot that doesn't reach steady state by then is
+recorded and rerun) and restores only the 64 GiB test partition at block
+level before each pass (at most 2 min, measured and recorded); then every
+entry runs 3 times in table order. **Time** is per run, setup and cache
+drop included; for fixed-work entries it is a cap, and a run that hits it
+fails that entry. One pass is 25 min (20 min before Phase 5). Every entry
+compared against Linux runs the same binary on both (a static binary in
+4a). The Phase 4a done-when is "every 4a entry compared against Linux is
+within 10% of matched Linux": the worse end of its Holm-corrected 95%
+confidence interval, over at least 20 boots per kernel, against both
+matched LTS and matched stable. Storage tail metrics follow the tail rule
+and its noise ceiling.
 
-| Benchmark | Against Linux | From |
-|---|---|---|
-| fio `psync`, 4k random read, QD1 | yes | 4a |
-| fio `psync`, 4k random overwrite, QD1 | yes | 4a |
-| fio `psync`, 1M sequential write, QD1 | yes | 4a |
-| 1 MiB sequential `O_DIRECT` write at QD32 (fio `psync`, 32 forked static processes, each its own region; the replay log's worst case, [storage.md](storage.md)) | yes | 4a |
-| page-rewrite microbenchmark: the same 4 KiB page rewritten and written back in a loop (the SQLite WAL-tail pattern) | yes | 4a |
-| `fsync` burst: 1,000 `fsync`s of distinct 4 KiB files within 1 s, latency P50, P99, P99.9 (full commits are capped at one per second, so the burst goes through the per-file intent log, [storage.md](storage.md)) | yes | 4a |
-| `syncfs` latency (one full commit) after 1 GiB of dirty data, and the full-commit rate under a continuous `fsync` load (at most 1 per second) | yes (`syncfs` latency); the rate is Optimal only | 4a |
-| fio `psync`, 4k random read and 4k random overwrite at QD32, as 32 forked static `psync` processes (fio's default process mode, `numjobs=32`) | yes | 4a |
-| fsync latency P50, P99, P99.9 | yes | 4a |
-| fsync latency P50, P99, P99.9 of a 4 KiB file while a background writer streams 1M sequential writes | yes | 4a |
-| SQLite in WAL mode, static binary (insert and point-query mix) | yes | 4a |
-| untar of a pinned source tree, static binary | yes | 4a |
-| metadata: create, stat, unlink of 1 million small files | yes | 4a |
-| in-kernel block benchmark at QD32 | no: Optimal against itself only (there is no identical program on Linux) | 4a |
-| fio `io_uring`, 4k random read and overwrite at QD32 | yes | 5 |
-| pgbench | yes | 5 |
-| git checkout and `git status` on a pinned large repository | yes | 5 |
-| the whole set above, rerun on a per-user home volume ([storage.md](storage.md)); each entry within 10% of the same entry on the system volume path | yes (Linux: ext4 on dm-crypt over `dm-linear` with the same extents) | 5 |
+| Benchmark | Against Linux | Time | From |
+|---|---|---|---|
+| fio `psync`, 4k random read, QD1 | yes | 20 s | 4a |
+| fio `psync`, 4k random overwrite, QD1 | yes | 20 s | 4a |
+| fio `psync`, 1M sequential write, QD1 | yes | 20 s | 4a |
+| 1 MiB sequential `O_DIRECT` write at QD32 (fio `psync`, 32 forked static processes, each its own region; the replay log's worst case, [storage.md](storage.md)) | yes | 20 s | 4a |
+| page-rewrite microbenchmark: the same 4 KiB page rewritten and written back in a loop (the SQLite WAL-tail pattern) | yes | 20 s | 4a |
+| `fsync` burst: 5 bursts per run, each 1,000 `fsync`s of distinct 4 KiB files within 1 s, latency P50, P99, P99.9 (full commits are capped at one per second, so the burst goes through the per-file intent log, [storage.md](storage.md)) | yes | 10 s | 4a |
+| `syncfs` latency (one full commit) after 1 GiB of dirty data, and the full-commit rate under a continuous `fsync` load (at most 1 per second) | yes (`syncfs` latency); the rate is Optimal only | 40 s | 4a |
+| fio `psync`, 4k random read and 4k random overwrite at QD32, as 32 forked static `psync` processes (fio's default process mode, `numjobs=32`) | yes | 40 s | 4a |
+| fsync latency P50, P99, P99.9 | yes | 20 s | 4a |
+| fsync latency P50, P99, P99.9 of a 4 KiB file while a background writer streams 1M sequential writes | yes | 20 s | 4a |
+| SQLite in WAL mode, static binary (insert and point-query mix) | yes | 30 s | 4a |
+| untar of a pinned source tree, static binary | yes | 30 s | 4a |
+| metadata: create, stat, unlink of 1 million small files | yes | 90 s | 4a |
+| in-kernel block benchmark at QD32 | no: Optimal against itself only (there is no identical program on Linux) | 20 s | 4a |
+| fio `io_uring`, 4k random read and overwrite at QD32 | yes | 40 s | 5 |
+| pgbench | yes | 30 s | 5 |
+| git checkout and `git status` on a pinned large repository | yes | 30 s | 5 |
+| the whole set above, rerun on a per-user home volume ([storage.md](storage.md)); each entry within 10% of the same entry on the system volume path | yes (Linux: ext4 on dm-crypt over `dm-linear` with the same extents) | 25 min a pass | 5 |
 
 Power is reported next to every throughput result (RAPL package power where
 the CPU has it), so a win bought with extra watts is visible.
@@ -502,12 +569,14 @@ is on in the image people actually download:
   disk encryption stage, side-channel mitigations) and the measured cost of
   each.
 - Microcode revision and the mitigation chosen per CPU vulnerability.
-- Named exposures per machine (boot DMA window, remote DMA exposure, SMT on
-  affected CPUs), the ATS-enabled devices and their firmware (part of the
+- Named exposures per machine (boot DMA window, pre-loader secret DMA
+  window on D2 boots, S3 resume DMA window, remote DMA exposure, SMT on
+  affected CPUs, "out-of-band remote management: on"), the ATS-enabled devices and their firmware (part of the
   trusted base), the B2 anti-rollback scope: "holds against OS-level
   attackers only" (against physical attackers only with owner keys), and
   "B4: no automatic rollback, no floor" until Optimal Boot's BIOS stage
-  lands ([boot.md](boot.md)).
+  lands ([boot.md](boot.md)), and "after a security update there is no
+  older release to fall back to" (F11).
 - Disk encryption stage per machine, and "stage 2: new installs only"
   until the per-user stage 1 to stage 2 migration lands
   ([storage.md](storage.md)).
@@ -518,11 +587,14 @@ is on in the image people actually download:
   the published hammering PoC), and machines with fewer than 4 CPUs, where
   hot-removable device handlers can't be kept off real-time CPUs
   ([scheduler.md](scheduler.md)).
-- **Prompts per typical day:** the number of permission prompts after
-  first run in the scripted typical-day workload (install 5 apps, browse,
-  download, plug in a known keyboard and a USB stick), at each prompt
-  level ("Always ask", "Only when suspicious", "Almost never"); target at
-  most 5 at the default "Only when suspicious", counted by the
+- **Prompts per typical day:** every prompt of every kind (install
+  approvals, first-use, device and DNS-fallback prompts included) in the
+  pinned typical-day script: Firefox (browse, download a file), Steam, a
+  chat app, an editor, a media player, an AppImage, a cargo project, a
+  video call, joining a new Wi-Fi network, and plugging in a new mouse, a
+  headset and a gamepad; at each prompt level ("Always ask", "Only when
+  suspicious", "Almost never"). Target at most 5 at the default "Only when
+  suspicious"; the measured count is published, counted by the
   threat-model test ([threat-model.md](threat-model.md),
   [capabilities.md](capabilities.md)), from Phase 7.
 - The Argon2id parameters chosen on each reference machine, and the TPM
@@ -545,8 +617,10 @@ is on in the image people actually download:
   presented (target 0, F1); packets outside the tunnel from power-on and
   across 1,000 VPN-client kills (target 0) and plain-DNS packets with
   encrypted DNS on (target 0, F6); the tamper alert's scope per boot tier
-  (F7); the panic-lock residual (frozen apps' memory, DRAM remanence and
-  cold boot, F4); the hidden vault's limits in the words of its Settings
+  (F7); the panic-lock residuals (frozen apps' memory including tmpfs,
+  shm, memfd and the pipe, socket and tty buffers they hold, names of open
+  files, DMA-pinned pages until their timeout, DRAM remanence and cold
+  boot, F4); the hidden vault's limits in the words of its Settings
   text (defeats one-time inspection of a powered-off disk; not two images
   over time, a compromised running system, forced unlock of the outer
   volume while the hidden one is open, TRIM-pattern analysis if the

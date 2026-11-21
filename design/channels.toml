@@ -10,7 +10,8 @@
 #
 # direction: "writer_to_reader" (one edge) or "both" (two edges).
 # created:   "open"   = the edge is made when the channel is opened;
-#            "grant"  = made when the grant that allows it is given;
+#            "grant"  = made when the grant that allows it is given, and
+#                       rebuilt from the stored grants at every login;
 #            "write"  = made on the first actual write (terminal only).
 # refusal:   what the app sees when the component check refuses it.
 
@@ -109,15 +110,6 @@ phase = 5
 test = "exfil/terminal-write"
 
 [[channel]]
-id = "launch-relay-stdin"
-what = "stdin the launch relay forwards from a terminal-identity process to a registered app"
-direction = "writer_to_reader"
-created = "open"
-refusal = "the app's stdin is /dev/null"
-phase = 5
-test = "exfil/launch-relay-stdin"
-
-[[channel]]
 id = "host-command"
 what = "output of a prompted flatpak-spawn --host command, run as the terminal, back to the app"
 direction = "writer_to_reader"
@@ -182,6 +174,12 @@ phase = 5
 test = "exfil/file-chooser"
 
 [[user_transfer]]
+id = "launch-relay-typed"
+rule = "a command line the user typed in the terminal: argv, allowlisted env, cwd and path arguments (one-use document-portal entries) and the stdio relay go to the registered app for that run; the edge lasts the app's process lifetime and joins no components"
+phase = 5
+test = "exfil/launch-relay-stdin"
+
+[[user_transfer]]
 id = "drag-and-drop"
 rule = "each dropped file becomes a one-use document-portal entry for the receiving app"
 phase = 7
@@ -189,7 +187,7 @@ test = "exfil/drag-and-drop"
 
 [[user_transfer]]
 id = "clipboard"
-rule = "the compositor gives clipboard contents only to the focused surface on a paste; no background reads"
+rule = "the compositor gives clipboard contents only to the focused surface on a paste; background reads only under the background-clipboard portal's grant, which is in the data set"
 phase = 7
 test = "exfil/clipboard"
 
@@ -224,13 +222,23 @@ covert = ["CPU and cache timing", "statfs free space", "flock on shared read-onl
 
 # ---------------------------------------------------------- grant checks
 # Every new grant is checked against the holder's component and every
-# networked identity downstream of it before it is made.
+# networked identity downstream of it before it is made. A component's data
+# set = persistent file grants + camera, microphone, screen capture and
+# screenshot, location and background clipboard-read grants; data set +
+# network is in the floor (capabilities.md, "Direct channels make one
+# principal").
 
 [[grant_check]]
 id = "network"
-rule = "first use raises one request; prompts per level; floor when the component holds file grants"
+rule = "first non-loopback connect or send, or first resolver lookup, raises one request per identity; silent decisions synchronous; a human decision waits up to 30 s, then SERVFAIL (EAI_AGAIN) or ENETUNREACH; floor when the component's data set is non-empty"
 phase = 5
 test = "exfil/grant-network"
+
+[[grant_check]]
+id = "data-set"
+rule = "camera, microphone, screen capture, screenshot, location and background clipboard-read grants join the data set; with network in the component, the combined approval naming each source, at every level"
+phase = 7
+test = "floor/data-set-network"
 
 [[grant_check]]
 id = "folder"
@@ -251,6 +259,12 @@ phase = 6
 test = "exfil/grant-inbound"
 
 [[grant_check]]
+id = "grant-edges-across-logout"
+rule = "a writer-to-reader folder pair granted in one session still joins the two identities after logout and login (grant edges rebuilt at login)"
+phase = 5
+test = "exfil/grant-edges-across-logout"
+
+[[grant_check]]
 id = "grant-after-join"
 rule = "A (files) -> B (nothing), then network for B: the combined approval is asked at B's grant, and a refusal refuses the grant"
 phase = 5
@@ -260,12 +274,12 @@ test = "exfil/grant-after-join"
 
 [[tcb_service]]
 id = "resolver"
-rule = "answers only identities holding outbound network; others get ECONNREFUSED"
-phase = 6
+rule = "queries upstream only for identities holding outbound network; a lookup with no recorded answer is the first-use event; refused identities get SERVFAIL (EAI_AGAIN), never ECONNREFUSED; fake upstream on the loopback-only stack until Phase 6"
+phase = 5
 
 [[tcb_service]]
 id = "launcher"
-rule = "spawns with identity; launch relay for registered apps run from a terminal; turns private-home autostart and desktop files into portal requests"
+rule = "spawns with identity; launch relay (argv, env allowlist, cwd, path arguments as one-use document-portal entries) for registered apps run from a terminal; turns private-home autostart and desktop files into portal requests"
 phase = 5
 
 [[tcb_service]]
@@ -285,7 +299,7 @@ phase = 6
 
 [[tcb_service]]
 id = "ssh-agent"
-rule = "first use per session per app confirmed by a broker prompt naming the app; keys never leave the agent"
+rule = "first use per session per app confirmed by a broker prompt naming the app; keys never leave the agent and live in kernel-registered secret memory (F4)"
 phase = 5
 
 [[tcb_service]]
@@ -320,6 +334,7 @@ phase = 5
 # "per-send" (a confirmation showing one send's content, every level),
 # "always" (the request is itself a one-off approval, as for sudo),
 # "user-action" (the user's own pick; not a prompt).
+# data_set: true when the grant joins the component's data set.
 
 [[portal]]
 id = "file-chooser"
@@ -360,7 +375,7 @@ interface = "org.freedesktop.portal.Email"
 sends = "deputy"
 rule = "caller without network: prompt showing recipients, subject and attachments"
 prompt = "per-send"
-phase = 5
+phase = 6
 test = "exfil/email"
 
 [[portal]]
@@ -369,7 +384,7 @@ interface = "org.freedesktop.portal.Notification"
 sends = "deputy"
 rule = "caller without network: remote content dropped, action URIs go through the open-uri rule"
 prompt = "level"
-phase = 5
+phase = 6
 test = "exfil/notification"
 
 [[portal]]
@@ -518,7 +533,7 @@ test = "portal/realtime"
 id = "usb"
 interface = "org.freedesktop.portal.Usb"
 sends = "no"
-rule = "access to an approved USB device; new HID devices are in the floor (drivers.md)"
+rule = "access to an approved USB device; raw access to audio (class 0x01) and video (class 0x0E) interfaces refused (PipeWire only); HID interfaces with keyboard/keypad or system-control usages are in the floor, other HID on the suspicious list (drivers.md, Device authorization)"
 prompt = "level"
 phase = 6
 test = "portal/usb"
@@ -527,22 +542,45 @@ test = "portal/usb"
 id = "camera"
 interface = "org.freedesktop.portal.Camera"
 sends = "no"
+data_set = true
 prompt = "level"
 phase = 7
 test = "portal/camera"
 
 [[portal]]
+id = "microphone"
+interface = "org.optimal.portal.Microphone"
+sends = "no"
+rule = "hands out a PipeWire capture stream; F1 indicator and kill switch apply"
+data_set = true
+prompt = "level"
+phase = 7
+test = "portal/microphone"
+
+[[portal]]
 id = "location"
 interface = "org.freedesktop.portal.Location"
 sends = "no"
+data_set = true
 prompt = "level"
 phase = 7
 test = "portal/location"
 
 [[portal]]
+id = "background-clipboard"
+interface = "org.optimal.portal.BackgroundClipboard"
+sends = "no"
+rule = "clipboard reads without a paste (clipboard managers)"
+data_set = true
+prompt = "level"
+phase = 7
+test = "portal/background-clipboard"
+
+[[portal]]
 id = "screenshot"
 interface = "org.freedesktop.portal.Screenshot"
 sends = "remote"
+data_set = true
 prompt = "floor"
 phase = 7
 test = "portal/screenshot"
@@ -551,6 +589,7 @@ test = "portal/screenshot"
 id = "screencast"
 interface = "org.freedesktop.portal.ScreenCast"
 sends = "remote"
+data_set = true
 prompt = "floor"
 phase = 7
 test = "portal/screencast"
@@ -580,6 +619,15 @@ rule = "events reach only the focused surface, never the prompt layer"
 prompt = "floor"
 phase = 7
 test = "portal/virtual-input"
+
+[[portal]]
+id = "vpn"
+interface = "org.optimal.portal.Vpn"
+sends = "no"
+rule = "only for the VPN identity designated on the trusted path; sets addresses, routes and DNS on its designated TUN only; every endpoint update logged"
+prompt = "user-action"
+phase = 6
+test = "portal/vpn"
 
 [[portal]]
 id = "global-shortcuts"

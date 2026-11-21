@@ -127,14 +127,18 @@ produces them for removed devices and network file systems.
   home are keyed by an **identity ID**, never by a path. For a manifest or
   Flatpak app it is (ID, signing key). For an unpackaged program it is
   (launch path, lineage ID, argv hash): the lineage ID is a random 128-bit
-  value created when the identity's record is first made (its first launch
-  or first grant) and carried to a new closure hash only across an update
-  the rules below accept. A binary replaced at the same path by another
+  value created at the identity's first launch and carried to a new
+  closure hash only across an update the rules below accept. A binary replaced at the same path by another
   writer gets a new lineage, no grants and an empty home; `sh -c '<a>'` and
   `sh -c '<b>'` differ in argv hash and get disjoint homes. Hostile tests
   (Phase 5): a replaced binary sees an empty home; two `-c` identities see
   disjoint homes; a replaced `helper.py` beside a granted Python app fails
-  `EACCES` and inherits nothing.
+  `EACCES` and inherits nothing. For a vault identity (F3 in
+  [features.md](features.md)) every per-identity record (lineage, closure
+  record, grants, first-use answers, silent-grant log entries, provenance
+  timestamps, known-device entries added while the vault is open,
+  dashboard logs) lives inside the open hidden volume and is never written
+  to the system settings store.
 - **Updates.** The install directory of every program launched from the
   desktop is a protected path: the directory holding its executable (for
   example `~/opt/firefox/`), or for a script the script's directory tree;
@@ -154,42 +158,64 @@ produces them for removed devices and network file systems.
   Milestone 13 test (Phase 9): Steam updates a game and Proton, the game
   relaunches with no `EACCES` and keeps its grants and home.
 - **Provenance.** Every file an app identity creates or writes carries a
-  kernel-maintained provenance tag naming that identity, stored in an xattr
-  namespace no app can set or remove. Two origin flags go with it:
-  **downloaded**, set on every file written by an identity that held
-  network when it wrote it (so every browser download carries it), and
-  **removable**, set on files read from removable or foreign volumes.
-  Copies keep the source's tag and flags when the kernel does the copy
-  (`copy_file_range`, `FICLONE`, `sendfile` and `splice` from a file) or the
-  file manager portal does; and a terminal-identity process that has
-  opened for reading a file with an app tag or either flag gives that
-  provenance to every file it writes afterwards (the lowest-trust tag it
-  has read, inherited across `fork` and `execve`), so `cp` and `tar x` from
-  a USB stick keep it. Bytes piped into an interpreter carry no tag;
-  running them is the user's own command.
+  kernel-maintained provenance tag naming that identity and the time it was
+  written (a clock never earlier than the signed time floor in
+  [boot.md](boot.md)), stored in an xattr namespace no app can set or remove. Two
+  origin flags go with it. **Downloaded** is defined here once
+  ([threat-model.md](threat-model.md) and the roadmap refer to this
+  definition): a file is tagged downloaded when (a) any identity writes it
+  into a download folder (the XDG Downloads folder, a browser's download
+  directory), (b) it arrives through a portal from a networked identity, or
+  (c) it is written by a process that has read from a non-loopback socket
+  since its last `execve` (a per-process taint, sticky until `execve`).
+  Files an identity writes inside its own install directory or closure keep
+  its provenance and are not tagged (update rule (a) below). **Removable**
+  is set on files read from removable or foreign volumes. Copies keep the
+  source's tag and flags when the kernel does the copy (`copy_file_range`,
+  `FICLONE`, `sendfile` and `splice` from a file) or the file manager
+  portal does; and a terminal-identity process that has opened for reading
+  a file with an app tag or the removable flag gives that provenance to
+  every file it writes afterwards (the lowest-trust tag it has read,
+  inherited across `fork` and `execve`), so `cp` and `tar x` from a USB
+  stick keep it. Bytes piped into an interpreter carry no tag; running
+  them is the user's own command.
 
-  An executable whose provenance is an app identity, downloaded or
-  removable (anything but the store or the system image) launched from the
-  desktop runs under its own identity in the default profile, with no
-  network until the user approves it in a prompt naming where it came from
-  ("written by *App*", "downloaded by Firefox", "from USB stick *label*").
-  The user service manager and D-Bus activation apply the same rule to
-  every unit and service they start. A terminal-identity process that
-  executes such a file gets `EACCES` until the user approves that file in
-  a prompt naming its provenance. "Executes" means `execve` (a `#!` script
-  included), an executable mapping, and `execveat` with
-  `AT_EXECVE_CHECK`, the Linux 6.14 call interpreters use before running a
-  script. Files that tools run as data (a `Makefile`, `.envrc`, a
-  `.git/hooks` entry run by git, `.git/config`, npm scripts) are covered by
-  a published list of code-bearing names: a terminal-identity process that
-  opens a file on that list whose provenance is another app identity, or
-  downloaded or removable, gets `EACCES` until the same approval. Tests
-  (Phase 5, with a hot-added virtio-blk volume standing in for removable
-  media; a real USB stick in Phase 6): an app-written binary, a downloaded
-  binary and a removable-media binary each run without network from the
-  desktop and fail `EACCES` from the terminal until approved; `cp` and
-  `tar x` copies keep the tag; a planted `Makefile` and git hook fail
-  `EACCES`.
+  What the tags change:
+  - **Desktop launch** (file manager, launcher, portal open) of a
+    downloaded executable prompts at every level (the floor), naming where
+    it came from ("downloaded by Firefox", "downloaded in Terminal"); an
+    executable with another app's provenance or the removable flag
+    ("written by *App*", "from USB stick *label*") follows the levels
+    (suspicious-list entry 1). Approved, it runs under its own identity in
+    the default profile. The user service manager and D-Bus activation
+    apply the same rule to every unit and service they start.
+  - **The terminal executing a file with terminal provenance** is the
+    user's own typed action: no prompt and no `EACCES`, whatever its flags.
+    So `git clone`, `cargo build` and `./target/debug/x` just work.
+  - **Exec by any other identity than the file's provenance identity**
+    (the terminal running a file Firefox downloaded or an editor wrote, or
+    one from a USB stick) follows the levels; where the level asks, the
+    terminal process gets `EACCES` and the terminal shows a one-click
+    request naming the provenance. Approving it covers files from that
+    provenance identity under that folder from then on (listed in Settings
+    and revocable), so an edit-build-run loop with a GUI editor asks once.
+
+  "Executes" means `execve` (a `#!` script included), an executable
+  mapping, and `execveat` with `AT_EXECVE_CHECK`, the Linux 6.14 call
+  interpreters use before running a script. Files that tools run as data
+  (a `Makefile`, `.envrc`, a `.git/hooks` entry run by git, `.git/config`,
+  npm scripts) are covered by a published list of code-bearing names: a
+  terminal-identity process that opens a file on that list whose
+  provenance is another identity or that carries the removable flag is
+  treated as executing it. Tests (Phase 5, with a hot-added virtio-blk
+  volume standing in for removable media and a local fake git remote over
+  loopback; a real USB stick and a real remote in Phase 6): `git clone` +
+  `cargo build` + `./target/debug/x`, rebuilt and run 10 times, gives 0
+  prompts and 0 `EACCES`; an app-written binary and a removable-media
+  binary fail `EACCES` from the terminal at "Only when suspicious" until
+  approved; `cp` and `tar x` copies keep the tag; a planted `Makefile` and
+  git hook written by another identity fail `EACCES`. Phase 7: `curl -O`
+  then a double-click in the file manager gives exactly 1 prompt.
 - **Protected launch paths.** `~/.config/autostart`,
   `~/.local/share/applications`, `~/.local/share/dbus-1/services`,
   `~/.config/systemd/user`, `~/.config/environment.d`,
@@ -224,14 +250,21 @@ produces them for removed devices and network file systems.
   kernel-set attribute. When a terminal-identity process `execve`s such a
   path, the kernel runs the system image's **launch relay** in its place:
   the relay asks the launcher to start the app under its own identity on a
-  fresh pty, relays stdio between its own fds and that pty (with the escape
-  filter above), forwards signals, waits on the app's pidfd and exits with
-  its status. So `firefox` typed in a shell and Firefox started from the
-  desktop use one profile. The relay's stdin forwarding is a direct channel
-  from the terminal (below); when it is refused the app's stdin is
-  `/dev/null`. Test (Phase 5): a registered test app run from the shell and
-  from the launcher sees the same home, and its exit status and signals
-  pass through.
+  fresh pty, passing argv, the environment variables on a published
+  allowlist (locale, `TERM`, `EDITOR`, `VISUAL`, `PAGER` and the like) and
+  the cwd; path arguments and the cwd become one-use
+  document-portal entries for the app, and argv is rewritten to their
+  paths (Flatpak's `@@` file forwarding). It relays stdio between its own
+  fds and that pty (with the escape filter above), forwards signals, waits
+  on the app's pidfd and exits with its status. So `firefox` typed in a
+  shell and Firefox started from the desktop use one profile. A typed
+  command line is the user's own action for that run: the path entries
+  and the stdio relay are not prompts, and the relay's edge lasts the
+  app's process lifetime and doesn't join components. Tests: (Phase 5) a
+  registered test app run from the shell and from the launcher sees the
+  same home, and its exit status and signals pass through; (Phase 7)
+  `code .`, `EDITOR="code --wait" git commit` and a pipe into an app each
+  work with 0 prompts.
 - **Direct channels make one principal.** Data moves between identities
   through **direct channels**, a closed list checked in as
   [`design/channels.toml`](channels.toml), each row with its phase and test.
@@ -239,20 +272,24 @@ produces them for removed devices and network file systems.
   the one that can read from it; a two-way channel (a socket, writable
   shared memory, a D-Bus peer pair) is two edges. The kernel keeps, per
   session, a directed graph of identities with an edge for every channel
-  opened in the session, live or past; edges are dropped only at logout.
-  The **component** of an identity is itself plus every identity with a
-  path of edges to it, and the component's **file set** is the union of
-  its members' persistent file grants. The files + network rule applies to
-  components: an identity holding network may have a non-empty component
-  file set only under a **combined approval**, a prompt that names that
-  file set and every networked identity it would reach, and that is asked
-  again whenever either grows. It is checked at two points:
+  opened in the session, live or past; edges are dropped only at logout,
+  and edges created by grants (`created = "grant"` in channels.toml) are
+  rebuilt from the stored grants at every login. The **component** of an
+  identity is itself plus every identity with a path of edges to it, and
+  the component's **data set** is the union of its members' persistent
+  file grants and their camera, microphone, screen capture and screenshot,
+  location and background clipboard-read grants. The data + network rule
+  applies to components: an identity holding network may have a non-empty
+  component data set only under a **combined approval**, a prompt that
+  names each source in that data set and every networked identity it would
+  reach, and that is asked again whenever either grows. It is checked at
+  two points:
   - **opening a channel** A → B checks every networked identity reachable
     from B, B included; without a covering approval the channel is refused
     (`ECONNREFUSED` on connect, `EACCES` on passing the fd or mapping the
     object, `org.freedesktop.DBus.Error.AccessDenied` from the D-Bus proxy);
   - **every new grant** (network, folder, inbound port, persistent
-    document) is checked against the holder's component and every
+    document, and each data-set grant above) is checked against the holder's component and every
     networked identity downstream of it before it is made. A writable
     folder grant creates its folder channels then. A grant whose combined
     approval the user refuses is refused at grant time, and the portal's
@@ -267,8 +304,8 @@ produces them for removed devices and network file systems.
   **The terminal** is a special node, because it can read the whole home:
   its reads make no edge (what it runs is covered by the provenance rule
   above), so a writable grant inside its home doesn't join an app to it,
-  and that grant's prompt says that the terminal will ask before running
-  anything the app writes there. Its writes do make edges, created on its
+  and that grant's prompt says that running anything the app writes there
+  from the terminal follows the prompt level (provenance rule above). Its writes do make edges, created on its
   first actual write of a file inside a folder another identity's grant
   covers, not when the grant is made; when that edge is refused the write
   fails `EACCES` and the terminal shows a one-click request for the
@@ -281,9 +318,13 @@ produces them for removed devices and network file systems.
   (channels.toml lists every one). Covert channels (CPU and cache timing,
   `statfs` free space, `flock` on shared read-only files) are out of scope;
   their measured bandwidth is published on the scorecard. The exfiltration
-  suite runs every row of `channels.toml` in that row's phase, and in
+  suite runs every row of `channels.toml` in that row's phase, a
+  writer-to-reader folder pair split across a logout (Phase 5), and in
   Phase 7 two colluding apps, a three-app chain and a grant after a join,
-  each as its own row.
+  each as its own row. The graph crate is proof target 18 in
+  [verification.md](verification.md) (B/T at Phase 5, P/T at Phase 7): no
+  networked identity's upstream data set is outside a combined approval
+  after any sequence of channel opens, grants and approvals.
 - **Apps that launch apps.** A launcher like Steam can start children under a
   **child identity** (`steam/<game id>`): the child gets its own capability
   set and file view (by default its own private home and the folders the
@@ -328,7 +369,8 @@ produces them for removed devices and network file systems.
   store-owned storage no app can write, never from the app's own files at
   run time. User (`--user`) installs are installed through the store
   service, which shows the permissions and records the user's approval at
-  install. Each Flatpak app's view follows Flatpak's layout exactly: `/usr`
+  install (before the store, on the settings console's install review
+  page, below). Each Flatpak app's view follows Flatpak's layout exactly: `/usr`
   is its runtime, `/app` is the app, `$HOME` is the user's real home path,
   which shows only `~/.var/app/<app id>` (persistent, at its own path)
   unless a home or host grant shows more, and writes elsewhere under
@@ -341,12 +383,19 @@ produces them for removed devices and network file systems.
   in milestone 6, alongside upstream `flatpak run` tests.
 - **The default profile** for unpackaged desktop programs, and for manifest
   apps that don't declare network, has **no network**, no file or device
-  grants, and portals for everything else. The first time an identity
-  without a recorded network answer gets `ENETUNREACH`, the kernel queues
-  one request for it to the network portal, which applies the prompt level
-  (below): it prompts, or grants silently and logs it; the answer is
-  remembered per identity, and the app's next attempt works (programs retry
-  after a network failure). A manifest app's network declaration is shown
+  grants, and portals for everything else. **First use.** The first
+  non-loopback `connect` or send, or the first name lookup at the resolver
+  (below), from an identity with no recorded network answer queues one
+  request per identity to the network portal, which applies the prompt
+  level (below); the answer is remembered per identity. Silent decisions
+  are made synchronously from the level policy the broker pushes into the
+  kernel and the resolver, so the call itself succeeds and no app sees a
+  failure when no human is needed (granted silently and logged). When a
+  human is needed, the lookup or `connect` waits up to 30 s for the
+  decision (an `O_NONBLOCK` connect returns `EINPROGRESS` and completes or
+  fails later); on refusal or timeout the lookup answers SERVFAIL
+  (`EAI_AGAIN`) and `connect` returns `ENETUNREACH`, never
+  `ECONNREFUSED`. A manifest app's network declaration is shown
   at install, and the install approval is the grant. Inbound ports and
   remote-control access (screen casting, remote desktop, input capture, the
   virtual keyboard and pointer) are never implied by network: each is its
@@ -354,9 +403,13 @@ produces them for removed devices and network file systems.
   a grant, also holds its private home, the Wayland socket through its
   security context, PipeWire playback and the GPU render node (for a
   Flatpak app the render node only with `--device=dri`, as on Flatpak). The
-  profile is shown in Settings and can be changed per program. Test
-  (Phase 5): a new unpackaged program gets `ENETUNREACH`, exactly one
-  network request is raised, and it prompts at "Always ask".
+  profile is shown in Settings and can be changed per program. Tests
+  (Phase 5 on the loopback-only stack with a fake upstream; Phase 6 against
+  the real network): `curl https://<name>` from a new identity raises
+  exactly 1 request, prompts at "Always ask" and succeeds on its first run
+  once approved within 30 s; at the default level a network-only first use
+  gives 0 failures and 0 prompts; a refused identity's lookup gets
+  `EAI_AGAIN` and its `connect` `ENETUNREACH`.
 
 ## The file view
 
@@ -364,7 +417,8 @@ Each app has its own mount namespace, built at launch. Its contents are fixed
 by a published list, so apps find everything they expect:
 
 - the system image read-only (`/usr`, and `/bin`, `/lib`, `/lib64`, `/sbin` as
-  links into it), or for a Flatpak app its runtime as `/usr` and the app as
+  links into it, with the i386 multiarch set of [compat.md](compat.md) from
+  Phase 7), or for a Flatpak app its runtime as `/usr` and the app as
   `/app`;
 - `/etc` as a generated, read-only view: `passwd` and `group` (this user and
   system accounts only), `hosts`, `resolv.conf` (naming the system
@@ -459,9 +513,10 @@ separate namespace, so a grant or revocation reaches live sockets:
 
 - The network grant is **outbound only**, and the default profile has
   none (above). Every non-loopback `connect`, `sendto` and `sendmsg`
-  checks the sender's identity; an identity without the grant gets
-  `ENETUNREACH` immediately (raising the one first-use request above), and
-  revoking the grant resets its live sockets (`ECONNRESET`).
+  checks the sender's identity; an identity with no recorded answer goes
+  through the first-use request above, one whose answer is a refusal gets
+  `ENETUNREACH` immediately, and revoking the grant resets its live
+  sockets (`ECONNRESET`).
 - **Inbound.** `bind` and `listen` always succeed, as on Linux. A socket
   bound to the wildcard address receives only loopback traffic unless its
   identity holds a **per-port inbound grant** for that port (declared in
@@ -486,9 +541,14 @@ separate namespace, so a grant or revocation reaches live sockets:
   lives. For an app without outbound network the request is an ordinary
   open-URI request (below).
 - **DNS.** `resolv.conf` names `127.0.0.53`, served by the system
-  resolver, a TCB service and not an identity's loopback port. It answers
-  only identities holding outbound network; any other identity gets
-  `ECONNREFUSED`, so DNS can't tunnel data out of an app without network.
+  resolver, a TCB service and not an identity's loopback port. It sends
+  queries upstream only for identities holding outbound network. A lookup
+  from an identity with no recorded answer is the first-use event above
+  (decided before any query leaves the machine); an identity whose answer
+  is a refusal gets SERVFAIL (`EAI_AGAIN`), never `ECONNREFUSED`, so DNS
+  can't tunnel data out of an app without network. The resolver lands in
+  Phase 5, forwarding to a fake upstream on the loopback-only stack until
+  the full stack arrives in Phase 6.
 - **Services that send for an app.** Every TCB service that sends traffic
   on an app's behalf checks the caller's attested grants first: the
   resolver as above; the open-URI portal, which for a caller without
@@ -514,14 +574,15 @@ grant is refused on the loopback-only stack. In Phase 6: revoke the
 network grant under a live TCP connection; an app without an inbound
 grant that listens on the wildcard and on a non-loopback address is
 unreachable from another machine, and with a per-port grant exactly that
-port is reachable; an identity without network gets `ECONNREFUSED` from
-the resolver; the OAuth callback flow of a named app works.
+port is reachable; a refused identity gets SERVFAIL from the resolver
+and no query for it leaves the machine; the OAuth callback flow of a
+named app works.
 Exfiltration-suite rows, each its own row: an app holding Documents and no
-network sends a canary through open-URI with an `https` URL, through a
-notification, and through the email portal (Phase 5, with a networked test
-app as the URI handler), through a `<canary>.example` lookup, a
-cross-identity loopback relay and an mDNS-advertised IPP printer through
-the print portal (Phase 6), and through its own loopback page opened in
+network sends a canary through open-URI with an `https` URL (Phase 5,
+with a networked test app as the URI handler), through a notification,
+the email portal, a `<canary>.example` lookup, a cross-identity loopback
+relay and an mDNS-advertised IPP printer through the print portal
+(Phase 6), and through its own loopback page opened in
 the browser (Phase 7); each is refused or shown in the prompt.
 
 ## Unix permissions, uids and Linux capabilities
@@ -561,7 +622,9 @@ the browser (Phase 7); each is refused or shown in the prompt.
 - **Denials never hang.** A call the app isn't allowed returns `EACCES`,
   `EPERM`, `ENETUNREACH` or `ENOENT` immediately. Prompts never happen inside
   a system call, because a syscall that blocks on a human would hang or time
-  out real programs. Apps ask through portals, which are asynchronous.
+  out real programs; apps ask through portals, which are asynchronous. The
+  one exception is the first-use network request (above): a lookup or
+  `connect` waits at most 30 s, and only when a human must decide.
 
 ## Granting access: portals
 
@@ -581,19 +644,25 @@ terminal, and in the compositor's prompt layer from Phase 7) are accepted
 only from keyboards parsed in the kernel (PS/2, boot-protocol USB, and
 in-kernel I2C-HID for internal laptop keyboards once it meets the parser
 promotion thresholds) or from a keyboard whose own per-device HID process
-(one process per device) passed typed-code confirmation. Bluetooth
-keyboards never count unless the user opts that keyboard in by name;
+(one process per device) passed typed-code confirmation. Before Phase 6
+(no device authorization yet) the prompt terminal accepts USB input only
+from the port and device that typed the unlock passphrase this boot
+(Phase 5 test: a `usb-kbd` hot-added after unlock can't open or answer a
+prompt). Bluetooth keyboards and 2.4 GHz receivers never count unless the
+user opts that keyboard in by name;
 `uinput` devices and the compositor's virtual keyboard and pointer never
 count, and neither do events produced by the user's key remapping, which
 applies only to app surfaces (F17 in [features.md](features.md)). The
 polled xHCI boot-keyboard reader stops when the Phase 6 xHCI driver
 binds, and resume PIN entry uses the in-kernel paths. Ordinary
-input is gated too, with the mechanisms in [drivers.md](drivers.md): every
-new USB device (by class and serial or port identity) gets no driver
-binding until approved, a keyboard additionally needs the typed code,
-known devices are remembered, and every USB and Thunderbolt port refuses
-new devices while the screen is locked (devices already present keep
-working); Bluetooth stays off until a device is paired, and input from the
+input is gated too, with the mechanisms and the one HID definition in
+[drivers.md](drivers.md) "Device authorization": every new USB device
+(identity VID/PID, serial if any, descriptor hash and port path) gets no
+driver binding until approved, an interface with keyboard/keypad or
+system-control usages additionally needs the typed code, known devices
+are remembered, and every USB, Thunderbolt and other PCIe hotplug port
+refuses new devices while the screen is locked (devices already present
+keep working); Bluetooth stays off until a device is paired, and input from the
 Bluetooth stack is accepted only for paired HID devices whose link keys
 the tier-2 transport holds. Attack rows: a compromised Bluetooth stack or
 HID process injects the secure-attention key and approves a prompt, and a
@@ -620,16 +689,26 @@ compromised Bluetooth stack injects keys into a focused terminal; all fail
   intended divergences in [compat.md](compat.md) with this user-facing
   outcome: the dialog shows the app's private home, its granted folders
   and `$XDG_RUNTIME_DIR/doc`; to open another file the user grants a folder
-  in Settings or drags the file onto the window.
+  in Settings or drags the file onto the window. Files such an app saves
+  into its private home (`~/Documents/x.blend` there) are found through
+  Files, which shows each private home's XDG folders in a trusted-path
+  browser with an export action. Test (Phase 7): Blender saves
+  `~/Documents/x.blend` and the user finds and exports it in Files.
 - **Network:** outbound access, and each inbound port, is requested through
   the network portal or declared at install; the first-use request is
   raised for the app (above).
-- **Camera, microphone, screen capture, location, notifications, background
-  running, real-time scheduling (the rtkit interface), USB devices:** the
-  portal decides once per the prompt level, the answer is remembered and
-  can be changed in Settings, and the app gets a capability (often an fd,
-  such as a PipeWire stream). Screen casting, remote desktop and input
-  capture are in the floor below. Trusted indicators for the camera,
+- **Camera, microphone, screen capture, location, background clipboard
+  read, notifications, background running, real-time scheduling (the rtkit
+  interface), USB devices:** the portal decides once per the prompt level,
+  the answer is remembered and can be changed in Settings, and the app gets
+  a capability (often an fd, such as a PipeWire stream). Camera,
+  microphone, screen capture and screenshot, location and background
+  clipboard-read grants are in the component's data set (above), so with
+  network in the component they need the combined approval at every
+  level. Screenshots, screen casting, remote desktop and input capture are
+  in the floor below. The USB portal refuses raw access to audio (class
+  0x01) and video (class 0x0E) interfaces; those devices are reached only
+  through PipeWire, where F1's indicators and kill switches apply. Trusted indicators for the camera,
   microphone and screen capture, per-sensor kill switches and the privacy
   dashboard over these grants are F1 and F2 in [features.md](features.md).
 - **Every portal** is a row of [`design/channels.toml`](channels.toml)
@@ -640,41 +719,71 @@ compromised Bluetooth stack injects keys into a focused terminal; all fail
 TCB setting stored by the broker and changed only on the trusted path (the
 prompt terminal, later the compositor's prompt layer); no app can change
 it. A **prompt** here is a dialog the user
-didn't open: the store's install page, a file chooser pick and drag and
-drop are the user's own actions and aren't prompts.
+didn't open: an install review page, a file chooser pick and drag and
+drop are the user's own actions and aren't prompts (the prompt budget
+below still counts install approvals).
 - *Always ask:* every new grant prompts.
 - *Only when suspicious:* a request prompts if it is on the closed
   **suspicious list**, or in the floor; any other grant is given silently.
 - *Almost never:* only the floor prompts.
 
-The suspicious list (each entry with its test phase):
-1. executing a file with app, downloaded or removable provenance, or an
-   unsigned executable whose closure hash was first seen on this machine
-   less than 7 days ago (5);
-2. any identity's first network request while its component holds file
-   grants (the files + network combination) (5);
+The suspicious list (each entry with its test phase). An executable is
+**signed** when it carries a store signature, a Flatpak remote signature,
+or a signature by a publisher key the user approved; its **age** is the
+age of its provenance timestamp (above), never when its hash was first
+seen.
+1. executing a file with app, downloaded or removable provenance by an
+   identity other than its provenance identity, or an unsigned executable
+   less than 7 days old; the terminal running a file with terminal
+   provenance never matches (5; tested with the clock set back);
+2. any identity's first network request while its component's data set is
+   non-empty (the data + network combination) (5);
 3. any inbound listener grant, and any remote-control access: screen
    casting, remote desktop, input capture, the virtual keyboard and pointer
    (inbound in 6, the rest in 7);
-4. a new USB device of HID, network or storage class (6);
+4. a new USB device of network or storage class, or a new HID interface
+   without keyboard/keypad or system-control usages (mice, gamepads,
+   consumer-control-only headset buttons, FIDO keys) (6);
 5. a device presenting a different class than it did last time (6);
-6. any grant requested while the screen is locked, or within 2 s of the
-   app's start before the user has given it any input (5).
+6. any grant requested while the screen is locked, or requested before any
+   user input to the identity's own surfaces (5).
 
-The **floor** prompts at every level: inbound access, remote control and
-screen sharing (every grant in entry 3), a new keyboard-like (HID) device,
-and files + network for one identity or component (every combined
-approval). It is the remote-read promise, and Settings explains it in
-those words. A grant given silently is logged with its time, app and the
-reason it didn't prompt, listed in Settings and revocable there. Tests: at
-"Only when suspicious" each entry prompts and a request outside the list
-doesn't; at "Almost never" each floor case still prompts; an app's attempt
-to change the level (D-Bus, settings files, input injection) fails (5,
-with the entries in their phases above). Prompt budget (Phase 7): a
-scripted typical day at the default level (install 5 apps, browse,
-download a file, plug a known keyboard and a USB stick) shows at most 5
-prompts after first run, counted by the test and published as the
-scorecard row "prompts per typical day".
+A network-only first use (an empty component data set) is suspicious only
+by entries 1 to 5, never by entry 6.
+
+The **floor** prompts at every level: inbound access, remote control,
+screen sharing and screenshots (every grant in entry 3, and the
+screenshot portal); a new HID interface with keyboard/keypad or
+system-control usages (the typed code, [drivers.md](drivers.md)); any
+PCIe device or tunnel added after boot on any hotplug port, refused while
+locked; a desktop launch of a downloaded executable; and data + network
+for one identity or component (every combined approval). It is the
+remote-read promise, and Settings explains it in those words. A grant
+given silently is logged with its time, app and the reason it didn't
+prompt, listed in Settings and revocable there. Tests: at "Only when
+suspicious" each entry prompts and a request outside the list doesn't; at
+"Almost never" each floor case still prompts, with microphone + network,
+camera + network, location + network, background clipboard + network and
+screenshot + network each prompting exactly once (Phase 7) and a
+hot-added PCIe device and Thunderbolt tunnel each prompting (Phase 6); an
+app's attempt to change the level (D-Bus, settings files, input
+injection) fails (5, with the entries in their phases above). Prompt
+budget (Phase 7): a pinned typical-day script at the default level
+(Firefox, Steam, a chat app, an editor, a media player, an AppImage, a
+cargo project, a video call, a new Wi-Fi network, plugging a new mouse, a
+headset and a gamepad, a known keyboard and a USB stick, browsing and one
+download) counts every prompt kind after first run, install approvals
+included; the target is at most 5, and the measured count is published as
+the scorecard row "prompts per typical day".
+
+**Settings before Phase 12.** Until the Settings app lands, every
+"Settings" screen named in this file is a trusted-path **settings
+console**: on the prompt terminal from Phase 5 and in the compositor's
+prompt layer from Phase 7. Screens by phase: prompt level, silent-grant
+log and revocation, document and folder grants (5); Bluetooth pairing and
+VPN designation (6); kill switches, the private-home browser and the
+Flatpak install review page, which shows a Flatpak app's permissions and
+records the approval before the store exists (7).
 - **Prompts can't be faked.** Only the broker's terminal (Phase 5) and the
   compositor (from Phase 7) show portal prompts, the compositor in a layer
   apps can't draw over, capture or cover, both showing the app's attested
@@ -700,7 +809,7 @@ Flatpak permissions map onto the same grants:
 | Flatpak permission | Optimal grant |
 |---|---|
 | `--share=network` | outbound network, shown at install |
-| `--filesystem=home` or `host` | home minus protected paths, persistent, overlaid as in the file view with `~/.var/app/<app id>` at its own path, so it needs the combined files + network approval if the app also has network |
+| `--filesystem=home` or `host` | home minus protected paths, persistent, overlaid as in the file view with `~/.var/app/<app id>` at its own path, so it needs the combined data + network approval if the app also has network |
 | `--persist=<dir>` | `~/.var/app/<app id>/<dir>` mounted at `~/<dir>` |
 | `--filesystem=xdg-documents` and similar | that folder, persistent |
 | `--device=dri` | GPU render node |
@@ -724,7 +833,12 @@ devices only inside the caller's own network namespace (milestone 8,
 Phase 6, because it needs the full network stack). The one exception is
 the VPN app the user designates on the trusted path for the VPN-only guard,
 whose TUN interface is in the system network namespace (F6 in
-[features.md](features.md)).
+[features.md](features.md)). It holds no `CAP_NET_ADMIN`; the **VPN
+portal** (Phase 6) sets addresses, routes and DNS on that designated TUN
+only, on the VPN identity's request, and logs every endpoint update it
+makes, so roaming and mesh VPNs work. Tests (Phase 6): an unchanged
+WireGuard config (through `wireguard-go`) and an unchanged OpenVPN config
+connect; Tailscale keeps its tunnel while roaming between two networks.
 
 ## Proof and test obligations
 
@@ -757,9 +871,10 @@ whose TUN interface is in the system network namespace (F6 in
   run it as the terminal or through the service manager. Each channel and
   portal is gated in the phase its `channels.toml` row names: D-Bus, kernel
   keyrings, the document portal, the Flatpak launcher and portal and the
-  loopback-only stack in Phase 5, PipeWire, the resolver, the print portal
-  and full sockets in Phase 6, Wayland, XWayland, the clipboard, DnD and
-  the remote-control portals in Phase 7. Each TCB service named here (the
+  loopback-only stack and the resolver in Phase 5, PipeWire, the
+  notification, email, print and VPN portals and full sockets in Phase 6,
+  Wayland, XWayland, the clipboard, DnD, the camera, location and
+  screenshot portals and the remote-control portals in Phase 7. Each TCB service named here (the
   launcher and launch relay, broker and portals, the SSH agent, GPG agent
   and secret service included) has an A3 row in
   [threat-model.md](threat-model.md) with 10^8 protocol fuzz executions
