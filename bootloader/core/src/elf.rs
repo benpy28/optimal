@@ -286,12 +286,17 @@ pub fn parse(file: &[u8]) -> Result<Layout, ElfError> {
     if layout.segment_count == 0 {
         return Err(ElfError::NoLoadableSegments);
     }
+    // Relocations are only reachable through PT_DYNAMIC; without it the
+    // image can only run where it was linked.
+    if layout.pie && layout.dynamic.is_none() {
+        layout.pie = false;
+    }
     layout.base = lo;
     layout.span = hi - lo;
     if layout.span > MAX_SPAN {
         return Err(ElfError::TooLarge);
     }
-    if !pie && lo < KERNEL_BASE_MIN {
+    if !layout.pie && lo < KERNEL_BASE_MIN {
         return Err(ElfError::NotInHigherHalf);
     }
     if !layout
@@ -646,6 +651,30 @@ mod tests {
         f[18] = 3;
         assert_eq!(parse(&f).unwrap_err(), ElfError::NotX86_64);
         assert_eq!(parse(&f[..40]).unwrap_err(), ElfError::TooSmall);
+    }
+
+    #[test]
+    fn dyn_without_dynamic_segment_is_not_slid() {
+        // An ET_DYN file with no PT_DYNAMIC (what static-pie linking with a
+        // custom PHDRS list produces) has relocations we cannot find, so
+        // sliding it would leave every stored pointer wrong. It must load
+        // exactly at its link address, which then has to be in the top 2 GiB.
+        let f = build(
+            ET_DYN,
+            K,
+            &[load_ph(PF_R | PF_X, 0x1000, K, 0x10, 0x10)],
+            0x2000,
+        );
+        let l = parse(&f).unwrap();
+        assert!(!l.pie);
+        assert_eq!(slide_range(&l).unwrap(), (0, 1));
+        let low = build(
+            ET_DYN,
+            0x1000,
+            &[load_ph(PF_R | PF_X, 0x1000, 0x1000, 0x10, 0x10)],
+            0x2000,
+        );
+        assert_eq!(parse(&low).unwrap_err(), ElfError::NotInHigherHalf);
     }
 
     #[test]
