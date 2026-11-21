@@ -116,5 +116,28 @@ Each phase ends with a "done when" test. The next phase doesn't start until it p
 - No ads, no forced accounts, no telemetry by default. Optional local AI that is off until switched on.
 - Done when: a stranger goes from the website to a working desktop with Steam running in under 30 minutes, without opening a terminal.
 
+## Built by us: our own stack
+
+These pieces will be written by us, from specs, instead of borrowed. Each one
+runs as its own track alongside the kernel phases, and starts once the kernel
+can support it. Until ours is ready, the borrowed version (where one exists)
+keeps things working.
+
+| Piece | Starts after | Replaces | Done when |
+|---|---|---|---|
+| Bootloader | Phase 1 | Limine | Boots Optimal on UEFI (and BIOS) across the full CI boot matrix and on 3 real PCs, with Secure Boot signing |
+| Filesystem | Phase 4 | ext4 as the default | Copy-on-write with checksums and snapshots (instant rollback for updates); survives a 7-day power-cut fuzz test with zero corruption; beats ext4 on our file benchmarks |
+| Compositor | Phase 7 | Borrowed Wayland compositor | Speaks the Wayland protocol so existing apps run; tear-free, variable refresh rate, and lower input latency than KWin/Mutter in our tests |
+| Desktop | Compositor | Borrowed desktop shell | Panel, launcher, notifications, built-in tiling and gaming mode, all under the lean budget |
+| Settings app | Desktop | Separate config tools | One app controls everything, with no terminal needed for any common task |
+| Store | Desktop + networking | Borrowed store | One store and one package format, with signed packages, atomic installs and rollback |
+| Everyday apps | Desktop | Borrowed apps | Files, terminal, text editor, image viewer, media player, calculator and system monitor |
+| Web browser engine | Phase 7 | Borrowed browser | Passes a set share of the Web Platform Tests and Acid3, then runs the 50 most-visited sites correctly |
+
+Honest notes:
+- **Bootloader** and **everyday apps** are the most achievable. The bootloader can start soon after Phase 1.
+- **Filesystem** is very hard to get right, because a bug loses people's files. It gets the heaviest testing of anything here.
+- **Web browser engine** is the biggest single project on this list, bigger than the kernel. HTML, CSS and JavaScript each take years. It is a long-running track, and a borrowed browser ships until ours passes its tests.
+
 ## What we deliberately don't build
-- A bootloader (Limine), a compiler (Rust/LLVM), or the user-space programs themselves. We run the existing ones through the Linux interface.
+- A compiler (Rust/LLVM), and for now the GPU graphics stack (Mesa) and Windows compatibility (Wine/Proton). Those run through the Linux interface and can become "built by us" tracks later.
