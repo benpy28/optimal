@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = ["core"]
+default-members = ["core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+# Cryptography: audited RustCrypto / dalek crates, all MIT OR Apache-2.0 / BSD-3-Clause.
+ed25519-dalek = { version = "2", default-features = false, features = ["fast"] }
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = 3
+debug = 1
+codegen-units = 1
+lto = true
