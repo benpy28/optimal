@@ -16,7 +16,8 @@
 # firmware or bootloader refuses it with the expected message and the kernel
 # never runs. Nothing may hang, and nothing may panic.
 #
-# More conditions join as the kernel grows: failed allocations (1b), quirky
+# The kernel test suite run in every scenario includes fault injection
+# (failed frame allocations, 1b). More conditions join as the kernel grows: quirky
 # ACPI tables, timer jitter and spurious interrupts (1c), disk power cuts and
 # IO errors (Phase 4).
 #

@@ -8,7 +8,12 @@
 #   can't overlap (an aligned address with flag bits 0-8 and 63, or a table
 #   index shifted into place over an aligned base), and on disjoint bits
 #   OR and XOR give the same value, so these mutants are equivalent.
+# - `replace < with <=` in zones::merged: the two only differ when a usable
+#   and a later piece start at the same address, which is an overlap; plan
+#   refuses that on its first pass whichever piece comes first, and the
+#   other callers only see maps plan accepted.
 exclude_re = [
     "proofs::",
     "replace \\| with \\^ in (Flags::bits|AddressSpace::map|AddressSpace::protect|AddressSpace::for_each_leaf::walk)",
+    "replace < with <= in merged",
 ]

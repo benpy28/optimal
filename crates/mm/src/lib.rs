@@ -14,6 +14,8 @@
 
 pub mod frames;
 pub mod paging;
+pub mod slab;
+pub mod zones;
 
 /// Size of a base page / physical frame.
 pub const PAGE_SIZE: u64 = 4096;

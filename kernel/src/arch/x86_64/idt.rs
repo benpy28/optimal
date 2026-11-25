@@ -239,6 +239,11 @@ fn crash(f: &InterruptFrame) -> ! {
     if f.vector < 32 && has_error_code(f.vector as u8) {
         println!("error code {:#x}", f.error_code);
     }
+    if (f.vector == VEC_PAGE_FAULT || f.vector == VEC_DOUBLE_FAULT)
+        && crate::mm::paging::in_stack_guard(cpu::read_cr2())
+    {
+        println!("kernel stack overflow: the fault is in the boot stack's guard page");
+    }
     if f.vector == VEC_PAGE_FAULT {
         let e = f.error_code;
         println!(

@@ -100,6 +100,19 @@ impl<'m, const MAX: usize> Buddy<'m, MAX> {
         }
     }
 
+    /// Swap in a different view of the same metadata, for when the kernel
+    /// moves its direct map: `meta` must hold exactly what the current array
+    /// holds (it is the same physical memory seen at a new address). Returns
+    /// the old view. Panics if the length differs.
+    pub fn relocate(&mut self, meta: &'m mut [FrameMeta]) -> &'m mut [FrameMeta] {
+        assert_eq!(
+            meta.len(),
+            self.meta.len(),
+            "relocated metadata has a different length"
+        );
+        core::mem::replace(&mut self.meta, meta)
+    }
+
     /// First frame number this allocator could manage.
     pub fn base(&self) -> u64 {
         self.base
@@ -472,6 +485,30 @@ mod tests {
         b2.add_range(7, 1);
         assert_eq!(b2.alloc(0), Some(7));
         assert_eq!(b2.allocated_order(7), Some(0));
+    }
+
+    #[test]
+    fn relocation_keeps_working_state() {
+        let mut m1 = zone(16);
+        let mut b: Buddy<4> = Buddy::new(&mut m1, 0);
+        b.add_range(0, 16);
+        let x = b.alloc(1).unwrap();
+        let mut m2 = b.meta.to_vec();
+        let old = b.relocate(&mut m2);
+        assert_eq!(old.len(), 16);
+        b.check().unwrap();
+        b.free(x, 1).unwrap();
+        assert_eq!(b.free_blocks(4), 1);
+        b.check().unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "different length")]
+    fn relocation_refuses_a_different_length() {
+        let mut m1 = zone(16);
+        let mut b: Buddy<4> = Buddy::new(&mut m1, 0);
+        let mut m2 = zone(8);
+        b.relocate(&mut m2);
     }
 
     #[test]
