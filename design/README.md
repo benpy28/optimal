@@ -20,7 +20,7 @@ roadmap and a design file disagree, that's a bug in one of them; fix it.
 | [channels.toml](channels.toml) | every portal and channel, checked by CI |
 
 Component designs that live next to their code: `bootloader/DESIGN.md` (Optimal
-Boot internals) and `fs/docs/DESIGN.md` and `fs/docs/FORMAT.md` (the own file
+Boot internals, not yet written) and `fs/docs/DESIGN.md` and `fs/docs/FORMAT.md` (the own file
 system).
 
 ## Rules for the design
@@ -50,6 +50,7 @@ round finds nothing blatant.
 | 5 | 2026-11-21 | the resume and hibernation objects let a TPM unseal skip the PIN; signed PCR 8/9-only approvals bypassed PCR 4; the PCR 7 reseal's test-unseal couldn't run while the system was up; the volume tag missed the LUKS2 secondary header; the 4-slot superblock couldn't reach back K commits; AML could rewrite any device's PCI config through ECAM; the transitive one-principal rule merged every session into one component; private homes keyed by path contradicted the identity rules; Phase 5 needed networking that only arrives in Phase 6; tail-latency gates broke their own statistics and budget; plus the owner's new approve-before-access feature (USB authorization, per-app network, untrusted downloads, prompt levels with a floor) | all fixed in this directory and the roadmap; file system findings sent to its track |
 | 6 | 2026-11-21 | apps that look up a host name never raised the first-use network request; "downloaded" had two definitions and one blocked every self-built program; camera, microphone, location and screenshots could reach the network with no prompt; Verus couldn't reason about the shipped atomics; a replay bump wrote all four superblock slots in one flush; one volume tag over both LUKS2 copies had no atomic update or recovery; the PIN was typed before the loader's DMA protection; 2 witnesses with threshold 2 could stop all updates; plus the owner's 17 optional features, whose panic lock zeroed pages frozen apps still mapped and whose wipe lists missed vault and travel keys | all fixed in this directory and the roadmap; file system findings sent to its track |
 | 7 | 2026-11-21 | many round-6 fixes were wrong in detail: the loader dropped DMA protection for the boot disk while secrets were live, and an AMD-Vi entry passed through an unprotected state; 1c DMA tests had no driver to run them; the DUP copy-1 key could repeat across mounts and online re-encryption had no power-cut story; TPM proof target 17 didn't match the per-object policies; vstd's exec subset leaked into public APIs; first-boot TPM writes ran in the wrong order and F2's NV indexes had no owner; 4b tests needed parts that arrive later; protected install directories broke the terminal; the release rule wasn't family-wise and tail metrics were underpowered; freed frames kept plaintext; hibernation wiped keys before wrapping them; prompt counts didn't add up | all fixed in this directory and the roadmap; file system findings sent to its track |
+| 8 | 2026-11-25 | the loader's own DMA set-up was itself the hole: firmware code stayed DMA-patchable while the PIN was live, the ExitBootServices gap was open, and the loader's own IOMMU protocol was extra attack surface; the terminal-to-app launch relay could exfiltrate data and load code, broke pipes, and blocked `gdb`/`strace`; a verification target could be fooled by injected interrupts; the ESP term in the rollback floor could brick fallback; home keys were single-factor; panic hibernate could resume without the PIN | all fixed, mostly by deleting mechanisms; file system findings sent to its track |
 
 ## Decisions log
 
@@ -94,24 +95,28 @@ One line each: what was chosen, why, and what was rejected.
 - The secure-attention key and prompt answers are accepted only from in-kernel input parsers or confirmed per-device HID processes, never Bluetooth by default; rejected: trusting every tier-3 input stack.
 - Services that send traffic for an app check the app's own grants, and the one-principal rule is transitive over a session; rejected: pairwise checks, which a relay app defeats.
 - Each app gets a persistent private home and a document portal; rejected: a home containing only the app's own config directories, which breaks Wine, Steam and every dotfile app.
-- D1 needs firmware pre-boot DMA protection or the loader's deny-all set-up, and DMA is considered stopped only by the IOMMU and upstream bridges; rejected: trusting a device's own Bus Master Enable bit.
+- D1 needs firmware pre-boot DMA protection, and DMA is considered stopped only by the IOMMU and upstream bridges; rejected: trusting a device's own Bus Master Enable bit.
 - Benchmarks use at least 20 boots per build with t-based intervals and a between-boot noise ceiling; rejected: 10 boots with a normal-approximation bootstrap, which overstated power.
 - The KDF floor scales with RAM (min(1 GiB, RAM/4), at least 64 MiB, at least 4 passes) with 256 MiB as the minimum for an encrypted install; rejected: a fixed 1 GiB floor that can't unlock small machines.
 - A name lookup is a first-use network event, silent decisions are synchronous, and a pending human decision holds the call for up to 30 s; rejected: refusing lookups with `ECONNREFUSED`, which meant the request never fired.
 - "Downloaded" has one definition (download folders, portal transfers from networked identities, writes by a process that read a non-loopback socket), and the terminal running its own files never prompts; rejected: tagging every file written by any networked identity, which broke every build.
 - The prompt floor counts a component's whole data set (files, camera, microphone, screen capture and screenshots, location, background clipboard) with network; rejected: counting file grants only.
 - The shipping kernel uses a vendored, audited exec subset of vstd so Verus proofs cover the real atomics; rejected: proving an abstract model only, unless the Phase 3 spike fails.
-- The loader installs its deny-all IOMMU tables before the PIN prompt and any unseal; rejected: doing all firmware I/O first.
 - At least 4 transparency witnesses with threshold 2 and an offline-root emergency change; rejected: 2 of 2, where losing one witness stops all updates.
 - Panic lock unmaps and evicts page-cache pages before zeroing them, closes vaults and lists what stays in RAM; rejected: zeroing pages under frozen apps' mappings.
 - One key inventory table in storage.md gives every key's fate at lock, suspend, panic, hibernate and shutdown, and every canary set comes from it; rejected: per-section wipe lists, which kept missing keys.
 - The typed-code floor applies only to HID interfaces with keyboard or system-control usages, and every HID identity includes its port path; rejected: asking for every HID device (mice and headsets can't type a code).
-- The loader reads everything from disk, drops the boot disk's DMA exception and invalidates the IOTLB before the PIN prompt or any unseal, and D1 requires firmware pre-boot DMA protection; rejected: keeping the disk exception live while secrets are in memory.
 - AMD-Vi device table entries change through blocking intermediate entries written with `cmpxchg16b`, never V=0 on a live device; rejected: clearing V, which lets the device DMA untranslated.
 - A test-only edu-style DMA driver carries the 1c DMA tests; rejected: moving them all to 4a, when the code under test exists at 1c.
 - DUP copy 1's key is derived from copy 0's block key with BLAKE3 `derive_key`, under copy 0's nonce, which carries the per-mount prefix; rejected: a separate per-mount copy-1 key, which adds a derivation per prefix and no uniqueness.
 - Online re-encryption works by copy to a spare extent with flushes around the map switch; rejected: in-place re-encryption, which a power cut can tear.
 - Install directories are protected only against other app identities; rejected: protecting them from the terminal, which broke building and editing your own programs.
 - The release gate fails a metric only when a Holm test (family-wise 5%, at most 150 metrics) shows it worse past its margin and a fresh-boot rerun confirms it; rejected: per-metric tests, which fail some release by chance.
-- Frames that held encrypted page cache or vault and travel memory are zeroed on free, and panic and vault close sweep the free lists; rejected: zeroing only mapped pages.
+- Every user-anonymous and tagged-slab frame is zeroed on free; rejected: zeroing only mapped pages, and free-list sweeps at panic and vault close.
 - Hibernation wraps the image key before wiping any key it depends on; rejected: the old order, which wiped first and left nothing to wrap with.
+- Pre-boot DMA: D1 requires firmware protection that maps per buffer; the loader keeps the firmware's tables for all firmware I/O, enables PMRs and clears bridge Bus Master Enable before ExitBootServices, and loads its deny-all tables after it; remaining gaps are named windows on the scorecard; rejected: the loader's own IOMMU protocol, exception lists and pre-EBS takeover, which were themselves the holes.
+- Running a registered app from the terminal is a channel like any other (combined approval, environment allowlist, only existing-path arguments become portal entries); tracing goes through the debugger portal; rejected: a relay trusted because the user typed the command.
+- Home volumes need the TPM object and the user's stretched secret, and every on-disk passphrase wrap meets the 60-bit floor; rejected: a TPM-only home key.
+- Panic with something to keep powers off; rejected: panic hibernate, whose resume path was a second unlock route.
+- The rollback floor is max(built-in minimum, counter minus base) with no ESP term; rejected: the ESP term, which could floor out every bootable slot.
+- F2 uses one system NV ratchet index with per-user keys derived from it; rejected: a per-user NV pool, which capped users at 8.
