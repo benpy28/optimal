@@ -30,7 +30,7 @@ gamed. Security rules that shape the ABI are in
   Mesa GL and Vulkan drivers with their ICD JSON files, and their entries
   in `ld.so.cache`, because pressure-vessel imports the host's graphics
   stack and Steam's i386 client and Proton need them. Test (Phase 7): a
-  32-bit Vulkan triangle renders under pressure-vessel.
+  32-bit Vulkan triangle renders under pressure-vessel on i386 lavapipe.
 - **16-bit stack segments from `modify_ldt` don't leak kernel bits.**
   Linux lets `modify_ldt` install a 16-bit SS, and `IRET` to a 16-bit stack
   restores only RSP[15:0], leaving RSP[31:16] of the kernel stack visible.
@@ -57,8 +57,8 @@ gamed. Security rules that shape the ABI are in
   (glibc's minimum supported kernel), and programs fall back through `ENOSYS`.
   Programs pick code paths by this version (containers/storage uses
   native rootless overlay only from 5.13), so the reported version is
-  published per phase and the differential baseline's Linux reports the
-  same version.
+  published per phase, and the differential tracer normalises `uname`
+  for the Linux baseline.
 - **Unknown means ENOSYS.** Every syscall number not implemented returns
   `-ENOSYS`, never a kill or `SIGSYS` (seccomp aside). Every unsupported
   `ioctl` returns `-ENOTTY`. Unsupported flags behave exactly as on Linux
@@ -196,7 +196,8 @@ sanitizers read `/proc/self/status`, glibc reads
   `cmdline` holding argv[0] alone (`environ`, `maps`, `mem`, `fd` and the
   rest are absent), and `kill(2)` from the terminal reaches them with `SIGTERM`,
   `SIGINT`, `SIGKILL`, `SIGSTOP` and `SIGCONT` only; other signals need
-  the process portal's grant (`EPERM` without it). Golden test
+  the process portal's grant (`EPERM` without it), except the launch
+  relay's forwarded signals to its own app ([capabilities.md](capabilities.md)). Golden test
   (Phase 5): `ps aux`, `top -b -n1` and `kill` against another app's
   process on Linux and Optimal. Kernel pointers are hidden as in the
   lockdown table. `/sys/class/powercap` (RAPL energy counters) is absent
@@ -264,17 +265,19 @@ sanitizers read `/proc/self/status`, glibc reads
   from another identity, `TIOCSTI` returning `EPERM` and `TIOCLINUX`
   absent, wildcard sockets receiving only loopback without an inbound
   grant, no network in the default profile until the first-use request is
-  answered (a name lookup, `connect` or `sendto` that needs a human waits up to 30 s,
+  answered (a name lookup, `connect` or send that needs a human waits up to 30 s,
   then gets `EAI_AGAIN` or `ENETUNREACH` if refused), the per-app private
   home, `SO_PEERCRED` giving pid 0 for a peer
   in another app's PID namespace (as Linux does for a pid outside the
   receiver's namespace), the terminal's portal-backed `/proc` (argv[0]
   only for other identities) and its limited signals to other identities
   (above), a registered app run from a
-  shell running under its own identity behind the launch relay (path
-  arguments and cwd rewritten to one-use document-portal paths, the
-  environment passed minus the `LD_*`, `*PRELOAD` and `PYTHONPATH`
-  denylist), autostart
+  shell running under its own identity behind the launch relay (only
+  argv tokens that are existing paths and the cwd rewritten to
+  document-portal paths, other path forms such as `--file=x` passed
+  unchanged; the environment cut to the published allowlist; the app
+  traced only with `gdb -p` or `strace -p` through the debugger portal),
+  Tailscale run with `--netfilter-mode=off` (no nfnetlink), autostart
   and desktop entries written inside a private home becoming Background
   and launcher portal requests (nothing appears until approved; Phase 5
   test, and Steam's shortcuts in milestone 13), the Flatpak portal's

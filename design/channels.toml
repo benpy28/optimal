@@ -156,6 +156,15 @@ phase = 7
 test = "exfil/wayland-x11-relay"
 
 [[channel]]
+id = "launch-relay"
+what = "a terminal-identity exec of a registered app (identity exec): argv, the environment allowlist, rlimits, nice, affinity, cgroup, the cwd as a directory entry and existing-path argv tokens as document-portal entries, and fds 0-2 (a pty for ttys, other fds as their open file descriptions); argv tokens beyond existing paths and URLs need a floor prompt naming the app"
+direction = "writer_to_reader"
+created = "open"
+refusal = "the exec fails EACCES and the terminal shows a one-click request for the combined approval (asked once per app; floor when the app holds network)"
+phase = 5
+test = "exfil/launch-relay"
+
+[[channel]]
 id = "steam-child-shared"
 what = "a launcher's manifest-declared shared channels to a child identity (Steam: mapped from SteamAppId and the appmanifest install directory by the signed Steam manifest): read-only paths (parent to child), writable compatdata/<appid> and shadercache/<appid>, named shared memory and socket endpoints, and a read-write edge between Steam and each child's save paths (both)"
 direction = "both"
@@ -172,12 +181,6 @@ id = "file-chooser-pick"
 rule = "one-use or persistent document-portal entry for the picking app only; a persistent pick is a grant (grant checks below); counts only when driven from a confirmed device (a prompt-capable keyboard, or a pointer confirmed by a click on a target the prompt layer shows)"
 phase = 5
 test = "exfil/file-chooser"
-
-[[user_transfer]]
-id = "launch-relay-typed"
-rule = "a command line the user typed in the terminal: argv, env minus the denylist, rlimits, nice, affinity and cgroup, cwd and path arguments (one-use document-portal entries) and the stdio relay go to the registered app for that run; the edge lasts the app's process lifetime and joins no components"
-phase = 5
-test = "exfil/launch-relay-stdin"
 
 [[user_transfer]]
 id = "drag-and-drop"
@@ -237,7 +240,7 @@ covert = ["CPU and cache timing", "statfs free space", "flock on shared read-onl
 
 [[grant_check]]
 id = "network"
-rule = "first non-loopback connect or send, or first resolver lookup, raises one request per identity; silent decisions synchronous; a human decision waits up to 30 s (resolv.conf options timeout:30 attempts:1; an O_NONBLOCK sendto gets EAGAIN), then SERVFAIL (EAI_AGAIN) or ENETUNREACH; floor when the component's data set is non-empty"
+rule = "first non-loopback connect or send, or first resolver lookup, raises one request per identity; silent decisions synchronous; a human decision waits up to 30 s (resolv.conf options timeout:30 attempts:1; an O_NONBLOCK send gets EAGAIN; a pending socket reports no POLLOUT until decided, then EPOLLOUT or EPOLLERR; triggers: TCP connect, sendto, sendmsg, sendmmsg, write on a connected socket, io_uring send, MSG_FASTOPEN; UDP connect never triggers), then SERVFAIL (EAI_AGAIN) or ENETUNREACH; floor when the component's data set is non-empty"
 phase = 5
 test = "exfil/grant-network"
 
@@ -292,7 +295,7 @@ phase = 5
 
 [[tcb_service]]
 id = "launcher"
-rule = "spawns with identity; launch relay (argv, env minus the denylist, rlimits, nice, affinity, cgroup, cwd, path arguments as one-use document-portal entries; a traced exec starts the app stopped and hands the tracer a debug capability through the debugger portal) for registered apps run from a terminal; maps Steam's execs to child identities through the signed Steam manifest; turns private-home autostart and desktop files into portal requests"
+rule = "spawns with identity; performs identity execs (new process under the launcher, AT_SECURE=1, only fds 0-2 plus manifest-declared fds, the exec'ing task becomes a stub whose waitpid returns the child's exit status) for registered apps run from a terminal (the launch-relay channel) and for the Steam identity's own execs, mapped to child identities through the signed Steam manifest (a child's execs keep its identity whatever SteamAppId says); turns private-home autostart and desktop files into portal requests"
 phase = 5
 
 [[tcb_service]]
@@ -307,12 +310,12 @@ phase = 7
 
 [[tcb_service]]
 id = "a11y-proxy"
-rule = "per-app AT-SPI proxy (Flatpak --a11y-own-name model): an app exposes only its own accessible tree; reading other apps' text needs the screen-reader grant, which is in the data set"
+rule = "per-app AT-SPI proxy (Flatpak --a11y-own-name model): an app exposes only its own accessible tree; reading other apps' text needs the screen-reader grant, which is in the data set; control and key listening need the a11y-input grant"
 phase = 7
 
 [[tcb_service]]
 id = "input-method"
-rule = "IBus/Fcitx-style input method run as one TCB service, never an app; sees keystrokes for the focused surface and commits text only to it; size budget and 10^8 protocol fuzz row in threat-model.md"
+rule = "IBus/Fcitx-style input method run as one TCB service, never an app; sees keystrokes for the focused surface and commits text only to it; conversion engines (Mozc, libpinyin, Rime, Hangul) run as sandboxed non-TCB helpers: keys in, candidates out, no network, own dictionary per identity, nothing learned from password fields, fuzzed at Phase 7; size budget (front ends and candidate window) and 10^8 protocol fuzz row in threat-model.md"
 phase = 7
 
 [[tcb_service]]
@@ -648,7 +651,7 @@ test = "portal/virtual-input"
 id = "vpn"
 interface = "org.optimal.portal.Vpn"
 sends = "no"
-rule = "only for the VPN identity designated on the trusted path; sets addresses, routes and DNS on its designated TUN only; every endpoint update logged"
+rule = "only for the VPN identity designated on the trusted path; sets addresses, routes and DNS on its designated TUN only (the identity's rtnetlink address, route and rule requests on that TUN are filtered by this policy; nfnetlink absent); every endpoint update logged"
 prompt = "user-action"
 phase = 6
 test = "portal/vpn"
@@ -657,11 +660,20 @@ test = "portal/vpn"
 id = "screen-reader"
 interface = "org.a11y.Bus (through the a11y-proxy)"
 sends = "no"
-rule = "a screen reader reads other apps' accessible text"
+rule = "a screen reader reads other apps' accessible text; read only"
 data_set = true
 prompt = "level"
 phase = 7
 test = "portal/screen-reader"
+
+[[portal]]
+id = "a11y-input"
+interface = "org.a11y.Bus (through the a11y-proxy): Action, EditableText, Value.Set, GenerateKeyboardEvent, global key listeners"
+sends = "remote"
+rule = "input injection; never toward the terminal or the prompt layer"
+prompt = "floor"
+phase = 7
+test = "portal/a11y-input-hostile"
 
 [[portal]]
 id = "global-shortcuts"

@@ -54,10 +54,8 @@ sets the requirements it must meet.
   as after a restart; when the Abort alone succeeded (no CC.EN=0), the
   device's cache was not dropped, so only the aborted command is re-sent. A
   kernel crash is never the result of a device stall. PCIe Completion
-  Timeout is set to the 1–10 ms sub-range of range A by default, and to
-  50–100 µs only on devices measured safe with ASPM L1 substates off, after
-  a 24 h soak with 0 spurious timeouts on that device, and drivers never
-  read PCIe endpoint BARs or ECAM in any non-preemptible section; a stall
+  Timeout and the rule against BAR reads in non-preemptible sections are
+  in [drivers.md](drivers.md) `MmioRegion`; a stall
   with an outstanding device-gone event is reported as a device stall
   ([drivers.md](drivers.md), [scheduler.md](scheduler.md) "Device
   stalls"). Test (Phase 4a): an emulated NVMe and AHCI device stops
@@ -105,6 +103,17 @@ sets the requirements it must meet.
   least 20 boots, is within 10% of matched Linux. Both run on a real VWC=1
   NVMe drive (not only in QEMU), and the number of flushes the full log
   forced is published with each result.
+- **Power transitions flush and shut down the drive.** Before S3, after
+  the hibernation image and header-block writes, and at reboot, power-off
+  and panic power-off, the block layer issues Flush and then NVMe
+  shutdown notification (CC.SHN = 01b, waiting for CSTS.SHST = 10b) or ATA
+  FLUSH CACHE EXT then STANDBY IMMEDIATE, so a VWC=1 drive keeps its last
+  writes and a DRAM-less SSD its mapping tables. An S3 resume is treated as
+  a controller reset: the replay log above is re-sent and flushed before
+  any request is resubmitted. Tests, on the power-cut rig with a VWC=1
+  NVMe drive, power cut 1 s after each transition completes, the last
+  written data intact: reboot and power-off (Phase 4a), panic power-off
+  (Phase 5), S3 and hibernation (Phase 10).
 
 ## What durability calls promise (the Linux contract)
 
@@ -177,13 +186,15 @@ workload join the Linux compatibility suite (milestone 4 in
   `SIGBUS`, the same as Linux on a full file system). A metadata reserve of
   2% of the volume, minimum 256 MiB and maximum 8 GiB, guarantees deletes,
   truncates and snapshot removal always succeed on a full disk.
-- **Zero on free.** A frame that held page cache of an encrypted volume,
-  or belonged to a vault or travel identity (F3, F5), is zeroed when it is
-  freed (eviction, truncate, delete, exit), and panic lock and vault close
-  also sweep the buddy and per-CPU free lists, so plaintext never sits in
-  the free lists ([scheduler.md](scheduler.md) "Frame allocator";
-  from Phase 4a, cost published with the 4a storage set; tests in
-  [features.md](features.md) F4 and the class-C lock test below).
+- **Zero on free.** Every frame of user anonymous memory or of a tagged
+  slab (pipe, socket and tty buffers, keyrings), and every frame that held
+  page cache of an encrypted volume or belonged to a vault or travel
+  identity (F3, F5), is zeroed when it is freed (eviction, truncate,
+  delete, exit, slab release), the equivalent of Linux `init_on_free`, so
+  plaintext never sits in the free lists and no sweep is needed
+  ([scheduler.md](scheduler.md) "Frame allocator"; from Phase 4a, cost
+  published with the 4a storage set; the first canary gate is Phase 5,
+  [features.md](features.md) F4, then the class-C lock test below).
 - **Truncate versus mmap.** Truncating a mapped file unmaps the cut-off pages
   first; touching them afterwards delivers `SIGBUS`, as on Linux.
 - Tests: an xfstests-style group for mmap, truncate, `ENOSPC` and writeback
@@ -251,8 +262,8 @@ the pre-cap PCR 8 and 9 policy.
 **Volume tags.** Each LUKS2 header copy has its own tag: one over the
 primary (binary header and JSON area), one over the secondary. Each is
 HMAC-SHA-256 under a key derived from the volume key ([boot.md](boot.md))
-and also covers the header block's fields other than the tags and the
-blob slots. Once the volume key is unwrapped, the kernel checks the tags
+and also covers every header-block field (the version included) except the
+tags themselves, the CRC and the blob area. Once the volume key is unwrapped, the kernel checks the tags
 over the bytes as read, before S is unsealed and before any JSON is
 parsed, and uses the primary if its own tag verifies, otherwise the
 secondary; it never selects a copy by seqid. A copy whose tag fails is
@@ -311,20 +322,25 @@ the volume map below, which is parsed only after capping, and each map
 entry says which key its extent is under. Per extent: write its new
 ciphertext to a free extent, flush, switch the map entry to it, flush,
 free the old extent; a write to the extent in progress goes to both
-copies, each under its own key. Re-encryption needs one free extent and
+copies, each under its own key. While the record exists the volume map
+carries two MACs, one under each key's map-MAC derivation, so a boot
+verifies it under whichever key its header-block copy unwraps; the new key has its own inventory row
+(below). Re-encryption needs one free extent and
 is refused without one. At the end every freed extent has been
 overwritten (reused as the next copy target, the last one with zeros),
 the kernel replaces the volume-key wraps in each header-block copy in
-turn, rewrites both LUKS2 copies in the tag order above, removes the
-record and wipes the old key. After it, old header backups and old
+turn, rewrites both LUKS2 copies in the tag order above, writes the map
+with only the new key's MAC, removes the record and wipes the old key,
+flushing after each step. After it, old header backups and old
 recovery keys open nothing through the drive's interface (flash blocks
 the drive remapped internally are outside this; [boot.md](boot.md)
 "Changing credentials"). While it runs the LUKS2 JSON can't describe the
 volume, so the scorecard says "Linux rescue unavailable: re-encryption
 running". Test (Phase 5, with the volume map): a power cut at every 4 KiB
-write inside an extent, with writes to that extent running, resumes and
-finishes with the oracle below clean; the old header backup and the old
-recovery key then open nothing.
+write inside an extent, with writes to that extent running, and at every
+write of the finishing sequence, resumes and finishes with the oracle
+below clean; the old header backup and the old recovery key then open
+nothing.
 
 **KDF (one rule everywhere).** Every human secret (PIN, passphrase, fTPM
 passphrase, LUKS2 key slots, the own file system's slots) is stretched with
@@ -332,7 +348,13 @@ Argon2id, 4 lanes, memory = min(1 GiB, RAM/4) but at least 64 MiB, at least
 4 passes, with the passes raised at install until unlocking takes about
 2 seconds on that machine (checked on the reference laptop in
 [benchmarks.md](benchmarks.md)). The parameters are stored per key slot and
-shown on the scorecard. The minimum RAM for an encrypted install is
+shown on the scorecard. Every passphrase that wraps a key on disk (the
+system volume's passphrase wrap and LUKS2 passphrase slot, each home
+volume's passphrase wrap and slot, F4's P blob) must be estimated at 60
+bits or more, the [boot.md](boot.md) fTPM rule, on every tier, because a
+stolen disk meets these wraps with no TPM lockout; an install that keeps
+a weaker one has the scorecard publish its stolen-disk strength as that
+of the weakest wrap. The minimum RAM for an encrypted install is
 256 MiB; below it the installer refuses to create an encrypted install and
 the scorecard says "disk not encrypted: under 256 MiB RAM". The 256-bit
 random recovery key is exempt, because its input is already high-entropy
@@ -340,8 +362,10 @@ and a second slow KDF would only add seconds to every unlock: its LUKS2
 slot uses PBKDF2-SHA-256 at the LUKS2 minimum of 1,000 iterations (the
 header block's TPM wrap is likewise unstretched, its input being
 the TPM-released disk secret already mixed with the stretched PIN;
-[boot.md](boot.md)). Tests (Phase 4a): a human-secret slot below the
-floor for its machine's RAM is refused by the installer, the key-slot
+[boot.md](boot.md)). Tests (Phase 4a): a passphrase estimated below 60
+bits for a system wrap is refused unless the weak-wrap scorecard line is
+shown (home and P wraps the same at Phase 5); a human-secret slot below the
+KDF floor for its machine's RAM is refused by the installer, the key-slot
 tools and the unlock path, and the recovery slot is accepted at the
 PBKDF2 minimum; CI unlocks an encrypted install on 256 MiB and 512 MiB
 guests.
@@ -389,10 +413,11 @@ file per volume and class.
 | Key | Lock | Suspend | Panic lock (F4) | Hibernate | Shutdown |
 |---|---|---|---|---|---|
 | System volume key, S, PIN half 2 (held) | kept | wrapped | wiped ¹ | wiped after the K blob is built, before the snapshot; resume boot unseals | wiped |
-| R1, R2, TOTP key, M, PIN half 1 (held under HKDF(S, `optimal-held`)) | kept | wrapped with S | wiped | wiped before the snapshot | wiped |
+| R1, R2, TOTP key, M, PIN half 1 (held under HKDF(S, `optimal-held`)) | kept | wrapped with S | wiped; until reboot, suspend is passphrase-only and the update client defers PCR-7-changing updates | wiped before the snapshot | wiped |
 | Owner and lockout secrets | none (unwrapped only during first-boot sealing, a recovery-key boot or a lockout reset, wiped when it ends) | none | none | none | none |
 | Derived keys: volume-tag and volume-map MAC keys, per-mount and copy-1 subkeys, name-hash keys, every key schedule | parent's fate | parent's fate | parent's fate | parent's fate | parent's fate |
 | Home volume keys (stage 2: per-user keys) | kept | wrapped | wiped ¹ | wiped before the snapshot; reopened at each login | wiped |
+| New volume key during re-encryption (while the record exists) | kept | wrapped | parent's fate (wiped ¹) | hibernation refused while the record exists | wiped |
 | Vault outer and hidden keys (F3) | kept while open | vault closed, wiped | vault closed, wiped | vault closed, wiped | wiped |
 | Travel key (F5) | kept while unsealed | resealed, wiped | resealed, wiped | resealed, wiped | wiped |
 | Swap key | kept | wrapped | kept (swap holds frozen apps' memory, a residual of F4) | in the image, under the image key | wiped; new each boot |
@@ -403,16 +428,17 @@ file per volume and class.
 | Hibernation image key K and R4 | none | none | none | R4 sealed, K encrypted under HKDF(R4 ‖ PIN half 2) in the header block; plaintext K and PIN half 2 in a reserved page left out of the image, wiped after the write | none (any normal mount erases the blob) |
 | Resume object's R5 | none | sealed; plaintext wiped | none | none | none |
 | Agents' keys (SSH agent, GPG agent, secret service) and F2's day keys, in kernel-registered secret memory | kept | AEAD-wrapped under HKDF(R5 ‖ PIN half 2), RAM only, never in swap or the page cache | wiped by the kernel | not in the image | wiped |
-| F4 panic key P (from login, while panic lock is enabled) | kept, held under HKDF(S, `optimal-held`), plus a blob of P wrapped under the stretched login passphrase in RAM | wrapped with S | wiped; its passphrase-wrapped blob kept | panic hibernate: K wrapped under P before P is wiped; P wrapped under the stretched passphrase in header-block slot 15 | wiped |
+| F4 panic key P (from login, while panic lock is enabled) | kept, held under HKDF(S, `optimal-held`), plus a blob of P wrapped under the stretched login passphrase in RAM | wrapped with S | wiped; its passphrase-wrapped blob kept | plaintext wiped before the snapshot; its held and passphrase-wrapped copies in the image | wiped |
 
 ¹ Kept only encrypted under a key that the full login passphrase unwraps
-(the panic key P, [features.md](features.md) F4).
+(the panic key P, [features.md](features.md) F4). Tests of the panic
+row: after a panic unlock, a dbx update waits for reboot (Phase 5), and
+suspend resumes only with the passphrase (Phase 10, when suspend lands).
 
-Two header-block slots ([boot.md](boot.md)) hold copies outside the
+One header-block slot ([boot.md](boot.md)) holds a copy outside the
 table's stages: S (with the lockout secret) wrapped under the recovery
 key, so a recovery-key boot reopens S and only a TPM clear recreates the
-service key; and slot 15, F4's panic-hibernate key wrapped under the
-passphrase. While panic lock is enabled, dirty pages of encrypted volumes
+service key. While panic lock is enabled, dirty pages of encrypted volumes
 are capped at max(writeback bound, 1 s) times the device's measured write
 bandwidth, dirty `MAP_SHARED` pages counted through write-protect
 throttling ([features.md](features.md) F4 has the hard writeback limit),
@@ -448,17 +474,21 @@ HKDF from the system volume key, and parsed only after capping and after
 its tag checks. Its user count and per-user sizes are plaintext metadata
 and are listed as such on the scorecard. Each home volume is a
 LUKS2 volume with its own volume key and key slots, unwrapped at that
-user's login. Its passphrase wrap alone opens it; on B1 it also has a TPM
-wrap through the post-cap `PolicySecret` path in [boot.md](boot.md),
-which every reseal and clear recovery covers. If that wrap fails (a TPM
-clear, which recreates the service key; a recovery-key boot alone
-doesn't, because S is also wrapped under the recovery key), the login
-opens the home from its passphrase wrap alone and reseals the TPM wrap at
-that login, so no home is lost with the TPM. Tests
-(Phase 5): a second user logs in long after capping on B1; after a TPM
-clear and recovery, each user's next login opens their home and reseals.
+user's login. Its passphrase wrap (60-bit rule above) opens it; on B1
+it also has a TPM wrap: a random R_u sealed in a home object whose policy
+is `PolicySecret` on the service key (S, the post-cap path in
+[boot.md](boot.md)) AND `PolicyAuthValue` (one half of the user's
+stretched login secret), the wrap key being HKDF(R_u ‖ the other half),
+so S or the recovery key alone opens no home. Every reseal and clear
+recovery covers it. If that wrap fails (a TPM clear, which recreates the
+service key), the login opens the home from its passphrase wrap and
+reseals the TPM wrap at that login, so no home is lost with the TPM.
+Tests (Phase 5): a second user logs in long after capping on B1; after a
+TPM clear and recovery, each user's next login opens their home and
+reseals; once 4b is done, the recovery key plus S alone cannot open a
+user's home.
 The home volume holds an ext4 created by Optimal's
-`mkfs`. Its extents are encrypted only by that key (the system key doesn't cover them, so
+`mkfs` with `-E resize=` set to the outer device's size. Its extents are encrypted only by that key (the system key doesn't cover them, so
 nothing is encrypted twice). Home volumes are mounted in-kernel as internal
 volumes, and grow by adding extents and resizing ext4 online
 (`resize_inode`); shrinking is offline. The map is still parsed as
@@ -503,8 +533,8 @@ system track, and until it lands the scorecard says "stage 2: new installs
 only". On top of that:
 
 - **Per-user keys.** Each user's files are under their own key, wrapped by
-  their login secret (and on B1 by the TPM, through the same post-cap
-  `PolicySecret` path as home volumes). Another user, even an
+  their login secret (and on B1 by the TPM, through the same home object
+  as home volumes, so S alone opens none). Another user, even an
   administrator, can't read them without that user's login.
 - **Data protection classes** (modelled on iOS's, because they're what
   makes "a locked laptop gives up nothing" true while apps keep working):
@@ -541,36 +571,49 @@ only". On top of that:
   ~/Downloads keeps syncing across the lock, and one holding ~/Documents
   files resumes at unlock with no error and no lost change.
 - **Swap** is encrypted with a key that doesn't survive a cold boot.
-- **Hibernation (both stages).** At hibernate open vaults are closed and
-  unsealed travel volumes resealed, the volume is frozen and written back
+- **Hibernation (both stages).** Hibernation is entered only from a
+  running, unlocked system; suspend-then-hibernate (low battery) first
+  resumes, asking the PIN, and otherwise stays suspended, a listed limit.
+  Before anything is wiped the kernel bounds the image: the frames left
+  after dropping clean page cache, plus the image header, must fit the
+  hibernation extent, or hibernation is refused and the system keeps
+  running. Then open vaults are closed and
+  unsealed travel volumes resealed, the volumes are frozen and written back
   (stage 2: with a final commit), class-C eviction runs, and the image
-  records the volume's commit generation (stage 1: the ext4 superblock's
-  mount count and the journal's sequence number) and, in stage 2, the
-  replay value. Before anything is wiped, the kernel draws a random image
+  records, for every mounted volume, homes included, its commit generation
+  (stage 1: the ext4 superblock's mount count and the journal's sequence
+  number) and, in stage 2, the replay value. Still before any wipe, the
+  kernel draws a random image
   key K and a random R4, seals only R4 into object 4 with the signed
   pre-cap policy (steps 1 to 5 in [boot.md](boot.md); `TPM2_Create` needs
-  no matching PCRs), and AEAD-encrypts K under HKDF(R4 ‖ PIN half 2), or
+  no matching PCRs), AEAD-encrypts K under HKDF(R4 ‖ PIN half 2), or
   without a TPM under HKDF(volume key, `optimal-hibernate`), which resume
-  gets from the passphrase like any boot; K and PIN half 2 sit in a
-  reserved page left out of the image. Then the volume key, S and every
+  gets from the passphrase like any boot, and builds the complete next
+  header-block copy (new version, tags and CRC, the sealed blob and the
+  encrypted K in its blob area); K, PIN half 2 and that copy sit in
+  reserved pages left out of the image. Then the volume key, S and every
   home-volume key are wiped (key inventory above) and memory is
   snapshotted, so the image holds none of them and no class-C key or
-  plaintext; the reserved page is wiped after the image is written. The image goes into a **dedicated hibernation
+  plaintext. The image goes into a **dedicated hibernation
   extent** (stage 1: extents of the volume map marked for hibernation;
   stage 2: a reserved region outside the file system's allocatable space;
   sized at install to 40% of RAM rounded up to 1 GiB), AEAD-encrypted under
-  K with a fresh random nonce prefix. The sealed blob and the encrypted K
-  go into the fixed header area. After the snapshot nothing but the
-  hibernation extent and the fixed header area is written. An image that
-  doesn't fit after dropping clean page cache is refused, and the machine
-  stays suspended. Resume is a normal boot of the same release: the loader
+  K with a fresh random nonce prefix; then the prebuilt copy is written
+  over the older header-block copy, the drive is flushed and shut down
+  (block layer, above), and the reserved pages are wiped. After the
+  snapshot nothing but the hibernation extent and that copy is written.
+  Resume is a normal boot of the same release: the loader
   keeps the slot the image was made by for the resume boot, and an image of
   another release is refused. Before capping it unseals R4 with the PIN as
   well as the disk secret and S; after capping it refuses the image unless
-  its generation matches the volume's (stage 1: mount count and journal
-  sequence, which a normal mount or any journal replay changes; stage 2:
-  the commit generation, and also its replay value equals the current
-  replay value, since a hibernation resume bumps nothing). The boot kernel writes the
+  the system volume's generation matches the recorded one (stage 1: mount
+  count and journal sequence, which a normal mount or any journal replay
+  changes; stage 2: the commit generation, and also its replay value
+  equals the current replay value, since a hibernation resume bumps
+  nothing). A home's key is unwrapped only at its user's next login, so
+  its generation is checked then, before any of its I/O resumes; on a
+  mismatch that home's cached state is discarded (its processes killed,
+  the home remounted from disk, the user told). The boot kernel writes the
   volume key and S into a reserved page named in the image header, the
   restored kernel reads them, wipes the page, erases the image blob from
   both header copies and flushes before thawing, and in stage 2 draws a new
@@ -584,7 +627,11 @@ only". On top of that:
   the other slot active (the resume boot runs the image's slot and
   resumes); try the unseal after
   capping (must fail); boot normally, then put back the old header area and
-  image (refused: generation; stage 2 also replay value); after a good resume the
+  image (refused: generation; stage 2 also replay value); hibernate, open
+  a home read-write from the pinned Linux, resume, log in (that home
+  remounted, nothing corrupted); a power cut at every write after the
+  snapshot; an image larger than the extent is refused with the system
+  still running; after a good resume the
   handoff page (which carries the 256-bit generator seed, see core.md) is
   zero and the nonce prefix is new.
 - **Cipher choice is measured.** The format records a cipher ID per volume.
@@ -611,9 +658,11 @@ only". On top of that:
   ([verification.md](verification.md)): a Kani part (the prefix and
   counter are unique per mount, a new prefix is drawn before the counter
   wraps, and no (copy-1 key, nonce) pair repeats, across mounts included,
-  with a seeded bug, copy 1 using a fixed or reused nonce, that it must
-  catch), reported "B/T, probabilistic", and a written
-  birthday-bound lemma in `axioms.md` resting on target 14 (two prefixes
+  with seeded bugs "k1 = k0" and "k1 derived from the base key, not k0"
+  that it must catch), reported "B/T, probabilistic", and a written
+  birthday-bound lemma in `axioms.md` resting on the ledger's
+  cryptographic assumptions (ChaCha20 as a PRF, BLAKE3 `derive_key`
+  domain separation) plus target 14 (two prefixes
   under one key collide with probability at most 2^-64 per volume
   lifetime), reported "T/T". The generator is our code (target 14), never
   an axiom.
@@ -688,9 +737,13 @@ only". On top of that:
   space that is never trimmed or snapshotted, F3; a travel class whose
   key is wrapped only by the travel passphrase, F5; removing a file from
   every snapshot, F12), a
-  per-file `fsync` intent log replayed at mount (so `fsync` of one file
-  doesn't commit the whole volume; benchmarked as `fsync` latency under
-  background writeback against ext4), the error policy of the block layer
+  `fsync` intent log replayed at mount that carries file data and
+  namespace operations (directory `fsync`, link, rename, `O_TMPFILE` +
+  `linkat`), so neither `fsync` of one file nor a directory `fsync` waits
+  for a full commit (benchmarked as `fsync` latency under background
+  writeback against ext4, and by the dpkg-style create, `fsync`, rename,
+  directory `fsync` loop in the storage set), a published bound on
+  `syncfs` latency, the error policy of the block layer
   above (a failed write retried at a newly allocated block, at most 3
   writeback cycles), and its own proof targets (copy-on-write never overwrites a live
   block; commits are atomic).
@@ -775,7 +828,7 @@ install. So:
   landed and publishes the distribution, and K is raised before the next
   release if the worst case seen exceeds K/2. Full commits are
   rate-limited to at most one per second, and `fsync` calls between them
-  go to the per-file intent log, so an `fsync` burst can't push the drop
+  and directory `fsync`s go to the intent log, so an `fsync` burst can't push the drop
   point out of the window in milliseconds. Every fallback is reported to
   the user (what was lost, back to which time); a fallback to a generation
   before a replay-counter bump gives the recovery-key prompt (above).
@@ -788,6 +841,11 @@ install. So:
   reported unrecoverable and opened with the read-only rescue mount
   (below). ext4 overwrites in place and has no such fallback, so for
   ext4 the only promise is that the volume is clean after `e2fsck -fy`.
+  After an unclean shutdown the own file system verifies every block born
+  inside the window; a relocated metadata run keeps its old birth, so the
+  root block records the last generation that moved one, and when that
+  generation is inside the window recovery verifies all metadata. Volumes
+  reach 2^45 blocks (128 PiB).
 - **Oracle.** After every crash state: the file system's own checker reports
   clean; every byte that was fsynced (by the table above) is present; every
   rename is atomic; and **no stale or foreign data** is visible (a file never

@@ -159,7 +159,8 @@ produces them for removed devices and network file systems.
   with it (Steam updating a game or Proton), or (c) for an app the terminal
   installed (every closure file had terminal provenance at first launch),
   the terminal, after a prompt listing the changed files (`pip install
-  --upgrade`). Any other writer makes a new lineage with the default
+  --upgrade`), a floor prompt when the app holds network or a non-empty
+  private home. Any other writer makes a new lineage with the default
   profile and an empty home. The old home is **retired**: moved into
   `~/.var/app/.retired/`, a protected path listed in Settings, where the
   user can delete it or hand it to the new identity on the trusted path.
@@ -174,14 +175,17 @@ produces them for removed devices and network file systems.
   definition): a file is tagged downloaded when (a) any identity writes it
   into a download folder (the XDG Downloads folder, a browser's download
   directory), (b) it arrives through a portal from a networked identity, or
-  (c) it is written by a tainted process. A process is tainted when it
-  has read from a non-loopback socket since its last `execve`, and within
-  an identity the taint spreads across `fork` and to every process that
-  reads from a tainted one through a pipe, Unix socket or shared memory;
-  for a non-terminal app identity it is identity-wide (Chromium's network
+  (c) it is written by a tainted process. For every identity, a process is
+  tainted once it has read from a non-loopback socket or read a downloaded
+  file (a low-water mark like "removable" below, inherited across `fork`
+  and `execve`), and the taint spreads to every process that reads from a
+  tainted one through a pipe or Unix socket, and to every process that maps
+  shared memory a tainted one can write (applied at map time); for a
+  non-terminal app identity it is identity-wide (Chromium's network
   process taints its browser process). Tests (Phase 7): Chromium "Save
-  as" to `~/Documents`, `curl … | tar x` and a cloned repository's binary
-  each prompt once on a double-click.
+  as" to `~/Documents`, `curl … | tar x`, `wget` then `tar xf`, an archive
+  app extracting a browser download outside Downloads, and a cloned
+  repository's binary each prompt once on a double-click.
   Files an identity writes inside its own install directory or closure keep
   its provenance and are not tagged (update rule (a) below). **Removable**
   is set on files read from removable or foreign volumes. Copies keep the
@@ -191,8 +195,8 @@ produces them for removed devices and network file systems.
   a file with an app tag or the removable flag gives that provenance to
   every file it writes afterwards (the lowest-trust tag it has read,
   inherited across `fork` and `execve`), so `cp` and `tar x` from a USB
-  stick keep it. Bytes piped into an interpreter carry no tag; running
-  them is the user's own command.
+  stick keep it. Bytes piped into an interpreter carry no tag; they run
+  as the terminal.
 
   What the tags change:
   - **Desktop launch** (file manager, launcher, portal open) of a
@@ -203,8 +207,8 @@ produces them for removed devices and network file systems.
     (suspicious-list entry 1). Approved, it runs under its own identity in
     the default profile. The user service manager and D-Bus activation
     apply the same rule to every unit and service they start.
-  - **The terminal executing a file with terminal provenance** is the
-    user's own typed action: no prompt and no `EACCES`, whatever its flags.
+  - **The terminal executing a file with terminal provenance** runs its
+    own code: no prompt and no `EACCES`, whatever its flags.
     So `git clone`, `cargo build` and `./target/debug/x` just work.
   - **Exec by any other identity than the file's provenance identity**
     (the terminal running a file Firefox downloaded or an editor wrote, or
@@ -263,26 +267,42 @@ produces them for removed devices and network file systems.
   launcher marks the launch path of every registered identity (a manifest
   app, a Flatpak export, an unpackaged program with a record) with a
   kernel-set attribute. When a terminal-identity process `execve`s such a
-  path, the kernel runs the system image's **launch relay** in its place:
-  the relay asks the launcher to start the app under its own identity on a
-  fresh pty, passing argv, the typed environment minus a published
-  denylist (`LD_*`, `*PRELOAD`, `PYTHONPATH` and similar), the cwd, and the
-  caller's rlimits, nice value, CPU affinity and cgroup; when the
-  `execve`ing process is traced, the app starts stopped and the tracer
-  gets a debug capability on it through the debugger portal. Path arguments and the cwd become one-use
-  document-portal entries for the app, and argv is rewritten to their
-  paths (Flatpak's `@@` file forwarding). It relays stdio between its own
-  fds and that pty (with the escape filter above), forwards signals, waits
-  on the app's pidfd and exits with its status. So `firefox` typed in a
-  shell and Firefox started from the desktop use one profile. A typed
-  command line is the user's own action for that run: the path entries
-  and the stdio relay are not prompts, and the relay's edge lasts the
-  app's process lifetime and doesn't join components. Tests: (Phase 5) a
-  registered test app run from the shell and from the launcher sees the
-  same home, and its exit status and signals pass through; `gdb`,
-  `strace -f` and `taskset` on a registered app act on the app; (Phase 7)
-  `code .`, `EDITOR="code --wait" git commit` and a pipe into an app each
-  work with 0 prompts.
+  path, the exec is an **identity exec**: the launcher starts the app as a
+  new process, a child of the launcher service, under the app's own
+  identity with `AT_SECURE=1`; only fds 0 to 2 plus fds its manifest
+  declares pass; and the `execve`ing process becomes the system image's
+  **launch relay**, a stub holding a pidfd on the app, so a `waitpid` on it
+  returns the app's exit status. The launcher passes argv, an environment
+  allowlist (locale variables, `LANG*`, `TERM`, `TZ`, `DISPLAY`,
+  `WAYLAND_DISPLAY`, the `XDG_*` runtime directories, `HOME`, `PATH`;
+  nothing else), the cwd and the caller's rlimits, nice value, CPU
+  affinity and cgroup. Only whole argv tokens that `stat` to an existing
+  file or directory become document-portal entries (argv rewritten to
+  their paths, Flatpak's `@@` forwarding), and the cwd becomes a directory
+  entry; entries last until the identity's last process exits, and other
+  forms (`--file=x`, a new output path outside the cwd) are listed
+  divergences ([compat.md](compat.md)). Any other argv token beyond those
+  paths and URLs (`--load-extension`, `-e`, `--remote-debugging-*`) needs a
+  floor prompt naming the app. Of fds 0 to 2, those that are ttys get a
+  fresh pty that the relay connects to the caller's tty (with the escape
+  filter above); the others pass as their open file descriptions, so pipes
+  and redirections are untouched. The relay forwards `SIGINT`, `SIGTSTP`,
+  `SIGCONT`, `SIGWINCH` and `SIGHUP` to its app, exempt from the
+  terminal's signal limit toward other identities ([compat.md](compat.md)).
+  The exec is a direct channel terminal → app (`launch-relay` in
+  channels.toml): it needs the combined approval like any other channel,
+  asked once per app ("your home, through Terminal → *App*"), a floor
+  prompt when the app holds network. Tracing a registered app is an
+  intended divergence: `gdb -p` or `strace -p` through the debugger portal.
+  So `firefox` run from a shell and Firefox started from the desktop use
+  one profile. Tests: (Phase 5) a registered test app run from the shell
+  and from the launcher sees the same home, and its exit status and the
+  forwarded signals pass through; `head -c 1G /dev/urandom | app |
+  sha256sum` matches; `gdb -p` and `strace -p` through the debugger portal
+  and `taskset` act on the app; (Phase 7) `code .` and `EDITOR="code
+  --wait" git commit` work, asking the combined approval once per app, and
+  a script exec'ing a registered browser with a crafted HTML file is
+  caught by the exfiltration suite.
 - **Direct channels make one principal.** Data moves between identities
   through **direct channels**, a closed list checked in as
   [`design/channels.toml`](channels.toml), each row with its phase and test.
@@ -334,7 +354,7 @@ produces them for removed devices and network file systems.
   fails `EACCES` and the terminal shows a one-click request for the
   combined approval, which names "your home, through Terminal". The
   projected shared settings are written only by the settings portal, so
-  they join nobody. TCB services (portals, the launcher and launch relay,
+  they join nobody. TCB services (portals, the launcher,
   compositor, PipeWire, the D-Bus proxies, the resolver, the document
   portal, the SSH agent, GPG agent and secret service, the per-app
   accessibility proxy and the input method) are not principals:
@@ -357,8 +377,9 @@ produces them for removed devices and network file systems.
   **child identity** (`steam/<game id>`): the child gets its own capability
   set and file view (by default its own private home and the folders the
   parent declares for it, never the parent's tokens or data), but stays in a
-  PID namespace below the parent's, so the parent can `wait` for it, track it
-  with a pidfd and signal it. The parent's manifest declares the **shared
+  PID namespace below the parent's, so the parent can `wait` for it
+  (through the identity exec's stub, above), track it with a pidfd and
+  signal it. The parent's manifest declares the **shared
   channels** each child gets, all mediated: read-only paths (the Steam
   library folders), writable per-child paths (`compatdata/<appid>` and
   `shadercache/<appid>`), named shared memory objects (the overlay), named
@@ -368,13 +389,16 @@ produces them for removed devices and network file systems.
   Steam ships unpackaged, so the system image carries a **signed Steam
   manifest** for the official Steam path and closure (and a mapping of
   Flatpak Steam's metadata onto the same grants), written as a Phase 9
-  input. When a Steam process `execve`s a program with `SteamAppId` in its
-  environment or under an appmanifest install directory, the kernel hands
-  the exec to the launcher, which maps the two through that manifest to
-  the child identity (so
+  input. When a process of the Steam identity itself `execve`s a program
+  with `SteamAppId` in its environment or under an appmanifest install
+  directory, the exec is an identity exec (above), which the launcher maps
+  through that manifest to the child identity (so
   Proton's shared `proton` and `wine64` binaries run as the game's child)
-  and builds its view. Phase 9 test: a Proton title and a Cloud-synced
-  native title each round-trip their saves. Steam Input's virtual controllers go through the
+  and builds its view; a child identity's execs keep its own identity
+  whatever `SteamAppId` says. Phase 9 tests: a Proton title and a
+  Cloud-synced native title each round-trip their saves; Steam's reaper's
+  `waitpid` sees the game's exit; an fd Steam holds open is absent in the
+  game; an exec with `SteamAppId=B` from game A is refused B's identity. Steam Input's virtual controllers go through the
   **virtual-gamepad portal**, which hands out a `uinput` fd that accepts
   only gamepad event codes (`BTN_GAMEPAD` to `BTN_THUMBR`,
   `BTN_TRIGGER_HAPPY*`, the `ABS_*` axes, `EV_FF`); keyboard and pointer
@@ -428,9 +452,14 @@ produces them for removed devices and network file systems.
   are made synchronously from the level policy the broker pushes into the
   kernel and the resolver, so the call itself succeeds and no app sees a
   failure when no human is needed (granted silently and logged). When a
-  human is needed, the lookup, `connect` or `sendto` waits up to 30 s for
+  human is needed, the lookup, `connect` or send waits up to 30 s for
   the decision (an `O_NONBLOCK` connect returns `EINPROGRESS` and
-  completes or fails later; an `O_NONBLOCK` `sendto` returns `EAGAIN`).
+  completes or fails later; an `O_NONBLOCK` send returns `EAGAIN`). A
+  pending socket reports no `POLLOUT` until the decision, then wakes with
+  `EPOLLOUT`, or `EPOLLERR` with `ENETUNREACH`. The triggers are TCP
+  `connect` and every send path: `sendto`, `sendmsg`, `sendmmsg`, `write`
+  on a connected socket, io_uring sends and `MSG_FASTOPEN`; a UDP
+  `connect` sends nothing and never triggers.
   The generated `resolv.conf` carries `options timeout:30 attempts:1`, so
   stub resolvers wait out the hold, and the resolver dedupes retransmits
   per identity and answers SERVFAIL within 5 s on upstream failure; on refusal or timeout the lookup answers SERVFAIL
@@ -448,7 +477,8 @@ produces them for removed devices and network file systems.
   the real network): `curl https://<name>` from a new identity raises
   exactly 1 request, prompts at "Always ask" and succeeds on its first run
   when approved at 2 s and at 25 s, through glibc, musl, Go and Chromium's
-  built-in resolver; at the default level a network-only first use
+  built-in resolver; an epoll UDP client sees 0 spurious wakeups during a
+  25 s hold; at the default level a network-only first use
   gives 0 failures and 0 prompts; a refused identity's lookup gets
   `EAI_AGAIN` and its `connect` `ENETUNREACH`.
 
@@ -500,7 +530,8 @@ by a published list, so apps find everything they expect:
   bus (through the app's D-Bus proxy), the portal sockets and the
   **document portal** at `$XDG_RUNTIME_DIR/doc` (see the file chooser
   below);
-- a generated `/.flatpak-info` holding the app's ID and permissions, and
+- a generated `/.flatpak-info` holding the app's ID (for an unpackaged
+  identity `org.optimal.Unpackaged.<base32 identity ID>`) and permissions, and
   `GTK_USE_PORTAL=1`, `GDK_DEBUG=portals` and
   `QT_QPA_PLATFORMTHEME=xdgdesktopportal` in its environment, so GTK, Qt,
   Electron and GLib use the portals for file dialogs, URI opening and
@@ -670,7 +701,7 @@ the browser (Phase 7); each is refused or shown in the prompt.
   a system call, because a syscall that blocks on a human would hang or time
   out real programs; apps ask through portals, which are asynchronous. The
   one exception is the first-use network request (above): a lookup,
-  `connect` or `sendto` waits at most 30 s, and only when a human must
+  `connect` or send waits at most 30 s, and only when a human must
   decide.
 
 ## Granting access: portals
@@ -697,8 +728,9 @@ from the device that typed the unlock secret this boot: the loader records
 the EFI device path behind `ConIn` and hands it over, and the kernel's
 reader trusts that device; if no path is known, the reader asks for a
 typed code after hand-over. Unencrypted installs use the keyboard that
-types the login password. Phase 5 test, also run on a B1 swtpm boot: a
-`usb-kbd` hot-added after unlock can't open or answer a prompt. Bluetooth keyboards and 2.4 GHz receivers never count unless the
+types the login password. Phase 5 test (the B1 swtpm boot rerun at
+max(5, 4b)): a `usb-kbd` hot-added after unlock can't open or answer a
+prompt. Bluetooth keyboards and 2.4 GHz receivers never count unless the
 user opts that keyboard in by name;
 `uinput` devices and the compositor's virtual keyboard and pointer never
 count, and neither do events produced by the user's key remapping, which
@@ -764,9 +796,16 @@ clipboard into it; nothing arrives.
   screen-reader grants are in the component's data set (above), so with
   network in the component they need the combined approval at every
   level. A screen reader reaches other apps' text only through the
-  per-app accessibility proxy (Flatpak's `--a11y-own-name` model), and
-  the input method, which sees every keystroke, is a TCB service, never an
-  app ([`channels.toml`](channels.toml) rows). Screenshots, screen casting, remote desktop and input capture are
+  per-app accessibility proxy (Flatpak's `--a11y-own-name` model), and the
+  screen-reader grant reads only: AT-SPI `Action`, `EditableText`,
+  `Value.Set`, `GenerateKeyboardEvent` and global key listeners are input
+  injection, in the floor and never toward the terminal or the prompt
+  layer. The input method, which sees every keystroke, is a TCB service,
+  never an app; its conversion engines (Mozc, libpinyin, Rime, Hangul) run
+  as sandboxed non-TCB helpers (keys in, candidates out, no network, their
+  own dictionary per identity, nothing learned from password fields)
+  ([`channels.toml`](channels.toml) rows; hostile and fuzz tests at
+  Phase 7). Screenshots, screen casting, remote desktop and input capture are
   in the floor below. The USB portal refuses raw access to audio (class
   0x01) and video (class 0x0E) interfaces; those devices are reached only
   through PipeWire, where F1's indicators and kill switches apply. Trusted indicators for the camera,
@@ -820,7 +859,10 @@ screenshot portal); a new HID interface with keyboard/keypad or
 system-control usages (the typed code, [drivers.md](drivers.md) "Device
 authorization"); any
 PCIe device or tunnel added after boot on any hotplug port, refused while
-locked; a desktop launch of a downloaded executable; and data + network
+locked; a desktop launch of a downloaded executable; AT-SPI input
+injection; a terminal exec of a registered app with argv beyond paths and
+URLs; a terminal update's lineage carry-over for an app holding network or
+a non-empty private home; and data + network
 for one identity or component (every combined approval). It is the
 remote-read promise, and Settings explains it in those words. A grant
 given silently is logged with its time, app and the reason it didn't
@@ -899,9 +941,14 @@ whose TUN interface is in the system network namespace (F6 in
 [features.md](features.md)). It holds no `CAP_NET_ADMIN`; the **VPN
 portal** (Phase 6) sets addresses, routes and DNS on that designated TUN
 only, on the VPN identity's request, and logs every endpoint update it
-makes, so roaming and mesh VPNs work. Tests (Phase 6): an unchanged
-WireGuard config (through `wireguard-go`) and an unchanged OpenVPN config
-connect; Tailscale keeps its tunnel while roaming between two networks.
+makes, so roaming and mesh VPNs work. The VPN identity's netlink surface
+is rtnetlink address, route and rule requests on its own TUN, filtered by
+the VPN portal's policy; nfnetlink is absent. Tests (Phase 6): an
+unchanged WireGuard config through `wg-quick` with
+`WG_QUICK_USERSPACE_IMPLEMENTATION=wireguard-go` (bash in the test image)
+and an unchanged OpenVPN config connect; Tailscale with
+`--netfilter-mode=off` (a listed divergence) keeps its tunnel while
+roaming between two networks.
 
 ## Proof and test obligations
 
@@ -931,7 +978,9 @@ connect; Tailscale keeps its tunnel while roaming between two networks.
   two Python apps and two `-c` identities and check they get two
   identities and disjoint homes, install a same-ID app under another key
   as an administrator, plant a foreign-provenance hook or unit and try to
-  run it as the terminal or through the service manager. Each channel and
+  run it as the terminal or through the service manager, and exec a
+  registered app from the terminal with `ELECTRON_RUN_AS_NODE=1` or
+  `--load-extension`. Each channel and
   portal is gated in the phase its `channels.toml` row names: D-Bus, kernel
   keyrings, the document portal, the Flatpak launcher and portal and the
   loopback-only stack and the resolver in Phase 5, PipeWire, the

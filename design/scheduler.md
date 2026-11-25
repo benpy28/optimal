@@ -43,14 +43,12 @@ audio keeps up under load. This file is the design that the targets in
   interrupt until the read completes, whatever the interrupt flag says, so
   a surprise-removed device stalls that CPU for its whole Completion
   Timeout. These rules bound it ([drivers.md](drivers.md)): Completion
-  Timeout defaults to the 1 to 10 ms range, and is set to 50 to 100 µs
-  only on devices measured safe with ASPM L1 substates off (a 24-hour soak
-  with 0 spurious timeouts gates each one); no read of a PCIe endpoint BAR
+  Timeout is set to the 1 to 10 ms range; no read of a PCIe endpoint BAR
   or of ECAM happens in any non-preemptible section (spinlock held,
   preemption or interrupts off; LAPIC, I/O APIC, HPET and IOMMU registers
   are not PCIe reads and are exempt), so hard-IRQ handlers only write; a
   wait for IPI acknowledgement (TLB shootdown, text poke) spins with
-  preemption off for at most 50 µs, then becomes a preemptible wait and is
+  preemption off for at most 20 µs, then becomes a preemptible wait and is
   reported with the late CPU; the NMI watchdog reports a stall while a
   device-gone event is outstanding (the all-ones read and its Vendor ID
   confirm read, up to 20 ms) as a device stall, not a stuck CPU; and
@@ -61,23 +59,28 @@ audio keeps up under load. This file is the design that the targets in
   which the real-time class never places a thread while any other CPU can
   take it, so audio, input and other real-time threads don't share a CPU
   with a stall (on machines with fewer than 4 CPUs this is off, and the
-  scorecard says so). **The real-time gate under device stalls** (the one
+  scorecard says so). User mappings of a hot-removable device's BARs (a
+  Mesa CPU mapping of an external GPU's VRAM, a tier-3 driver process) can
+  stall whichever CPU reads them; they are outside the gate below and named
+  as an exposure on the scorecard. **The real-time gate under device stalls** (the one
   definition; [drivers.md](drivers.md) and [storage.md](storage.md) cite
   it): the wake-up target of [benchmarks.md](benchmarks.md) (P99 < 50 µs,
   P99.9 < 100 µs) holds for real-time threads on every CPU except the
-  removable-device core while a device stalls. Test (Phase 4a): the
-  surprise-removal latency test pulls an NVMe device during reads, with the
-  real-time wake-up load, TLB shootdowns and a tracer toggle running, and
-  publishes the worst CPU stall and the worst real-time wake-up latency;
-  the gate is enforced on the bare-metal reference machines with a
-  hot-pluggable NVMe or Thunderbolt device and reported only in VMs (QEMU
+  removable-device core while a device stalls, user BAR mappings of
+  hot-removable devices excepted. Test (Phase 4a): the
+  surprise-removal latency test cuts the power of an NVMe device during
+  reads, with the real-time wake-up load, TLB shootdowns and a tracer
+  toggle running, and publishes the worst CPU stall and the worst real-time
+  wake-up latency; the gate is enforced on the reference desktop, whose
+  Thunderbolt/USB4 NVMe enclosure a rig relay switches off (an owner need
+  from Phase 4a, [benchmarks.md](benchmarks.md)), and reported only in VMs (QEMU
   behind a hotplug root port, and the stall tests of
   [storage.md](storage.md)), as for the 50 µs limit.
 - **Where the 50 µs limit is enforced.** In virtual machines the host can
   stall a vCPU at any moment, so there the tracer only reports; the limit
   is enforced (CI fails above it) on the bare-metal reference machines, in
-  dedicated stress boots from Phase 2 (their own slot in the machine-hours
-  budget, [benchmarks.md](benchmarks.md)). Benchmark boots run with the
+  dedicated stress boots from Phase 2 (their own slot in the machine plan,
+  [benchmarks.md](benchmarks.md)). Benchmark boots run with the
   tracer off. The target tightens to 20 µs in Phase 10.
 - **Interrupt handlers are threaded.** Hard-IRQ handlers live in the core and
   only acknowledge the device and wake the driver's handler thread, which is
@@ -187,26 +190,30 @@ thread on that CPU.
 - **Time sources** (Phase 1c). The clock is the TSC when CPUID
   0x8000_0007 reports it invariant and the boot-time sync check across CPUs
   (with `IA32_TSC_ADJUST` where present) passes; otherwise HPET, then the
-  ACPI PM timer. TSC frequency comes from CPUID 0x15/0x16 when they give it,
-  else is calibrated against HPET or the PM timer, else the PIT. A
-  clocksource watchdog compares the TSC with HPET or the PM timer every
-  0.5 s and, if the TSC deviates by more than 100 ppm over 10 consecutive
-  checks, switches to that source and logs it. Timer events use the LAPIC
+  ACPI PM timer. TSC frequency comes from CPUID 0x15 when it gives it;
+  otherwise it starts from CPUID 0x16 or a calibration against HPET or the
+  PM timer (else the PIT) and is refined against HPET or the PM timer over
+  the first 10 s after boot. A clocksource watchdog detects only
+  instability: every 0.5 s it compares the TSC with HPET or the PM timer
+  (each comparison the minimum of 3 reads bracketed by TSC reads) and, if
+  the TSC deviates by 500 ppm or more over 10 consecutive checks or goes
+  backwards, switches to that source and logs it. Timer events use the LAPIC
   TSC-deadline mode, falling back to LAPIC one-shot, then HPET, then the
   PIT. The drift test measures against an independent reference only, never
   the calibration source. On KVM (the Phase 1 gate: under 1 ppm over
   10 minutes, on the dedicated KVM host, an owner need from Phase 1) QEMU
   runs with CPUID level at least 0x15 and an explicit `tsc-frequency`,
-  which the guest reads from CPUID 0x15; once a second the kernel writes its clock reading
+  which the guest reads from CPUID 0x15, and a second run with 0x15 hidden
+  (`level=0x14`) tests the calibration path to the same bound; once a second the kernel writes its clock reading
   as a line on the 16550 UART (polled, no DMA), and a host-side program
   timestamps each line's arrival with `CLOCK_MONOTONIC_RAW`; drift is the
   slope of a least-squares fit of guest time against host time, so serial
   latency jitter averages out. On bare metal (Phase 2, when the rig exists)
   the controller host, disciplined by a GPS receiver, drives a PPS pulse
   onto the UART's DCD pin; the kernel timestamps each DCD edge from the
-  modem-status interrupt and fits the same slope (the result is the board
-  crystal's error, which no kernel can remove without an outside reference;
-  published, and at most 50 ppm).
+  modem-status interrupt and fits the same slope (with CPUID 0x15 the result
+  is the board crystal's error, which no kernel can remove without an
+  outside reference; published, and at most 50 ppm).
 - **High-resolution timers and a tickless kernel** are part of the Phase 2
   design, not Phase 10: timers are kept in per-CPU structures with
   nanosecond expiry on the timer event source above, and an idle CPU takes
@@ -218,13 +225,16 @@ thread on that CPU.
   sampling run only on housekeeping CPUs (the boot CPU, or the
   non-isolated CPUs), so a tick-stopped CPU arms only timers its own
   thread asked for and, from Phase 5, the `cpu.max` quota-expiry timer of
-  its thread's group (one per period while the group has a quota, which
-  the bound counts). When that thread is real-time or has a CPU-time limit
+  its thread's group. When that thread is real-time or has a CPU-time limit
   (`RLIMIT_RTTIME`, `RLIMIT_CPU`, the 95% RT throttle, the driver
-  real-time cap below), the CPU also arms one budget-expiry timer at the
-  earliest of those limits, which the bound counts too. A Phase 2 test runs
+  real-time cap below), the CPU also arms a budget-expiry timer at the
+  earliest of those limits. The bound counts 2 timers per quota or budget
+  period (expiry and refill). A tick-stopped CPU accounts user and system
+  time by a TSC read at every kernel entry and exit, a cost charged inside
+  the syscall round-trip metric, which runs on tick-stopped CPUs
+  ([benchmarks.md](benchmarks.md)). A Phase 2 test runs
   one spinning thread on a CPU for 10 s, logs every interrupt there by
-  source, and requires at most 10 timer interrupts (plus one per quota or
+  source, and requires at most 10 timer interrupts (plus 2 per quota or
   budget period where one applies); a second Phase 2 test holds a lone
   `SCHED_FIFO` spinner on a tick-stopped CPU to at most 950 ms per 1 s
   period, ±1 ms. Phase 10 only tunes it.
@@ -246,18 +256,20 @@ explicit:
 
 - **Frame allocator.** Buddy allocator per NUMA node with per-CPU caches of
   free frames, so most allocations take no lock. 4 KiB, 2 MiB and 1 GiB
-  frames. A frame that held page cache of an encrypted volume, or was
-  allocated to a vault or travel identity, carries a flag set at
-  allocation and is zeroed when freed; panic lock and vault close also
-  sweep the buddy and per-CPU free lists ([storage.md](storage.md) "Zero on
-  free", [features.md](features.md) F3 and F4; their canary tests gate
-  it at 4a, 5 and 12; cost published in [benchmarks.md](benchmarks.md)).
+  frames. Every frame that held user anonymous memory, a tagged slab or
+  page cache of an encrypted volume, or was allocated to a vault or travel
+  identity, is zeroed when freed (the `init_on_free` equivalent,
+  [storage.md](storage.md) "Zero on free"; [features.md](features.md) F4's
+  and F3's canary tests gate it at 5 and 12; its cost is published from 4a
+  in [benchmarks.md](benchmarks.md)).
 - **TLB: PCID allocation** (Phase 3, with user address spaces). PCID is used
   whenever the CPU has it (essential to keep page-table isolation cheap).
   Each CPU keeps 6 dynamic PCID slots, each holding an address-space id and
   the address space's flush generation at the time the slot was last valid;
   with page-table isolation the user half uses the same PCID with bit 11
-  set. Switching to an address space already in a slot whose generation
+  set, and a CPU completes a shootdown only after `INVPCID` on the user
+  PCID or after setting a per-CPU "flush user PCID" flag that the return to
+  user checks before SYSRET or IRET. Switching to an address space already in a slot whose generation
   matches loads CR3 with the no-flush bit (bit 63); otherwise the least
   recently used slot is taken and CR3 is loaded with a flush. Every change
   that removes a permission or changes a frame (unmap; write-protect for
@@ -286,9 +298,10 @@ explicit:
   operation returns", with two obligations at each such change: every CPU
   in the may-cache set has acknowledged, and every other PCID slot holding
   that address space has a generation older than the change, so reloading
-  it flushes. Tests: a QEMU test forks while other threads of the parent
-  write continuously and checks no write lands in a page the child sees
-  (Phase 3); a teardown test tears down an address space with lazy CPUs
+  it flushes; with page-table isolation the user PCID is invalidated or
+  flagged as above. Tests: a QEMU test forks while other threads of the
+  parent write continuously and checks no write lands in a page the child
+  sees (Phase 3, with and without page-table isolation); a teardown test tears down an address space with lazy CPUs
   and checks no CPU holds its freed top-level table in CR3: the IPI path
   in QEMU (Phase 3), the INVLPGB path on the bare-metal reference AMD
   desktop (Zen 3 or later; QEMU and KVM don't offer INVLPGB to guests),
@@ -303,17 +316,20 @@ explicit:
   all CPUs at once. Every CPU with INVLPGB is immune to Meltdown, so
   page-table isolation is off there and no user-half PCID needs a second
   invalidation. The initiator, with preemption disabled so it can't migrate,
-  issues INVLPGB for each range in the batch (with the page-structure-cache
-  bit set whenever page tables were freed) and then one TLBSYNC, which waits
+  issues INVLPGB for each range in the batch, at most 32 per section (a
+  larger batch issues one INVLPGB by ASID instead), with the
+  page-structure-cache bit set whenever page tables were freed, and then
+  one TLBSYNC, which waits
   until those invalidations have completed everywhere. When the global pool
   runs out, freed global ASIDs are recycled only after a full flush of those
   ASIDs on every CPU (INVLPGB by ASID, then TLBSYNC); until then the address
   space falls back to a dynamic PCID and IPIs. A frame is reused only after
   its shootdown has completed on every CPU in the set
   ([verification.md](verification.md) target 1s: M/T at Phase 2 for the
-  IPI path, re-gated at M/T in Phase 3 with PCID, lazy switch, permission
-  downgrades and lazy-CPU teardown on the IPI path, and in Phase 5 with
-  INVLPGB, its lazy-CPU teardown, and THP).
+  IPI path, re-gated at M/T in Phase 3 with PCID, the
+  page-table-isolation user PCID, lazy switch, permission downgrades and
+  lazy-CPU teardown on the IPI path, and in Phase 5 with INVLPGB, its
+  32-range cap, its lazy-CPU teardown, and THP).
 - **Huge pages** (Phase 5). Transparent huge pages for anonymous memory on
   fault where the region is aligned and large enough, plus background
   collapse; a fault never waits for compaction (if no 2 MiB frame is free it

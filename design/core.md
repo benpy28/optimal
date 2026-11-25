@@ -17,8 +17,10 @@ Consequences:
 
 - `unsafe fn`, raw pointers, physical addresses, raw page-table entries and
   the vendored `vstd` types (`PPtr`, `PAtomicU64`, `PCell`, sound only
-  under Verus's permission checks) never appear in a tier-0 crate's public API. They are `pub(crate)` or
-  behind sealed traits.
+  under Verus's permission checks) never appear in a tier-0 crate's public
+  API. They are `pub(crate)` or behind sealed traits; `PPtr` is wrapped in
+  a newtype private to the `core-mm` crates
+  ([verification.md](verification.md)).
 - **The core never relies on `Drop` for safety.** If a guard's destructor
   doesn't run (it was leaked), the result may be a resource leak, never
   unsoundness. A guard that must run (for example, re-enabling interrupts)
@@ -30,7 +32,7 @@ Consequences:
   whose implementation calls a shim (`with_irqs_disabled`, MMIO and DMA
   handles, the context switch, `UserPtr` copies) by target 3c: compile-fail
   tests plus QEMU tests that `forget` every guard, panic at every callback
-  and inject an interrupt at every instruction boundary of the shim
+  and inject an interrupt at every IF=1 instruction boundary of the shim
   ([verification.md](verification.md)).
 
 ## Crate layout and mechanical enforcement
@@ -104,9 +106,10 @@ tests):
   switch, XSAVE and signal frames, APIC and timer, MSRs, `RDSEED`/`RDRAND`,
   text poke), `core-mm` 400 (CR3, `INVLPG`/`INVPCID`/`INVLPGB`, the
   user-copy instructions, and about 150 lines of memory-access backend),
-  `core-io` 850 (MMIO and port access, PCI config, MSI-X, VT-d and AMD-Vi
-  register and queue programming, TPM CRB/TIS access), `core-sync` 100;
-  2,770 in all, leaving 230 lines of headroom. Exceeding
+  `core-io` 870 (MMIO and port access, PCI config, MSI-X, VT-d and AMD-Vi
+  register and queue programming, the `write_dte_half` `cmpxchg16b` shim,
+  TPM CRB/TIS access), `core-sync` 100; 2,790 in all, leaving 210 lines of
+  headroom. Exceeding
   any cap fails CI until the cap is raised by a written design change
   explaining why the code can't live outside the core.
 - **Panic lints everywhere.** `unwrap_used`, `expect_used`, `panic` and
@@ -133,13 +136,16 @@ tests):
   depend on crates with `build.rs` scripts or procedural macros unless the
   crate is vendored and audited, because both run arbitrary code at build
   time. Verus's `verus_builtin` crate, the exec subset of `vstd` the
-  shipping kernel uses (`atomic`, `simple_pptr`, `cell`) and the whole
-  procedural-macro chain (`builtin_macros`, `verus_syn`, `proc-macro2`,
-  `quote`) are vendored, pinned by hash and audited on this rule; their
-  ghost code erases in non-Verus builds. The `vstd` subset counts as a
-  tier-0 dependency (inventoried and inside the 15,000-line cap); only
-  verified crates may depend on it, and it is byte-identical to the pinned
-  Verus `vstd` (CI checks in [verification.md](verification.md)).
+  shipping kernel uses (`atomic`, `simple_pptr`, `cell` and their full
+  module closure) and the whole procedural-macro chain (`builtin_macros`,
+  `verus_syn`, `proc-macro2`, `quote`) are vendored, pinned by hash and
+  audited on this rule; their ghost code erases in non-Verus builds. The
+  `vstd` subset counts as a tier-0 dependency: inventoried, and its lines
+  that survive erasure count in the 15,000-line cap. It is byte-identical
+  to the pinned Verus `vstd`, so it is exempt from the tier-0 lints by name,
+  with a review note per module hash. Only verified crates and the
+  memory-access backend crate may depend on it (CI checks in
+  [verification.md](verification.md)).
   Build-time-only procedural-macro crates emit code but never ship, so they
   are outside the tier-0 count and cap; in exchange, CI expands each
   verified crate in an erased build and fails if any ghost or tracked item
@@ -174,8 +180,11 @@ in `core-crypto`, proof target 14 from Phase 3.
   `TPM2_GetRandom`, interrupt timings and the seed file written at shutdown
   ([boot.md](boot.md) lists the same sources). A source is credited at the
   SP 800-90B min-entropy estimate published for it (for the EFI seed, the
-  lowest estimate measured across the reference firmware); `RDRAND` and
-  the TPM are credited 0.
+  lowest estimate measured across the reference firmware), and only while
+  its samples pass the SP 800-90B repetition-count and adaptive-proportion
+  tests; `RDRAND` and the TPM are credited 0, and `RDSEED` is credited 0
+  until the running microcode revision meets the mitigation table's
+  minimum. Test (Phase 3): an emulated stuck `RDSEED` is credited 0.
 - **Construction.** When 256 bits are credited, the base generator is keyed
   with 256 bits of pool output. It is ChaCha20 with fast key erasure: each
   request generates a block batch whose first 32 bytes replace the key

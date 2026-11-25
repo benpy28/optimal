@@ -37,7 +37,7 @@ Three rules hold for all of them:
 | F1 | Trusted sensor indicators and kill switches | indicators on; kill switches off | 7 | compositor prompt layer, device authorization, PipeWire permissions |
 | F2 | Privacy dashboard | on, 30 days | 12 | silent-grant log, egress filter, device authorization, F1 |
 | F3 | Hidden encrypted vault | off | 12 (stage 2: file system track) | volume map, KDF rule, provenance and private homes |
-| F4 | Panic lock | off | 5 (freeze, power-off), 10 (hibernate) | suspend key wipe, lock screen, in-kernel input |
+| F4 | Panic lock | off | 5 | suspend key wipe, lock screen, in-kernel input |
 | F5 | Travel mode | off | 12 (stage 2: file system track) | volume map, class C eviction |
 | F6 | Network leak guard | VPN-only off; encrypted DNS on | 6 | egress filter, system resolver |
 | F7 | Tamper alert | on | 4b | measured boot, event log replay, TOTP |
@@ -179,21 +179,17 @@ F1):
 - *Storage.* Records are kept by the log service in the user's own
   encrypted storage (stage 2: class A, so recording continues while
   locked), at most 64 MiB per user, oldest day dropped first. Each day's
-  records are encrypted under a per-day key from a hash ratchet (day d+1's
-  key is HKDF(day d's key, `optimal-dash-ratchet`)); only the oldest
-  retained day's key is stored, and the daily prune replaces it with the
-  next one. While in use the day keys are held in kernel-registered
-  secret memory (the agents' row of the key inventory,
-  [storage.md](storage.md)). On B1 the stored key is in one of 8 per-user
-  TPM NV indexes of 32 bytes that first-boot sealing defines while the
-  owner secret is unwrapped ([boot.md](boot.md), which states their NV
-  space against fTPM capacity; on a TPM without room install defines fewer,
-  down to 0), written once a day through the TPM broker's named "write the
-  caller's F2 NV index" operation, which the kernel performs under
-  `PolicySecret` on the service key for the owning user's session only
-  ([threat-model.md](threat-model.md)), never on the
-  disk, so an image of the drive, old flash blocks included, can't decrypt
-  an expired day. Retention is 1, 7, 30 or 90 days, or off. Administrators can't read
+  records are encrypted under a per-day key: a system hash ratchet (day
+  d+1's ratchet key is HKDF(day d's, `optimal-dash-ratchet`)) gives each
+  user's day key as HKDF(ratchet key, user ID). Only the ratchet key of
+  the oldest day any user retains is stored, and the daily prune replaces
+  it with the next one. While in use the day keys are held in
+  kernel-registered secret memory (the agents' row of the key inventory,
+  [storage.md](storage.md)). On B1 the stored key is in one system TPM NV
+  index of 32 bytes ([boot.md](boot.md) "F2's ratchet index"), written once
+  a day and read, both only under `PolicySecret` on the service key, never
+  on the disk, so an image of the drive, old flash blocks included, can't
+  decrypt an expired day. Retention is 1, 7, 30 or 90 days, or off. Administrators can't read
   another user's dashboard.
 - *Revoke.* One click revokes the grant through the broker, with the
   revocation semantics of [capabilities.md](capabilities.md): open files
@@ -206,11 +202,13 @@ sends to a destination, is not shown. An app that runs its own encrypted
 DNS shows only its resolver's address. Covert channels are not shown. A
 compromised TCB service can omit records. The history is itself sensitive:
 anyone who unlocks the session can read it, which is why it is bounded,
-expiring and can be switched off. Without a TPM (B2 to B4), and for a
-user on B1 with no index (a 9th and later user, or none left), the ratchet key
-is kept in the user's encrypted storage, and an SSD that keeps old blocks
-can keep an older ratchet key, from which someone with the user's key can
-decrypt expired days still in flash.
+expiring and can be switched off. Records left in flash after a user's
+retention has expired stay decryptable, by someone with that user's key,
+until the longest retention among the machine's users has passed. Without a TPM (B2 to B4), or on a TPM
+without room for the index, the ratchet key is kept in encrypted system
+storage, and an SSD that keeps old blocks can keep an older ratchet key,
+from which someone with the system key can decrypt expired days still in
+flash.
 
 **Phase.** Phase 12. Needs the broker and log service (5), the egress filter
 and resolver (6), F1 (7) and the settings app (12).
@@ -307,8 +305,7 @@ on a fixed region that nothing else writes, trims or snapshots:
   wiped, never wrapped (the key inventory in [storage.md](storage.md));
   Settings says so on the vault page. Every frame that held vault page
   cache or belonged to a vault identity is zeroed when freed, and every
-  close runs unmap-evict-zero on the vault's page cache and sweeps the
-  buddy and per-CPU free lists. At close the TCB intermediaries
+  close runs unmap-evict-zero on the vault's page cache. At close the TCB intermediaries
   (clipboard, document-portal entries, notifications, the input method
   and PipeWire buffers) drop every entry a vault identity owns; TCB
   services are never killed, their open descriptions in the vault are
@@ -392,9 +389,8 @@ against the service key plus `PolicyAuthValue` with the stretched PIN
 half, without `noDA`, so lock-screen failures share the TPM's 32-try
 dictionary-attack budget; after 10 failed unlocks only the passphrase is
 accepted; without a TPM, persistent exponential back-off on disk.)
-Settings offers three modes: **freeze** (the default: apps are frozen and
-resume after unlock), **panic hibernate** (Phase 10: an encrypted image is
-written, then power off) and **panic power-off**. Settings also says that
+Settings offers two modes: **freeze** (the default: apps are frozen and
+resume after unlock) and **panic power-off**. Settings also says that
 a panic kills the apps of an open vault (F3) and of unsealed travel
 folders (F5), losing their unsaved work.
 
@@ -416,7 +412,7 @@ fails closed and the in-kernel input paths in
   identity's group) except the lock screen, the compositor (from Phase
   7) and the tier-3 HID processes of known keyboards (from Phase 6); each of these runs from the read-only
   system image and keeps no state on an encrypted volume. Tasks not frozen
-  within 500 ms are killed. (3) Processes of
+  within 500 ms are sent a kill, which is not waited for. (3) Processes of
   vault identities are killed and open vaults closed (F3); unsealed travel
   folders are resealed (F5) and non-TCB processes holding open file
   descriptions in them are killed; TCB services are never killed, their
@@ -426,17 +422,19 @@ fails closed and the in-kernel input paths in
   write-protect throttling), are capped at max(bound, 1 s) times the
   device's measured write bandwidth, the bound being 1 s by default, a
   setting from 0 to 10 s. Writeback stops at the bound plus 2 s; any page
-  still dirty is encrypted in place under P (a fresh key that goes into
-  the P-wrapped blobs with its volume's key) and written back after
-  unlock. The volumes are then frozen. (5) The keys are wiped. (6) Every
+  still dirty is encrypted in place under P (with several sessions, the
+  active session's P; such pages stay unreadable until that user unlocks)
+  and written back after unlock. The volumes are then frozen. (5) The keys are wiped. (6) Every
   PTE mapping a page-cache page of an encrypted volume is unmapped
   (through the reverse map, with a TLB shootdown), and the pages, except
   those encrypted in step 4, are evicted and zeroed; frozen apps refault them from disk after unlock.
   Long-term DMA pins of those pages are revoked: the GPU core's invalidate
-  callback unmaps them from GPUVM and io_uring fixed buffers are
-  unregistered. Frames that held encrypted-volume page cache are zeroed
-  whenever they are freed, and the panic sweeps the buddy and per-CPU free
-  lists; the cost of both is published ([benchmarks.md](benchmarks.md)).
+  callback unmaps them from GPUVM, preempting the GPU context or, after
+  50 ms, killing it; io_uring fixed buffers lose their pins but keep their
+  registration, and both are re-pinned at unlock. Freed frames hold no
+  plaintext: user anonymous, tagged-slab and encrypted-volume page-cache
+  frames are zeroed when freed ([scheduler.md](scheduler.md) "Frame
+  allocator", cost in [benchmarks.md](benchmarks.md)).
   The dentry and inode caches of those volumes, which hold file names, are
   evicted except dentries pinned by open files and working directories.
   The kernel then emits a "panic complete" event and the lock screen takes
@@ -467,28 +465,24 @@ fails closed and the in-kernel input paths in
   resume. With several users logged in, the system keys are in every
   one's blob and each user's home keys only in their own. With no session
   unlocked since boot there is no P, and a panic needs a reboot. A RAM
-  dump after a panic holds only blobs that need an Argon2id passphrase
-  search, as for a powered-off disk.
+  dump after a panic holds only blobs that need an Argon2id search of a
+  passphrase under the 60-bit floor of [boot.md](boot.md) "Recovery key,
+  PIN, passphrase", as for a powered-off disk.
 - *Suspend from the panic state* (a lid close while panic-locked) wraps
   nothing, since the keys are already in the blob: resume asks for the
-  passphrase only, and the PIN is refused.
+  passphrase only, and the PIN is refused. After a panic unlock, until the
+  next reboot, suspend is passphrase-only too and the update client defers
+  updates that change PCR 7, because the secrets that create objects 4
+  and 5 and reseal are gone.
 - *Panic power-off* zeroes every user page and the page cache, and from
-  Phase 8 clears VRAM with the GPU's copy engine, before
-  `TPM2_Shutdown(CLEAR)` and power-off. While a panic mode is enabled, and
+  Phase 8 clears VRAM with the GPU's copy engine, before the disks' flush
+  and shutdown ([storage.md](storage.md)), `TPM2_Shutdown(CLEAR)` and
+  power-off. While a panic mode is enabled, and
   only then, the kernel sets the firmware's memory-overwrite request (the
   TCG MOR variable) at boot where the firmware supports it, so a forced
   reset in the middle makes the firmware clear memory before anything else
   boots; the boot-time cost of MOR is measured per reference machine and
-  published. *Panic hibernate* (Phase 10) is offered only while exactly
-  one session is logged in (otherwise the panic powers off, and Settings
-  says so). It draws the image key K and wraps it under P before step 5
-  wipes P; P stays wrapped under that user's stretched login passphrase
-  in the 15th header-block slot ([boot.md](boot.md)). No TPM object holds
-  K, so resume needs no PIN: the loader boots the slot that made the image
-  without unsealing anything, the boot kernel asks for the passphrase on
-  the trusted path, unwraps P from slot 15 and K under P, authenticates
-  the image and hands P over, and the restored kernel unwraps its keys
-  from the P blob as at a normal panic unlock.
+  published.
 
 **What it does not protect against.** Plaintext already in app memory: in
 freeze mode the frozen apps' memory, including their tmpfs, shared-memory
@@ -497,8 +491,9 @@ compressed swap pages, their kernel keyrings and their GPU buffers
 (including what was on screen), stays, because the apps are to resume.
 The names of files frozen apps hold open, or use as working directories,
 stay in their pinned dentries. Encrypted-volume pages pinned for DMA by a
-path other than GPUVM and io_uring fixed buffers stay mapped (a named
-residual). DRAM keeps its contents for seconds to minutes after power-off
+path other than GPUVM and io_uring fixed buffers stay mapped, and a GPU
+context that can't be preempted keeps running until killed at 50 ms (named
+residuals). DRAM keeps its contents for seconds to minutes after power-off
 (longer when chilled), so a cold-boot attack that moves the memory soon
 after a panic power-off can still find what the zeroing didn't reach, and
 in freeze mode finds the apps' memory; memory encryption (AMD SME, Intel
@@ -512,47 +507,49 @@ chord (malware, a compromised kernel) is not stopped.
 **Phase.** Freeze and power-off modes in Phase 5: needs per-user home keys,
 the lock screen on the prompt terminal and the in-kernel keyboard paths
 (all 5), and group freezing (`cgroup.freeze`), which this feature brings
-into Phase 5. The test reruns in Phases 6, 7 and 10 as the input paths and
-the compositor change. Panic hibernate in Phase 10, with hibernation.
+into Phase 5. The test reruns in Phases 6 and 7 as the input paths and
+the compositor change, and at max(5, 4b) for the keys that need 4b.
 Vault and travel keys join in Phase 12 with F3 and F5; stage-2 keys when
 the file system track lands.
 
 **Test (Phase 5, QEMU, 12 GiB guest).** Canary keys are planted as the
-volume key, S, a home key, both PIN halves and an SSH agent key (in its
-secret memory); 8 GiB of page cache is filled from encrypted files with
+volume key, a home key, P and an SSH agent key (in its secret memory); 8 GiB of page cache is filled from encrypted files with
 canary plaintext; a frozen test app maps a canary file `MAP_SHARED` and
 runs an executable from the home volume; a canary file name not held open
 goes into the dentry cache, and another canary-named file is held open; a
 canary goes into a tmpfs file and into a test app's memory; canary files
 are read and then evicted under memory pressure before the chord; a
-canary file is registered as an io_uring fixed buffer. The chord is
+canary file is registered as an io_uring fixed buffer; a test task sits
+in uninterruptible sleep on a stalled FUSE request. The chord is
 sent through the polled readers (QEMU `sendkey` on PS/2 and on `usb-kbd`),
 and at the kernel's "panic complete" event guest memory is dumped
 (`dump-guest-memory`) and scanned: 0 hits for every key canary and its
 AES key schedule, the page-cache, evicted, fixed-buffer and mapped-file
 canaries and the not-held-open file name; the held-open file
 name, the tmpfs canary and the app's canary are found and published as
-the freeze-mode residuals. The PIN is refused at the lock screen in 20 of
-20 tries; the passphrase unlocks with the guest's free memory exhausted
+the freeze-mode residuals. The passphrase unlocks with the guest's free memory exhausted
 by a test app; the apps resume, the mapped executable runs, the app's
-canary is intact and the canary files read back unchanged. An SQLite
+canary is intact, the canary files read back unchanged and the fixed
+buffer's next read through io_uring returns the canary. An SQLite
 database in WAL mode and an LMDB environment, each with a writer running,
 pass `PRAGMA integrity_check` and `mdb_stat` checks after each of 100
 panics. A lid close while panic-locked resumes with the passphrase only. In
 power-off mode, a dump at the kernel's last instruction before power-off
 (`-no-shutdown`) holds 0 hits for the app canary as well. On a D2 guest a
 panic and unlock complete with NVMe I/O intact and the unlock typed on a
-USB keyboard on xHCI. Each step's time is published, step 6 included;
-time from chord to keys wiped, not counting writeback (step 4, published
-on its own), is at most 200 ms at the shipped 1 s bound on the reference
-desktop with 8 GiB of page cache (scorecard row). Phase 6 adds the chord injected through `uinput` and a
+USB keyboard on xHCI. Each step's time is published, step 6 included; at
+the shipped 1 s bound on the reference desktop with 8 GiB of page cache,
+chord to keys wiped is at most 4 s with dirty data at the cap and one task
+that never freezes, and typically at most 200 ms excluding writeback
+(step 4, published on its own) (scorecard rows). Rerun at max(5, 4b):
+canaries for S and both PIN halves, 0 hits; the PIN is refused at the
+lock screen in 20 of 20 tries; after a panic unlock, suspend asks for the
+passphrase only and a PCR-7-changing update is deferred to the reboot. Phase 6 adds the chord injected through `uinput` and a
 Bluetooth test keyboard, Phase 7 through the compositor's virtual
 keyboard: none triggers a lock. Phase 8 adds a GPU userptr canary,
-gone from the dump. Phase 10 adds: after panic hibernate the
-image holds no key canary, resume without the full passphrase is
-refused and resume with it needs no PIN; with two sessions logged in,
-panic hibernate powers off instead; a VRAM canary reads back as zero after panic power-off on the
-reference desktop. Phase 12 adds an open hidden vault and an unsealed
+gone from the dump, a GPU context that ignores preemption killed at
+50 ms, and a VRAM canary that reads back as zero after panic power-off on
+the reference desktop. Phase 12 adds an open hidden vault and an unsealed
 travel folder: 0 hits for their keys, the travel canaries, a killed vault
 app's anonymous-memory canary and canaries in the clipboard, a
 notification and a document-portal path, and their processes are gone.
@@ -666,8 +663,10 @@ area says so. "Encrypted DNS" with a provider chosen from a shipped list
   so nothing leaks before the VPN app starts.
 - *The VPN app* is designated on the trusted path, never by a request,
   and Settings says it sees all traffic. It holds no `CAP_*`: the VPN portal
-  (`org.optimal.portal.Vpn`, Phase 6) in the network service sets addresses, routes, fwmark rules, WireGuard
-  netlink settings and DNS on its designated TUN interface only, and
+  (`org.optimal.portal.Vpn`, Phase 6) in the network service sets addresses, routes, fwmark rules and DNS
+  on its designated TUN interface only (also through the VPN identity's
+  rtnetlink address, route and rule requests on that TUN, filtered by the
+  portal's policy; nfnetlink is absent, [capabilities.md](capabilities.md)), and
   refuses any change to another interface or the main routing table. The
   VPN identity can update its server endpoints through the portal at any
   time (roaming, mesh relays); the guard's exception follows the current
@@ -721,9 +720,11 @@ the encrypted path blocked and fallback "never", 1,000 lookups fail with
 DNS works on that network and on no other; (e) from first boot with the
 RTC reset to the firmware's epoch, the default provider is reached, 0
 packets go to port 53, and NTS sets the clock; (f) unchanged `wg-quick`
-and OpenVPN configs bring their tunnels up through the VPN portal, a
-portal request to change another interface's addresses or routes is
-refused, and a Tailscale client roams between two host networks with its
+configs (with `WG_QUICK_USERSPACE_IMPLEMENTATION=wireguard-go` and bash in
+the test image) and OpenVPN configs bring their tunnels up through the VPN
+portal, a portal request to change another interface's addresses or routes
+is refused, and a Tailscale client with `--netfilter-mode=off` (a listed
+divergence) roams between two host networks with its
 endpoint updates logged and 0 packets outside the tunnel. Cost row: the large TCP download
 through the tunnel with the guard on is at least 99% of the same with the
 guard off ([benchmarks.md](benchmarks.md)).
@@ -834,8 +835,9 @@ hardware planes (8), measured with the input-latency rig (7).
 
 **Test (Phase 8, bare-metal reference desktop, discrete GPU, 144 Hz).** A
 pinned fullscreen Vulkan test app on direct scanout, 20 boots per
-condition: with the overlay on, its CPU cost is at most 0.5% (one-sided
-95% bound); input-to-display latency P99 (rig) and frame time P99 are no
+condition: with the overlay on, its CPU cost is at most 0.5% (the
+two-sided Holm rule of [benchmarks.md](benchmarks.md) "How a target is
+decided"); input-to-display latency P99 (rig) and frame time P99 are no
 worse than with it off (the "no worse" rule in
 [benchmarks.md](benchmarks.md)); the overlay's P99 and P99.9 equal the
 harness's values computed from the same presentation timestamps exactly;
@@ -929,7 +931,8 @@ accuracy for that machine. Optionally a cap in watts per app.
 - *Attribution.* Each second, package energy above the machine's measured
   idle power is split among identities in proportion to the unhalted
   cycles their threads used (per-CPU `APERF` deltas charged at each
-  context switch), which follows frequency changes better than CPU time,
+  context switch and, on a tick-stopped CPU, at each kernel entry, so no
+  IPI reads them), which follows frequency changes better than CPU time,
   each core type's cycles weighted by its energy per cycle (calibrated per
   core type and frequency step on each machine at install, so a P-core
   cycle and an E-core cycle are charged differently);
@@ -962,10 +965,10 @@ driver (8).
 pinned CPU-bound loads at three intensities, on a hybrid CPU one on a
 P-core and one on an E-core, each first alone (its increment over idle
 measured) and then together: each load's attributed power is within 10% of
-its solo increment (one-sided 95% bound); (b) the per-change
+its solo increment; (b) the per-change
 context-switch and pipe/futex ping-pong metrics with the meter on are at
-least 99% of meter off (one-sided 95% bound, scorecard row in
-[benchmarks.md](benchmarks.md)); (c) a 10 W cap on a load that draws 25 W keeps its attributed 60 s average
+least 99% of meter off (scorecard row); both by the two-sided Holm rule of
+[benchmarks.md](benchmarks.md) "How a target is decided"; (c) a 10 W cap on a load that draws 25 W keeps its attributed 60 s average
 at or under 11 W; (d) an app's `open` of `/sys/class/powercap` gives
 `ENOENT` and a system-wide power `perf_event_open` gives `EACCES`.
 
