@@ -67,7 +67,11 @@ fn annotation_xml_context_integration_point() {
     let html = [("encoding", "text/html")];
     let c = ctx(Namespace::MathMl, "annotation-xml", &html);
     assert_eq!(fragment("<foo>", &c, false), "| <foo>");
-    let c = ctx(Namespace::MathMl, "annotation-xml", &[("encoding", "application/xhtml+xml")]);
+    let c = ctx(
+        Namespace::MathMl,
+        "annotation-xml",
+        &[("encoding", "application/xhtml+xml")],
+    );
     assert_eq!(fragment("<foo>", &c, false), "| <foo>");
     let c = ctx(Namespace::MathMl, "annotation-xml", &[]);
     assert_eq!(fragment("<foo>", &c, false), "| <math foo>");
