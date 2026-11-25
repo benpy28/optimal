@@ -5,7 +5,16 @@ object through a handle it holds, and the handle says what it may do.**
 Linux programs don't know about handles; they open paths, check uids and
 inherit file descriptors. This file defines the capability system and then,
 precisely, how every Linux way of getting authority maps onto it, so "runs
-unchanged" and "sandboxed by default" are both true and both testable.
+unmodified" (for the suites in [compat.md](compat.md)) and "sandboxed by
+default" are both testable.
+
+Linux has the building blocks for per-app isolation (namespaces, seccomp,
+cgroups, Landlock, SELinux and AppArmor, and Flatpak or bubblewrap on top),
+but each is opt-in: a program started normally runs with all of its user's
+files and the network, and a Flatpak's own manifest chooses its holes
+(`--filesystem=home`, `--share=network`). The difference here is that the
+boundary applies to every process, packaged or not, with no opt-out the app
+can declare for itself; only the user widens it, through the prompts below.
 
 ## Objects and capabilities
 

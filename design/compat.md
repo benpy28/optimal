@@ -1,6 +1,13 @@
 # Linux compatibility
 
-Optimal runs existing Linux programs unchanged by implementing the Linux
+Optimal's goal is to run existing Linux programs unmodified. That is a
+measured claim, never a blanket one: it holds only for the programs in each
+milestone's suite below, at the pass rate the scorecard publishes, and every
+known gap is a listed divergence. Syscalls alone are not enough: programs
+also depend on exact `/proc` and `/sys` formats, `ioctl`s, `AF_UNIX`
+features, DRM/KMS and GPU drivers, Wayland and XWayland, D-Bus, PipeWire
+and the dynamic loader's behaviour, and each of those is a milestone row
+below with its own suite. Optimal implements the Linux
 user-space ABI from the public documentation (man pages, the ELF and x86-64
 psABI specs, kernel uAPI documentation). This file says exactly which ABI,
 in what order, and how compatibility is measured so the numbers can't be

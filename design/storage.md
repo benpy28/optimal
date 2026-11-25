@@ -845,6 +845,15 @@ install. So:
   reported unrecoverable and opened with the read-only rescue mount
   (below). ext4 overwrites in place and has no such fallback, so for
   ext4 the only promise is that the volume is clean after `e2fsck -fy`.
+  Snapshots, rollback and fallback never rewrite a MAC: a snapshot is a
+  retained root set, copy-on-write never overwrites a block any retained
+  root reaches, and deleting a snapshot frees only blocks no remaining root
+  reaches (after the K-commit quarantine). Rolling back to a snapshot is a
+  new commit whose root is the old one, guarded by the replay counter, so
+  every root's path verifies with no re-hashing. Test (own file system
+  gate): a seeded random mix of writes, snapshot create, delete and
+  rollback under the crash-state enumerator above, after which the checker
+  verifies every MAC reachable from every root.
   After an unclean shutdown the own file system verifies every block born
   inside the window; a relocated metadata run keeps its old birth, so the
   root block records the last generation that moved one, and when that
