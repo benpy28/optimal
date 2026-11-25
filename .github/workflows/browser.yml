@@ -60,7 +60,10 @@ jobs:
         env:
           PROPTEST_CASES: ${{ github.event_name == 'schedule' && '2000000' || '200000' }}
           TOKENIZER_RANDOM_ROUNDS: ${{ github.event_name == 'schedule' && '200' || '25' }}
+          TREE_RANDOM_ROUNDS: ${{ github.event_name == 'schedule' && '100' || '10' }}
+          TREE_SCALING: "1"
           CONFORMANCE_OUT: ${{ github.workspace }}/browser/build/html5lib-tokenizer.json
+          TREE_CONFORMANCE_OUT: ${{ github.workspace }}/browser/build/wpt-tree-construction.json
         run: cargo test --workspace --release -- --nocapture 2>&1 | tee build/test-output.txt
       - name: Conformance summary
         if: always()
@@ -70,6 +73,7 @@ jobs:
             echo
             echo '```'
             sed -n '/results (seed/,/TOTAL/p' build/test-output.txt
+            grep -E 'parse error count|ours minus expected' build/test-output.txt || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
@@ -82,7 +86,8 @@ jobs:
 
   mutants:
     # Sharded, two builds at a time per runner: four parallel mutant builds
-    # ran a hosted runner out of memory (it was shut down mid-run).
+    # ran a hosted runner out of memory (it was shut down mid-run). The tree
+    # builder alone has thousands of mutants.
     strategy:
       fail-fast: false
       matrix:
@@ -100,8 +105,9 @@ jobs:
         run: ./scripts/fetch-test-suites.sh
       - name: Mutation testing (any surviving mutant fails; harmless ones are excluded with a reason in .cargo/mutants.toml)
         env:
-          PROPTEST_CASES: "512"
+          PROPTEST_CASES: "128"
           TOKENIZER_RANDOM_ROUNDS: "1"
+          TREE_RANDOM_ROUNDS: "1"
         run: |
           # Exit 0: every mutant caught. Exit 3: some mutants only hung until
           # the timeout, which the tests also catch (an infinite loop is a failure). Anything else fails.

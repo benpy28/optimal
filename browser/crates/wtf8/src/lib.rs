@@ -563,6 +563,14 @@ impl Wtf8Buf {
     }
 }
 
+/// Lets hash maps keyed by `Wtf8Buf` be queried with plain bytes. Consistent
+/// with `Hash` and `Eq`, which are those of the byte vector.
+impl core::borrow::Borrow<[u8]> for Wtf8Buf {
+    fn borrow(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 impl From<&str> for Wtf8Buf {
     fn from(s: &str) -> Self {
         Wtf8Buf {

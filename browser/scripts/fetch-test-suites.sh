@@ -26,3 +26,25 @@ fetch() { # name url commit
 
 # html5lib-tests: tokenizer suite. (Tree construction tests moved to WPT.)
 fetch html5lib-tests https://github.com/html5lib/html5lib-tests.git c5495c539ca8a79c3c5107f5f14010bcff9a35d5
+
+fetch_sparse() { # name url commit path
+  local dir="build/$1" url="$2" commit="$3" path="$4"
+  if [ -d "$dir/.git" ] && [ "$(git -C "$dir" rev-parse HEAD)" = "$commit" ]; then
+    echo "$1 already at $commit"
+    return
+  fi
+  rm -rf "$dir"
+  git init -q "$dir"
+  git -C "$dir" remote add origin "$url"
+  git -C "$dir" sparse-checkout set --no-cone "/$path/"
+  for attempt in 1 2 3 4; do
+    if git -C "$dir" fetch -q --depth 1 --filter=blob:none origin "$commit"; then break; fi
+    [ "$attempt" = 4 ] && { echo "failed to fetch $1" >&2; exit 1; }
+    sleep $((attempt * 5))
+  done
+  git -C "$dir" checkout -q FETCH_HEAD
+  echo "$1 at $(git -C "$dir" rev-parse HEAD) ($path only)"
+}
+
+# web-platform-tests: the tree construction tests (html/syntax/parsing).
+fetch_sparse wpt https://github.com/web-platform-tests/wpt.git 6852422b49e7dc8037d7f130ee07cf991fb73f05 html/syntax/parsing/resources

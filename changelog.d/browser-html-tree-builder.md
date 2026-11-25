@@ -1,0 +1,1 @@
+Browser engine: the `optimal-dom` arena DOM and the WHATWG HTML tree builder (every insertion mode of the current standard, documents and fragments), passing all 3890 runnable WPT tree construction tests under any input chunking, with parsing kept linear on hostile inputs such as 200,000 levels of nesting.
