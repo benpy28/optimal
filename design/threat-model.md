@@ -18,8 +18,11 @@ makes.
    can read to the network unless the user approved that combination (the
    data-set floor below).
 2. **Nothing on the network can talk to the machine** unless the user started
-   that conversation or explicitly opened a service. One exposure is outside
-   the kernel's reach: a provisioned Intel AMT (vPro) management engine
+   that conversation or explicitly opened a service. Exceptions, each named on
+   the scorecard: Wi-Fi, Bluetooth and NIC firmware parse unsolicited frames
+   and are TCB; on D2 machines with radios accepted, the remote promise does
+   not hold ("remote DMA exposure", Hardware security tiers below); and one
+   exposure is outside the kernel's reach: a provisioned Intel AMT (vPro) management engine
    answers on the shared NIC by itself. A tier-3 MEI/HECI client reads the
    AMT provisioning state, and a provisioned machine shows the named
    exposure "out-of-band remote management: on" at install, in Settings, on

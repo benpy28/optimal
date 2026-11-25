@@ -12,9 +12,10 @@ audio keeps up under load. This file is the design that the targets in
   interrupts off, per-CPU access). Each CPU keeps a preempt count; the core's
   types enforce it ([core.md](core.md): per-CPU data needs a
   `PreemptDisabled` token).
-- **Bounded non-preemptible sections.** No section with preemption or
-  interrupts disabled may last longer than **50 µs** on the reference
-  desktop. A built-in tracer (always compiled in) records the longest
+- **Bounded non-preemptible sections.** Target: no section with preemption or
+  interrupts disabled above **50 µs** observed in any stress boot on the
+  reference desktop (SMI-overlapped sections excluded and counted;
+  [benchmarks.md](benchmarks.md)). A built-in tracer (always compiled in) records the longest
   sections. When off, each trace point is a 5-byte no-op; switching the
   tracer on or off rewrites trace points between exactly two precompiled
   states (no-op and jump to the trace stub), never any other bytes. The

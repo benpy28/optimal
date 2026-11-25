@@ -1,7 +1,9 @@
 # Optimal OS roadmap
 
-Goal: build the best desktop OS there is, starting with our own kernel written
-from scratch: fast, lean, safe, and able to run the software people already use.
+Goal: a desktop OS on our own kernel written from scratch that beats matched
+Linux on the published benchmark set ([design/benchmarks.md](design/benchmarks.md)),
+keeps every promise in [design/threat-model.md](design/threat-model.md), and runs
+the software in each compatibility suite ([design/compat.md](design/compat.md)).
 The kernel comes first (Phases 0 to 11); the full OS is built on top of it (Phase 12).
 
 This is a serious engineering project, not a toy. That means every phase ends
@@ -13,10 +15,10 @@ meet, is in [design/](design/README.md).
 
 ## Pillars, in priority order
 1. **Performance.** The main focus. Measured against Linux on the same machine, never guessed ([design/benchmarks.md](design/benchmarks.md)).
-2. **Security.** An absolute focus. Nobody can read a user's data remotely, and a compromised app can't reach anything it wasn't given. Exactly what that means, against whom, and how each promise is tested is in [design/threat-model.md](design/threat-model.md).
-3. **Lean.** Nothing runs unless something needs it. Small memory footprint, fast boot.
+2. **Security.** An absolute focus. By design, nobody can read a user's data remotely and a compromised app can't reach anything it wasn't given, assuming the trusted computing base holds and except the residuals the scorecard names (Rowhammer, covert channels, the SMT opt-in, the D2 and B3 tiers, out-of-band management). Exactly what that means, against whom, and how each promise is tested is in [design/threat-model.md](design/threat-model.md).
+3. **Lean.** Nothing runs unless something needs it. Small memory footprint, fast boot (both measured against matched Linux, [design/benchmarks.md](design/benchmarks.md)).
 4. **Runs on almost anything.** Any 64-bit x86 PC first, ARM64 later. On hardware that lacks a security feature (no TPM, no IOMMU, BIOS only), Optimal still runs and says plainly which protections that machine can't have.
-5. **Compatibility.** Runs existing Linux programs unchanged, 64-bit and 32-bit, which is the road to Windows games through Wine/Proton.
+5. **Compatibility.** Runs unmodified Linux programs, 64-bit and 32-bit, measured on each milestone's suite with the gaps listed ([design/compat.md](design/compat.md)), which is the road to Windows games through Wine/Proton.
 6. **User respect.** The kernel does what the user says. No hidden telemetry, ever.
 7. **Polish.** Clear error messages, clean crash reports, good docs.
 8. **Customisation.** The smallest pillar: boot options, schedulers and modules the user can choose.
@@ -32,9 +34,9 @@ process, are never off by default whatever they cost.
 
 These are decided now because they are expensive to change later.
 
-- **Language: Rust.** Memory-safety bugs cause most serious kernel security holes. Rust removes most of them at compile time with no speed cost.
-- **Shape: a "framekernel".** A small core is allowed `unsafe` code: boot, paging, interrupts, context switching and the raw hardware access. Everything else (scheduler policy, filesystems, network stack, drivers) is written in safe Rust on top of that core. This is a memory-safe in-kernel component architecture: it keeps monolithic-kernel speed (no message passing between processes for every operation) and removes most memory-corruption bugs. It is not a hardware isolation boundary the way a microkernel's separate address spaces are: a safe-Rust component still runs with kernel privilege and can still exhaust resources, deadlock, get logic wrong or misprogram a device, and safe Rust is no defence against a hostile author. So in-kernel code is ours or fully audited, third-party drivers run in their own processes, and isolation comes from the driver trust tiers, resource budgets and per-device IOMMU domains in [design/drivers.md](design/drivers.md). The boundary between the core and the rest is enforced by tools, not convention ([design/core.md](design/core.md)).
-- **Compatibility through the Linux system-call interface.** Instead of inventing a new interface and waiting for apps to be written for it, Optimal speaks the same system calls as Linux, 64-bit and 32-bit. Linux programs, Mesa, Wayland and eventually Wine/Proton can then run unchanged. This is our own clean implementation of a public interface, so it involves no Linux code. How Linux semantics sit on top of capabilities is in [design/capabilities.md](design/capabilities.md), and the ABI plan in [design/compat.md](design/compat.md).
+- **Language: Rust.** Memory-safety bugs are the largest class of serious security holes in large C and C++ code bases (about 70% of the serious security bugs in Microsoft's and Chromium's published analyses). Rust removes most of them at compile time; the runtime cost on hot paths (bounds checks, safe-API overhead) is measured by the per-change gate.
+- **Shape: a "framekernel".** A small core is allowed `unsafe` code: boot, paging, interrupts, context switching and the raw hardware access. Everything else (scheduler policy, filesystems, network stack, drivers) is written in safe Rust on top of that core. This is a memory-safe in-kernel component architecture: it avoids message passing between processes for every operation and removes most memory-corruption bugs. It is not a hardware isolation boundary the way a microkernel's separate address spaces are: a safe-Rust component still runs with kernel privilege and can still exhaust resources, deadlock, get logic wrong or misprogram a device, and safe Rust is no defence against a hostile author. So in-kernel code is ours or fully audited, third-party drivers run in their own processes, and isolation comes from the driver trust tiers, resource budgets and per-device IOMMU domains in [design/drivers.md](design/drivers.md). The boundary between the core and the rest is enforced by tools, not convention ([design/core.md](design/core.md)).
+- **Compatibility through the Linux system-call interface.** Instead of inventing a new interface and waiting for apps to be written for it, Optimal speaks the same system calls as Linux, 64-bit and 32-bit. Linux programs, Mesa, Wayland and eventually Wine/Proton can then run unmodified, to the extent each compatibility suite measures. This is our own clean implementation of a public interface, so it involves no Linux code. How Linux semantics sit on top of capabilities is in [design/capabilities.md](design/capabilities.md), and the ABI plan in [design/compat.md](design/compat.md).
 - **Boot: our own bootloader, "Optimal Boot"**, a UEFI loader in Rust that speaks the Limine boot protocol, checks a signed config and measures everything into the TPM ([design/boot.md](design/boot.md), `bootloader/DESIGN.md`). Until it ships, Limine (BSD-2-Clause) is used, with every file hash-pinned and its config enrolled, in the shipped image as well as the tests (Phase 1 work, not done yet: the current ISO ships stock, unsigned Limine and enrols nothing).
 - **First target: x86_64.** ARM64 comes once the core is stable. Code that depends on the architecture lives in its own module from day one.
 - **Licence: our own code only, never GPL.**

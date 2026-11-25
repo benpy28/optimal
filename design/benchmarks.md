@@ -438,7 +438,8 @@ the sample column gives the rest.
 | Frame time P99 at 144 Hz on the reference discrete GPU | ≤ refresh period + 1 ms | 20 boots, 5 min (43,200 frames) per boot | 8 |
 | Foreground input latency P99 while a large copy or compile runs | ≤ 1.25 times idle | one nightly window, as above | 7 |
 | Memory pressure test (8 GiB usable RAM as measured, 50 browser pages and a compile, [scheduler.md](scheduler.md)) | the compile finishes; input latency P99 ≤ 1.5 times idle; frame time P99 ≤ refresh period + 2 ms; 0 OOM kills of the foreground app or the compositor; each, and the compile's wall time and the count of background-app kills (both published), no worse than matched Linux | 20 memory-pressure boots | 7 |
-| Boot time, from the TSC stamp taken at kernel entry from Limine to the kernel's named `kernel ready` event (boot initialisation done, before the first task starts) | mean < 300 ms (a Phase 1 done-when item) | 20 boots, run in CI on the dedicated KVM host in Phase 1, on the reference desktop from Phase 2 | 1 |
+| Kernel initialisation time, from the TSC stamp taken at kernel entry from Limine to the kernel's named `kernel ready` event (boot initialisation done, before the first task starts) | mean < 300 ms (a Phase 1 done-when item) | 20 boots, run in CI on the dedicated KVM host in Phase 1, on the reference desktop from Phase 2 | 1 |
+| Boot to login screen, from the loader's first instruction to the first frame of the login screen (unencrypted install, so no PIN wait) | P95 no worse than matched Linux to its login screen with the same compositor | 20 boots per OS | 7 |
 | Total OS memory at an idle desktop (Phase 7 done-when) | ≤ 60% of the lightest mainstream Linux desktop on the same machine | 20 boots per OS | 7 |
 | Idle CPU over the defined window (Phase 7 done-when) | < 0.5% and no worse than matched Linux | 20 boots, one window each | 7 |
 | Latency tracer cost when off, on the `getppid` round trip, kernel-thread context switch, 4 KiB anonymous fault and slab allocate/free (futex ping-pong from 5) | each ≤ 0.5% against a build with the tracer compiled out, both with the fixed code layout | 40 boots per build, 7 runs each (SE ≤ 0.15%) | 3 |
@@ -549,7 +550,11 @@ the CPU has it), so a win bought with extra watts is visible.
 2. **Background services:** everything in user space that runs with no app
    open.
 3. **Total OS memory:** 1 + 2, at an idle desktop, measured 2 minutes after
-   login settles.
+   the `login done` event (the shell's first frame after login). Optimal's
+   reclaimable set uses Linux's rule (page cache, reclaimable slab) and is
+   checked by a drop-caches test: memory freed by dropping caches must
+   equal the reclaimable figure within 2%. The scorecard lists every
+   process running in each session measured.
 4. **Available to applications:** what a new app can actually allocate
    without swapping, at that same moment.
 
@@ -561,7 +566,7 @@ autostart entries added, the same display resolution and the same machine.
 Memory is reported from Phase 3 (kernel only) and in full from Phase 7, when
 there is a desktop to measure; the idle-desktop target below is a Phase 7
 done-when item.
-Measured on each reference machine and on the CI VM. Targets: total OS memory
+Measured on each reference machine (the CI VM is trend only). Targets: total OS memory
 at an idle desktop at most 60% of the lightest mainstream Linux desktop
 measured on the same machine, tightened as data comes in.
 

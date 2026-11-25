@@ -877,14 +877,16 @@ install. So:
   raised. A night below the target fails the nightly job; the target is
   never lowered to fit.
 - **Real power cuts.** Before each release: a relay-controlled power-cut rig,
-  at least 1,000 cuts on at least 3 drive models (Phase 4a included), with
+  at least 1,000 cuts on at least 3 drive models, at least one of them a
+  consumer drive with a volatile write cache (VWC=1) and no power-loss
+  protection, results published per drive model (Phase 4a included), with
   the same oracle; from the own file system's first rig run on, it also
   records the fallback depths that set K (above). The first run is on ext4 over LUKS2, before the first release with read-write
   ext4 (Phase 4a); the own file system gets its own before it becomes the
   default. This needs physical hardware and is listed as a hardware need in
   the roadmap.
 
-## Benchmarks (so "within 10%" and "beats ext4" mean something)
+## Benchmarks (so "within 10%" means something)
 
 All storage comparisons run with encryption on for both systems (Linux with
 dm-crypt AES-XTS in stage 1, with `no_read_workqueue` and `no_write_workqueue`
