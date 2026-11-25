@@ -11,9 +11,9 @@ fn dmar(width: u8, flags: u8, extra: &[u8]) -> Vec<u8> {
     build_table(b"DMAR", 1, &body)
 }
 
-/// QEMU's intel-iommu DMAR: width 39 bits (stored 38 = 0x26), flags
-/// INTR_REMAP | X2APIC_OPT_OUT = 0b011 when started with intremap=on and
-/// eim=off.
+/// A DMAR with width 39 bits (stored 38 = 0x26) and flags
+/// INTR_REMAP | X2APIC_OPT_OUT = 0b011. (QEMU's intel-iommu sets only
+/// INTR_REMAP, even with eim=off.)
 #[test]
 fn hand_worked_qemu_style() {
     let d = Dmar::parse(&dmar(0x26, 0b011, &[])).unwrap();

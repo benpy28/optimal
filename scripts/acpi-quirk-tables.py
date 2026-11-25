@@ -12,6 +12,7 @@ Usage: acpi-quirk-tables.py <output directory>
   odd-<n>.bin      tables with signatures nobody knows, odd lengths and
                    revision 0, which must be listed and otherwise ignored.
   ssdt-<n>.bin     40 small SSDTs: a long root table.
+  dmar-x2apic-opt-out.bin  a DMAR whose only flag is X2APIC_OPT_OUT.
   ssdt-big.bin     a 65535-byte SSDT (the most QEMU allows): 16 pages (on SeaBIOS
                    every page goes through the kernel's read window).
 """
@@ -50,6 +51,9 @@ def main() -> None:
         write(f"ssdt-{i}.bin", table(b"SSDT", b"", rev=2))
     # 65535 bytes in all, filled with AML Noop (0xa3) opcodes.
     write("ssdt-big.bin", table(b"SSDT", b"\xa3" * (65535 - 36), rev=2))
+    # DMAR with no remapping units: width 39 bits (stored 38), flags
+    # X2APIC_OPT_OUT only. QEMU's own intel-iommu DMAR never sets that flag.
+    write("dmar-x2apic-opt-out.bin", table(b"DMAR", bytes([38, 0b10]) + bytes(10), rev=1))
 
 
 main()

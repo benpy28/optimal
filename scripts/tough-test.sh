@@ -418,7 +418,7 @@ scenario "apic-x2apic-host-cpu" "boot:^apic: x2APIC \(CPU supports it\), id 0, "
 scenario "apic-xapic-tcg-qemu64" "boot:^apic: xAPIC \(CPU has no x2APIC\), id 0, " "$ISO" bios q35 512M 2 40 tcg -- -cpu qemu64
 # ...and xAPIC when the DMAR table opts out (an Intel IOMMU with interrupt
 # remapping but without extended interrupt mode).
-scenario "apic-dmar-x2apic-opt-out" "boot:^acpi: .* tables \[.*DMAR.*\]; .*; 0 warnings$ && ^apic: xAPIC \(firmware opted out of x2APIC \(DMAR\)\), " "$ISO" bios q35,kernel-irqchip=split 512M 2 30 kvm -- -device intel-iommu,intremap=on,eim=off
+scenario "apic-dmar-x2apic-opt-out" "boot:^acpi: .* tables \[.*DMAR.*\]; .*; 0 warnings$ && ^apic: xAPIC \(firmware opted out of x2APIC \(DMAR\)\), " "$ISO" bios q35 512M 2 30 kvm -- -acpitable "file=$AQ/dmar-x2apic-opt-out.bin"
 # A CPU with no local APIC at all: everything masked, interrupts stay off.
 scenario "apic-none-tcg" "boot:^apic: firmware left: local APIC disabled; PIC masks 0xff/0xff; I/O APIC pins unmasked 0/24$ && ^interrupts: off \(the CPU has no local APIC \(IA32_APIC_BASE 0x100\)\); 0 warnings$" "$ISO" bios q35 512M 1 40 tcg -- -cpu qemu64,-apic
 # Local APIC states from the firmware-quirk injector (applied after
@@ -431,7 +431,7 @@ if has_uefi && [ -f "$QUIRK_EFI" ]; then
     scenario "apic-quirk-lapic" "boot:$(quirk_lines lapic) && ^apic: firmware left: local APIC xAPIC, software enabled, TPR 0x20, [4-7] LVTs unmasked, 0 in service; " "$QDIR/apic-lapic.img" uefi q35 512M 2 30 kvm
     scenario "apic-quirk-lapic-tcg" "boot:$(quirk_lines lapic) && ^apic: firmware left: local APIC xAPIC, software enabled, TPR 0x20, 6 LVTs unmasked, 0 in service; " "$QDIR/apic-lapic.img" uefi q35 512M 2 40 tcg -- -cpu qemu64
     scenario "apic-quirk-x2apic" "boot:$(quirk_lines x2apic) && ^apic: firmware left: local APIC x2APIC, software enabled, TPR 0x0, && ^apic: x2APIC \(firmware left it on\), " "$QDIR/apic-x2apic.img" uefi q35 512M 2 30 kvm
-    scenario "apic-quirk-x2apic-lapic" "boot:$(quirk_lines x2apic lapic) && ^apic: firmware left: local APIC x2APIC, software enabled, TPR 0x20, [4-7] LVTs unmasked, 0 in service; && ^apic: x2APIC \(firmware left it on\), " "$QDIR/apic-x2apic-lapic.img" uefi q35 512M 2 30 kvm
+    scenario "apic-quirk-x2apic-lapic" "boot:$(quirk_lines lapic x2apic) && ^apic: firmware left: local APIC x2APIC, software enabled, TPR 0x20, [4-7] LVTs unmasked, 0 in service; && ^apic: x2APIC \(firmware left it on\), " "$QDIR/apic-x2apic-lapic.img" uefi q35 512M 2 30 kvm
     # Re-enabling a globally disabled local APIC works under KVM, as on
     # current CPUs; QEMU's emulated APIC only re-enables on reset, as on
     # some older ones, and then interrupts must stay off cleanly.
