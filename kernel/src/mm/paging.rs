@@ -19,7 +19,9 @@
 //!   448..480  kernel stacks region (16 TiB), placed at random in it
 //!   480       firmware read window: one page at a random spot, mapped only
 //!             while the ACPI reader copies a table out (1c)
-//!   481..510  reserved for other kernel mappings
+//!   481       device registers (MMIO), uncached, from a random 1 GiB-aligned
+//!             spot in the slot, one page after another, never unmapped (1c2)
+//!   482..510  reserved for other kernel mappings
 //!   510       never mapped
 //!   511       kernel image (Limine places it at random in the top 2 GiB)
 
@@ -37,6 +39,7 @@ const KERNEL_HALF: u64 = 0xffff_8000_0000_0000;
 pub const DIRECT_REGION: (u64, u64) = (KERNEL_HALF, KERNEL_HALF + 192 * SLOT);
 pub const STACK_REGION: (u64, u64) = (KERNEL_HALF + 192 * SLOT, KERNEL_HALF + 224 * SLOT);
 pub const WINDOW_REGION: (u64, u64) = (KERNEL_HALF + 224 * SLOT, KERNEL_HALF + 225 * SLOT);
+pub const MMIO_REGION: (u64, u64) = (KERNEL_HALF + 225 * SLOT, KERNEL_HALF + 226 * SLOT);
 
 /// An address in PML4 slot 510, which is never mapped: a hole between
 /// everything else and the kernel image. Crash tests use it.
@@ -453,6 +456,70 @@ pub fn unmap_kernel_page(virt: u64) -> Result<u64, optimal_mm::paging::MapError>
     let r = space.unmap(&mut KernelTables, virt, PageSize::Size4K);
     cpu::flush_page(virt);
     r
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MmioError {
+    /// The range overlaps memory the memory map does not call reserved
+    /// (RAM, ACPI tables, the framebuffer...). Mapping it uncached as well
+    /// would give the same physical memory two cache types, which x86 does
+    /// not allow, and device registers are never there on a sane machine.
+    NotReserved {
+        phys: u64,
+        kind: crate::bootinfo::Kind,
+    },
+    /// Not page aligned, empty, or past the physical address space.
+    BadRange,
+    /// The MMIO region is used up (it holds 512 GiB).
+    Exhausted,
+    Map(optimal_mm::paging::MapError),
+}
+
+/// Next free MMIO virtual address (0 until the first mapping picks a
+/// random start).
+static MMIO_NEXT: IrqSpinLock<u64> = IrqSpinLock::new(0);
+
+/// Map `pages` pages of device registers starting at page-aligned `phys`,
+/// uncached, read-write, no-execute and global, and return their virtual
+/// address. Mappings are never removed: device registers stay mapped for
+/// the kernel's lifetime.
+pub fn map_mmio(info: &BootInfo, phys: u64, pages: u64) -> Result<u64, MmioError> {
+    let len = pages.checked_mul(PAGE_SIZE).ok_or(MmioError::BadRange)?;
+    let end = phys.checked_add(len).ok_or(MmioError::BadRange)?;
+    if pages == 0 || !phys.is_multiple_of(PAGE_SIZE) || end > 1 << 52 {
+        return Err(MmioError::BadRange);
+    }
+    use crate::bootinfo::Kind;
+    if let Some(e) = info.memory_map().iter().find(|e| {
+        !matches!(e.kind, Kind::Reserved | Kind::Unknown(_))
+            && e.base < end
+            && phys < e.base + e.len
+    }) {
+        return Err(MmioError::NotReserved { phys, kind: e.kind });
+    }
+    let mut next = MMIO_NEXT.lock();
+    if *next == 0 {
+        // Leave room for at least 1 GiB of mappings after the start.
+        let slots = (MMIO_REGION.1 - MMIO_REGION.0) / GIB - 1;
+        *next = MMIO_REGION.0 + (random_u64() % slots) * GIB;
+    }
+    let virt = *next;
+    if MMIO_REGION.1 - virt < len {
+        return Err(MmioError::Exhausted);
+    }
+    // Taken even if a page below fails to map, so a half-mapped range is
+    // never handed out again.
+    *next = virt + len;
+    drop(next);
+    let flags = Flags {
+        cache: Cache::Uncached,
+        ..Flags::READ_WRITE
+    };
+    for i in 0..pages {
+        map_kernel_page(virt + i * PAGE_SIZE, phys + i * PAGE_SIZE, flags)
+            .map_err(MmioError::Map)?;
+    }
+    Ok(virt)
 }
 
 /// Look up a kernel virtual address in the kernel's tables.

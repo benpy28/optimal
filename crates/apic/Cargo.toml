@@ -1,0 +1,14 @@
+[package]
+name = "optimal-apic"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "Interrupt controller logic for the Optimal kernel: local APIC (xAPIC and x2APIC) and I/O APIC register encodings, IA32_APIC_BASE mode changes, the 8259 PIC remap sequence, and the plan that routes ISA IRQs from the MADT. Pure, safe Rust with no hardware access, written from the Intel SDM, the 82093AA I/O APIC datasheet and the ACPI 6.5 specification, and tested on the host."
+
+[dependencies]
+# The MADT and DMAR types the routing plan is built from.
+optimal-acpi = { path = "../acpi" }
+
+[dev-dependencies]
+# Property-based testing (MIT OR Apache-2.0).
+proptest = { version = "1", default-features = false, features = ["std"] }

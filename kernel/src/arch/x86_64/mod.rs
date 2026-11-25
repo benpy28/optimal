@@ -1,5 +1,6 @@
 //! Everything specific to x86_64. Other architectures get a sibling module.
 
+pub mod apic;
 pub mod cpu;
 pub mod gdt;
 pub mod idt;

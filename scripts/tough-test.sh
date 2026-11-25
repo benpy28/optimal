@@ -12,9 +12,11 @@
 #     core, and the whole host loaded with stress-ng
 #
 # A "boot" scenario passes only if the full kernel test suite passes with zero
-# failures and the kernel's ACPI line is there and reports no warnings; a
-# "boot:<regex>[ && <regex>...]" scenario instead needs every regex to match
-# a line of the log (the machine's expected ACPI summary and warnings). A "refuse" scenario (Secure Boot attacks) passes only if the
+# failures, the kernel's ACPI line is there and reports no warnings, and
+# interrupts came on with no warnings; a "boot:<regex>[ && <regex>...]"
+# scenario instead needs every regex to match a line of the log (the
+# machine's expected ACPI summary and warnings), and the same `interrupts:`
+# line unless one of its regexes names its own. A "refuse" scenario (Secure Boot attacks) passes only if the
 # firmware or bootloader refuses it with the expected message and the kernel
 # never runs. Nothing may hang, and nothing may panic.
 #
@@ -27,9 +29,12 @@
 # that disagree or point into PCI configuration space) are made in RAM by
 # the firmware-quirk injector (bootloader/quirk) just before the kernel
 # starts, on UEFI disk images from scripts/quirk-image.sh; each must print
-# exactly the expected summary and warnings too. More conditions join as the kernel
-# grows: timer jitter and spurious interrupts (1c), disk power cuts and IO
-# errors (Phase 4).
+# exactly the expected summary and warnings too. Interrupt controllers left
+# dirty (8259s on the BIOS vectors and unmasked, every I/O APIC pin live,
+# local APIC LVTs live with a raised TPR, x2APIC on, the local APIC
+# globally disabled) must be cleaned up and reported exactly. More
+# conditions join as the kernel grows: timer jitter (1c3), disk power cuts
+# and IO errors (Phase 4).
 #
 # REPEAT=N runs every scenario N times (the nightly soak uses a bigger N).
 # ONLY=<regex> runs only scenarios whose name matches.
@@ -157,11 +162,14 @@ boot_ok() {
     else
         rest="${expect#boot:}"
     fi
+    if [[ "$rest" != *"interrupts:"* ]]; then
+        rest="$rest && ^interrupts: on; 0 warnings\$"
+    fi
     while :; do
         re="${rest%% && *}"
         if ! grep -qE -- "$re" "$log"; then
             echo "EXPECTED a line matching: $re"
-            grep -E "^acpi" "$log"
+            grep -E "^(acpi|apic|ioapic|pic|interrupts|irqdirt|OPTIMAL-QUIRK)" "$log"
             return 1
         fi
         [ "$re" = "$rest" ] && return 0
@@ -275,7 +283,9 @@ has_uefi && scenario "mem-extra-dimms-uefi" boot "$ISO" uefi q35 1G,slots=4,maxm
 scenario "fw-no-hpet" "boot:^acpi: .*, HPET none, .*; 0 warnings$" "$ISO" bios q35,hpet=off 512M 2 30 kvm
 has_uefi && scenario "fw-no-hpet-uefi" "boot:^acpi: XSDT .*, HPET none, .*; 0 warnings$" "$ISO" uefi q35,hpet=off 512M 2 30 kvm
 scenario "fw-no-hpet-pc" "boot:^acpi: .*, HPET none, .*; 0 warnings$" "$ISO" bios pc,hpet=off 512M 2 30 kvm
-scenario "fw-no-acpi" "boot:^acpi: none \(no RSDP from the bootloader\)$" "$ISO" bios pc,acpi=off 512M 1 30 kvm
+# No ACPI means no MADT: the local APIC and the 8259s are still set up,
+# but no I/O APIC is known, which is the one warning.
+scenario "fw-no-acpi" "boot:^acpi: none \(no RSDP from the bootloader\)$ && ^apic: warning: no MADT: no I/O APIC routes, LINT pins masked$ && ^interrupts: on; 1 warnings$" "$ISO" bios pc,acpi=off 512M 1 30 kvm
 scenario "fw-pc-no-smbus-no-sata" boot "$ISO" bios pc,smbus=off,sata=off 256M 1 30 kvm
 # Quirky ACPI tables, added with -acpitable (scripts/acpi-quirk-tables.py).
 # A second MADT full of junk, plus tables with unknown signatures: the first
@@ -381,6 +391,53 @@ for code in build/firmware/*/OVMF_CODE*.fd; do
         scenario "fw-ovmf-$ver-acpi-ram-all-1" "boot:$(quirk_lines "$ALL1") && $ALL1_EXPECT" "$QDIR/acpi-ram-all-1.img" "ovmf=$code" q35 512M 4 40 tcg -- -cpu qemu64
     fi
 done
+
+# ---------------------------------------------------------------------------
+# Interrupt controllers left dirty.
+# ---------------------------------------------------------------------------
+# Limine masks the 8259s and the I/O APIC's fixed-delivery pins on its way
+# to the kernel (its protocol promises it), so the injector's pic and
+# ioapic words never reach the kernel, and Limine itself triple-faults on
+# the ExtINT and NMI pins the ioapic word leaves live (seen under QEMU 8.2
+# with OVMF, 2026-11-26). So the test kernel dirties them itself, after Limine
+# (irqdirt=, kernel/src/irq/dirt.rs): 8259s on the BIOS vectors and
+# unmasked, every I/O APIC pin live, the local APIC's LVTs live with TPR
+# 0x20. The kernel must report exactly that, clean it all up, and pass
+# its interrupt tests (the PIT must still arrive only on its I/O APIC
+# route, never through an 8259).
+DIRT_ISO=build/optimal-ktest-irqdirt.iso
+dirt='^irqdirt: applied: pic ioapic lapic; PIC masks 0x00/0x00; 24 I/O APIC pins unmasked; [4-7] LVTs unmasked, TPR 0x20;$ && ^apic: firmware left: local APIC xAPIC, software enabled, TPR 0x20, [4-7] LVTs unmasked, 0 in service; PIC masks 0x00/0x00; I/O APIC pins unmasked 24/24$ && ^pic: 8259s remapped to 0x20/0x28 and masked$ && ^ioapic: ISA IRQs: 15 routed; moved 0>2; level 5 9 10 11; active low none; 0 NMI pins$'
+scenario "irq-dirty-bios" "boot:$dirt" "$DIRT_ISO" bios q35 512M 2 30 kvm
+has_uefi && scenario "irq-dirty-uefi" "boot:$dirt" "$DIRT_ISO" uefi q35 512M 2 30 kvm
+scenario "irq-dirty-tcg-qemu64" "boot:$dirt" "$DIRT_ISO" bios q35 512M 2 40 tcg -- -cpu qemu64
+scenario "irq-dirty-tcg-smp4-max" "boot:$dirt" "$DIRT_ISO" bios q35 1G 4 40 tcg -- -cpu max
+scenario "irq-dirty-pc" "boot:$dirt" "$DIRT_ISO" bios pc 256M 1 30 kvm
+# Which mode the local APIC ends in: x2APIC whenever the CPU has it...
+scenario "apic-x2apic-host-cpu" "boot:^apic: x2APIC \(CPU supports it\), id 0, " "$ISO" bios q35 512M 2 30 kvm
+# ...xAPIC when it does not...
+scenario "apic-xapic-tcg-qemu64" "boot:^apic: xAPIC \(CPU has no x2APIC\), id 0, " "$ISO" bios q35 512M 2 40 tcg -- -cpu qemu64
+# ...and xAPIC when the DMAR table opts out (an Intel IOMMU with interrupt
+# remapping but without extended interrupt mode).
+scenario "apic-dmar-x2apic-opt-out" "boot:^acpi: .* tables \[.*DMAR.*\]; .*; 0 warnings$ && ^apic: xAPIC \(firmware opted out of x2APIC \(DMAR\)\), " "$ISO" bios q35,kernel-irqchip=split 512M 2 30 kvm -- -device intel-iommu,intremap=on,eim=off
+# A CPU with no local APIC at all: everything masked, interrupts stay off.
+scenario "apic-none-tcg" "boot:^apic: firmware left: local APIC disabled; PIC masks 0xff/0xff; I/O APIC pins unmasked 0/24$ && ^interrupts: off \(the CPU has no local APIC \(IA32_APIC_BASE 0x100\)\); 0 warnings$" "$ISO" bios q35 512M 1 40 tcg -- -cpu qemu64,-apic
+# Local APIC states from the firmware-quirk injector (applied after
+# ExitBootServices; Limine leaves the local APIC as it finds it).
+if has_uefi && [ -f "$QUIRK_EFI" ]; then
+    quirk_img apic-lapic lapic
+    quirk_img apic-x2apic x2apic
+    quirk_img apic-x2apic-lapic x2apic lapic
+    quirk_img apic-off apic-off
+    scenario "apic-quirk-lapic" "boot:$(quirk_lines lapic) && ^apic: firmware left: local APIC xAPIC, software enabled, TPR 0x20, [4-7] LVTs unmasked, 0 in service; " "$QDIR/apic-lapic.img" uefi q35 512M 2 30 kvm
+    scenario "apic-quirk-lapic-tcg" "boot:$(quirk_lines lapic) && ^apic: firmware left: local APIC xAPIC, software enabled, TPR 0x20, 6 LVTs unmasked, 0 in service; " "$QDIR/apic-lapic.img" uefi q35 512M 2 40 tcg -- -cpu qemu64
+    scenario "apic-quirk-x2apic" "boot:$(quirk_lines x2apic) && ^apic: firmware left: local APIC x2APIC, software enabled, TPR 0x0, && ^apic: x2APIC \(firmware left it on\), " "$QDIR/apic-x2apic.img" uefi q35 512M 2 30 kvm
+    scenario "apic-quirk-x2apic-lapic" "boot:$(quirk_lines x2apic lapic) && ^apic: firmware left: local APIC x2APIC, software enabled, TPR 0x20, [4-7] LVTs unmasked, 0 in service; && ^apic: x2APIC \(firmware left it on\), " "$QDIR/apic-x2apic-lapic.img" uefi q35 512M 2 30 kvm
+    # Re-enabling a globally disabled local APIC works under KVM, as on
+    # current CPUs; QEMU's emulated APIC only re-enables on reset, as on
+    # some older ones, and then interrupts must stay off cleanly.
+    scenario "apic-quirk-off" "boot:$(quirk_lines apic-off) && ^apic: firmware left: local APIC disabled; && ^apic: x2APIC \(CPU supports it\), && ^apic: warning: firmware left the local APIC disabled; switched it back on$ && ^interrupts: on; 1 warnings$" "$QDIR/apic-off.img" uefi q35 512M 2 30 kvm
+    scenario "apic-quirk-off-tcg" "boot:$(quirk_lines apic-off) && ^apic: firmware left: local APIC disabled; && ^interrupts: off \(the local APIC is disabled and would not switch back on \(IA32_APIC_BASE 0xfee00100\)\); 0 warnings$" "$QDIR/apic-off.img" uefi q35 512M 2 40 tcg -- -cpu qemu64
+fi
 
 # ---------------------------------------------------------------------------
 # Secure Boot (images from scripts/secureboot.sh).

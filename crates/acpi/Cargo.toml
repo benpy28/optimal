@@ -3,7 +3,7 @@ name = "optimal-acpi"
 version = "0.0.1"
 edition = "2024"
 publish = false
-description = "ACPI table parsing for the Optimal kernel: RSDP, RSDT/XSDT, MADT, HPET, FADT and MCFG. Pure, safe Rust with no hardware access, written from the ACPI 6.5 specification and tested on the host with hand-worked tables, random tables and corrupted tables."
+description = "ACPI table parsing for the Optimal kernel: RSDP, RSDT/XSDT, MADT, HPET, FADT, MCFG and the DMAR flags. Pure, safe Rust with no hardware access, written from the ACPI 6.5 specification and tested on the host with hand-worked tables, random tables and corrupted tables."
 
 [dependencies]
 

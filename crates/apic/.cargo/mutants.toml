@@ -1,0 +1,15 @@
+# cargo-mutants settings for optimal-apic.
+#
+# Excluded on purpose, with the reason:
+# - `replace | with ^` in Mode::bits, transition, Lvt::encode, Ipi::low,
+#   Ipi::x2apic, svr and Redirection::encode: each of those ORs combines
+#   register fields that cannot overlap (EN and EXTD are different bits;
+#   `keep` has EN and EXTD cleared before a mode's bits go in; vector,
+#   delivery mode, polarity, trigger, mask, shorthand and enable each own
+#   their own bits; the x2APIC destination sits above bit 31), and on disjoint
+#   bits OR and XOR give the same value, so these mutants are equivalent.
+#   The encodings themselves are pinned by hand-worked values and by
+#   round trips over every bit pattern in src/suite.
+exclude_re = [
+    "replace \\| with \\^ in (Mode::bits|transition|Lvt::encode|Ipi::low|Ipi::x2apic|svr|Redirection::encode)",
+]

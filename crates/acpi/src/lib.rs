@@ -1,8 +1,9 @@
 //! ACPI table parsing for the Optimal kernel.
 //!
 //! Written from the ACPI 6.5 specification (sections 5.2.5 to 5.2.12 and
-//! 5.2.9 for the FADT), the IA-PC HPET specification 1.0a and the PCI
-//! Firmware Specification 3.3 (the MCFG). Plain safe Rust with no hardware
+//! 5.2.9 for the FADT), the IA-PC HPET specification 1.0a, the PCI
+//! Firmware Specification 3.3 (the MCFG) and the Intel VT-d specification
+//! 4.1 (the DMAR header). Plain safe Rust with no hardware
 //! access: the kernel copies each table out of firmware memory and hands
 //! the bytes in, so every parser works on a byte slice and is tested on the
 //! host.
@@ -21,6 +22,7 @@
 
 extern crate alloc;
 
+pub mod dmar;
 pub mod fadt;
 pub mod hpet;
 pub mod madt;

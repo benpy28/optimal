@@ -193,8 +193,8 @@ extern "C" fn dispatch(frame: &mut InterruptFrame) {
             BREAKPOINTS.fetch_add(1, Ordering::SeqCst);
         }
         v if v < 32 => crash(frame),
-        // Hardware interrupts are routed here once the APIC is set up (Phase 1c).
-        _ => crash(frame),
+        // Hardware interrupts, IPIs and anything stray (crate::irq).
+        _ => crate::irq::dispatch(frame),
     }
 }
 
