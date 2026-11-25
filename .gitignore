@@ -1,2 +1,5 @@
 /build/
 /kernel/target/
+/bootloader/target/
+/bootloader/build/
+/fs/target/

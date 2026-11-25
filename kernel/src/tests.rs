@@ -103,3 +103,45 @@ ktest!(exception_names_cover_every_vector, {
     }
     assert_eq!(idt::exception_name(14), "#PF page fault");
 });
+
+ktest!(isr_stubs_are_laid_out_as_expected, {
+    // Decode every generated stub: optional `push 0` (6a 00), then
+    // `push vector` (6a imm8 or 68 imm32), then `jmp rel32` (e9) to the
+    // common entry, all inside its 16-byte slot. This is what makes computing
+    // stub addresses (instead of a relocated pointer table) safe.
+    let mut common = None;
+    for v in 0..=255u8 {
+        let base = idt::stub_address(v);
+        // SAFETY: the stubs are mapped, readable kernel text.
+        let code =
+            unsafe { core::slice::from_raw_parts(base as *const u8, idt::STUB_SIZE as usize) };
+        let mut i = 0;
+        if !idt::has_error_code(v) {
+            assert_eq!(&code[0..2], &[0x6a, 0x00], "stub {} dummy error code", v);
+            i = 2;
+        }
+        if v < 0x80 {
+            assert_eq!(&code[i..i + 2], &[0x6a, v], "stub {} push imm8", v);
+            i += 2;
+        } else {
+            assert_eq!(code[i], 0x68, "stub {} push imm32", v);
+            assert_eq!(
+                &code[i + 1..i + 5],
+                &u32::from(v).to_le_bytes(),
+                "stub {} imm32",
+                v
+            );
+            i += 5;
+        }
+        assert_eq!(code[i], 0xe9, "stub {} jmp", v);
+        let rel = i32::from_le_bytes(code[i + 1..i + 5].try_into().unwrap());
+        let target = (base + i as u64 + 5).wrapping_add_signed(i64::from(rel));
+        assert_eq!(
+            *common.get_or_insert(target),
+            target,
+            "stub {} jumps elsewhere",
+            v
+        );
+        assert!(i + 5 <= idt::STUB_SIZE as usize);
+    }
+});

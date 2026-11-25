@@ -1,0 +1,32 @@
+[package]
+name = "optimalfs"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Optimal's own copy-on-write, checksummed, encrypted filesystem"
+
+# The library is no_std (it only needs `alloc`), so the kernel can link it
+# directly. The `std` feature adds a file-backed block device and OS entropy
+# for host-side tools and tests.
+[features]
+default = ["std"]
+std = ["dep:getrandom"]
+
+[dependencies]
+# All dependencies are permissively licensed (checked by cargo-deny in CI).
+blake3 = { version = "1.8", default-features = false }             # CC0-1.0 OR Apache-2.0
+chacha20poly1305 = { version = "0.11", default-features = false }  # Apache-2.0 OR MIT
+argon2 = { version = "0.6", default-features = false, features = ["alloc"] } # MIT OR Apache-2.0
+zeroize = { version = "1.8", default-features = false }            # Apache-2.0 OR MIT
+getrandom = { version = "0.4", optional = true }                   # MIT OR Apache-2.0
+
+[dev-dependencies]
+proptest = "1.5"
+
+[profile.release]
+debug = true
+
+[profile.test]
+opt-level = 2
+debug-assertions = true
+overflow-checks = true

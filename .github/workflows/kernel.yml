@@ -12,6 +12,12 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same PR makes the older run moot: cancel it, so stale
+# runs don't hold runners other PRs need. Runs on main are never cancelled.
+concurrency:
+  group: kernel-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build-and-boot:
     runs-on: ubuntu-24.04
@@ -59,4 +65,125 @@ jobs:
             build/optimal.iso
             build/boot-logs/
             build/test-logs/
+          retention-days: 14
+
+  # Tough but realistic conditions (scripts/tough-test.sh): odd CPUs, NUMA,
+  # odd memory, firmware quirks and other OVMF builds, Secure Boot attacks,
+  # and a host fighting for CPU. Runs alongside build-and-boot.
+  tough-conditions:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable KVM so QEMU runs at full speed
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Install QEMU, firmware, signing and stress tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 xorriso ovmf \
+            stress-ng sbsigntool mtools python3-virt-firmware
+
+      - name: Install Rust (version pinned in kernel/rust-toolchain.toml)
+        working-directory: kernel
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Build kernel and ISOs
+        run: ./scripts/build-iso.sh
+
+      - name: Build Secure Boot images (throwaway test keys)
+        run: ./scripts/secureboot.sh
+
+      - name: Fetch older and newer OVMF firmware
+        env:
+          STRICT: "1"
+        run: ./scripts/fetch-firmware.sh
+
+      - name: Tough conditions
+        run: ./scripts/tough-test.sh
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: tough-conditions-logs
+          path: build/tough-logs/
+          retention-days: 14
+
+  # Memory-management logic (crates/mm): host unit tests and property tests
+  # against reference models, then Kani proofs (docs/verification.md, proof
+  # targets 1 and 2). Kani brings its own pinned toolchain; the kernel itself
+  # still builds on stable Rust.
+  mm-tests-and-proofs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: crates/mm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint
+        run: |
+          rustup component add clippy rustfmt
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+
+      - name: Unit and property tests (many more random cases than locally)
+        env:
+          PROPTEST_CASES: "50000"
+        run: cargo test --release
+
+      - name: Install Kani
+        run: |
+          cargo install --locked kani-verifier --version 0.68.0
+          cargo kani setup
+
+      - name: Kani proofs
+        run: cargo kani
+
+  mm-mutation-tests:
+    # Deliberately breaks the code in hundreds of small ways (cargo-mutants);
+    # every break must make a test fail or hang. Equivalent mutants are
+    # excluded, each with its reason, in crates/mm/.cargo/mutants.toml.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: crates/mm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-mutants
+        run: cargo install --locked cargo-mutants --version 27.1.0
+
+      - name: Mutation tests (any surviving mutant fails the job)
+        env:
+          PROPTEST_CASES: "400"
+        # Exit code 3 means some mutants made the tests hang (for example an
+        # infinite loop in a walk); a hang is a detected break, so it counts
+        # as caught. Anything else non-zero, or any missed mutant, fails.
+        #
+        # Each process is capped at 3 GiB of address space: a mutant that
+        # makes a test allocate without end (an endless split pushed into a
+        # Vec, say) then fails that test instead of exhausting the runner's
+        # memory, which got the whole runner shut down once (2026-11-21).
+        run: |
+          ulimit -v 3145728
+          code=0
+          cargo mutants -j 4 --timeout 180 || code=$?
+          echo "cargo-mutants exit code $code"
+          cat mutants.out/missed.txt
+          [ "$code" -eq 0 ] || [ "$code" -eq 3 ]
+          [ ! -s mutants.out/missed.txt ]
+
+      - name: Upload mutation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mm-mutants
+          path: crates/mm/mutants.out/
           retention-days: 14
