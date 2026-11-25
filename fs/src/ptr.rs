@@ -18,7 +18,7 @@ pub struct BlockPtr {
     pub nonce: [u8; NONCE_LEN],
     /// Meaning depends on the pointer's role: tree level for tree nodes,
     /// free-block count for space-map blocks.
-    pub aux: u32,
+    pub aux: u64,
 }
 
 impl BlockPtr {
@@ -39,8 +39,7 @@ impl BlockPtr {
         w.u64(self.birth);
         w.bytes(&self.mac);
         w.bytes(&self.nonce);
-        w.u32(self.aux);
-        w.zeros(4);
+        w.u64(self.aux);
     }
 
     pub fn decode(r: &mut Reader) -> Result<BlockPtr> {
@@ -48,10 +47,7 @@ impl BlockPtr {
         let birth = r.u64()?;
         let mac = r.array()?;
         let nonce = r.array()?;
-        let aux = r.u32()?;
-        if r.u32()? != 0 {
-            return Err(r.err());
-        }
+        let aux = r.u64()?;
         Ok(BlockPtr {
             addr,
             birth,

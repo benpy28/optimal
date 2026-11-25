@@ -22,6 +22,7 @@ pub mod fsck;
 mod io;
 mod ptr;
 mod rangeset;
+mod recover;
 pub mod sim;
 mod snapshot;
 mod space;
@@ -41,4 +42,5 @@ pub use fs::{
     Attr, Clock, DirEntry, FileKind, Filesystem, FormatOptions, MountOptions, ROOT_INO, SetAttr,
     StatFs, ZeroClock,
 };
+pub use recover::RecoveryStats;
 pub use snapshot::SnapshotInfo;

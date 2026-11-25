@@ -9,6 +9,7 @@
 //!
 //! The torture tests run this after every simulated crash.
 
+use crate::crypto::BlockKind;
 use crate::device::{BLOCK_SIZE, BlockDevice};
 use crate::error::{Error, Result};
 use crate::fs::{
@@ -17,7 +18,7 @@ use crate::fs::{
 };
 use crate::ptr::BlockPtr;
 use crate::snapshot::{K_DEAD, K_SNAP, decode_dead, list_records};
-use crate::space::{SB_RESERVED_BACK, SB_RESERVED_FRONT};
+use crate::space::{BITS_PER_BMP, SB_RESERVED_BACK, SB_RESERVED_FRONT};
 use crate::tree::{Child, Key, TreeId};
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
@@ -153,50 +154,79 @@ pub fn check<D: BlockDevice>(fs: &mut Filesystem<D>, verify_data: bool) -> Resul
     check_meta(fs, &mut cx, &recs, &block_sets)?;
 
     // Space map and free log.
-    let (sroot, l1, bmp) = fs.store.space.tables();
-    let (sroot, l1, bmp) = (sroot, l1.to_vec(), bmp.to_vec());
-    cx.claim(sroot.addr, 1, Role::SpaceTable, sroot.birth, sroot.mac);
-    for p in &l1 {
-        cx.claim(p.addr, 1, Role::SpaceTable, p.birth, p.mac);
-    }
-    for p in &bmp {
-        cx.claim(p.addr, 1, Role::Bitmap, p.birth, p.mac);
+    for (kind, p) in fs.store.space.all_pointers(&mut fs.store.io)? {
+        let role = if kind == BlockKind::Bitmap {
+            Role::Bitmap
+        } else {
+            Role::SpaceTable
+        };
+        cx.claim(p.addr, 1, role, p.birth, p.mac);
     }
     for a in fs.store.space.log_addrs().to_vec() {
         cx.claim(a, 1, Role::FreeLog, 0, [0; 16]);
     }
     cx.rep.referenced_blocks = cx.owners.len() as u64 + SB_RESERVED_FRONT + SB_RESERVED_BACK;
     let total = cx.total;
-    let mut b = 0u64;
-    let mut mismatches = 0;
-    while b < total {
-        let used = fs.store.space.is_used(&mut fs.store.io, b)?;
-        let reserved = b < SB_RESERVED_FRONT || b >= total - SB_RESERVED_BACK;
-        let referenced = reserved || cx.owners.contains_key(&b);
-        if used != referenced {
-            mismatches += 1;
-            if mismatches <= 20 {
-                cx.err(format!(
-                    "block {b}: space map says {} but it is {}",
-                    if used { "used" } else { "free" },
-                    if referenced {
-                        "referenced"
-                    } else {
-                        "unreferenced"
-                    }
-                ));
+    let reserved = |b: u64| b < SB_RESERVED_FRONT || b >= total - SB_RESERVED_BACK;
+    let mut mismatches = 0u64;
+    // A never-written bitmap means "all free": nothing may live there.
+    // Only written bitmaps are compared bit by bit, so sparse multi-terabyte
+    // volumes stay fast.
+    let written = fs.store.space.written_bitmaps(&mut fs.store.io)?;
+    let written_set: BTreeSet<u64> = written.iter().copied().collect();
+    let reserved_list = [0, 1, total - 2, total - 1];
+    let in_null: Vec<u64> = cx
+        .owners
+        .keys()
+        .chain(reserved_list.iter())
+        .copied()
+        .filter(|b| !written_set.contains(&(b / BITS_PER_BMP)))
+        .take(21)
+        .collect();
+    for b in in_null {
+        mismatches += 1;
+        cx.err(format!(
+            "block {b}: space map says free (unwritten bitmap {}) but it is referenced",
+            b / BITS_PER_BMP
+        ));
+    }
+    for (n, i) in written.into_iter().enumerate() {
+        let first = i * BITS_PER_BMP;
+        let end = total.min(first + BITS_PER_BMP);
+        for b in first..end {
+            let used = fs.store.space.is_used(&mut fs.store.io, b)?;
+            let referenced = reserved(b) || cx.owners.contains_key(&b);
+            if used != referenced {
+                mismatches += 1;
+                if mismatches <= 20 {
+                    cx.err(format!(
+                        "block {b}: space map says {} but it is {}",
+                        if used { "used" } else { "free" },
+                        if referenced {
+                            "referenced"
+                        } else {
+                            "unreferenced"
+                        }
+                    ));
+                }
             }
         }
-        b += 1;
+        if n % 1024 == 1023 {
+            fs.store.space.evict_clean();
+        }
     }
     if mismatches > 20 {
         cx.err(format!("{mismatches} space map mismatches in total"));
     }
-    let q: Vec<(u64, u64)> = fs.store.space.freed_prev.to_vec();
+    // Quarantined blocks must be free in the map and unreferenced.
+    let mut q = fs.store.space.held_ranges();
+    q.extend(fs.store.space.freed_now.to_vec());
     for (s, l) in q {
         for x in s..s + l {
             if cx.owners.contains_key(&x) {
                 cx.err(format!("block {x} is in the free log but still referenced"));
+            } else if fs.store.space.is_used(&mut fs.store.io, x)? {
+                cx.err(format!("block {x} is in the free log but marked used"));
             }
         }
     }
