@@ -383,6 +383,55 @@ fn nmi_sources() {
     );
 }
 
+/// A broken entry (reserved polarity) is skipped with a warning, and a later
+/// good entry for the same GSI is still used: it is not a duplicate of an
+/// entry that was never accepted. (Found by the random-MADT property.)
+#[test]
+fn nmi_source_after_a_broken_one() {
+    let mut m = qemu();
+    m.nmi_sources = vec![
+        NmiSource {
+            gsi: 13,
+            polarity: Polarity::Reserved,
+            trigger: Trigger::Bus,
+        },
+        NmiSource {
+            gsi: 13,
+            polarity: Polarity::Low,
+            trigger: Trigger::Bus,
+        },
+    ];
+    let p = build(&m, 0, &[Some(23)]);
+    let nmi = Redirection {
+        vector: 0,
+        delivery: Delivery::Nmi,
+        logical: false,
+        active_low: true,
+        level: false,
+        masked: false,
+        destination: 0,
+    };
+    assert_eq!(
+        p.nmi_pins,
+        [NmiPin {
+            gsi: 13,
+            ioapic: 0,
+            pin: 13,
+            entry: nmi
+        }]
+    );
+    assert_eq!(p.table(0)[13], nmi);
+    assert_eq!(p.isa[13], Err(NotRouted::NmiSource { gsi: 13 }));
+    assert!(
+        p.warnings
+            .contains(&Warning::NmiSourceReservedFlags { gsi: 13 })
+    );
+    assert!(
+        !p.warnings
+            .contains(&Warning::NmiSourceDuplicate { gsi: 13 })
+    );
+}
+
 /// An x2APIC boot CPU with ID 300 cannot be named by an I/O APIC entry
 /// (8 bits) without interrupt remapping: every route is refused.
 #[test]
@@ -613,7 +662,13 @@ proptest! {
             prop_assert!(!n.entry.masked && !n.entry.level);
             prop_assert_eq!(Some(n.entry.destination), dest);
             prop_assert!(p.nmi_pins[..k].iter().all(|o| o.gsi != n.gsi));
-            let src = m.nmi_sources.iter().find(|s| s.gsi == n.gsi).unwrap();
+            // The first entry for this GSI with usable flags: a broken
+            // entry is skipped (with a warning) rather than hiding a good one.
+            let src = m
+                .nmi_sources
+                .iter()
+                .find(|s| s.gsi == n.gsi && s.polarity != Polarity::Reserved)
+                .unwrap();
             prop_assert_eq!(n.entry.active_low, src.polarity == Polarity::Low);
         }
 
