@@ -1,0 +1,15 @@
+[package]
+name = "optimal-boot-quirk"
+description = "Test-only EFI app that leaves the machine the way sloppy firmware would, then chain-loads a bootloader."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "optimal-boot-quirk"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+optimal-boot-core = { path = "../core" }

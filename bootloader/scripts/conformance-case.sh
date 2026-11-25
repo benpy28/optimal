@@ -8,6 +8,12 @@
 #
 # Cases: r3 r4 r5 r6 pie entry la57 tpm iommu-intel iommu-amd smp big small
 #        headless old-cpu
+#        quirk-r3 quirk quirk-x2apic quirk-apic-off quirk-iommu-intel
+#        quirk-iommu-amd
+#
+# The quirk-* cases boot through the firmware-quirk injector (quirk/), which
+# leaves PICs, I/O APIC pins, the local APIC and IOMMUs the way sloppy
+# firmware would, and only count if its report shows every quirk took.
 set -euo pipefail
 case_name="$1"; loaders="${2:-optimal limine}"
 cd "$(dirname "$0")/.."
@@ -20,6 +26,7 @@ export OB_EXPECT_CMDLINE="conformance case=$case_name" OB_EXPECT_MODULES=1
 export OB_REVISION=3 OB_PIE=0 OB_PAGING=4 OB_ENTRY_REQ=0
 QEMU=(-machine q35 -m 512M)
 TPM=0
+QUIRKS=""
 case "$case_name" in
     r3) ;;
     r4) OB_REVISION=4 ;;
@@ -36,11 +43,34 @@ case "$case_name" in
     small) QEMU=(-machine q35 -m 160M) ;;
     headless) OB_REVISION=5; QEMU+=(-vga none) ;;
     old-cpu) QEMU+=(-cpu qemu64,-nx,-pdpe1gb); export QEMU_ACCEL=tcg ;;
+    quirk-r3) QUIRKS="pic ioapic lapic" ;;
+    quirk) OB_REVISION=5; QUIRKS="pic ioapic lapic" ;;
+    quirk-x2apic) OB_REVISION=6; QUIRKS="pic ioapic x2apic lapic"; QEMU+=(-cpu max,+x2apic)
+        # QEMU 8.2's emulator has no x2APIC; refuse rather than run weaker.
+        if [ ! -w /dev/kvm ] || [ "${QEMU_ACCEL:-auto}" = tcg ]; then
+            echo "quirk-x2apic needs KVM (QEMU 8.2 cannot emulate x2APIC)"; exit 1
+        fi ;;
+    # Limine v11.4.1 leaves a globally disabled local APIC disabled (base
+    # revision 5 says it must be enabled with SVR 0x1FF), so this case runs
+    # under Optimal Boot only unless loaders are given explicitly.
+    # QEMU's emulated APIC cannot be re-enabled once disabled, so this needs
+    # KVM's in-kernel APIC to test anything.
+    quirk-apic-off) OB_REVISION=5; QUIRKS="pic ioapic apic-off"; loaders="${2:-optimal}"
+        if [ ! -w /dev/kvm ] || [ "${QEMU_ACCEL:-auto}" = tcg ]; then
+            echo "quirk-apic-off needs KVM (QEMU's emulated APIC cannot be re-enabled)"; exit 1
+        fi ;;
+    quirk-iommu-intel) OB_REVISION=5; QUIRKS="pic ioapic lapic vtd"
+        QEMU=(-machine q35,kernel-irqchip=split -m 512M -device intel-iommu,intremap=on) ;;
+    quirk-iommu-amd) OB_REVISION=5; QUIRKS="pic ioapic lapic amdvi"; QEMU+=(-device amd-iommu) ;;
     *) echo "unknown case $case_name"; exit 2 ;;
 esac
 CMDLINE="$OB_EXPECT_CMDLINE"
 kernel="$OUT/conformance-$case_name"
 scripts/build-conformance.sh "$kernel"
+if [ -n "$QUIRKS" ]; then
+    cargo build -q --release -p optimal-boot-quirk --target x86_64-unknown-uefi
+    export QUIRK_EFI=$PWD/target/x86_64-unknown-uefi/release/optimal-boot-quirk.efi QUIRKS
+fi
 
 status=0
 for l in $loaders; do
@@ -54,7 +84,19 @@ for l in $loaders; do
     fi
     if [ "$l" = optimal ]; then
         KERNEL="$kernel" CMDLINE="$CMDLINE" MODULES="$OUT/pattern" scripts/build-images.sh >/dev/null
+        if [ -n "$QUIRKS" ]; then
+            # Put the injector in front: it chain-loads \EFI\BOOT\NEXT.EFI.
+            printf '%s\n' "$QUIRKS" > "$OUT/QUIRKS.TXT"
+            esp="$OUT/disk.img@@1M"
+            mmove -i "$esp" ::EFI/BOOT/BOOTX64.EFI ::EFI/BOOT/NEXT.EFI
+            mcopy -i "$esp" "$QUIRK_EFI" ::EFI/BOOT/BOOTX64.EFI
+            mcopy -i "$esp" "$OUT/QUIRKS.TXT" ::EFI/BOOT/QUIRKS.TXT
+        fi
         drive=(-drive format=raw,file="$OUT/disk.img")
+    elif [ -n "$QUIRKS" ]; then
+        # A GPT disk rather than a CD, so the injector can sit in front.
+        CMDLINE="$CMDLINE" MODULES="$OUT/pattern" scripts/limine-image.sh "$kernel" "$OUT/limine-$case_name.img"
+        drive=(-drive format=raw,file="$OUT/limine-$case_name.img")
     else
         CMDLINE="$CMDLINE" MODULES="$OUT/pattern" scripts/limine-image.sh "$kernel" "$OUT/limine-$case_name.iso"
         drive=(-cdrom "$OUT/limine-$case_name.iso")
@@ -65,6 +107,22 @@ for l in $loaders; do
     if ! grep -aq "OPTIMAL-CONFORMANCE: PASS" "$log"; then
         grep -a "^FAIL\|FATAL" "$log" || tail -20 "$log"
         status=1
+    fi
+    if [ -n "$QUIRKS" ]; then
+        # The test only counts if every quirk really took.
+        applied=$(grep -a "^OPTIMAL-QUIRK: applied:" "$log" || true)
+        echo "  ${applied:-OPTIMAL-QUIRK: no report (the injector did not run)}"
+        grep -a "^OPTIMAL-QUIRK: detail:" "$log" | sed 's/^/  /' || true
+        if grep -aq "^skip rev5-lapic" "$log"; then
+            echo "  the kernel skipped the local APIC checks under $l: this run proves nothing about them"
+            status=1
+        fi
+        for q in $QUIRKS; do
+            if ! grep -qw -- "$q" <<<"${applied#*applied:}"; then
+                echo "  quirk $q did not take under $l: this run proves nothing about it"
+                status=1
+            fi
+        done
     fi
 done
 exit $status

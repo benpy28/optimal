@@ -4,7 +4,7 @@
 # soon as the kernel or the loader reports it is done.
 set -uo pipefail
 log="$1"; timeout="$2"; shift 2
-DONE='OPTIMAL: kernel booted|KERNEL PANIC|OPTIMAL-BOOT: FATAL|OPTIMAL-CONFORMANCE: (PASS|FAIL)|Access Denied|Security Violation'
+DONE='OPTIMAL: kernel booted|KERNEL PANIC|OPTIMAL-BOOT: FATAL|OPTIMAL-QUIRK: FATAL|OPTIMAL-CONFORMANCE: (PASS|FAIL)|Access Denied|Security Violation'
 rm -f "$log"
 ACCEL=()
 # QEMU_ACCEL=tcg forces the emulator (to test CPU features the host lacks).

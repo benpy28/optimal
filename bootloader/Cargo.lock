@@ -138,6 +138,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "optimal-boot-quirk"
+version = "0.1.0"
+dependencies = [
+ "optimal-boot-core",
+]
+
+[[package]]
 name = "optimal-boot-sign"
 version = "0.1.0"
 dependencies = [

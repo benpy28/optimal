@@ -2031,6 +2031,18 @@ fn platform(t: &mut T, c: &Ctx) {
     if c.rev >= 5 {
         let ab = rdmsr(0x1b);
         let x2 = ab & (1 << 10) != 0;
+        // "If available": a globally disabled APIC that the CPU will not
+        // re-enable before a reset (CPUID.1:EDX.APIC then reads 0) is not.
+        // The quirk-apic-off case refuses this skip, so it is never how a
+        // loader passes that test.
+        let cpuid_apic = core::arch::x86_64::__cpuid(1).edx & (1 << 9) != 0;
+        let lapic_off = ab & (1 << 11) == 0 && !cpuid_apic;
+        if lapic_off {
+            t.skip(
+                "rev5-lapic",
+                "local APIC not available (globally disabled, cannot be re-enabled)",
+            );
+        }
         let base = ab & 0x000f_ffff_ffff_f000;
         let rd = |off: u32| -> u32 {
             if x2 {
@@ -2043,12 +2055,12 @@ fn platform(t: &mut T, c: &Ctx) {
         check!(
             t,
             "rev5-lapic",
-            ab & (1 << 11) != 0 && svr & 0x3ff == 0x1ff && tpr == 0,
+            lapic_off || ab & (1 << 11) != 0 && svr & 0x3ff == 0x1ff && tpr == 0,
             "APIC base {ab:#x}, SVR {svr:#x}, TPR {tpr:#x}"
         );
         let max_lvt = rd(0x30) >> 16 & 0xff;
         let mut bad = None;
-        for (off, name) in LAPIC_LVTS {
+        for (off, name) in LAPIC_LVTS.iter().copied().filter(|_| !lapic_off) {
             let present = match off {
                 0x330 => max_lvt >= 5,
                 0x340 => max_lvt >= 4,
