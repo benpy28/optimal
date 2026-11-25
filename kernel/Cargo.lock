@@ -36,8 +36,13 @@ dependencies = [
  "optimal-acpi",
  "optimal-apic",
  "optimal-mm",
+ "optimal-time",
 ]
 
 [[package]]
 name = "optimal-mm"
+version = "0.0.1"
+
+[[package]]
+name = "optimal-time"
 version = "0.0.1"

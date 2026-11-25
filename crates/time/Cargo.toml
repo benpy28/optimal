@@ -1,0 +1,12 @@
+[package]
+name = "optimal-time"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "Time keeping logic for the Optimal kernel: exact rational frequencies, ticks to nanoseconds without drift or overflow, calibration with a proven error bound, and the HPET, ACPI PM timer, 8254 PIT and CPUID timing encodings. Pure, safe Rust with no hardware access, written from the IA-PC HPET specification 1.0a, ACPI 6.5, the Intel 8254 datasheet and the Intel SDM, and tested on the host."
+
+[dependencies]
+
+[dev-dependencies]
+# Property-based testing (MIT OR Apache-2.0).
+proptest = { version = "1", default-features = false, features = ["std"] }
