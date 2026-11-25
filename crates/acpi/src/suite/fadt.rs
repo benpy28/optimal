@@ -19,6 +19,10 @@ const CENTURY: usize = 108;
 const BOOT_ARCH: usize = 109;
 const FLAGS: usize = 112;
 const X: usize = 208;
+const FACS32: usize = 36;
+const DSDT32: usize = 40;
+const XFACS: usize = 132;
+const XDSDT: usize = 140;
 
 fn gas(space: u8, addr: u64) -> Vec<u8> {
     let mut g = vec![space, 32, 0, 3];
@@ -49,6 +53,10 @@ fn acpi_1_fadt_hand_worked() {
             hw_reduced: false,
             boot_arch: 0,
             century: Some(0x32),
+            dsdt: None,
+            dsdt_mismatch: false,
+            facs: None,
+            facs_mismatch: false,
         }
     );
 }
@@ -198,8 +206,106 @@ fn flags_and_boot_arch_bits() {
     assert!(!Fadt::parse(&bad).unwrap().checksum_ok);
 }
 
+#[test]
+fn dsdt_and_facs_hand_worked() {
+    // ACPI 1.0 table (116 bytes): only the 32-bit fields exist.
+    let t = fadt(
+        116,
+        &[
+            (FACS32, &0x7ffe_0000u32.to_le_bytes()),
+            (DSDT32, &0x7ffe_0040u32.to_le_bytes()),
+        ],
+    );
+    let f = Fadt::parse(&t).unwrap();
+    assert_eq!((f.dsdt, f.dsdt_mismatch), (Some(0x7ffe_0040), false));
+    assert_eq!((f.facs, f.facs_mismatch), (Some(0x7ffe_0000), false));
+    // Both set and equal (QEMU does this): no mismatch.
+    let t = fadt(
+        244,
+        &[
+            (FACS32, &0x1000u32.to_le_bytes()),
+            (DSDT32, &0x2000u32.to_le_bytes()),
+            (XFACS, &0x1000u64.to_le_bytes()),
+            (XDSDT, &0x2000u64.to_le_bytes()),
+        ],
+    );
+    let f = Fadt::parse(&t).unwrap();
+    assert_eq!((f.dsdt, f.dsdt_mismatch), (Some(0x2000), false));
+    assert_eq!((f.facs, f.facs_mismatch), (Some(0x1000), false));
+    // Both set and different: the X_ field wins and the clash is reported.
+    let t = fadt(
+        244,
+        &[
+            (FACS32, &0x1000u32.to_le_bytes()),
+            (DSDT32, &0x2000u32.to_le_bytes()),
+            (XFACS, &0x1_0000_1000u64.to_le_bytes()),
+            (XDSDT, &0x1_0000_2000u64.to_le_bytes()),
+        ],
+    );
+    let f = Fadt::parse(&t).unwrap();
+    assert_eq!((f.dsdt, f.dsdt_mismatch), (Some(0x1_0000_2000), true));
+    assert_eq!((f.facs, f.facs_mismatch), (Some(0x1_0000_1000), true));
+    // Only the X_ fields set: used, no mismatch.
+    let t = fadt(
+        244,
+        &[
+            (XFACS, &0x3000u64.to_le_bytes()),
+            (XDSDT, &0x4000u64.to_le_bytes()),
+        ],
+    );
+    let f = Fadt::parse(&t).unwrap();
+    assert_eq!((f.dsdt, f.dsdt_mismatch), (Some(0x4000), false));
+    assert_eq!((f.facs, f.facs_mismatch), (Some(0x3000), false));
+    // Nothing set: none (a HW-reduced machine may have no FACS).
+    let f = Fadt::parse(&fadt(244, &[])).unwrap();
+    assert_eq!((f.dsdt, f.facs), (None, None));
+}
+
+#[test]
+fn x_fields_need_the_bytes() {
+    // X_FIRMWARE_CTRL is bytes 132..140 and X_DSDT 140..148. A 147-byte
+    // table has the first but not the second, so DSDT falls back to the
+    // 32-bit field.
+    let mut t = fadt(
+        148,
+        &[
+            (DSDT32, &0x2000u32.to_le_bytes()),
+            (XFACS, &0x5000u64.to_le_bytes()),
+            (XDSDT, &0x6000u64.to_le_bytes()),
+        ],
+    );
+    let f = Fadt::parse(&t).unwrap();
+    assert_eq!((f.dsdt, f.dsdt_mismatch), (Some(0x6000), true));
+    assert_eq!(f.facs, Some(0x5000));
+    t.truncate(147);
+    t[4..8].copy_from_slice(&147u32.to_le_bytes());
+    let f = Fadt::parse(&t).unwrap();
+    assert_eq!((f.dsdt, f.dsdt_mismatch), (Some(0x2000), false));
+    assert_eq!(f.facs, Some(0x5000));
+    t.truncate(139);
+    t[4..8].copy_from_slice(&139u32.to_le_bytes());
+    assert_eq!(Fadt::parse(&t).unwrap().facs, None);
+}
+
 proptest! {
     #![proptest_config(super::config(3000))]
+
+    /// The address rule for both DSDT and FACS: the X_ field when non-zero,
+    /// else the 32-bit field when non-zero, else none; a clash is reported
+    /// only when both are non-zero and differ.
+    #[test]
+    fn address_choice_rule(f32: u32, x: u64, d32: u32, xd: u64, zero_mask in 0u8..16) {
+        let pick = |bit: u8, v: u64| if zero_mask & bit != 0 { 0 } else { v };
+        let (f32, x, d32, xd) = (pick(1, f32.into()) as u32, pick(2, x), pick(4, d32.into()) as u32, pick(8, xd));
+        let t = fadt(244, &[(FACS32, &f32.to_le_bytes()), (XFACS, &x.to_le_bytes()), (DSDT32, &d32.to_le_bytes()), (XDSDT, &xd.to_le_bytes())]);
+        let f = Fadt::parse(&t).unwrap();
+        let rule = |l: u32, x: u64| {
+            let addr = if x != 0 { Some(x) } else if l != 0 { Some(u64::from(l)) } else { None };
+            (addr, l != 0 && x != 0 && u64::from(l) != x)
+        };
+        prop_assert_eq!((f.facs, f.facs_mismatch), rule(f32, x));
+        prop_assert_eq!((f.dsdt, f.dsdt_mismatch), rule(d32, xd));
+    }
 
     #[test]
     fn random_fadt_never_panics(body in proptest::collection::vec(any::<u8>(), 0..300)) {

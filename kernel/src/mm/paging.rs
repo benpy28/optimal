@@ -17,7 +17,9 @@
 //! Virtual layout of the kernel half (PML4 slots, 512 GiB each):
 //!   256..448  direct map region (96 TiB), the map placed at random in it
 //!   448..480  kernel stacks region (16 TiB), placed at random in it
-//!   480..510  reserved for the heap and other kernel mappings (Phase 1b+)
+//!   480       firmware read window: one page at a random spot, mapped only
+//!             while the ACPI reader copies a table out (1c)
+//!   481..510  reserved for other kernel mappings
 //!   510       never mapped
 //!   511       kernel image (Limine places it at random in the top 2 GiB)
 
@@ -34,6 +36,7 @@ const SLOT: u64 = 512 * GIB;
 const KERNEL_HALF: u64 = 0xffff_8000_0000_0000;
 pub const DIRECT_REGION: (u64, u64) = (KERNEL_HALF, KERNEL_HALF + 192 * SLOT);
 pub const STACK_REGION: (u64, u64) = (KERNEL_HALF + 192 * SLOT, KERNEL_HALF + 224 * SLOT);
+pub const WINDOW_REGION: (u64, u64) = (KERNEL_HALF + 224 * SLOT, KERNEL_HALF + 225 * SLOT);
 
 /// An address in PML4 slot 510, which is never mapped: a hole between
 /// everything else and the kernel image. Crash tests use it.
@@ -247,6 +250,28 @@ fn map_or_panic(
     }
 }
 
+/// The framebuffer's physical pages, [start, end).
+fn framebuffer_span(info: &BootInfo) -> Option<(u64, u64)> {
+    info.framebuffer.map(|fb| {
+        let start = fb.phys & !(PAGE_SIZE - 1);
+        let end = (fb.phys + fb.pitch * fb.height).next_multiple_of(PAGE_SIZE);
+        (start, end)
+    })
+}
+
+/// Every physical span the direct map covers, as [start, end), each to be
+/// rounded out to whole pages: the RAM entries of the memory map and the
+/// framebuffer. `build_and_switch` maps exactly these; the ACPI reader uses
+/// the same list to know which firmware pages it can read in place.
+pub fn for_each_direct_span(info: &BootInfo, mut f: impl FnMut(u64, u64)) {
+    for e in info.memory_map().iter().filter(|e| e.kind.is_ram()) {
+        f(e.base, e.base + e.len);
+    }
+    if let Some((s, e)) = framebuffer_span(info) {
+        f(s, e);
+    }
+}
+
 /// Build the kernel's page tables, switch to them and to a guarded boot
 /// stack, and continue in `next` (which never returns). Limine's HHDM, its
 /// page tables and its stack are not used again after this.
@@ -290,17 +315,8 @@ pub unsafe fn build_and_switch(info: &BootInfo, next: extern "C" fn() -> !) -> !
 
     // Direct map of RAM, at a random 1 GiB-aligned base.
     let mut top = 0;
-    for e in info.memory_map().iter().filter(|e| e.kind.is_ram()) {
-        top = top.max(e.base + e.len);
-    }
-    let fb = info.framebuffer.map(|fb| {
-        let start = fb.phys & !(PAGE_SIZE - 1);
-        let end = (fb.phys + fb.pitch * fb.height).next_multiple_of(PAGE_SIZE);
-        (start, end)
-    });
-    if let Some((_, end)) = fb {
-        top = top.max(end);
-    }
+    for_each_direct_span(info, |_, end| top = top.max(end));
+    let fb = framebuffer_span(info);
     let span = top.next_multiple_of(GIB);
     let slots = (DIRECT_REGION.1 - DIRECT_REGION.0 - span) / GIB + 1;
     assert!(
@@ -411,13 +427,6 @@ pub fn finish_switch() {
 
 /// Map one 4 KiB page in the kernel's tables (later kernel mappings and
 /// tests). The caller flushes nothing: a new mapping has no stale entry.
-#[cfg_attr(
-    not(feature = "ktest"),
-    expect(
-        dead_code,
-        reason = "first user outside tests is 1c (ACPI and APIC mappings)"
-    )
-)]
 pub fn map_kernel_page(
     virt: u64,
     phys: u64,
@@ -438,13 +447,6 @@ pub fn map_kernel_page(
 }
 
 /// Unmap one 4 KiB kernel page and flush it from this CPU's TLB.
-#[cfg_attr(
-    not(feature = "ktest"),
-    expect(
-        dead_code,
-        reason = "first user outside tests is 1c (ACPI and APIC mappings)"
-    )
-)]
 pub fn unmap_kernel_page(virt: u64) -> Result<u64, optimal_mm::paging::MapError> {
     let guard = KERNEL_SPACE.lock();
     let space = guard.as_ref().expect("kernel page tables not built yet");

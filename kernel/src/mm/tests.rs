@@ -14,13 +14,23 @@ use crate::mm::frames::{self, phys_to_virt, virt_to_phys};
 
 const MAGIC: u64 = 0x0b71_3a1f_5eed_f00d;
 
-/// Memory the allocator may hand out: usable, or the bootloader's, which
-/// is reclaimed once the kernel runs on its own page tables.
+/// Memory the allocator may hand out: usable, the bootloader's (reclaimed
+/// once the kernel runs on its own page tables), or ACPI reclaimable memory
+/// (reclaimed once the tables are copied), except the FACS's pages.
 fn usable(phys: u64) -> bool {
+    let in_facs = match crate::acpi::get() {
+        Ok(a) => a.facs.is_some_and(|(s, e)| {
+            (s & !(PAGE_SIZE - 1)) <= phys && phys < e.next_multiple_of(PAGE_SIZE)
+        }),
+        Err(_) => false,
+    };
     bootinfo::get().memory_map().iter().any(|e| {
-        matches!(e.kind, Kind::Usable | Kind::BootloaderReclaimable)
-            && e.base <= phys
-            && phys - e.base < e.len
+        let allocatable = match e.kind {
+            Kind::Usable | Kind::BootloaderReclaimable => true,
+            Kind::AcpiReclaimable => !in_facs,
+            _ => false,
+        };
+        allocatable && e.base <= phys && phys - e.base < e.len
     })
 }
 
@@ -68,7 +78,12 @@ ktest!(every_free_frame_is_handed_out_exactly_once, {
     let top = bootinfo::get()
         .memory_map()
         .iter()
-        .filter(|e| matches!(e.kind, Kind::Usable | Kind::BootloaderReclaimable))
+        .filter(|e| {
+            matches!(
+                e.kind,
+                Kind::Usable | Kind::BootloaderReclaimable | Kind::AcpiReclaimable
+            )
+        })
         .map(|e| e.base + e.len)
         .max()
         .unwrap();

@@ -9,6 +9,8 @@ publish = false
 limine = "0.5"
 # Frame allocator, zones and page-table logic, tested on the host.
 optimal-mm = { path = "../crates/mm" }
+# ACPI table parsing, tested on the host.
+optimal-acpi = { path = "../crates/acpi" }
 
 [features]
 # Build the in-kernel test suite into the image (CI boots this build).

@@ -6,6 +6,7 @@ use limine::paging;
 use limine::request::{
     BootloaderInfoRequest, ExecutableAddressRequest, ExecutableCmdlineRequest, FramebufferRequest,
     HhdmRequest, MemoryMapRequest, PagingModeRequest, RequestsEndMarker, RequestsStartMarker,
+    RsdpRequest,
 };
 
 #[used]
@@ -35,6 +36,11 @@ pub static HHDM: HhdmRequest = HhdmRequest::new();
 #[used]
 #[unsafe(link_section = ".requests")]
 pub static EXECUTABLE_ADDRESS: ExecutableAddressRequest = ExecutableAddressRequest::new();
+
+/// Where the firmware's ACPI RSDP is (none on machines without ACPI).
+#[used]
+#[unsafe(link_section = ".requests")]
+pub static RSDP: RsdpRequest = RsdpRequest::new();
 
 /// 4-level paging, asked for explicitly: the kernel's page tables are
 /// 4-level until LA57 support lands.
