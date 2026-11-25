@@ -22,6 +22,9 @@ CASES=(
   "# only a comment|bad QUIRKS.TXT word \"(no quirks listed)\""
   "pic vtd|quirk vtd asked for, but this machine has no such hardware"
   "pic amdvi|quirk amdvi asked for, but this machine has no such hardware"
+  "acpi-dsdt-clash acpi-dsdt-in-ecam|bad QUIRKS.TXT word \"acpi-dsdt-clash together with acpi-dsdt-in-ecam\""
+  "acpi-xsdt-signature acpi-rsdp-checksum|bad QUIRKS.TXT word \"acpi-xsdt-signature together with acpi-rsdp-checksum\""
+  "acpi-madt-junk|ACPI quirks asked for, but the MADT needs 3 Processor Local APIC entries and one entry after them (use -smp 3 or more)"
 )
 status=0
 for c in "${CASES[@]}"; do

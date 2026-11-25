@@ -68,8 +68,9 @@ jobs:
           retention-days: 14
 
   # Tough but realistic conditions (scripts/tough-test.sh): odd CPUs, NUMA,
-  # odd memory, firmware quirks and other OVMF builds, Secure Boot attacks,
-  # and a host fighting for CPU. Runs alongside build-and-boot.
+  # odd memory, firmware quirks and other OVMF builds, ACPI tables broken in
+  # RAM, Secure Boot attacks, and a host fighting for CPU. Runs alongside
+  # build-and-boot.
   tough-conditions:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -86,7 +87,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends qemu-system-x86 xorriso ovmf \
-            stress-ng sbsigntool mtools python3-virt-firmware
+            stress-ng sbsigntool mtools python3-virt-firmware dosfstools fdisk
 
       - name: Install Rust (version pinned in kernel/rust-toolchain.toml)
         working-directory: kernel
@@ -94,6 +95,12 @@ jobs:
 
       - name: Build kernel and ISOs
         run: ./scripts/build-iso.sh
+
+      - name: Build the firmware-quirk injector (breaks ACPI tables in RAM)
+        working-directory: bootloader
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          cargo build --release -p optimal-boot-quirk --target x86_64-unknown-uefi
 
       - name: Build Secure Boot images (throwaway test keys)
         run: ./scripts/secureboot.sh

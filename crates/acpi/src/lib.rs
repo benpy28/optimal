@@ -1,10 +1,11 @@
 //! ACPI table parsing for the Optimal kernel.
 //!
 //! Written from the ACPI 6.5 specification (sections 5.2.5 to 5.2.12 and
-//! 5.2.9 for the FADT) and the IA-PC HPET specification 1.0a. Plain safe
-//! Rust with no hardware access: the kernel copies each table out of
-//! firmware memory and hands the bytes in, so every parser works on a byte
-//! slice and is tested on the host.
+//! 5.2.9 for the FADT), the IA-PC HPET specification 1.0a and the PCI
+//! Firmware Specification 3.3 (the MCFG). Plain safe Rust with no hardware
+//! access: the kernel copies each table out of firmware memory and hands
+//! the bytes in, so every parser works on a byte slice and is tested on the
+//! host.
 //!
 //! Policy for broken firmware (real machines ship all of these):
 //! - A table whose checksum is wrong is still parsed, because many shipping
@@ -23,6 +24,7 @@ extern crate alloc;
 pub mod fadt;
 pub mod hpet;
 pub mod madt;
+pub mod mcfg;
 pub mod reach;
 pub mod tables;
 

@@ -10,6 +10,7 @@
 use core::arch::x86_64::__cpuid_count;
 
 use optimal_acpi::checksum;
+use optimal_acpi::mcfg::Mcfg;
 use optimal_acpi::tables::PhysRead;
 use optimal_mm::PAGE_SIZE;
 
@@ -19,9 +20,14 @@ use crate::ktest;
 use crate::mm::{LOW_MEMORY_END, frames, paging};
 
 /// A reader as it is after boot: ACPI reclaimable memory belongs to the
-/// frame allocator now, so it is refused like any other kernel RAM.
+/// frame allocator now, so it is refused like any other kernel RAM, and so
+/// is PCI configuration space.
 fn reader() -> FirmwareMem {
-    FirmwareMem::new(bootinfo::get(), false, window_page())
+    let pci = match crate::acpi::get() {
+        Ok(a) => a.pci_config.as_slice(),
+        Err(_) => &[],
+    };
+    FirmwareMem::new(bootinfo::get(), false, window_page(), pci)
 }
 
 /// Reads `len` bytes (at most 64) into a buffer pre-filled with 0xa5, and
@@ -198,11 +204,21 @@ ktest!(every_table_copy_is_whole, {
         assert_eq!(checksum(&t.bytes) == 0, t.checksum_ok);
         assert!(t.phys != 0);
     }
-    // A FADT on a machine that isn't hardware-reduced means a DSDT copy.
+    // A FADT on a machine that isn't hardware-reduced means a DSDT copy,
+    // unless the FADT points it into PCI configuration space.
     if let Some(f) = &a.fadt
         && !f.hw_reduced
     {
-        assert!(a.table(b"DSDT").is_some(), "FADT but no DSDT copied");
+        let in_pci = f.dsdt.is_some_and(|p| {
+            a.pci_config
+                .iter()
+                .any(|s| s.start < p.saturating_add(8) && p < s.end)
+        });
+        assert_eq!(
+            a.table(b"DSDT").is_some(),
+            !in_pci,
+            "DSDT copied (or not) against the FADT"
+        );
     }
     // The heap copies hold no pointer into firmware memory: they are in
     // the direct map's view of kernel RAM.
@@ -321,4 +337,61 @@ ktest!(direct_map_spans_are_mapped, {
         }
     });
     crate::println!("ktest: {checked} direct-map pages checked");
+});
+
+ktest!(pci_config_space_is_refused, {
+    let Ok(a) = crate::acpi::get() else {
+        crate::println!("ktest: no ACPI on this machine");
+        return;
+    };
+    // The refused ranges are exactly those of every MCFG copied (the reader
+    // was built from the same tables before the copies were made).
+    let mut expect = alloc::vec::Vec::new();
+    for t in a.tables.iter().filter(|t| &t.signature == b"MCFG") {
+        if let Ok(m) = Mcfg::parse(&t.bytes) {
+            expect.extend(m.refused());
+        }
+    }
+    assert_eq!(a.pci_config, expect);
+    assert_eq!(a.mcfg.is_some(), a.table(b"MCFG").is_some());
+    if a.pci_config.is_empty() {
+        crate::println!("ktest: no PCI configuration space listed (no MCFG); nothing to refuse");
+        return;
+    }
+    let mem = reader();
+    let map_only = FirmwareMem::new(bootinfo::get(), false, window_page(), &[]);
+    for s in &a.pci_config {
+        for p in [s.start, s.start + 4096, s.end - 4] {
+            assert_eq!(
+                try_read(&mem, p, 4),
+                (false, true),
+                "PCI config {p:#x} read"
+            );
+        }
+        // A read that only starts below the range is refused too.
+        assert!(!mem.allows(s.start - 1, 2));
+        crate::println!(
+            "ktest: PCI config {:#x}..{:#x} refused ({} by the memory map alone)",
+            s.start,
+            s.end,
+            if map_only.allows(s.start, 1) {
+                "would be readable"
+            } else {
+                "also refused"
+            }
+        );
+    }
+    // No table copy came from there.
+    for t in &a.tables {
+        let end = t.phys + t.bytes.len() as u64;
+        assert!(
+            !a.pci_config.iter().any(|s| s.start < end && t.phys < s.end),
+            "{:?} copied from PCI configuration space",
+            t.signature
+        );
+    }
+    assert!(
+        paging::translate(mem.window()).is_none(),
+        "read window left mapped"
+    );
 });
