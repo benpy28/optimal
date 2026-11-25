@@ -52,6 +52,12 @@ pub enum BlockKind {
     SpaceTable = 4,
     FreeLog = 5,
     Superblock = 6,
+    /// The commit's root block (tree and space-map roots, counters).
+    Root = 7,
+    /// Chunk-table leaf (logical metadata chunk -> two physical copies).
+    ChunkLeaf = 8,
+    /// Chunk-table interior table.
+    ChunkTable = 9,
 }
 
 /// Argon2id parameters for turning a passphrase into a key-encryption key.
@@ -178,8 +184,25 @@ pub fn unwrap_key(
 }
 
 /// The per-volume sealing engine.
+///
+/// Metadata is stored twice (two physical copies of each logical block).
+/// The copies must not be byte-identical, or a drive that deduplicates or
+/// compresses writes could keep only one. Copy 0 is the normal sealed
+/// block. Copy 1 is copy 0 XOR a *copy mask*: on encrypted volumes the
+/// XOR of the XChaCha20 keystreams under the block key and under a
+/// separate copy-1 subkey with the same nonce (so copy 1 is exactly the
+/// encryption of the plaintext under the subkey), on plain volumes a
+/// BLAKE3 XOF of the block's associated data under a copy-1 key. A reader
+/// turns copy 1 back into copy 0 with the same XOR and checks the MAC in
+/// the parent pointer, so both copies are bound by one Merkle MAC. No
+/// (key, nonce) pair ever repeats: copy 0 uses the block key, copy 1 the
+/// subkey, and the re-derived copy 0 is only compared, never written.
 pub struct Sealer {
     aead: Option<XChaCha20Poly1305>,
+    /// Copy-1 subkey cipher (encrypted volumes).
+    aead1: Option<XChaCha20Poly1305>,
+    /// Copy-1 mask key (plain volumes).
+    copy1_key: [u8; 32],
     checksum_key: [u8; 32],
     /// Key for hashing directory entry names (keeps the on-disk name hash
     /// order from leaking anything and stops hash-flooding).
@@ -198,6 +221,7 @@ impl core::fmt::Debug for Sealer {
 impl Drop for Sealer {
     fn drop(&mut self) {
         self.checksum_key.zeroize();
+        self.copy1_key.zeroize();
         self.name_key.zeroize();
     }
 }
@@ -215,6 +239,8 @@ impl Sealer {
                 let base = blake3::derive_key("OptimalFS v1 plain checksum key", &ctx);
                 Sealer {
                     aead: None,
+                    aead1: None,
+                    copy1_key: blake3::derive_key("OptimalFS v1 plain copy 1 mask key", &base),
                     checksum_key: base,
                     name_key: blake3::derive_key("OptimalFS v1 plain name hash key", &base),
                     uuid,
@@ -224,10 +250,15 @@ impl Sealer {
             }
             Some(m) => {
                 let mut bk = blake3::derive_key("OptimalFS v1 block encryption key", &m.0);
+                let mut k1 = blake3::derive_key("OptimalFS v1 copy 1 block encryption key", &bk);
                 let aead = XChaCha20Poly1305::new(&bk.into());
+                let aead1 = XChaCha20Poly1305::new(&k1.into());
                 bk.zeroize();
+                k1.zeroize();
                 Sealer {
                     aead: Some(aead),
+                    aead1: Some(aead1),
+                    copy1_key: [0; 32],
                     checksum_key: blake3::derive_key("OptimalFS v1 encrypted checksum key", &m.0),
                     name_key: blake3::derive_key("OptimalFS v1 encrypted name hash key", &m.0),
                     uuid,
@@ -310,6 +341,67 @@ impl Sealer {
         let nonce = self.next_nonce();
         let mac = self.seal_with(kind, addr, birth, &nonce, buf);
         (nonce, mac)
+    }
+
+    /// Turns a plaintext block into its copy-1 bytes (the copy-0 bytes are
+    /// [`Sealer::seal_with`]'s output for the same arguments).
+    pub fn seal_copy1(
+        &self,
+        kind: BlockKind,
+        addr: u64,
+        birth: u64,
+        nonce: &[u8; NONCE_LEN],
+        buf: &mut [u8],
+    ) {
+        let ad = self.ad(kind, addr, birth);
+        match &self.aead1 {
+            // Encryption is a keystream XOR; the tag is not needed (the
+            // parent's MAC covers copy 0, which copy 1 maps back to).
+            Some(c) => {
+                let _ = c
+                    .encrypt_inout_detached(&xnonce(nonce), &ad, buf.into())
+                    .expect("seal copy 1");
+            }
+            None => self.xor_plain_mask(&ad, buf),
+        }
+    }
+
+    /// Converts copy-0 bytes to copy-1 bytes or back (an involution: it is
+    /// an XOR with a mask that depends only on the keys, nonce and
+    /// associated data). Nothing is verified; check the result with
+    /// [`Sealer::open`] as copy 0.
+    pub fn swap_copy(
+        &self,
+        kind: BlockKind,
+        addr: u64,
+        birth: u64,
+        nonce: &[u8; NONCE_LEN],
+        buf: &mut [u8],
+    ) {
+        let ad = self.ad(kind, addr, birth);
+        match (&self.aead, &self.aead1) {
+            (Some(c0), Some(c1)) => {
+                for c in [c0, c1] {
+                    let _ = c
+                        .encrypt_inout_detached(&xnonce(nonce), &ad, (&mut *buf).into())
+                        .expect("copy mask");
+                }
+            }
+            _ => self.xor_plain_mask(&ad, buf),
+        }
+    }
+
+    fn xor_plain_mask(&self, ad: &[u8], buf: &mut [u8]) {
+        let mut h = blake3::Hasher::new_keyed(&self.copy1_key);
+        h.update(ad);
+        let mut xof = h.finalize_xof();
+        let mut m = [0u8; 64];
+        for c in buf.chunks_mut(64) {
+            xof.fill(&mut m[..c.len()]);
+            for (x, y) in c.iter_mut().zip(m.iter()) {
+                *x ^= y;
+            }
+        }
     }
 
     /// Verifies (and decrypts) `buf` in place.

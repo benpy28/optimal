@@ -10,7 +10,7 @@ was written from first principles. The byte-level format is in
 
 The crate is `no_std` + `alloc` and talks to storage only through the
 `BlockDevice` trait, so it runs on the host today (tests, tools) and links
-into the kernel unchanged in Phase 4.
+into the kernel unchanged in the file system track, after Phase 4a.
 
 ## Goals, in order
 
@@ -125,6 +125,63 @@ rolled-back one after the bump returned.
 - **Delayed allocation**: file data and tree nodes get disk addresses only
   when written, which keeps files and tree nodes contiguous.
 
+## Duplicated metadata
+
+Every metadata block (tree nodes, space-map blocks, free-log blocks, the
+root block) is stored twice, on single-disk volumes too, so one bad sector
+or a small damaged region never loses a directory or the volume. File data
+is stored once (users who want two copies of data use two devices).
+
+**Logical addresses.** Pointers stay 64 bytes and hold a *logical* address
+for metadata. Metadata is allocated in chunks of up to 64 blocks
+(`auto_chunk_blocks`: the device size / 64, clamped to 4..64 and rounded
+down to a power of two; set at format). A chunk is backed by two physical
+runs, normally half the device apart. The MAC binds the logical address,
+so nothing above the chunk table knows a physical metadata address, and a
+chunk can be moved by copying it and changing one entry.
+
+**The chunk table** maps chunk ids to `(copy 0 run, copy 1 run, used
+slots, length)`. It is a copy-on-write radix tree (leaves of 128 entries,
+tables of 32 children with free and mapped counts, depth grown as needed)
+whose blocks are themselves stored twice. Its root is in every root set:
+the superblock core of this commit and of each of the 8 commits in the
+history. So a fallback to an older commit resolves that commit's logical
+addresses through the table that commit wrote. Freed metadata blocks and
+chunk runs go through the same K = 8 commit quarantine as everything else,
+and a chunk is released only when it is empty and none of its slots are
+still quarantined.
+
+**The two copies differ.** Copy 1 is copy 0 passed through a second,
+keyed, per-block map (a second encryption pass under a per-copy subkey on
+encrypted volumes; a keyed BLAKE3 mask on plain ones), so a drive that
+deduplicates or compresses cannot collapse them into one physical block.
+Both are checked against the one MAC in the parent: a copy is good only if
+it turns back into exactly what the parent committed. Nothing from copy 1
+is used before that check. On plain volumes the mask key is public (as is
+the checksum key), so it only stops deduplication.
+
+**Reads and repair.** A normal read uses copy 0 and falls back to copy 1.
+After an unclean shutdown, recovery reads both copies of every recent
+block, and a scrub (`scrub_metadata`) reads both copies of everything. A
+bad copy is repaired at the next commit by *moving* it: its chunk run is
+rebuilt at a fresh place from the good blocks, the chunk entry is changed,
+and the old run is quarantined. A bad chunk-table block is rewritten to a
+new pair. Nothing live is ever overwritten in place, so a torn or
+misdirected repair write cannot damage a committed block, and a failing
+region is left behind rather than written again. A moved block keeps its
+old birth under unchanged parents, so the birth-pruned recovery walk would
+never reach it: each commit records the last generation that moved a run
+of live blocks, and if that falls inside the window, recovery reads all
+metadata (data blocks are still checked by birth). Moves are rare (repairs
+and relocation), so the usual unclean mount stays cheap. Read-only mounts count
+bad copies but never write.
+
+**Cost.** Metadata writes double; data writes don't. A fresh 4096-block
+volume uses 134 blocks (4 superblock slots, 2 x 64 for chunk 0, 2 for the
+chunk table root) where a single-copy design would use 8; on real volumes
+the extra is about the size of the metadata, which is a small fraction of
+the data.
+
 ## Snapshots
 
 A snapshot is just a saved tree root: O(1), and it shares every block.
@@ -156,7 +213,7 @@ system stops all writes on a single error. In this crate:
   the list) is to rebuild the failed commit from the dirty in-memory state
   with fresh allocations, so a permanently bad block is reallocated, not
   retried forever, and nothing dirty is lost.
-- The VFS (Phase 4) owns errseq, page retention while a device is gone,
+- The VFS (the file system track, after 4a) owns errseq, page retention while a device is gone,
   and the read-only switch.
 
 ## Testing
@@ -185,8 +242,23 @@ the heaviest testing in the project:
 - **Decoder fuzzing**: random and mutated bytes into every on-disk decoder.
 - **Hand-worked cases**: small examples with the expected numbers worked
   out in the comments (space usage, slot placement, nonce arithmetic).
+- **Duplicated metadata**: a flipped bit in either copy (found, reported,
+  repaired by moving), one bad copy of every metadata and chunk-table block
+  at once (nothing lost, all found by a scrub), both copies bad (never wrong
+  data), every copy pair differs on disk, chunk moves keep reading back and
+  keep the old runs quarantined, fallback through each commit's own chunk
+  table, the chunk table against a reference model, and decoder fuzzing.
+  The lying-drive suite moves chunks inside the window and prints the
+  fallback-depth distribution it saw (K must stay at least twice the
+  deepest).
 - **Mutation checks**: deliberate bugs (wrong snapshot rule, missing flush,
-  no quarantine, stale tail, ...) must each be caught by the suite.
+  no quarantine, stale tail, ...) must each be caught by the suite. For
+  duplicated metadata: no quarantine for moved runs or freed logical
+  blocks, fallback through the newest chunk table, identical copies, copy 1
+  accepted without the MAC check, repairs never done, a repair of the wrong
+  copy, stale chunk entries after a move or repair, reads that ignore the
+  write batch, copy 1 in the same half, and releasing a chunk with
+  quarantined slots.
 - **Nightly soak** in CI runs all of this with a much larger scale and new
   seeds every night. A failing seed is printed so it can be replayed with
   `OFS_SEED=<seed>`.
@@ -213,47 +285,73 @@ the heaviest testing in the project:
   creation is O(1) and the live write path never updates a refcount tree.
 - Inode numbers are never reused (64-bit), so stale handles can't alias.
 - Keyed name hashes: no hash-flooding, and the hash order leaks nothing.
+- Duplicated metadata through a logical address and a copy-on-write chunk
+  table (design review rounds 5 and 6). Pointers stay 64 bytes. Rejected:
+  pointers with two physical addresses (wider pointers, and every move
+  rewrites parents); a non-copy-on-write chunk table (a fallback would
+  resolve through the wrong mapping).
+- Copy 1 differs from copy 0 by a keyed per-block map, checked through the
+  parent's MAC. Rejected: a separate tag for copy 1 in a block trailer (it
+  costs space in every metadata block, and proves nothing the parent's MAC
+  doesn't); byte-identical copies (a deduplicating drive collapses them).
+- The copy 1 key is derived once per volume from the block key; its nonce
+  is the block's own, unique per write across mounts. Rejected: a copy 1
+  key per mount (adds a key derivation per read for no gain, since the
+  nonce is already unique).
+- Repair moves the bad copy (round 7). Rejected: rewriting in place (it
+  overwrites a live block, and writes again to a region that just failed).
+- One KDF for every internal subkey: BLAKE3 `derive_key`.
 
 ## Compliance with the storage design
 
-How each requirement `design/storage.md` places on this file system is met.
+Every requirement `design/storage.md` places on this file system, and the
+section that meets it. This table must be complete (no "open" rows) before
+the file system track is done.
 
-| Requirement | Where | State |
+| Requirement (storage.md) | Where it is met | State |
 |---|---|---|
-| Copy-on-write, never overwrite a live block | Crash consistency | done (proof target pending Kani) |
-| Atomic commits | Crash consistency | done, power-cut tested at every write point |
+| Copy-on-write never overwrites a live block (proof target) | Crash consistency; Duplicated metadata (repair moves) | done; Kani proof open |
+| Commits are atomic (proof target) | Crash consistency | done, power-cut tested at every write point; Kani proof open |
 | Torn-write model: any subset of unflushed writes, torn per 512 bytes | Crash consistency; `sim::CrashDevice` | done |
-| Lying drives: fallback within K = 8 commits, rescue beyond | Lying drives; FORMAT "Lying drives" | done (rescue mount open) |
-| Frozen plaintext header bytes 0..512 | FORMAT "Superblock" | done |
-| Nonce scheme: 128-bit per-mount prefix + 64-bit counter | Integrity and encryption | done |
-| Replay value in the superblock, bump across all slots | Integrity and encryption | done (TPM binding: stage 2) |
-| KDF floor min(1 GiB, RAM/4), >= 64 MiB, >= 4 passes | Integrity and encryption | done |
+| Lying drives: K = 8 commits (raised if the power-cut rig ever records a fallback deeper than K / 2), fallback within K, rescue beyond | Crash consistency ("Lying drives"); FORMAT "Lying drives" | done; distribution printed by the lying suite; rig data needs hardware; rescue mount open |
+| Root history: previous K commits' full root sets, each with the chunk table root | FORMAT "Body" (core) | done |
+| Free-block and chunk-free quarantine for K commits | Crash consistency; Duplicated metadata | done |
+| Lying-drive test with a metadata-chunk move inside the window | Testing ("Duplicated metadata") | done |
+| Fixed plaintext header area (bytes 0..512, unused bytes reserved and zero), generation and slot in the authenticated trailer | FORMAT "Superblock" | done |
+| Stage-1 header-block format and stage magic | | open, stage 2 migration |
+| Nonce scheme: random per-mount prefix + counter | Integrity and encryption | done |
+| Replay value in the superblock, bump across all slots in two waves | Integrity and encryption | done (TPM binding with the kernel) |
+| KDF floor min(1 GiB, RAM / 4), >= 64 MiB, >= 4 passes | Integrity and encryption | done |
 | TPM key-slot kind | FORMAT "Superblock" (kind 2 reserved) | reserved, stage 2 |
-| Key hierarchy: per-user, per-class, class-B per-file keys | | open, stage 2 |
+| Key hierarchy: volume, system, per-user, per-class, class-B per-file keys | | open, stage 2 |
 | File-name encryption | names live only in encrypted tree nodes | done |
-| Plaintext metadata list | Integrity and encryption ("what an attacker can see") | done |
-| Discard (TRIM) policy | | open (no discard issued yet) |
-| Per-file fsync intent log | FORMAT body (root reserved) | open |
-| Block-layer error policy (retry, errseq, read-only) | Errors | partly: commit rebuild after a write failure open |
-| Feature bits: compat, ro-compat, incompat | FORMAT "Feature bits" | done |
-| fsck, scrub, duplicated metadata, rescue mount, export tool | Testing; Not done yet | fsck done; others open |
-| Suspend and hibernation key handling, stage 1 to 2 migration | | open, kernel integration |
+| Exact list of plaintext metadata | Integrity and encryption ("what an attacker can see") | done |
+| Discard (TRIM) policy and what it reveals | | open (no discard issued yet) |
+| Rate limit on full commits | VFS (Crash consistency notes it) | with the VFS |
+| Hibernation region, stage 1 to 2 migration | | open, kernel integration |
+| Optional features: vault region (F3), travel class key (F5), remove a file from every snapshot (F12) | | open |
+| Per-file fsync intent log, benchmarked under background writeback; it also carries namespace operations (directory fsync, link, rename, O_TMPFILE plus linkat), syncfs latency has a published bound, and a dpkg-style create, fsync, rename, directory-fsync loop joins the tests | FORMAT body (root reserved) | open (next but one) |
+| Error policy: failed write retried at a new block, at most 3 writeback cycles | Errors | partly: commit rebuild after a write failure is next |
+| Metadata stored twice: 64-byte pointers with logical addresses, paired chunks, copy-on-write chunk table in every root set, MAC binds the logical address | Duplicated metadata; FORMAT "Duplicated metadata" | done |
+| The two copies differ; no (copy 1 key, nonce) pair repeats | Duplicated metadata; FORMAT "The second copy" | done (copy 1 checked through the parent's MAC rather than a trailer tag, as agreed in design review) |
+| Online scrub | Duplicated metadata (`scrub_metadata`) | done for metadata on an idle volume; online (concurrent) scrub open |
+| Checker (fsck), fuzzed with corrupted images | Testing | done |
+| Read-only rescue mount, export tool | | open |
+| Feature bits: compat, ro-compat, incompat; frozen before user data | FORMAT "Feature bits and versioning" | done |
+| Zero on free for page-cache frames of encrypted volumes | page cache interface (kernel) | with the VFS: noted for the page cache interface |
 
 ## Not done yet (tracked, in order)
 
-1. Duplicated metadata on single-disk volumes: pointers keep a logical
-   address, and a chunk table in the superblock maps each metadata chunk to
-   two physical copies (both byte-identical, since the MAC covers the
-   logical address). The chunk-table format is frozen in v1 even if the
-   second copy ships later.
-2. Rebuilding a commit after a write failure (reallocate, keep dirty state).
-3. The per-file fsync intent log, with an fsync-under-writeback benchmark.
-4. Benchmarks against ext4 (fio-style workloads on the same device).
-5. Kani proofs for the space map and tree invariants.
-6. Inline data for small files and an AES-GCM-style suite.
-7. Concurrency (the API is `&mut self` today; the kernel will wrap it first).
-8. A metadata reserve sized for real disks (2%, 256 MiB to 8 GiB), online
+1. Rebuilding a commit after a write failure (reallocate, keep dirty state).
+2. The per-file fsync intent log, with an fsync-under-writeback benchmark.
+3. Benchmarks against ext4 (fio-style workloads on the same device),
+   including a scrub that reads copy 1 first.
+4. Kani proofs for the space map, chunk table and tree invariants.
+5. Inline data for small files and an AES-GCM-style suite.
+6. Concurrency (the API is `&mut self` today; the kernel will wrap it first).
+7. A metadata reserve sized for real disks (2%, 256 MiB to 8 GiB), online
    scrub, a rescue mount and an export tool.
-9. Orphan handling for files that are unlinked while still open (needs the VFS).
-10. Kernel VFS integration (Phase 4), including the key hierarchy, TRIM,
-    suspend and hibernation rules.
+8. Orphan handling for files that are unlinked while still open (needs the VFS).
+9. Kernel VFS integration (the file system track, after 4a), including the
+   key hierarchy, TRIM, suspend and hibernation rules, and zeroing freed
+   page-cache frames of encrypted volumes.

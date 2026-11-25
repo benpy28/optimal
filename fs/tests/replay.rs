@@ -10,6 +10,7 @@ fn bump_is_atomic_at_every_write_point() {
         passphrase: Some(b"pw".to_vec()),
         kdf: KdfParams::INSECURE_FAST_FOR_TESTS,
         quarantine_min_ns: 0,
+        meta_chunk_blocks: 0,
     };
     let mo = MountOptions {
         passphrase: Some(b"pw".to_vec()),

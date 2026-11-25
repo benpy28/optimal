@@ -611,6 +611,7 @@ pub fn fmt_opts(enc: bool) -> FormatOptions {
         passphrase: enc.then(|| b"correct horse".to_vec()),
         kdf: KdfParams::INSECURE_FAST_FOR_TESTS,
         quarantine_min_ns: 0,
+        meta_chunk_blocks: 0,
     }
 }
 
@@ -636,12 +637,29 @@ pub struct Harness {
     pub ops_done: u64,
 }
 
+/// Metadata chunk size for a run: `OFS_CHUNK` if set, otherwise spread
+/// over the seeds so every suite also runs with tiny chunks (many chunks,
+/// a deep chunk table, frequent releases) as well as the default size.
+pub fn chunk_for_seed(seed: u64) -> u32 {
+    if let Some(c) = std::env::var("OFS_CHUNK").ok().and_then(|v| v.parse().ok()) {
+        return c;
+    }
+    [0, 1, 0, 4, 0, 2][(seed % 6) as usize]
+}
+
 impl Harness {
     pub fn new(blocks: u64, enc: bool, seed: u64) -> Result<Harness> {
+        Self::new_chunked(blocks, enc, seed, chunk_for_seed(seed))
+    }
+
+    pub fn new_chunked(blocks: u64, enc: bool, seed: u64, chunk: u32) -> Result<Harness> {
         let dev = CrashDevice::new(blocks, seed ^ 0xdead);
         let fs = Filesystem::format(
             dev,
-            &fmt_opts(enc),
+            &FormatOptions {
+                meta_chunk_blocks: chunk,
+                ..fmt_opts(enc)
+            },
             &mut Rng::new(seed),
             Box::new(ZeroClock),
         )?;

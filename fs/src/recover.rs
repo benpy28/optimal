@@ -27,11 +27,18 @@ pub struct RecoveryStats {
     pub nodes: u64,
     pub data_blocks: u64,
     pub space_blocks: u64,
+    /// Chunk-table blocks read (both copies each).
+    pub chunk_blocks: u64,
+    /// Metadata copies that failed while the other copy was good; each is
+    /// rewritten at the next commit (unless mounted read-only).
+    pub bad_copies: u64,
     /// Files with a recent extent that failed to verify: (inode, extent's
     /// first block). Only filled when no candidate commit verified fully
     /// and mount settled for the newest one whose metadata is whole. Reads
     /// of those blocks fail with an error; nothing wrong is ever returned.
     pub damaged: Vec<(u64, u64)>,
+    /// A chunk moved inside the window, so all metadata was read.
+    pub full_metadata: bool,
 }
 
 /// Reads and verifies every block of the mounted commit born at or after
@@ -45,12 +52,21 @@ pub(crate) fn verify_since<D: BlockDevice>(
     strict: bool,
 ) -> Result<RecoveryStats> {
     let mut st = RecoveryStats::default();
+    // A chunk moved inside the window holds blocks with an old birth at a
+    // place written inside it, under parents the birth walk would skip:
+    // then every metadata block is read (data still by birth).
+    let meta_birth = if fs.body.last_move_gen >= min_birth {
+        st.full_metadata = true;
+        0
+    } else {
+        min_birth
+    };
     let mut stack: Vec<(TreeId, BlockPtr)> = vec![(TreeId::Fs, fs.body.fs_root)];
     if !fs.body.meta_root.is_null() {
         stack.push((TreeId::Meta, fs.body.meta_root));
     }
     while let Some((tree, p)) = stack.pop() {
-        if p.is_null() || p.birth < min_birth {
+        if p.is_null() || p.birth < meta_birth {
             continue;
         }
         let node = fs.store.read_node(tree, &p)?;
@@ -87,8 +103,16 @@ pub(crate) fn verify_since<D: BlockDevice>(
             }
         }
     }
-    st.space_blocks = fs.store.space.verify_since(&mut fs.store.io, min_birth)?;
-    // The free log is read in full by every mount already.
+    st.space_blocks = fs.store.space.verify_since(&mut fs.store.io, meta_birth)?;
+    st.chunk_blocks = fs
+        .store
+        .space
+        .chunks
+        .verify_since(&mut fs.store.io, min_birth)?;
+    // The free log and the root block are read (both copies) by every
+    // unclean mount already, in `open_commit`.
     let _ = BlockKind::FreeLog;
+    // Counted since this mount attempt began (root block and tables too).
+    st.bad_copies = fs.store.io.stats.bad_copies;
     Ok(st)
 }
