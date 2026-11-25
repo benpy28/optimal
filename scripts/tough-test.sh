@@ -12,14 +12,19 @@
 #     core, and the whole host loaded with stress-ng
 #
 # A "boot" scenario passes only if the full kernel test suite passes with zero
-# failures. A "refuse" scenario (Secure Boot attacks) passes only if the
+# failures and the kernel's ACPI line is there and reports no warnings; a
+# "boot:<regex>[ && <regex>...]" scenario instead needs every regex to match
+# a line of the log (the machine's expected ACPI summary and warnings). A "refuse" scenario (Secure Boot attacks) passes only if the
 # firmware or bootloader refuses it with the expected message and the kernel
 # never runs. Nothing may hang, and nothing may panic.
 #
 # The kernel test suite run in every scenario includes fault injection
-# (failed frame allocations, 1b). More conditions join as the kernel grows: quirky
-# ACPI tables, timer jitter and spurious interrupts (1c), disk power cuts and
-# IO errors (Phase 4).
+# (failed frame allocations, 1b) and checks of the ACPI reader (1c). Quirky
+# ACPI tables (duplicates, unknown signatures, a long root table, a 64 KiB
+# table) are added with -acpitable, and each such run must print exactly the
+# ACPI summary and warnings expected. More conditions join as the kernel
+# grows: timer jitter and spurious interrupts (1c), disk power cuts and IO
+# errors (Phase 4).
 #
 # REPEAT=N runs every scenario N times (the nightly soak uses a bigger N).
 # ONLY=<regex> runs only scenarios whose name matches.
@@ -55,7 +60,8 @@ failed=()
 platform=()
 
 # scenario <name> <expect> <iso> <firmware> <machine> <mem> <smp> <timeout> <accel: kvm|tcg> [-- extra qemu args]
-# <expect> is "boot" or "refuse:<text the refusal must contain>".
+# <expect> is "boot", "boot:<regex>[ && <regex>...]" or
+# "refuse:<text the refusal must contain>".
 scenario() {
     local name="$1" expect="$2" iso="$3" fw="$4" machine="$5" mem="$6" smp="$7" timeout="$8" accel="$9"
     shift 9
@@ -84,9 +90,8 @@ scenario() {
         for attempt in $(seq 1 "$PLATFORM_ATTEMPTS"); do
             run_qemu "$iso" "$log" "$fw" "$machine" "$mem" "$smp" "$timeout"
             ok=no
-            if [ "$expect" = boot ]; then
-                if grep -qE "OPTIMAL: ktest [0-9]+ passed, 0 failed" "$log" &&
-                    ! grep -qE "KTEST FAIL|KERNEL PANIC|EXCEPTION" "$log"; then
+            if [[ "$expect" == boot* ]]; then
+                if boot_ok "$log" "$expect"; then
                     ok=yes
                 fi
             else
@@ -136,6 +141,33 @@ scenario() {
 
 has_uefi() { [ -n "$OVMF" ]; }
 
+# boot_ok <log> <expect>: the kernel test suite passed in full, and the ACPI
+# expectations hold (see the top of this file). Prints what is missing.
+boot_ok() {
+    local log="$1" expect="$2" rest re
+    grep -qE "OPTIMAL: ktest [0-9]+ passed, 0 failed" "$log" || return 1
+    ! grep -qE "KTEST FAIL|KERNEL PANIC|EXCEPTION" "$log" || return 1
+    if [ "$expect" = boot ]; then
+        rest='^acpi: (XSDT|RSDT) rev .*; 0 warnings$'
+    else
+        rest="${expect#boot:}"
+    fi
+    while :; do
+        re="${rest%% && *}"
+        if ! grep -qE -- "$re" "$log"; then
+            echo "EXPECTED a line matching: $re"
+            grep -E "^acpi" "$log"
+            return 1
+        fi
+        [ "$re" = "$rest" ] && return 0
+        rest="${rest#* && }"
+    done
+}
+
+# Extra ACPI tables for the quirky-ACPI scenarios.
+AQ=build/acpi-quirks
+python3 scripts/acpi-quirk-tables.py "$AQ"
+
 # Prints why a failed boot is the platform's fault, or nothing if it isn't
 # provably so (see the comment in scenario).
 platform_failure() {
@@ -179,15 +211,15 @@ scenario "cpu-no-nx" boot "$ISO" bios q35 512M 2 40 tcg -- -cpu qemu64,-nx
 scenario "cpu-la57-bios" boot "$ISO" bios q35 512M 2 40 tcg -- -cpu max,+la57
 has_uefi && scenario "cpu-la57-uefi" boot "$ISO" uefi q35 512M 2 40 tcg -- -cpu max,+la57
 # 1 and 16 emulated cores on old and new chipsets: slow CPUs, lots of them.
-scenario "slow-tcg-smp16" boot "$ISO" bios q35 1G 16 40 tcg
-scenario "slow-tcg-pc-smp1" boot "$ISO" bios pc 256M 1 40 tcg
+scenario "slow-tcg-smp16" "boot:^acpi: .*; 16 CPUs \(0 off.*; 0 warnings$" "$ISO" bios q35 1G 16 40 tcg
+scenario "slow-tcg-pc-smp1" "boot:^acpi: RSDT .*; 1 CPUs \(0 off.*; 0 warnings$" "$ISO" bios pc 256M 1 40 tcg
 
 # ---------------------------------------------------------------------------
 # Core topologies and NUMA.
 # ---------------------------------------------------------------------------
 scenario "topo-2s-2c-2t" boot "$ISO" bios q35 1G 8,sockets=2,cores=2,threads=2 30 kvm
 scenario "topo-6-cores-not-pow2" boot "$ISO" bios q35 1G 6,sockets=2,cores=3,threads=1 30 kvm
-scenario "topo-2-of-8-present" boot "$ISO" bios q35 1G 2,maxcpus=8 30 kvm
+scenario "topo-2-of-8-present" "boot:^acpi: .*; 2 CPUs \(6 off, 0 hot-add.*; 0 warnings$" "$ISO" bios q35 1G 2,maxcpus=8 30 kvm
 scenario "topo-dies" boot "$ISO" bios q35 1G 8,sockets=1,dies=2,cores=4,threads=1 30 kvm
 # 64 vCPUs run under TCG. QEMU itself warns that 64 exceeds what KVM
 # supports on the 4-core CI runners, and there KVM stops the firmware with
@@ -197,8 +229,8 @@ scenario "topo-dies" boot "$ISO" bios q35 1G 8,sockets=1,dies=2,cores=4,threads=
 # 44903476305, long before Limine runs. TCG still boots the kernel with all
 # 64 CPUs on both firmwares, without the host bug; heavy oversubscription
 # under KVM is covered by the contention scenarios.
-scenario "topo-64-cores" boot "$ISO" bios q35 2G 64 30 tcg
-has_uefi && scenario "topo-64-cores-uefi" boot "$ISO" uefi q35 2G 64 30 tcg
+scenario "topo-64-cores" "boot:^acpi: .*; 64 CPUs \(0 off.*; 0 warnings$" "$ISO" bios q35 2G 64 30 tcg
+has_uefi && scenario "topo-64-cores-uefi" "boot:^acpi: XSDT .*; 64 CPUs \(0 off.*; 0 warnings$" "$ISO" uefi q35 2G 64 30 tcg
 
 numa2=(-object memory-backend-ram,id=m0,size=1G -object memory-backend-ram,id=m1,size=1G
     -numa node,nodeid=0,cpus=0-1,memdev=m0 -numa node,nodeid=1,cpus=2-3,memdev=m1)
@@ -235,11 +267,31 @@ has_uefi && scenario "mem-extra-dimms-uefi" boot "$ISO" uefi q35 1G,slots=4,maxm
 # ---------------------------------------------------------------------------
 # Firmware quirks.
 # ---------------------------------------------------------------------------
-scenario "fw-no-hpet" boot "$ISO" bios q35,hpet=off 512M 2 30 kvm
-has_uefi && scenario "fw-no-hpet-uefi" boot "$ISO" uefi q35,hpet=off 512M 2 30 kvm
-scenario "fw-no-hpet-pc" boot "$ISO" bios pc,hpet=off 512M 2 30 kvm
-scenario "fw-no-acpi" boot "$ISO" bios pc,acpi=off 512M 1 30 kvm
+scenario "fw-no-hpet" "boot:^acpi: .*, HPET none, .*; 0 warnings$" "$ISO" bios q35,hpet=off 512M 2 30 kvm
+has_uefi && scenario "fw-no-hpet-uefi" "boot:^acpi: XSDT .*, HPET none, .*; 0 warnings$" "$ISO" uefi q35,hpet=off 512M 2 30 kvm
+scenario "fw-no-hpet-pc" "boot:^acpi: .*, HPET none, .*; 0 warnings$" "$ISO" bios pc,hpet=off 512M 2 30 kvm
+scenario "fw-no-acpi" "boot:^acpi: none \(no RSDP from the bootloader\)$" "$ISO" bios pc,acpi=off 512M 1 30 kvm
 scenario "fw-pc-no-smbus-no-sata" boot "$ISO" bios pc,smbus=off,sata=off 256M 1 30 kvm
+# Quirky ACPI tables, added with -acpitable (scripts/acpi-quirk-tables.py).
+# A second MADT full of junk, plus tables with unknown signatures: the first
+# MADT is used, the duplicate is reported, the unknown ones are listed.
+dup=(-acpitable "file=$AQ/madt-dup.bin" -acpitable "file=$AQ/odd-0.bin"
+    -acpitable "file=$AQ/odd-1.bin" -acpitable "file=$AQ/odd-2.bin")
+dup_expect='boot:^acpi: .* tables \[FACP APIC .*APIC OPTQ ZZZZ \?\?\?\? (BGRT )?DSDT\]; 2 CPUs \(0 off, 0 hot-add, 0 x2APIC\), 1 I/O APIC, 5 overrides, .*; 1 warnings$ && ^acpi: warning: 2 APIC tables listed; using the first$'
+scenario "acpi-dup-madt-odd-tables" "$dup_expect" "$ISO" bios q35 512M 2 30 kvm -- "${dup[@]}"
+has_uefi && scenario "acpi-dup-madt-odd-tables-uefi" "$dup_expect" "$ISO" uefi q35 512M 2 30 kvm -- "${dup[@]}"
+# A long root table: 40 more SSDTs.
+many=()
+for i in $(seq 0 39); do many+=(-acpitable "file=$AQ/ssdt-$i.bin"); done
+scenario "acpi-46-tables" "boot:^acpi: RSDT rev 0, 46 tables .*; 0 warnings$" "$ISO" bios q35 512M 2 30 kvm -- "${many[@]}"
+has_uefi && scenario "acpi-47-tables-uefi" "boot:^acpi: XSDT rev 2, 47 tables .*; 0 warnings$" "$ISO" uefi q35 512M 2 30 kvm -- "${many[@]}"
+# A 64 KiB table (QEMU's limit): 16 pages through the read window on
+# SeaBIOS, and 64 KiB more ACPI reclaimable memory to give back on OVMF
+# (72 KiB without it).
+big_ssdt=(-acpitable "file=$AQ/ssdt-big.bin")
+scenario "acpi-64K-table" "boot:^acpi: RSDT .* SSDT DSDT\]; .*; 0 warnings$" "$ISO" bios q35 512M 2 30 kvm -- "${big_ssdt[@]}"
+has_uefi && scenario "acpi-64K-table-uefi" "boot:^acpi: XSDT .* SSDT BGRT DSDT\]; .*; (1[3-9][0-9]|[2-9][0-9]{2}) KiB reclaimed; 0 warnings$" "$ISO" uefi q35 512M 2 30 kvm -- "${big_ssdt[@]}"
+
 # Other OVMF builds (older and newer edk2), fetched by scripts/fetch-firmware.sh.
 for code in build/firmware/*/OVMF_CODE*.fd; do
     [ -f "$code" ] || continue

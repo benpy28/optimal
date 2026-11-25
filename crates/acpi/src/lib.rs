@@ -23,6 +23,7 @@ extern crate alloc;
 pub mod fadt;
 pub mod hpet;
 pub mod madt;
+pub mod reach;
 pub mod tables;
 
 /// Length of the common header every system description table starts with.

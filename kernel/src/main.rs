@@ -9,6 +9,7 @@
 
 extern crate alloc;
 
+mod acpi;
 mod arch;
 mod backtrace;
 mod boot;
@@ -89,6 +90,7 @@ extern "C" fn kmain_on_own_tables() -> ! {
         l.direct_map,
         l.boot_stack_top
     );
+    acpi::report(acpi::init(info));
     paint_screen(info);
 
     let cmdline = info.cmdline();

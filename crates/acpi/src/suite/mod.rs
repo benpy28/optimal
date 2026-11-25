@@ -4,6 +4,7 @@
 mod fadt;
 mod hpet;
 mod madt;
+mod reach;
 mod tables;
 
 use proptest::test_runner::Config;

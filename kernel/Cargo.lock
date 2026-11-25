@@ -18,10 +18,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "optimal-acpi"
+version = "0.0.1"
+
+[[package]]
 name = "optimal-kernel"
 version = "0.0.1"
 dependencies = [
  "limine",
+ "optimal-acpi",
  "optimal-mm",
 ]
 

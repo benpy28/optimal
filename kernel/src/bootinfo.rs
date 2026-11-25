@@ -90,6 +90,8 @@ pub struct BootInfo {
     cmdline: [u8; MAX_CMDLINE],
     cmdline_len: usize,
     pub framebuffer: Option<Framebuffer>,
+    /// Physical address of the ACPI RSDP, if the bootloader found one.
+    pub rsdp: Option<u64>,
 }
 
 impl BootInfo {
@@ -151,6 +153,7 @@ pub fn capture() -> &'static BootInfo {
         cmdline: [0; MAX_CMDLINE],
         cmdline_len: 0,
         framebuffer: None,
+        rsdp: None,
     };
     for (slot, e) in info.map.iter_mut().zip(entries) {
         *slot = MapEntry {
@@ -182,5 +185,13 @@ pub fn capture() -> &'static BootInfo {
             bpp: fb.bpp(),
         });
     }
+    // Base revision 3 gives the RSDP's physical address. Older Limine
+    // revisions gave an HHDM address; such an address can't be physical
+    // (it is in the upper half), so it is converted rather than misread.
+    info.rsdp = boot::RSDP
+        .get_response()
+        .map(|r| r.address() as u64)
+        .filter(|&a| a != 0)
+        .map(|a| if a >= hhdm { a - hhdm } else { a });
     INFO.set(info)
 }

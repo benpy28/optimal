@@ -74,8 +74,10 @@ pub fn init(info: &BootInfo) -> Summary {
     DIRECT_MAP.store(info.hhdm, Ordering::Relaxed);
     let mut usable_buf = [Range::EMPTY; MAX_MAP_ENTRIES];
     let mut later_buf = [Range::EMPTY; MAX_MAP_ENTRIES];
-    let usable = ranges_of(info, Kind::Usable, &mut usable_buf);
-    let later = ranges_of(info, Kind::BootloaderReclaimable, &mut later_buf);
+    let usable = ranges_of(info, |k| k == Kind::Usable, &mut usable_buf);
+    // Zones also cover ACPI reclaimable memory, so it can join the
+    // allocators once the tables are copied out (`reclaim_acpi_memory`).
+    let later = ranges_of(info, is_later, &mut later_buf);
 
     let mut a = FRAMES.lock();
     assert!(a.count == 0, "frame allocator initialised twice");
@@ -119,14 +121,20 @@ pub fn init(info: &BootInfo) -> Summary {
     }
 }
 
-/// The map entries of one kind, as ranges.
+/// Memory that joins the allocators after boot: the bootloader's, and ACPI
+/// tables' once they are copied.
+fn is_later(k: Kind) -> bool {
+    matches!(k, Kind::BootloaderReclaimable | Kind::AcpiReclaimable)
+}
+
+/// The map entries whose kind passes `want`, as ranges, in map order.
 fn ranges_of<'a>(
     info: &BootInfo,
-    kind: Kind,
+    want: impl Fn(Kind) -> bool,
     buf: &'a mut [Range; MAX_MAP_ENTRIES],
 ) -> &'a [Range] {
     let mut n = 0;
-    for e in info.memory_map().iter().filter(|e| e.kind == kind) {
+    for e in info.memory_map().iter().filter(|e| want(e.kind)) {
         buf[n] = Range {
             start: e.base,
             end: e.base.saturating_add(e.len),
@@ -155,13 +163,33 @@ pub fn move_direct_map(new_offset: u64) {
 /// after `move_direct_map`, when nothing reads Limine's responses, page
 /// tables or stack any more. Returns the bytes added.
 pub fn reclaim_bootloader_memory(info: &BootInfo) -> u64 {
+    reclaim(info, Kind::BootloaderReclaimable, None)
+}
+
+/// Hand ACPI reclaimable memory to the allocators, except the pages of
+/// `keep` (physical [start, end), rounded out to pages): firmware that puts
+/// something the OS must leave in place (the FACS) in reclaimable memory
+/// keeps it. Call once, after every table is copied out and nothing reads
+/// firmware memory through the ACPI reader any more. Returns the bytes added.
+pub fn reclaim_acpi_memory(info: &BootInfo, keep: Option<(u64, u64)>) -> u64 {
+    reclaim(info, Kind::AcpiReclaimable, keep)
+}
+
+fn reclaim(info: &BootInfo, kind: Kind, keep: Option<(u64, u64)>) -> u64 {
     let mut later_buf = [Range::EMPTY; MAX_MAP_ENTRIES];
-    let later = ranges_of(info, Kind::BootloaderReclaimable, &mut later_buf);
+    let later = ranges_of(info, |k| k == kind, &mut later_buf);
+    let keep = keep.map(|(s, e)| Range {
+        start: s & !(PAGE_SIZE - 1),
+        end: e.next_multiple_of(PAGE_SIZE),
+    });
     let mut a = FRAMES.lock();
     let count = a.count;
     let zones_copy = a.zones;
     let mut added = 0;
-    zones::later_ranges(later, super::LOW_MEMORY_END, |r| {
+    let mut add = |r: Range| {
+        if r.is_empty() {
+            return;
+        }
         let i = zones::zone_of(&zones_copy[..count], r.start)
             .expect("reclaimable memory outside every zone");
         let frames = (r.end - r.start) / PAGE_SIZE;
@@ -171,6 +199,19 @@ pub fn reclaim_bootloader_memory(info: &BootInfo) -> u64 {
             .add_range(r.start / PAGE_SIZE, frames);
         assert_eq!(n, frames, "reclaimable memory added twice");
         added += n * PAGE_SIZE;
+    };
+    zones::later_ranges(later, super::LOW_MEMORY_END, |r| match keep {
+        Some(k) if k.start < r.end && r.start < k.end => {
+            add(Range {
+                start: r.start,
+                end: k.start.max(r.start),
+            });
+            add(Range {
+                start: k.end.min(r.end),
+                end: r.end,
+            });
+        }
+        _ => add(r),
     });
     added
 }
@@ -211,10 +252,6 @@ pub fn free(phys: u64, order: usize) -> Result<(), FreeError> {
     a.buddies[i].as_mut().unwrap().free(phys / PAGE_SIZE, order)
 }
 
-#[cfg_attr(
-    not(feature = "ktest"),
-    expect(dead_code, reason = "first user outside tests is the heap (1b2d)")
-)]
 pub fn free_bytes() -> u64 {
     FRAMES.lock().free_frames() * PAGE_SIZE
 }

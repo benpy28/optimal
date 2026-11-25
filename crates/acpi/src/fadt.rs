@@ -4,7 +4,7 @@
 //! The FADT has grown with every ACPI revision, so each field is read only
 //! if the table is long enough to hold it; a missing field reads as absent.
 
-use crate::{Error, Gas, Sdt, u8_at, u16_at, u32_at};
+use crate::{Error, Gas, Sdt, u8_at, u16_at, u32_at, u64_at};
 
 /// Where the ACPI PM timer (3.579545 MHz) is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,14 +28,39 @@ pub struct Fadt {
     pub boot_arch: u16,
     /// RTC century register index, if any.
     pub century: Option<u8>,
+    /// Physical address of the DSDT: X_DSDT when it is set, else the
+    /// 32-bit DSDT field; `None` if both are zero.
+    pub dsdt: Option<u64>,
+    /// Both DSDT fields were set and disagree; X_DSDT was used.
+    pub dsdt_mismatch: bool,
+    /// Physical address of the FACS: X_FIRMWARE_CTRL when it is set, else
+    /// FIRMWARE_CTRL; `None` if both are zero (always so on HW-reduced
+    /// machines without one).
+    pub facs: Option<u64>,
+    /// Both FACS fields were set and disagree; X_FIRMWARE_CTRL was used.
+    pub facs_mismatch: bool,
+}
+
+/// Picks between a 32-bit address field and its 64-bit X_ counterpart
+/// (ACPI 6.5 Table 5.9: the X_ field is used when it is non-zero, and then
+/// the 32-bit one must be zero). Returns (address, both set and differ).
+fn pick_address(legacy: Option<u32>, extended: Option<u64>) -> (Option<u64>, bool) {
+    let legacy = legacy.filter(|&a| a != 0).map(u64::from);
+    let extended = extended.filter(|&a| a != 0);
+    let mismatch = matches!((legacy, extended), (Some(l), Some(x)) if l != x);
+    (extended.or(legacy), mismatch)
 }
 
 /// Field offsets (ACPI 6.5 Table 5.9).
+const FIRMWARE_CTRL: usize = 36;
+const DSDT: usize = 40;
 const PM_TMR_BLK: usize = 76;
 const PM_TMR_LEN: usize = 91;
 const CENTURY: usize = 108;
 const IAPC_BOOT_ARCH: usize = 109;
 const FLAGS: usize = 112;
+const X_FIRMWARE_CTRL: usize = 132;
+const X_DSDT: usize = 140;
 const X_PM_TMR_BLK: usize = 208;
 
 const TMR_VAL_EXT: u32 = 1 << 8;
@@ -71,6 +96,9 @@ impl Fadt {
         } else {
             extended.or(legacy)
         };
+        let (dsdt, dsdt_mismatch) = pick_address(u32_at(b, DSDT), u64_at(b, X_DSDT));
+        let (facs, facs_mismatch) =
+            pick_address(u32_at(b, FIRMWARE_CTRL), u64_at(b, X_FIRMWARE_CTRL));
         Ok(Fadt {
             checksum_ok: sdt.checksum_ok,
             pm_timer,
@@ -80,6 +108,10 @@ impl Fadt {
             hw_reduced,
             boot_arch: u16_at(b, IAPC_BOOT_ARCH).unwrap_or(0),
             century: u8_at(b, CENTURY).filter(|&c| c != 0),
+            dsdt,
+            dsdt_mismatch,
+            facs,
+            facs_mismatch,
         })
     }
 }
