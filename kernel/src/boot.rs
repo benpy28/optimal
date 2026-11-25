@@ -2,9 +2,10 @@
 //! jumps to `kmain`.
 
 use limine::BaseRevision;
+use limine::paging;
 use limine::request::{
-    BootloaderInfoRequest, ExecutableCmdlineRequest, FramebufferRequest, MemoryMapRequest,
-    RequestsEndMarker, RequestsStartMarker,
+    BootloaderInfoRequest, ExecutableAddressRequest, ExecutableCmdlineRequest, FramebufferRequest,
+    HhdmRequest, MemoryMapRequest, PagingModeRequest, RequestsEndMarker, RequestsStartMarker,
 };
 
 #[used]
@@ -26,6 +27,23 @@ pub static MEMORY_MAP: MemoryMapRequest = MemoryMapRequest::new();
 #[used]
 #[unsafe(link_section = ".requests")]
 pub static CMDLINE: ExecutableCmdlineRequest = ExecutableCmdlineRequest::new();
+
+#[used]
+#[unsafe(link_section = ".requests")]
+pub static HHDM: HhdmRequest = HhdmRequest::new();
+
+#[used]
+#[unsafe(link_section = ".requests")]
+pub static EXECUTABLE_ADDRESS: ExecutableAddressRequest = ExecutableAddressRequest::new();
+
+/// 4-level paging, asked for explicitly: the kernel's page tables are
+/// 4-level until LA57 support lands.
+#[used]
+#[unsafe(link_section = ".requests")]
+pub static PAGING_MODE: PagingModeRequest = PagingModeRequest::new()
+    .with_mode(paging::Mode::FOUR_LEVEL)
+    .with_max_mode(paging::Mode::FOUR_LEVEL)
+    .with_min_mode(paging::Mode::FOUR_LEVEL);
 
 #[used]
 #[unsafe(link_section = ".requests_start_marker")]

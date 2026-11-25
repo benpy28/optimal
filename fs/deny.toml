@@ -1,0 +1,35 @@
+# Dependency policy for OptimalFS: permissive licences only, no GPL/LGPL/AGPL,
+# no known-vulnerable versions, only crates.io sources.
+[graph]
+all-features = true
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.9
+unused-allowed-license = "allow"
+
+# OptimalFS itself has no licence yet (the repo is all rights reserved until
+# one is chosen), so only check our dependencies.
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+
+[advisories]
+yanked = "deny"

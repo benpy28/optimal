@@ -6,9 +6,23 @@ use core::arch::asm;
 
 use crate::println;
 
-/// A higher-half address nothing is mapped at (far beyond any RAM in the
-/// direct map).
-const UNMAPPED: u64 = 0xffff_9fff_dead_0000;
+/// A higher-half address nothing is ever mapped at.
+const UNMAPPED: u64 = crate::mm::paging::NEVER_MAPPED;
+
+/// Recurse with a 1 KiB frame until the boot stack runs into its guard page.
+#[inline(never)]
+fn recurse(depth: u64) -> u64 {
+    let mut pad = [0u8; 1024];
+    pad[0] = depth as u8;
+    let pad = core::hint::black_box(pad);
+    if core::hint::black_box(depth) == u64::MAX {
+        return 0;
+    }
+    recurse(depth + 1) + u64::from(pad[(depth % 1024) as usize])
+}
+
+/// A pointer the relocations fill in, so it lives in the RELRO region.
+static RELRO_POINTER: &u64 = &0x5eed;
 
 pub fn run(name: &str) {
     println!("OPTIMAL: crashtest {name}");
@@ -59,6 +73,51 @@ pub fn run(name: &str) {
                 asm!("mov rsp, {}", "push rax", in(reg) UNMAPPED, options(noreturn));
             }
             "panic" => panic!("deliberate panic from crashtest"),
+            "stack_overflow" => {
+                core::hint::black_box(recurse(0));
+            }
+            "write_relro" => {
+                // RELRO: relocated pointers are read-only once the kernel's
+                // own page tables are on.
+                asm!("mov qword ptr [{}], 0", in(reg) &raw const RELRO_POINTER);
+            }
+            "write_text" => {
+                // Kernel code must not be writable.
+                asm!("mov byte ptr [{}], 0xc3", in(reg) recurse as *const () as u64);
+            }
+            "heap_double_free" => {
+                let layout = core::alloc::Layout::from_size_align(64, 8).unwrap();
+                // black_box: the compiler may otherwise drop an unused
+                // allocation and its frees altogether.
+                let p = core::hint::black_box(alloc::alloc::alloc(layout));
+                alloc::alloc::dealloc(p, layout);
+                alloc::alloc::dealloc(core::hint::black_box(p), layout);
+            }
+            "heap_bad_pointer" => {
+                // Free a pointer into the middle of an object.
+                let layout = core::alloc::Layout::from_size_align(64, 8).unwrap();
+                let p = core::hint::black_box(alloc::alloc::alloc(layout));
+                alloc::alloc::dealloc(core::hint::black_box(p.add(8)), layout);
+            }
+            "heap_wild_pointer" => {
+                // Free a pointer the heap never handed out (kernel data).
+                static NOT_HEAP: [u8; 64] = [0; 64];
+                let layout = core::alloc::Layout::from_size_align(64, 8).unwrap();
+                alloc::alloc::dealloc(&raw const NOT_HEAP as *mut u8, layout);
+            }
+            "execute_heap" => {
+                // Heap memory is no-execute.
+                let code = alloc::boxed::Box::new([0xc3u8; 16]);
+                asm!("call {}", in(reg) code.as_ptr(), clobber_abi("C"));
+            }
+            "execute_direct_map" => {
+                // The direct map is no-execute: put a `ret` in a fresh frame
+                // and call it through the direct map.
+                let f = crate::mm::frames::alloc(0).expect("no frame for the test");
+                let p = crate::mm::frames::phys_to_virt(f) as *mut u8;
+                p.write_volatile(0xc3);
+                asm!("call {}", in(reg) p, clobber_abi("C"));
+            }
             other => println!("OPTIMAL: unknown crashtest {other}"),
         }
     }

@@ -7,19 +7,22 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 mod arch;
 mod backtrace;
 mod boot;
+mod bootinfo;
 mod crashtest;
 #[cfg(feature = "ktest")]
 mod ktest;
+mod mm;
 mod serial;
+mod sync;
 #[cfg(feature = "ktest")]
 mod tests;
 
 use core::panic::PanicInfo;
-
-use limine::memory_map::EntryType;
 
 /// The line CI looks for to decide the kernel booted.
 pub const BOOT_OK: &str = "OPTIMAL: kernel booted";
@@ -47,10 +50,48 @@ extern "C" fn kmain() -> ! {
     if let Some(info) = boot::BOOTLOADER_INFO.get_response() {
         crate::println!("bootloader: {} {}", info.name(), info.version());
     }
-    report_memory();
-    paint_screen();
+    let info = bootinfo::capture();
+    report_memory(info);
+    // SAFETY: once, on the boot CPU, after the frame allocator is up; kmain
+    // keeps nothing on this stack that kmain_on_own_tables needs.
+    unsafe { mm::paging::build_and_switch(info, kmain_on_own_tables) }
+}
 
-    let cmdline = boot::cmdline();
+/// The rest of boot, on the kernel's own page tables and boot stack.
+extern "C" fn kmain_on_own_tables() -> ! {
+    mm::paging::finish_switch();
+    let info = bootinfo::get();
+    let reclaimed = mm::frames::reclaim_bootloader_memory(info);
+    mm::heap::init(mm::paging::random_u64());
+    let l = mm::paging::layout();
+    crate::println!(
+        "paging: own tables on; kernel W^X by section, direct map {}, {} pages; {} KiB of bootloader memory reclaimed",
+        if l.nx {
+            "no-execute"
+        } else {
+            "without NX (CPU has none)"
+        },
+        if l.huge_1g { "1 GiB" } else { "2 MiB" },
+        reclaimed / 1024
+    );
+    match l.entropy {
+        mm::paging::Entropy::Rdrand => crate::println!("kaslr: on (RDRAND)"),
+        mm::paging::Entropy::TimestampOnly => {
+            crate::println!("kaslr: on, WEAK entropy (no RDRAND; timestamp jitter only)")
+        }
+    }
+    // Addresses are only printed in test builds, so normal boot logs don't
+    // give KASLR away.
+    #[cfg(feature = "ktest")]
+    crate::println!(
+        "kaslr: kernel {:#x} direct map {:#x} boot stack {:#x}",
+        l.kernel_virt,
+        l.direct_map,
+        l.boot_stack_top
+    );
+    paint_screen(info);
+
+    let cmdline = info.cmdline();
     if let Some(name) = boot::arg(cmdline, "crashtest") {
         crashtest::run(name);
     }
@@ -66,38 +107,40 @@ fn on(b: bool) -> &'static str {
     if b { "on" } else { "unsupported" }
 }
 
-fn report_memory() {
-    if let Some(map) = boot::MEMORY_MAP.get_response() {
-        let usable: u64 = map
-            .entries()
-            .iter()
-            .filter(|e| e.entry_type == EntryType::USABLE)
-            .map(|e| e.length)
-            .sum();
-        crate::println!(
-            "memory: {} MiB usable in {} map entries",
-            usable / (1024 * 1024),
-            map.entries().len()
-        );
-    }
+fn report_memory(info: &bootinfo::BootInfo) {
+    let usable: u64 = info
+        .memory_map()
+        .iter()
+        .filter(|e| e.kind == bootinfo::Kind::Usable)
+        .map(|e| e.len)
+        .sum();
+    crate::println!(
+        "memory: {} MiB usable in {} map entries",
+        usable / (1024 * 1024),
+        info.memory_map().len()
+    );
+    let s = mm::frames::init(info);
+    crate::println!(
+        "frames: {} MiB free in {} zone(s), {} KiB of allocator metadata",
+        s.free_bytes / (1024 * 1024),
+        s.zones,
+        s.metadata_bytes / 1024
+    );
 }
 
 /// Fill the screen with a dark blue and draw a lighter band across the
 /// middle, so a real PC visibly shows the kernel is in control.
-fn paint_screen() {
-    let Some(fb) = boot::FRAMEBUFFER
-        .get_response()
-        .and_then(|r| r.framebuffers().next())
-    else {
+fn paint_screen(info: &bootinfo::BootInfo) {
+    let Some(fb) = info.framebuffer else {
         crate::println!("screen: none (headless)");
         return;
     };
-    crate::println!("screen: {}x{} @ {} bpp", fb.width(), fb.height(), fb.bpp());
-    if fb.bpp() != 32 {
+    crate::println!("screen: {}x{} @ {} bpp", fb.width, fb.height, fb.bpp);
+    if fb.bpp != 32 {
         return;
     }
-    let (w, h, pitch) = (fb.width(), fb.height(), fb.pitch());
-    let base = fb.addr();
+    let (w, h, pitch) = (fb.width, fb.height, fb.pitch);
+    let base = mm::frames::phys_to_virt(fb.phys) as *mut u8;
     for y in 0..h {
         let colour: u32 = if y > h * 9 / 20 && y < h * 11 / 20 {
             0x3d7eff
@@ -106,8 +149,9 @@ fn paint_screen() {
         };
         for x in 0..w {
             let offset = (y * pitch + x * 4) as usize;
-            // SAFETY: (x, y) is inside the framebuffer Limine gave us, and each
-            // pixel is 4 bytes at `pitch` bytes per row.
+            // SAFETY: (x, y) is inside the framebuffer, which the kernel maps
+            // write-combining in its direct map; each pixel is 4 bytes at
+            // `pitch` bytes per row.
             unsafe { base.add(offset).cast::<u32>().write_volatile(colour) };
         }
     }

@@ -56,6 +56,27 @@ for fw in "${firmwares[@]}"; do
     done
 done
 
+# KASLR: the test build prints where the kernel, the direct map and the
+# boot stack landed. Across the ktest boots above, each must have moved at
+# least once (all equal would mean no randomisation; four boots all landing
+# on the same spot by chance is vanishingly unlikely).
+for what in kernel "direct map" "boot stack"; do
+    seen=$(grep -h "^kaslr: kernel" "$LOGDIR"/ktest-*.log 2>/dev/null |
+        sed -E "s/.*$what (0x[0-9a-f]+).*/\1/" | sort -u | wc -l)
+    boots=$(grep -l "^kaslr: kernel" "$LOGDIR"/ktest-*.log 2>/dev/null | wc -l)
+    name="kaslr-$what-moves"
+    name="${name// /-}"
+    if [ "$boots" -ge 2 ] && [ "$seen" -ge 2 ]; then
+        pass=$((pass + 1))
+        echo "PASS: $name ($seen different addresses in $boots boots)"
+    else
+        fail=$((fail + 1))
+        failed+=("$name")
+        echo "FAIL: $name ($seen different addresses in $boots boots)"
+        grep -h "^kaslr:" "$LOGDIR"/ktest-*.log
+    fi
+done
+
 echo "===== kernel tests: $pass passed, $fail failed ====="
 for f in "${failed[@]}"; do echo "  failed: $f"; done
 [ "$fail" -eq 0 ]
