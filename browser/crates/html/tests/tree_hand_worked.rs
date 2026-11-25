@@ -239,3 +239,16 @@ fn adoption_agency_bookmark_cases() {
         assert_eq!(&dump(&p), want, "{input}");
     }
 }
+
+/// "initial": whitespace and comments before the DOCTYPE leave the mode
+/// alone, so the DOCTYPE still counts and the document is in no-quirks mode.
+#[test]
+fn initial_mode_by_hand() {
+    let p = parse_document(" \n<!--x--><?pi d?><!DOCTYPE html>", options(false));
+    assert_eq!(
+        dump(&p),
+        "| <!-- x -->\n| <?pi d?>\n| <!DOCTYPE html>\n| <html>\n|   <head>\n|   <body>"
+    );
+    assert!(tree_errors(&p.errors).is_empty(), "{:?}", p.errors);
+    assert_eq!(p.document.quirks_mode, QuirksMode::NoQuirks);
+}

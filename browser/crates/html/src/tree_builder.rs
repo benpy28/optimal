@@ -188,6 +188,10 @@ impl Parser {
         self.tokenizer.end();
         self.pump();
         if cfg!(debug_assertions) {
+            // Every insertion mode's EOF rule ends in "stop parsing", which
+            // is where script execution and load events will hook in.
+            assert!(self.builder.stopped, "EOF did not reach stop parsing");
+            assert!(self.builder.open.is_empty(), "stop parsing pops everything");
             self.builder.open.check();
             self.builder.afe.check();
         }
