@@ -510,3 +510,244 @@ fn a_bad_chunk_table_copy_alone_is_repaired_by_rewriting_it() {
         rh.verify(&model);
     }
 }
+
+#[test]
+fn a_chunk_moved_in_the_window_is_verified_by_recovery() {
+    // A moved chunk's blocks keep their old birth, so a recovery check that
+    // only reads blocks born in the window would skip them, under parents
+    // that did not change. A lying drive that loses the moved copies must
+    // still be caught: losing one copy's new run leaves the newest commit
+    // whole, the bad copy found and queued for repair; losing both runs
+    // must make mount fall back to the commit before the move.
+    let mut caught = [0u32; 2];
+    for seed in 0..8u64 {
+        let enc = seed % 2 == 0;
+        let mut h = populated(0x30fe + seed, enc, 3000, chunk_for_seed(seed), 120);
+        h.apply(&Op::Commit).unwrap();
+        let honest = h.fs().generation();
+        assert_eq!(h.fs().last_move_gen_for_tests(), 0, "no move yet");
+        // The chunk with the most used blocks, all born before the move.
+        let (id, old) = h
+            .fs()
+            .metadata_chunks()
+            .unwrap()
+            .into_iter()
+            .max_by_key(|(_, e)| e.used.count_ones())
+            .unwrap();
+        assert!(old.used != 0);
+        h.fs().device_mut().lying_flush = true;
+        h.fs().relocate_metadata_chunk(id).unwrap();
+        h.apply(&Op::Commit).unwrap();
+        let moved = honest + 1;
+        assert_eq!(h.fs().generation(), moved);
+        assert_eq!(h.fs().last_move_gen_for_tests(), moved);
+        let new = h
+            .fs()
+            .metadata_chunks()
+            .unwrap()
+            .into_iter()
+            .find(|(j, _)| *j == id)
+            .unwrap()
+            .1;
+        assert!(new.p0 != old.p0 && new.p1 != old.p1);
+        let committed = h.committed.clone();
+        let mut dev = h.fs.take().unwrap().into_device();
+        dev.lying_flush = false;
+        let n = dev.num_blocks();
+        let used: Vec<u64> = (0..new.len as u64).filter(|&o| new.is_used(o)).collect();
+        for both in [false, true] {
+            let mut lose: Vec<u64> = used.iter().map(|o| new.p1 + o).collect();
+            if both {
+                lose.extend(used.iter().map(|o| new.p0 + o));
+            }
+            let land: Vec<u64> = (0..n).filter(|b| !lose.contains(b)).collect();
+            let img = dev.clone().lost_writes_image_steered(&land, &lose);
+            let fs = remount(img, enc, seed);
+            let st = fs
+                .recovery_stats()
+                .cloned()
+                .expect("unclean mount runs recovery");
+            let g = fs.generation();
+            let mut rh = Harness::from_mounted(fs, committed[&g].clone(), enc, seed);
+            rh.verify(&committed[&g]);
+            if both {
+                // Falls back, unless the move commit itself no longer uses
+                // any of the lost blocks (the moved chunk held only blocks
+                // that commit rewrote elsewhere, kept for older commits);
+                // either way everything read back matched and fsck below
+                // finds nothing.
+                assert!(g == honest || g == moved, "seed {seed}: generation {g}");
+                caught[1] += (g == honest) as u32;
+            } else {
+                assert_eq!(
+                    g, moved,
+                    "seed {seed}: one lost copy is not a reason to fall back"
+                );
+                assert!(st.full_metadata, "seed {seed}");
+                assert!(st.bad_copies >= used.len() as u64, "seed {seed}: {st:?}");
+                caught[0] += 1;
+            }
+            // Nothing bad left unaccounted for, now and after the repair.
+            let rep = fsck::check(rh.fs(), true).unwrap();
+            assert!(rep.ok(), "seed {seed} both {both}: {:?}", rep.errors);
+            rh.apply(&Op::Commit).unwrap();
+            let rep = fsck::check(rh.fs(), true).unwrap();
+            assert!(
+                rep.ok() && rep.bad_copies == 0,
+                "seed {seed}: {:?}",
+                rep.errors
+            );
+            // The move is carried forward until the window passes it.
+            assert!(rh.fs().last_move_gen_for_tests() >= if both { 0 } else { moved });
+        }
+    }
+    assert_eq!(caught[0], 8);
+    assert!(caught[1] >= 4, "too few fallbacks: {caught:?}");
+}
+
+#[test]
+fn last_move_gen_is_recorded_and_carried_forward() {
+    // Hand-worked: relocating a chunk with used blocks at commit g records
+    // g; commits without moves carry it forward unchanged, and it is read
+    // back from the root block at mount.
+    let mut h = populated(0xe417, false, 3000, 0, 60);
+    assert_eq!(h.fs().last_move_gen_for_tests(), 0);
+    let (id, e) = h.fs().metadata_chunks().unwrap()[0];
+    assert!(e.used != 0);
+    h.fs().relocate_metadata_chunk(id).unwrap();
+    h.fs().commit().unwrap();
+    let g = h.fs().generation();
+    assert_eq!(h.fs().last_move_gen_for_tests(), g);
+    for k in 1..=3 {
+        h.fs().commit_forced_for_tests().unwrap();
+        assert_eq!(h.fs().generation(), g + k);
+        assert_eq!(h.fs().last_move_gen_for_tests(), g, "carried forward");
+    }
+    let dev = h.fs.take().unwrap().unmount().unwrap();
+    let fs = remount(dev.clean_image(), false, 1);
+    assert_eq!(fs.last_move_gen_for_tests(), g, "survives a remount");
+}
+
+#[test]
+fn a_move_at_the_window_edge_is_still_covered() {
+    // Hand-worked boundary: blocks born at window_gen are checked, so a
+    // move made in commit window_gen must be too. Move a chunk in commit
+    // m, then keep committing (the drive lying all along) until the newest
+    // commit's window starts exactly at m; lose the new copy-1 run and
+    // land everything else. Mount keeps the newest commit and must read
+    // all metadata, finding the lost copies.
+    for seed in 0..4u64 {
+        let enc = seed % 2 == 1;
+        let mut h = populated(0xed6e + seed, enc, 3000, chunk_for_seed(seed), 100);
+        let (id, _) = h
+            .fs()
+            .metadata_chunks()
+            .unwrap()
+            .into_iter()
+            .max_by_key(|(_, e)| e.used.count_ones())
+            .unwrap();
+        h.fs().device_mut().lying_flush = true;
+        h.fs().relocate_metadata_chunk(id).unwrap();
+        h.apply(&Op::Commit).unwrap();
+        let m = h.fs().generation();
+        let new = h
+            .fs()
+            .metadata_chunks()
+            .unwrap()
+            .into_iter()
+            .find(|(j, _)| *j == id)
+            .unwrap()
+            .1;
+        while h.fs().window_gen_for_tests() < m {
+            h.fs().commit_forced_for_tests().unwrap();
+            assert!(h.fs().generation() < m + 20);
+        }
+        assert_eq!(h.fs().window_gen_for_tests(), m, "seed {seed}");
+        assert_eq!(h.fs().last_move_gen_for_tests(), m);
+        let newest = h.fs().generation();
+        let model = h.model.clone();
+        let mut dev = h.fs.take().unwrap().into_device();
+        dev.lying_flush = false;
+        let n = dev.num_blocks();
+        // Only slots the chunk still uses now (the commits since may have
+        // freed some, which are kept for older commits).
+        let lose: Vec<u64> = (0..new.len as u64)
+            .filter(|&o| new.is_used(o))
+            .map(|o| new.p1 + o)
+            .collect();
+        let land: Vec<u64> = (0..n).filter(|b| !lose.contains(b)).collect();
+        let fs = remount(dev.lost_writes_image_steered(&land, &lose), enc, seed);
+        assert_eq!(fs.generation(), newest, "seed {seed}");
+        let st = fs.recovery_stats().cloned().unwrap();
+        assert!(st.full_metadata, "seed {seed}: window edge not covered");
+        let mut rh = Harness::from_mounted(fs, model.clone(), enc, seed);
+        rh.verify(&model);
+        let rep = fsck::check(rh.fs(), true).unwrap();
+        assert!(rep.ok(), "seed {seed}: {:?}", rep.errors);
+    }
+}
+
+#[test]
+fn a_repair_lost_by_a_lying_drive_is_found_again() {
+    // A repair moves the bad copy's run, so the block keeps its old birth
+    // at a new place. Make the tree root old (older than any window), damage
+    // its copy 1, let a read find it, then have a lying drive lose the
+    // repaired copy. The next unclean mount must read all metadata and
+    // find copy 1 bad again, rather than trust a repair that never landed.
+    let mut found = 0;
+    for seed in 0..6u64 {
+        let enc = seed % 2 == 0;
+        let mut h = populated(0x4e9a + seed, enc, 2000, chunk_for_seed(seed), 60);
+        for _ in 0..10 {
+            h.fs().commit_forced_for_tests().unwrap();
+        }
+        let (_, tree_l) = h.fs().roots_for_tests();
+        let (_, p1) = h.fs().resolve_metadata(tree_l).unwrap();
+        let model = h.model.clone();
+        let mut img = h.fs().device().clean_image();
+        img[p1 as usize * BS + 100] ^= 0x10;
+        let fs = remount(img, enc, seed);
+        assert!(!fs.recovery_stats().unwrap().full_metadata);
+        let mut rh = Harness::from_mounted(fs, model.clone(), enc, seed);
+        rh.verify(&model);
+        assert_eq!(
+            rh.fs().io_stats().bad_copies,
+            1,
+            "seed {seed}: a read finds it"
+        );
+        rh.fs().device_mut().lying_flush = true;
+        rh.fs().commit().unwrap();
+        let (_, q1) = rh.fs().resolve_metadata(tree_l).unwrap();
+        assert_ne!(q1, p1, "seed {seed}: repaired by moving");
+        assert_eq!(rh.fs().last_move_gen_for_tests(), rh.fs().generation());
+        let newest = rh.fs().generation();
+        let mut dev = rh.fs.take().unwrap().into_device();
+        dev.lying_flush = false;
+        let n = dev.num_blocks();
+        let land: Vec<u64> = (0..n).filter(|&b| b != q1).collect();
+        let fs = remount(dev.lost_writes_image_steered(&land, &[q1]), enc, seed);
+        assert_eq!(fs.generation(), newest, "seed {seed}");
+        let st = fs.recovery_stats().cloned().unwrap();
+        assert!(
+            st.full_metadata && st.bad_copies >= 1,
+            "seed {seed}: {st:?}"
+        );
+        found += 1;
+        let mut rh = Harness::from_mounted(fs, model.clone(), enc, seed);
+        rh.verify(&model);
+        let rep = fsck::check(rh.fs(), true).unwrap();
+        assert!(
+            rep.ok() && rep.repairs_pending >= 1,
+            "seed {seed}: {:?}",
+            rep.errors
+        );
+        rh.fs().commit().unwrap();
+        let rep = fsck::check(rh.fs(), true).unwrap();
+        assert!(
+            rep.ok() && rep.bad_copies == 0,
+            "seed {seed}: {:?}",
+            rep.errors
+        );
+    }
+    assert_eq!(found, 6);
+}

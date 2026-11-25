@@ -483,6 +483,7 @@ impl<D: BlockDevice> Filesystem<D> {
             live_deadlist: 1,
             next_deadlist: 2,
             latest_snap_gen: 0,
+            last_move_gen: 0,
             commit_time_ns: 0,
             replay_value: 0,
             flags: 0,
@@ -885,6 +886,18 @@ impl<D: BlockDevice> Filesystem<D> {
     #[doc(hidden)]
     pub fn next_ino_for_tests(&self) -> u64 {
         self.next_ino
+    }
+
+    /// The oldest generation the current commit's recovery check covers.
+    #[doc(hidden)]
+    pub fn window_gen_for_tests(&self) -> u64 {
+        self.body.window_gen
+    }
+
+    /// The newest commit that moved a run of live metadata blocks.
+    #[doc(hidden)]
+    pub fn last_move_gen_for_tests(&self) -> u64 {
+        self.body.last_move_gen
     }
 
     pub fn generation(&self) -> u64 {
@@ -1927,6 +1940,11 @@ impl<D: BlockDevice> Filesystem<D> {
             live_deadlist: self.live_deadlist,
             next_deadlist: self.next_deadlist,
             latest_snap_gen: self.store.latest_snap_gen,
+            last_move_gen: if core::mem::take(&mut self.store.space.moved_live_run) {
+                generation
+            } else {
+                self.body.last_move_gen
+            },
             commit_time_ns: now,
             replay_value: self.body.replay_value + self.replay_bump as u64,
             flags: self.next_flags,

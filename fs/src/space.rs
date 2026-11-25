@@ -112,6 +112,9 @@ pub struct Space {
     maybe_empty: BTreeSet<u64>,
     /// Chunks to move at the start of the next commit.
     pub relocations: Vec<u64>,
+    /// This commit moved a run holding live metadata blocks (see
+    /// [`Body::last_move_gen`](crate::superblock::Body::last_move_gen)).
+    pub moved_live_run: bool,
 }
 
 fn span(level: u32) -> u64 {
@@ -167,6 +170,7 @@ impl Space {
             meta_cursor: 0,
             maybe_empty: BTreeSet::new(),
             relocations: Vec::new(),
+            moved_live_run: false,
             total,
             levels,
             root_ptr,
@@ -826,6 +830,7 @@ impl Space {
             }
         }
         let (q0, q1, _) = self.alloc_chunk_runs(io, len, false)?;
+        self.moved_live_run |= e.used != 0;
         for (off, first, b) in copies {
             io.queue(if first { q0 } else { q1 } + off, b);
         }
@@ -940,6 +945,7 @@ impl Space {
             Entry { p1: q, ..cur }
         };
         self.chunks.set_entry(io, id, moved)?;
+        self.moved_live_run = true;
         self.free(io, run, len)?;
         io.stats.copies_repaired += fixed;
         Ok(())

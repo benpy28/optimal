@@ -168,7 +168,12 @@ rebuilt at a fresh place from the good blocks, the chunk entry is changed,
 and the old run is quarantined. A bad chunk-table block is rewritten to a
 new pair. Nothing live is ever overwritten in place, so a torn or
 misdirected repair write cannot damage a committed block, and a failing
-region is left behind rather than written again. Read-only mounts count
+region is left behind rather than written again. A moved block keeps its
+old birth under unchanged parents, so the birth-pruned recovery walk would
+never reach it: each commit records the last generation that moved a run
+of live blocks, and if that falls inside the window, recovery reads all
+metadata (data blocks are still checked by birth). Moves are rare (repairs
+and relocation), so the usual unclean mount stays cheap. Read-only mounts count
 bad copies but never write.
 
 **Cost.** Metadata writes double; data writes don't. A fresh 4096-block

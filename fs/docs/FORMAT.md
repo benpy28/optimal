@@ -107,7 +107,14 @@ the rest of the commit's roots so the superblock stays small:
 magic `0x544f4f52` ("ROOT", u32), zero (u32), generation (u64, must equal
 the core's), fs tree root, meta tree root, space map root and free log head
 (pointers), next inode number, next snapshot id, live deadlist id, next
-deadlist id, newest snapshot generation (u64 each). The rest is zero.
+deadlist id, newest snapshot generation, last move generation (u64 each).
+The rest is zero.
+
+The *last move generation* is the newest commit that moved a chunk run
+holding live blocks (a relocation, or the repair of a bad copy), or 0. It is
+carried forward by every commit and is never above the generation. Moved
+blocks keep their birth, so when it is at or above the window generation,
+recovery reads every metadata block instead of only recent births.
 
 The *window generation* is the oldest commit still inside the free-block
 quarantine when this commit was made (at most generation - 7). Every block

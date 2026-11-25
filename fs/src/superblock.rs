@@ -103,6 +103,11 @@ pub struct Body {
     pub next_deadlist: u64,
     /// Generation of the newest snapshot (0 if none).
     pub latest_snap_gen: u64,
+    /// Newest commit that moved a metadata run holding live blocks (a
+    /// chunk relocation or a copy repair), 0 if none. Moved blocks keep
+    /// their old birth, so a recovery check whose window reaches this
+    /// commit must verify all metadata, not only recent births.
+    pub last_move_gen: u64,
     pub commit_time_ns: i64,
     /// Anti-rollback counter, mirrored into a TPM monotonic counter once
     /// the kernel has one (stage 2). Carried forward unchanged by commits.
@@ -309,6 +314,7 @@ impl Body {
             live_deadlist: 0,
             next_deadlist: 0,
             latest_snap_gen: 0,
+            last_move_gen: 0,
             commit_time_ns,
             replay_value,
             flags,
@@ -387,6 +393,7 @@ impl Body {
         w.u64(self.live_deadlist);
         w.u64(self.next_deadlist);
         w.u64(self.latest_snap_gen);
+        w.u64(self.last_move_gen);
         b
     }
 
@@ -406,6 +413,10 @@ impl Body {
         self.live_deadlist = r.u64()?;
         self.next_deadlist = r.u64()?;
         self.latest_snap_gen = r.u64()?;
+        self.last_move_gen = r.u64()?;
+        if self.last_move_gen > self.generation {
+            return Err(Error::Corrupt("root block move generation", at));
+        }
         if r.bytes(r.remaining())?.iter().any(|&x| x != 0) {
             return Err(Error::Corrupt("root block padding", at));
         }
