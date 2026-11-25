@@ -95,6 +95,9 @@ pub struct CrashDevice {
     pub cut_at: Option<u64>,
     powered: bool,
     pub faults: Faults,
+    /// A lying drive: flushes report success but make nothing durable, so
+    /// writes from many "flushed" commits pile up in the volatile cache.
+    pub lying_flush: bool,
     rng: Rng,
 }
 
@@ -110,6 +113,7 @@ impl CrashDevice {
             cut_at: None,
             powered: true,
             faults: Faults::default(),
+            lying_flush: false,
             rng: Rng::new(seed),
         }
     }
@@ -134,9 +138,26 @@ impl CrashDevice {
     /// What the platters hold after the power cut: resolves every in-flight
     /// write using the adversarial model described in the module docs.
     pub fn crash_image(&mut self) -> Vec<u8> {
+        self.crash_image_tearing(&[])
+    }
+
+    /// [`CrashDevice::crash_image`], except that every in-flight write to a
+    /// block in `tear` is torn: its last sector keeps the old content and
+    /// the rest come from any version written (so a block whose content
+    /// changed never verifies whole).
+    pub fn crash_image_tearing(&mut self, tear: &[u64]) -> Vec<u8> {
         let mut img = self.durable.clone();
         let volatile = core::mem::take(&mut self.volatile);
         for (block, versions) in volatile {
+            if tear.contains(&block) {
+                let off = block as usize * BLOCK_SIZE;
+                for s in 0..BLOCK_SIZE / SECTOR - 1 {
+                    let v = &versions[self.rng.below(versions.len() as u64) as usize];
+                    let r = s * SECTOR..(s + 1) * SECTOR;
+                    img[off + r.start..off + r.end].copy_from_slice(&v[r]);
+                }
+                continue;
+            }
             let off = block as usize * BLOCK_SIZE;
             let mut candidates: Vec<&[u8]> = Vec::with_capacity(versions.len() + 1);
             let old = self.durable[off..off + BLOCK_SIZE].to_vec();
@@ -162,6 +183,38 @@ impl CrashDevice {
         }
         img
     }
+    /// What the platters hold after a lying drive loses power: every write
+    /// it claimed to have flushed or still had cached independently either
+    /// landed (any version written to that block) or was lost (the block's
+    /// durable content). Nothing is torn: a lying cache loses whole writes.
+    /// Tearing is covered by [`CrashDevice::crash_image`].
+    pub fn lost_writes_image(&mut self) -> Vec<u8> {
+        self.lost_writes_image_steered(&[], &[])
+    }
+
+    /// [`CrashDevice::lost_writes_image`], except that the newest version
+    /// written to each block in `land` always landed and every write to a
+    /// block in `lose` was lost (superblock slots, to force the hardest
+    /// fallback cases).
+    pub fn lost_writes_image_steered(&mut self, land: &[u64], lose: &[u64]) -> Vec<u8> {
+        let mut img = self.durable.clone();
+        let volatile = core::mem::take(&mut self.volatile);
+        for (block, versions) in volatile {
+            let off = block as usize * BLOCK_SIZE;
+            let pick = if land.contains(&block) {
+                versions.len()
+            } else if lose.contains(&block) {
+                0
+            } else {
+                self.rng.below(versions.len() as u64 + 1) as usize
+            };
+            if pick > 0 {
+                img[off..off + BLOCK_SIZE].copy_from_slice(&versions[pick - 1]);
+            }
+        }
+        img
+    }
+
     /// The image if every in-flight write had landed in order (no crash).
     pub fn clean_image(&self) -> Vec<u8> {
         let mut img = self.durable.clone();
@@ -244,11 +297,71 @@ impl BlockDevice for CrashDevice {
         {
             return Err(IoError::Failed);
         }
+        if self.lying_flush {
+            return Ok(());
+        }
         let volatile = core::mem::take(&mut self.volatile);
         for (block, versions) in volatile {
             let off = block as usize * BLOCK_SIZE;
             self.durable[off..off + BLOCK_SIZE].copy_from_slice(versions.last().unwrap());
         }
+        Ok(())
+    }
+}
+
+/// A huge device that stores only blocks written with non-zero content
+/// (unwritten blocks read as zeros), for testing multi-terabyte volumes.
+#[derive(Debug, Clone, Default)]
+pub struct SparseDevice {
+    blocks: u64,
+    data: BTreeMap<u64, Vec<u8>>,
+    pub reads: u64,
+    pub writes: u64,
+}
+
+impl SparseDevice {
+    pub fn new(blocks: u64) -> Self {
+        SparseDevice {
+            blocks,
+            ..Default::default()
+        }
+    }
+    /// Blocks actually holding data.
+    pub fn stored_blocks(&self) -> usize {
+        self.data.len()
+    }
+}
+
+impl BlockDevice for SparseDevice {
+    fn num_blocks(&self) -> u64 {
+        self.blocks
+    }
+    fn read(&mut self, block: u64, buf: &mut [u8]) -> Result<(), IoError> {
+        let n = check_range(self.blocks, block, buf.len())?;
+        self.reads += n;
+        for i in 0..n {
+            let dst = &mut buf[i as usize * BLOCK_SIZE..(i as usize + 1) * BLOCK_SIZE];
+            match self.data.get(&(block + i)) {
+                Some(v) => dst.copy_from_slice(v),
+                None => dst.fill(0),
+            }
+        }
+        Ok(())
+    }
+    fn write(&mut self, block: u64, buf: &[u8]) -> Result<(), IoError> {
+        let n = check_range(self.blocks, block, buf.len())?;
+        self.writes += n;
+        for i in 0..n {
+            let src = &buf[i as usize * BLOCK_SIZE..(i as usize + 1) * BLOCK_SIZE];
+            if src.iter().all(|&x| x == 0) {
+                self.data.remove(&(block + i));
+            } else {
+                self.data.insert(block + i, src.to_vec());
+            }
+        }
+        Ok(())
+    }
+    fn flush(&mut self) -> Result<(), IoError> {
         Ok(())
     }
 }

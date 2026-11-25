@@ -47,12 +47,27 @@ fn superblock_slots_hand_worked() {
 
 #[test]
 fn space_shape_hand_worked() {
-    // 100000 blocks need ceil(100000 / 32768) = 4 bitmap blocks, all in one
-    // level-1 table. Free = 100000 - 4 superblock slots = 99996.
-    let s = crate::space::Space::format(100_000).unwrap();
+    // 100000 blocks need ceil(100000 / 32768) = 4 bitmaps, which fit under
+    // one level-1 table (64 bitmaps = 2^21 blocks), so depth is 1. Only the
+    // bitmaps holding superblock slots are materialised: bitmap 0 (blocks
+    // 0, 1) and bitmap 3 (99998 / 32768 = 3, blocks 99998, 99999).
+    // Root free counts: 32768-2, 32768, 32768, 100000-3*32768-2 = 1694,
+    // then zero for the 60 bitmaps past the end. Sum 99996 = 100000 - 4.
+    use crate::space::Space;
+    let s = Space::format(100_000, 6).unwrap();
     assert_eq!(s.free_blocks(), 99_996);
-    assert_eq!(s.tables().2.len(), 4);
-    assert_eq!(s.tables().1.len(), 1);
+    assert_eq!(s.levels(), 1);
+    let (tables, bmps, kids) = s.shape();
+    assert_eq!((tables, bmps), (1, 2));
+    assert_eq!(&kids[..5], &[32_766, 32_768, 32_768, 1_694, 0]);
+    assert!(kids[5..].iter().all(|&k| k == 0));
+    // Depth by size: one level covers 2^21 blocks (8 GiB), each extra level 64x.
+    assert_eq!(Space::levels_for(1 << 21).unwrap(), 1);
+    assert_eq!(Space::levels_for((1 << 21) + 1).unwrap(), 2);
+    assert_eq!(Space::levels_for(1 << 32).unwrap(), 3); // 16 TiB
+    assert_eq!(Space::levels_for(1 << 37).unwrap(), 4); // 512 TiB
+    assert_eq!(Space::levels_for(1 << 45).unwrap(), 5); // 128 PiB
+    assert!(Space::levels_for((1 << 45) + 1).is_err());
 }
 
 #[test]
@@ -84,29 +99,117 @@ fn extent_slice_hand_worked() {
 
 #[test]
 fn fresh_volume_space_hand_worked() {
-    // A fresh 4096-block volume uses: 4 superblock slots + 1 space root
-    // table + 1 level-1 table + 1 bitmap (4096 < 32768) + 1 tree leaf
-    // (the root inode) = 8 blocks. The meta tree is empty and nothing was
-    // freed, so there is no free log.
+    // A fresh 4096-block volume has a 64-block metadata chunk size
+    // (4096 / 64 = 64) and needs one bitmap (4096 < 32768) directly under
+    // the root table (depth 1). Format's commit writes 4 logical metadata
+    // blocks: the root inode's tree leaf, the root block, the bitmap and the
+    // root table, all in chunk 0. Physically that is 4 superblock slots +
+    // 2 x 64 (chunk 0's two copies) + 2 (the chunk-table root leaf's two
+    // copies) = 134 blocks. Nothing was freed, so there is no free log.
     let mut rng = Rng::new(3);
     let opts = FormatOptions {
         passphrase: None,
         kdf: crate::KdfParams::INSECURE_FAST_FOR_TESTS,
+        quarantine_min_ns: 0,
+        meta_chunk_blocks: 0,
     };
     let mut fs =
         Filesystem::format(MemDevice::new(4096), &opts, &mut rng, Box::new(ZeroClock)).unwrap();
-    assert_eq!(fs.statfs().free_blocks, 4096 - 8);
+    assert_eq!(fs.store.space.chunks.chunk_blocks(), 64);
+    assert_eq!(fs.statfs().free_blocks, 4096 - 134);
+    let chunks = fs.metadata_chunks().unwrap();
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(
+        (chunks[0].0, chunks[0].1.len, chunks[0].1.used),
+        (0, 64, 0b1111)
+    );
+    // Copy 1 sits half the usable area (4092 / 2 = 2046 blocks) after copy 0.
+    assert_eq!(chunks[0].1.p1, chunks[0].1.p0 + 2046);
+    assert!(
+        fs.store.space.held.is_empty(),
+        "{:?} gen {}",
+        fs.store.space.held,
+        fs.generation()
+    );
     // Writing 10000 bytes adds ceil(10000/4096) = 3 data blocks. The commit
-    // rewrites the leaf, the bitmap, the L1 table and the root table (their
-    // old copies are freed but quarantined) and writes 1 free-log block for
-    // those frees. Used: 4 + 3 tables/bitmap + 1 leaf + 3 data + 1 log = 12.
+    // rewrites the 4 logical blocks (the old ones are freed, quarantined)
+    // and adds 1 free-log block: logical use is 4 + 1 = 5 slots of chunk 0,
+    // still inside its 64, so no new physical metadata blocks. The chunk
+    // leaf changed, so it gets a new pair and its old pair (2 blocks) is
+    // quarantined: physical use 134 + 3 data = 137, allocatable 137 + 2
+    // fewer.
     let f = fs.create(ROOT_INO, b"f", 0o644).unwrap();
     fs.write(f, 0, &[5u8; 10_000]).unwrap();
     fs.commit().unwrap();
-    assert_eq!(fs.statfs().free_blocks, 4096 - 12);
-    // Quarantine: the 4 freed blocks can't be allocated until the next commit.
-    let st = fs.statfs();
-    assert_eq!(fs.store.space.allocatable_blocks(), st.free_blocks - 4);
+    let g = fs.generation();
+    assert_eq!(fs.statfs().free_blocks, 4096 - 137);
+    assert_eq!(fs.store.space.allocatable_blocks(), 4096 - 137 - 2);
+    let first = fs.store.space.held.front().unwrap().clone();
+    assert_eq!(
+        (first.generation, first.set.len(), first.lset.len()),
+        (g, 2, 4)
+    );
+    let chunks = fs.metadata_chunks().unwrap();
+    assert_eq!((chunks.len(), chunks[0].1.used.count_ones()), (1, 5));
+    // The batch from commit g stays held through commits g+1 .. g+7 and is
+    // released by commit g+8 (QUARANTINE_COMMITS = 8).
+    for k in 1..=8u64 {
+        fs.mark_dirty();
+        fs.commit().unwrap();
+        assert_eq!(fs.generation(), g + k);
+        let still = fs.store.space.held.iter().any(|h| h.generation == g);
+        assert_eq!(still, k < 8, "after commit g+{k}");
+        // Every held batch is younger than 8 commits.
+        assert!(fs.store.space.held.iter().all(|h| g + k - h.generation < 8));
+    }
+}
+
+#[test]
+fn quarantine_time_window_hand_worked() {
+    // A clock that ticks 10 s per reading, with a 30 s window: a batch
+    // freed at commit g (time t) needs both g+8 commits and t+30 s. Commits
+    // are > 10 s apart here, so the commit count is the binding limit; with
+    // a 200 s window the time is, and the batch must outlive commit g+8.
+    struct Tick(i64);
+    impl crate::fs::Clock for Tick {
+        fn now_ns(&mut self) -> i64 {
+            self.0 += 10_000_000_000;
+            self.0
+        }
+    }
+    for (window_s, expect_release_at) in [(30i64, 8u64), (200, 0)] {
+        let mut rng = Rng::new(4);
+        let opts = FormatOptions {
+            passphrase: None,
+            kdf: crate::KdfParams::INSECURE_FAST_FOR_TESTS,
+            quarantine_min_ns: window_s * 1_000_000_000,
+            meta_chunk_blocks: 0,
+        };
+        let mut fs =
+            Filesystem::format(MemDevice::new(4096), &opts, &mut rng, Box::new(Tick(0))).unwrap();
+        let f = fs.create(ROOT_INO, b"f", 0o644).unwrap();
+        fs.write(f, 0, &[1u8; 100]).unwrap();
+        fs.commit().unwrap();
+        let g = fs.generation();
+        let t0 = fs.body.commit_time_ns;
+        let mut released = 0;
+        for k in 1..=30u64 {
+            fs.mark_dirty();
+            fs.commit().unwrap();
+            if released == 0 && !fs.store.space.held.iter().any(|h| h.generation == g) {
+                released = k;
+                assert!(fs.body.commit_time_ns - t0 >= window_s * 1_000_000_000);
+            }
+        }
+        if expect_release_at != 0 {
+            assert_eq!(released, expect_release_at);
+        } else {
+            assert!(
+                released > 8,
+                "time window must hold past 8 commits, got {released}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -156,7 +259,7 @@ fn tree_shrinks_after_mass_delete() {
     );
     let mut st = Store {
         io,
-        space: crate::space::Space::format(4096).unwrap(),
+        space: crate::space::Space::format(4096, 6).unwrap(),
         cache: NodeCache::new(64),
         latest_snap_gen: 0,
         dead_pending: vec![],
@@ -195,7 +298,7 @@ fn tree_shrinks_after_mass_delete() {
     }
 }
 
-fn ptr_level(level: u32) -> BlockPtr {
+fn ptr_level(level: u64) -> BlockPtr {
     BlockPtr {
         addr: 5,
         birth: 3,
@@ -209,7 +312,7 @@ proptest! {
     #![proptest_config(ProptestConfig { cases: 2000, ..ProptestConfig::default() })]
 
     #[test]
-    fn decoders_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..4200), level in 0u32..20) {
+    fn decoders_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..4200), level in 0u64..20) {
         let _ = Node::decode(&bytes, TreeId::Fs, &ptr_level(level));
         let _ = Node::decode(&bytes, TreeId::Meta, &ptr_level(level));
         let _ = Extent::decode(&bytes, 1);
@@ -243,4 +346,278 @@ proptest! {
             }
         }
     }
+}
+
+#[test]
+fn kdf_for_ram_hand_worked() {
+    // memory = clamp(RAM/4, 64 MiB, 1 GiB); passes = ceil(4 GiB-passes / memory),
+    // clamped to 4..=64 (in KiB: 4194304 / mem_kib).
+    use crate::KdfParams;
+    let gib = 1u64 << 30;
+    let cases = [
+        (16 * gib, 1_048_576, 4), // capped at 1 GiB
+        (4 * gib, 1_048_576, 4),
+        (3 * gib, 786_432, 6), // 4194304 / 786432 = 5.33 -> 6
+        (2 * gib, 524_288, 8),
+        (gib, 262_144, 16),
+        (128 << 20, 65_536, 64), // RAM/4 = 32 MiB, raised to the 64 MiB floor
+        (0, 65_536, 64),
+    ];
+    for (ram, mem, it) in cases {
+        let p = KdfParams::for_ram(ram);
+        assert_eq!(
+            (p.mem_kib, p.iterations, p.lanes),
+            (mem, it, 1),
+            "ram {ram}"
+        );
+        assert!(p.meets_floor());
+    }
+    assert_eq!(KdfParams::for_ram(16 * gib), KdfParams::DEFAULT);
+    assert!(!KdfParams::INSECURE_FAST_FOR_TESTS.meets_floor());
+    // Format refuses an encrypted volume below the floor.
+    let weak = FormatOptions {
+        passphrase: Some(b"pw".to_vec()),
+        kdf: KdfParams {
+            mem_kib: 32 * 1024,
+            iterations: 4,
+            lanes: 1,
+        },
+        quarantine_min_ns: 0,
+        meta_chunk_blocks: 0,
+    };
+    let r = Filesystem::format(
+        MemDevice::new(4096),
+        &weak,
+        &mut Rng::new(1),
+        Box::new(ZeroClock),
+    );
+    assert!(matches!(r, Err(crate::Error::Invalid(_))));
+}
+
+#[test]
+fn replay_bump_reaches_all_four_slots() {
+    // After bump_replay every superblock copy carries the new value: the
+    // commit is written to its own pair, flushed, then to the other pair.
+    let opts = FormatOptions {
+        passphrase: None,
+        kdf: crate::KdfParams::INSECURE_FAST_FOR_TESTS,
+        quarantine_min_ns: 0,
+        meta_chunk_blocks: 0,
+    };
+    let mut fs = Filesystem::format(
+        MemDevice::new(4096),
+        &opts,
+        &mut Rng::new(1),
+        Box::new(ZeroClock),
+    )
+    .unwrap();
+    assert_eq!(fs.replay_value(), 0);
+    fs.create(ROOT_INO, b"x", 0o644).unwrap();
+    fs.commit().unwrap();
+    assert_eq!(fs.bump_replay().unwrap(), 1);
+    assert_eq!(fs.bump_replay().unwrap(), 2);
+    // An ordinary commit carries the value forward.
+    fs.create(ROOT_INO, b"y", 0o644).unwrap();
+    fs.commit().unwrap();
+    assert_eq!(fs.replay_value(), 2);
+    assert_eq!(fs.bump_replay().unwrap(), 3);
+    let g = fs.generation();
+    let mut dev = fs.into_device();
+    let cands = crate::superblock::candidates(&mut dev).unwrap();
+    assert_eq!(cands.len(), 4);
+    let sealer = crate::crypto::Sealer::new(cands[0].header.uuid, None, &mut Rng::new(2));
+    for c in &cands {
+        let b = crate::superblock::open_body(c, &sealer).unwrap();
+        assert_eq!(
+            (b.generation, b.replay_value),
+            (g, 3),
+            "slot {}",
+            c.header.slot
+        );
+        // Its history is the previous commits, newest first, with their values.
+        assert_eq!(b.history[0].replay_value, 2);
+        assert_eq!(b.history[0].generation, g - 1);
+    }
+}
+
+#[test]
+fn header_bytes_identical_in_every_slot_and_commit() {
+    // The plaintext header (bytes 0..512) must not change per slot or per
+    // commit: the volume tag and the pre-cap reader rely on fixed bytes.
+    // It changes only when a key slot does.
+    let opts = FormatOptions {
+        passphrase: Some(b"pw".to_vec()),
+        kdf: crate::KdfParams::INSECURE_FAST_FOR_TESTS,
+        quarantine_min_ns: 0,
+        meta_chunk_blocks: 0,
+    };
+    let mut fs = Filesystem::format(
+        MemDevice::new(4096),
+        &opts,
+        &mut Rng::new(1),
+        Box::new(ZeroClock),
+    )
+    .unwrap();
+    let headers = |fs: &mut Filesystem<MemDevice>| -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
+        let img = fs.device_mut().image_mut();
+        [0usize, 1, 4094, 4095]
+            .iter()
+            .map(|&b| img[b * 4096..b * 4096 + 512].to_vec())
+            .collect()
+    };
+    for i in 0..5u8 {
+        fs.create(ROOT_INO, &[b'a' + i], 0o644).unwrap();
+        fs.commit().unwrap();
+    }
+    let h1 = headers(&mut fs);
+    assert!(h1.iter().all(|h| *h == h1[0]), "slots differ");
+    // Bytes 424..512 are reserved and zero.
+    assert!(h1[0][424..].iter().all(|&x| x == 0));
+    fs.create(ROOT_INO, b"z", 0o644).unwrap();
+    fs.commit().unwrap();
+    assert_eq!(headers(&mut fs)[0], h1[0], "a commit changed the header");
+}
+
+#[test]
+fn feature_bits_hand_worked() {
+    // Unknown read-only-compatible bit: read-only mount works, read-write
+    // is refused. Unknown incompatible bit: refused, reported as such.
+    let opts = FormatOptions {
+        passphrase: None,
+        kdf: crate::KdfParams::INSECURE_FAST_FOR_TESTS,
+        quarantine_min_ns: 0,
+        meta_chunk_blocks: 0,
+    };
+    for (ro, inc) in [(1u32, 0u32), (0, 1)] {
+        let mut fs = Filesystem::format(
+            MemDevice::new(4096),
+            &opts,
+            &mut Rng::new(1),
+            Box::new(ZeroClock),
+        )
+        .unwrap();
+        fs.header.ro_compat = ro;
+        fs.header.incompat = inc;
+        fs.mark_dirty();
+        fs.commit().unwrap();
+        fs.mark_dirty();
+        fs.commit().unwrap(); // both pairs carry the bit
+        let dev = fs.into_device();
+        let rw = crate::MountOptions {
+            quarantine_min_ns: 0,
+            ..Default::default()
+        };
+        let ro_opts = crate::MountOptions {
+            read_only: true,
+            ..rw.clone()
+        };
+        let r = Filesystem::mount(dev.clone(), &rw, &mut Rng::new(2), Box::new(ZeroClock));
+        assert!(
+            matches!(r, Err(crate::Error::Unsupported(_))),
+            "{:?}",
+            r.err()
+        );
+        let r = Filesystem::mount(dev, &ro_opts, &mut Rng::new(2), Box::new(ZeroClock));
+        assert_eq!(r.is_ok(), inc == 0, "{:?}", r.err());
+    }
+}
+
+#[test]
+fn redirty_rewrites_exactly_one_clean_chunk_table_path() {
+    // Chunk size 1 maps one chunk per metadata block, so a few hundred
+    // files need more than one 128-entry leaf and the table grows a root
+    // table above its leaves (depth >= 1). After a commit every node is
+    // clean. Redirtying leaf (0, 0) must dirty exactly that leaf and each
+    // ancestor up to the root, queue each one's old pair for freeing, and
+    // the next commit must give each of them a new pair while every other
+    // node keeps its pair. Missing or pruned nodes answer false and
+    // change nothing.
+    let mut rng = Rng::new(11);
+    let opts = FormatOptions {
+        passphrase: None,
+        kdf: crate::KdfParams::INSECURE_FAST_FOR_TESTS,
+        quarantine_min_ns: 0,
+        meta_chunk_blocks: 1,
+    };
+    let mut fs =
+        Filesystem::format(MemDevice::new(40_000), &opts, &mut rng, Box::new(ZeroClock)).unwrap();
+    assert_eq!(fs.store.space.chunks.chunk_blocks(), 1);
+    for i in 0..6000u32 {
+        let f = fs
+            .create(ROOT_INO, alloc::format!("f{i}").as_bytes(), 0o644)
+            .unwrap();
+        fs.write(f, 0, &[i as u8; 100]).unwrap();
+        if i % 500 == 499 {
+            fs.commit().unwrap();
+        }
+    }
+    fs.commit().unwrap();
+    let depth = fs.store.space.chunks.depth();
+    assert!(
+        depth >= 1,
+        "depth {depth}, {} chunks",
+        fs.store.space.chunks.mapped_chunks()
+    );
+    let before = fs
+        .store
+        .space
+        .chunks
+        .all_node_ptrs(&mut fs.store.io)
+        .unwrap();
+    assert!(before.iter().filter(|n| n.0 == 0).count() >= 2);
+    let t = &mut fs.store.space.chunks;
+    assert!(t.dirty_nodes().is_empty());
+    let frees0 = t.pending_frees.len();
+
+    // Out of range at its level, and above the root: false, nothing dirty.
+    let leaves_cap = crate::chunk::ids_at(depth) / crate::chunk::LEAF_ENTRIES;
+    assert!(!t.redirty(&mut fs.store.io, 0, leaves_cap).unwrap());
+    assert!(!t.redirty(&mut fs.store.io, depth + 1, 0).unwrap());
+    // A leaf slot that exists in range but was never written (null kid).
+    let present: alloc::collections::BTreeSet<u64> =
+        before.iter().filter(|n| n.0 == 0).map(|n| n.1).collect();
+    if let Some(absent) = (0..leaves_cap).find(|i| !present.contains(i)) {
+        assert!(!t.redirty(&mut fs.store.io, 0, absent).unwrap());
+    }
+    assert!(t.dirty_nodes().is_empty());
+    assert_eq!(t.pending_frees.len(), frees0);
+
+    // Leaf 0: it and its `depth` ancestors (all index 0) become dirty.
+    assert!(t.redirty(&mut fs.store.io, 0, 0).unwrap());
+    let want: alloc::vec::Vec<(u32, u64)> = (0..=depth).map(|l| (l, 0)).collect();
+    assert_eq!(t.dirty_nodes(), want);
+    assert_eq!(t.pending_frees.len(), frees0 + want.len());
+    for &(l, i) in &want {
+        let p = before.iter().find(|n| (n.0, n.1) == (l, i)).unwrap().2;
+        assert!(
+            t.pending_frees[frees0..].contains(&(p.addr, p.aux)),
+            "({l}, {i})"
+        );
+    }
+    // Twice is the same as once (no double free).
+    assert!(t.redirty(&mut fs.store.io, 0, 0).unwrap());
+    assert_eq!(t.pending_frees.len(), frees0 + want.len());
+
+    fs.mark_dirty();
+    fs.commit().unwrap();
+    let after = fs
+        .store
+        .space
+        .chunks
+        .all_node_ptrs(&mut fs.store.io)
+        .unwrap();
+    let pair = |v: &[(u32, u64, BlockPtr)], l: u32, i: u64| {
+        v.iter()
+            .find(|n| (n.0, n.1) == (l, i))
+            .map(|n| (n.2.addr, n.2.aux))
+    };
+    for &(l, i, _) in &before {
+        let moved = pair(&before, l, i) != pair(&after, l, i);
+        // The commit's own tree, space and root-block writes may touch
+        // other leaves, but the redirtied path must have moved.
+        if i == 0 {
+            assert!(moved, "({l}, {i}) kept its pair");
+        }
+    }
+    assert!(crate::fsck::check(&mut fs, true).unwrap().ok());
 }

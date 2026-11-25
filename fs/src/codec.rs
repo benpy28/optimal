@@ -3,6 +3,7 @@
 
 use crate::error::{Error, Result};
 
+#[derive(Debug)]
 pub struct Writer<'a> {
     buf: &'a mut [u8],
     pos: usize,
@@ -39,6 +40,7 @@ impl<'a> Writer<'a> {
     }
 }
 
+#[derive(Debug)]
 pub struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,

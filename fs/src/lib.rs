@@ -13,15 +13,19 @@
 
 extern crate alloc;
 
+pub mod chunk;
 mod codec;
 pub mod crypto;
 pub mod device;
+#[cfg(test)]
+mod dup_tests;
 mod error;
 mod fs;
 pub mod fsck;
 mod io;
 mod ptr;
 mod rangeset;
+mod recover;
 pub mod sim;
 mod snapshot;
 mod space;
@@ -39,6 +43,8 @@ pub use device::{BLOCK_SIZE, BlockDevice, IoError, MemDevice};
 pub use error::{Error, Result};
 pub use fs::{
     Attr, Clock, DirEntry, FileKind, Filesystem, FormatOptions, MountOptions, ROOT_INO, SetAttr,
-    StatFs, ZeroClock,
+    StatFs, ZeroClock, auto_chunk_blocks,
 };
+pub use io::IoStats;
+pub use recover::RecoveryStats;
 pub use snapshot::SnapshotInfo;

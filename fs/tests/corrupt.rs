@@ -142,11 +142,12 @@ fn campaign(seed: u64, enc: bool, iters: u64) {
     let live: Vec<usize> = (0..good.len() / 4096)
         .filter(|&b| good[b * 4096..(b + 1) * 4096].iter().any(|&x| x != 0))
         .collect();
-    let (mut mounted, mut failed, mut fell_back) = (0, 0, 0);
+    let (mut mounted, mut failed, mut fell_back, mut healed) = (0, 0, 0, 0u64);
     for it in 0..iters {
         let mut img = good.clone();
         mutate(&mut r, &mut img, &old, &live);
         let fell_back_flag = std::cell::Cell::new(false);
+        let healed_flag = std::cell::Cell::new(false);
         let res = catch_unwind(AssertUnwindSafe(|| {
             let d = CrashDevice::from_image(img, it);
             match Filesystem::mount(d, &mount_opts(enc), &mut Rng::new(it), Box::new(ZeroClock)) {
@@ -162,6 +163,11 @@ fn campaign(seed: u64, enc: bool, iters: u64) {
                         .clone();
                     exercise(&mut fs, &want.live);
                     let _ = fsck::check(&mut fs, true);
+                    // A bad metadata copy whose twin was good: found and
+                    // survived, which is detection too.
+                    if fs.io_stats().bad_copies > 0 {
+                        healed_flag.set(true);
+                    }
                     // Writing to a damaged volume may fail but must not panic.
                     chaos(&mut fs, &want, it);
                     true
@@ -172,17 +178,20 @@ fn campaign(seed: u64, enc: bool, iters: u64) {
             Ok(true) => {
                 mounted += 1;
                 fell_back += fell_back_flag.get() as u64;
+                healed += healed_flag.get() as u64;
             }
             Ok(false) => failed += 1,
             Err(_) => panic!("seed {seed:#x} iteration {it}: panic on a damaged image"),
         }
     }
     eprintln!(
-        "seed {seed:#x} enc {enc}: {mounted} mounted ({fell_back} on an older commit), {failed} refused"
+        "seed {seed:#x} enc {enc}: {mounted} mounted ({fell_back} on an older commit, {healed} with a bad copy found and survived), {failed} refused"
     );
-    // The campaign must actually reach the interesting paths.
+    // The campaign must actually reach the interesting paths. With
+    // metadata stored twice, most single-block damage is caught as a bad
+    // copy and survived, so that counts as reaching them.
     assert!(
-        failed > 0 || fell_back > 0,
+        failed > 0 || fell_back > 0 || healed > 0,
         "no mutation was ever detected at mount; the test is too weak"
     );
 }

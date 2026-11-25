@@ -6,6 +6,8 @@ fn fmt(blocks: u64, enc: bool) -> Filesystem<MemDevice> {
     let opts = FormatOptions {
         passphrase: enc.then(|| b"pw".to_vec()),
         kdf: KdfParams::INSECURE_FAST_FOR_TESTS,
+        quarantine_min_ns: 0,
+        meta_chunk_blocks: 0,
     };
     Filesystem::format(MemDevice::new(blocks), &opts, &mut rng, Box::new(ZeroClock)).unwrap()
 }
@@ -25,6 +27,7 @@ fn basic_roundtrip() {
         let dev = fs.into_device();
         let mo = MountOptions {
             passphrase: enc.then(|| b"pw".to_vec()),
+            quarantine_min_ns: 0,
             ..Default::default()
         };
         let mut fs = Filesystem::mount(dev, &mo, &mut Rng::new(2), Box::new(ZeroClock)).unwrap();

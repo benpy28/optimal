@@ -8,6 +8,7 @@ use optimalfs::*;
 fn mount(dev: CrashDevice, seed: u64) -> Filesystem<CrashDevice> {
     let mo = MountOptions {
         dirty_limit_bytes: 64 * 1024,
+        quarantine_min_ns: 0,
         ..Default::default()
     };
     Filesystem::mount(dev, &mo, &mut Rng::new(seed), Box::new(ZeroClock)).unwrap()
@@ -19,6 +20,8 @@ fn previous_commit_survives_remount_and_reuse() {
     let opts = FormatOptions {
         passphrase: None,
         kdf: KdfParams::INSECURE_FAST_FOR_TESTS,
+        quarantine_min_ns: 0,
+        meta_chunk_blocks: 0,
     };
     let mut fs = Filesystem::format(
         CrashDevice::new(blocks, 1),

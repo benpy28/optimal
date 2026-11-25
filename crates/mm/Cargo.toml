@@ -1,0 +1,15 @@
+[package]
+name = "optimal-mm"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "Memory-management logic for the Optimal kernel: the physical frame allocator and page-table editing. Pure, safe Rust with no hardware access, so it is tested on the host, proved with Kani, and tested again inside the kernel."
+
+[dependencies]
+
+[dev-dependencies]
+# Property-based testing against simple reference models (MIT OR Apache-2.0).
+proptest = { version = "1", default-features = false, features = ["std"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

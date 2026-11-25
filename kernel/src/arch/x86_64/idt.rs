@@ -60,7 +60,21 @@ global_asm!(
 );
 
 unsafe extern "C" {
-    static isr_stub_table: [u64; 256];
+    /// First of the 256 generated entry stubs (see build.rs).
+    fn isr_stub_0();
+}
+
+/// Each generated stub occupies exactly this many bytes.
+pub const STUB_SIZE: u64 = 16;
+
+/// Address of the entry stub for `vector`.
+pub fn stub_address(vector: u8) -> u64 {
+    isr_stub_0 as *const () as u64 + u64::from(vector) * STUB_SIZE
+}
+
+/// True if the CPU pushes an error code for this vector (Intel SDM Vol. 3A, 6.13).
+pub fn has_error_code(vector: u8) -> bool {
+    matches!(vector, 8 | 10..=14 | 17 | 21 | 29 | 30)
 }
 
 /// Everything saved on interrupt entry, lowest address first.
@@ -151,8 +165,8 @@ pub unsafe fn init() {
     // SAFETY: early boot, single CPU, interrupts off: nothing else touches IDT.
     unsafe {
         let idt = &raw mut IDT;
-        let stubs = &*addr_of!(isr_stub_table);
-        for (vector, &stub) in stubs.iter().enumerate() {
+        for vector in 0..256usize {
+            let stub = stub_address(vector as u8);
             let ist = match vector as u64 {
                 VEC_DOUBLE_FAULT => gdt::IST_DOUBLE_FAULT,
                 VEC_NMI => gdt::IST_NMI,
@@ -222,7 +236,14 @@ fn crash(f: &InterruptFrame) -> ! {
         exception_name(f.vector),
         f.vector
     );
-    println!("error code {:#x}", f.error_code);
+    if f.vector < 32 && has_error_code(f.vector as u8) {
+        println!("error code {:#x}", f.error_code);
+    }
+    if (f.vector == VEC_PAGE_FAULT || f.vector == VEC_DOUBLE_FAULT)
+        && crate::mm::paging::in_stack_guard(cpu::read_cr2())
+    {
+        println!("kernel stack overflow: the fault is in the boot stack's guard page");
+    }
     if f.vector == VEC_PAGE_FAULT {
         let e = f.error_code;
         println!(

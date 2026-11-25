@@ -13,4 +13,12 @@ declare -A CRASHTESTS=(
     [execute_data]="protection violation on instruction fetch in kernel mode"
     [double_fault]="EXCEPTION #DF double fault"
     [panic]="KERNEL PANIC: panicked at"
+    [stack_overflow]="kernel stack overflow: the fault is in the boot stack's guard page"
+    [write_relro]="protection violation on write in kernel mode"
+    [write_text]="protection violation on write in kernel mode"
+    [heap_double_free]="(size 64, align 8): double free"
+    [heap_bad_pointer]="not the start of an object"
+    [heap_wild_pointer]="not heap memory"
+    [execute_heap]="protection violation on instruction fetch in kernel mode"
+    [execute_direct_map]="protection violation on instruction fetch in kernel mode"
 )

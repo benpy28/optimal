@@ -4,7 +4,7 @@ use crate::codec::{Reader, Writer};
 use crate::crypto::{self, BlockKind, Entropy, KdfParams, MAC_LEN, NONCE_LEN, Sealer, SecretKey};
 use crate::device::{BLOCK_SIZE, BlockDevice};
 use crate::error::{Error, Result};
-use crate::io::{Block, Io, zero_block};
+use crate::io::{Block, CopyMode, Io, zero_block};
 use crate::ptr::BlockPtr;
 use crate::space::Space;
 use crate::superblock::{
@@ -273,6 +273,12 @@ pub struct FormatOptions {
     /// Encrypts the volume when set.
     pub passphrase: Option<Vec<u8>>,
     pub kdf: KdfParams,
+    /// Minimum age before freed blocks may be reused (see [`MountOptions`]).
+    pub quarantine_min_ns: i64,
+    /// Metadata chunk size in blocks: a power of two from 1 to 64, or 0 to
+    /// size it to the device ([`auto_chunk_blocks`]). Fixed for the life
+    /// of the volume.
+    pub meta_chunk_blocks: u32,
 }
 
 impl Default for FormatOptions {
@@ -280,8 +286,18 @@ impl Default for FormatOptions {
         FormatOptions {
             passphrase: None,
             kdf: KdfParams::DEFAULT,
+            quarantine_min_ns: DEFAULT_QUARANTINE_NS,
+            meta_chunk_blocks: 0,
         }
     }
+}
+
+/// Default metadata chunk size for a `total`-block device: 64 blocks
+/// (256 KiB) from 4096 blocks (16 MiB) up, smaller below so tiny volumes
+/// don't spend their space on half-empty chunks (but at least 4).
+pub fn auto_chunk_blocks(total: u64) -> u32 {
+    let x = (total / 64).clamp(4, 64);
+    1 << (63 - x.leading_zeros())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -293,7 +309,26 @@ pub struct MountOptions {
     /// Dirty file data kept in memory before it is written out early
     /// (still committed atomically with everything else).
     pub dirty_limit_bytes: usize,
+    /// Freed blocks are not reused until they are both
+    /// [`crate::space::QUARANTINE_COMMITS`] commits and this many
+    /// nanoseconds old, so a drive that silently dropped recent flushes
+    /// still finds an intact older tree. See [`DEFAULT_QUARANTINE_NS`].
+    pub quarantine_min_ns: i64,
+    /// After an unclean shutdown, also read back file data written inside
+    /// the quarantine window (metadata in the window is always checked), so
+    /// mount falls back to an intact commit instead of later read errors.
+    pub verify_recent_data: bool,
+    /// Run a full fsck (with data) on each candidate commit; mount the
+    /// newest that passes. Slow: for rescue and tests.
+    pub fsck_on_mount: bool,
 }
+
+/// No extra time hold by default: the storage design promises fallback
+/// within K = 8 commits, and the VFS rate-limits full commits (fsync bursts
+/// go to the intent log), so 8 commits already span several seconds. A
+/// non-zero value adds a minimum age on top, for drives known to cache
+/// writes for longer; it costs free space while blocks wait.
+pub const DEFAULT_QUARANTINE_NS: i64 = 0;
 
 impl Default for MountOptions {
     fn default() -> Self {
@@ -302,6 +337,9 @@ impl Default for MountOptions {
             read_only: false,
             cache_nodes: 8192,
             dirty_limit_bytes: 64 << 20,
+            quarantine_min_ns: DEFAULT_QUARANTINE_NS,
+            verify_recent_data: true,
+            fsck_on_mount: false,
         }
     }
 }
@@ -328,6 +366,18 @@ pub struct Filesystem<D: BlockDevice> {
     read_only: bool,
     dirty_limit_blocks: usize,
     clock: Box<dyn Clock>,
+    /// The next commit's generation is above this: the newest generation
+    /// seen in any verified superblock, which can exceed `body.generation`
+    /// after mount fell back past commits that did not fully land.
+    gen_floor: u64,
+    /// Flags for the next commit ([`superblock::FLAG_CLEAN`] at unmount).
+    next_flags: u64,
+    /// Write the next commit to all four superblock slots.
+    rewrite_all_slots: bool,
+    fell_back_from: Option<u64>,
+    recovery: Option<crate::recover::RecoveryStats>,
+    /// The next commit raises the replay value by one.
+    replay_bump: bool,
 }
 
 impl<D: BlockDevice> core::fmt::Debug for Filesystem<D> {
@@ -363,16 +413,37 @@ impl<D: BlockDevice> Filesystem<D> {
         rng.fill(&mut uuid);
         let mut salt = [0u8; 32];
         rng.fill(&mut salt);
+        let chunk_blocks = match opts.meta_chunk_blocks {
+            0 => auto_chunk_blocks(total),
+            c if c.is_power_of_two() && c <= 64 => c,
+            _ => {
+                return Err(Error::Invalid(
+                    "metadata chunk size must be 1, 2, 4, .. or 64",
+                ));
+            }
+        };
         let mut header = Header {
             uuid,
             total_blocks: total,
             suite: SUITE_PLAIN,
+            compat: 0,
+            ro_compat: 0,
+            incompat: 0,
+            chunk_shift: chunk_blocks.trailing_zeros(),
             generation: 0,
             slot: 0,
             kdf: opts.kdf,
             salt,
             keyslots: [KeySlot::default(); KEYSLOTS],
         };
+        if opts.passphrase.is_some()
+            && !opts.kdf.meets_floor()
+            && opts.kdf != KdfParams::INSECURE_FAST_FOR_TESTS
+        {
+            return Err(Error::Invalid(
+                "key derivation below the floor (64 MiB, 4 passes)",
+            ));
+        }
         let master = match &opts.passphrase {
             None => None,
             Some(p) => {
@@ -389,7 +460,8 @@ impl<D: BlockDevice> Filesystem<D> {
             dev.write(superblock::slot_addr(slot, total), &zero[..])?;
         }
         let sealer = Sealer::new(uuid, master.as_ref(), rng);
-        let space = Space::format(total)?;
+        let mut space = Space::format(total, header.chunk_shift)?;
+        space.quarantine_min_ns = opts.quarantine_min_ns;
         let store = Store {
             io: Io::new(dev, sealer),
             space,
@@ -399,6 +471,9 @@ impl<D: BlockDevice> Filesystem<D> {
         };
         let body = Body {
             generation: 0,
+            chunk_root: BlockPtr::NULL,
+            chunk_depth: 0,
+            root_block: BlockPtr::NULL,
             fs_root: BlockPtr::NULL,
             meta_root: BlockPtr::NULL,
             space_root: BlockPtr::NULL,
@@ -408,7 +483,13 @@ impl<D: BlockDevice> Filesystem<D> {
             live_deadlist: 1,
             next_deadlist: 2,
             latest_snap_gen: 0,
+            last_move_gen: 0,
             commit_time_ns: 0,
+            replay_value: 0,
+            flags: 0,
+            window_gen: 0,
+            log_root: BlockPtr::NULL,
+            history: Vec::new(),
         };
         let mut fs = Filesystem {
             store,
@@ -427,6 +508,12 @@ impl<D: BlockDevice> Filesystem<D> {
             read_only: false,
             dirty_limit_blocks: MountOptions::default().dirty_limit_bytes / BLOCK_SIZE,
             clock,
+            gen_floor: 0,
+            next_flags: 0,
+            rewrite_all_slots: false,
+            fell_back_from: None,
+            recovery: None,
+            replay_bump: false,
         };
         let now = fs.clock.now_ns();
         let root = Attr {
@@ -449,11 +536,19 @@ impl<D: BlockDevice> Filesystem<D> {
     }
 
     /// Mounts the newest commit that fully verifies.
+    ///
+    /// Candidates are every superblock copy that verifies plus the commits
+    /// in their history rings, newest first. A candidate is accepted when
+    /// its roots read back and, unless it is a cleanly unmounted commit,
+    /// every metadata block born inside its quarantine window does too (and
+    /// file data, with [`MountOptions::verify_recent_data`]). If mount had
+    /// to skip newer commits, new commits are numbered above all of them
+    /// and the first one overwrites every superblock slot.
     pub fn mount(
         mut dev: D,
         opts: &MountOptions,
         rng: &mut dyn Entropy,
-        clock: Box<dyn Clock>,
+        mut clock: Box<dyn Clock>,
     ) -> Result<Self> {
         let cands = superblock::candidates(&mut dev)?;
         if cands.is_empty() {
@@ -461,8 +556,15 @@ impl<D: BlockDevice> Filesystem<D> {
         }
         let mut last_err = Error::NoFilesystem;
         let mut unlocked: Vec<([u8; 32], [KeySlot; KEYSLOTS], SecretKey)> = Vec::new();
-        let mut store_opt: Option<(D, Option<SecretKey>)> = Some((dev, None));
+        // (commit, its superblock's header, master key, from a history ring)
+        let mut commits: Vec<(Body, Header, Option<SecretKey>, bool)> = Vec::new();
+        let mut floor = 0u64;
         for c in &cands {
+            if c.header.ro_compat != 0 && !opts.read_only {
+                last_err =
+                    Error::Unsupported("unknown read-only-compatible features: mount read-only");
+                continue;
+            }
             let master = if c.header.suite == SUITE_PLAIN {
                 None
             } else {
@@ -495,66 +597,200 @@ impl<D: BlockDevice> Filesystem<D> {
                     continue;
                 }
             };
-            let (dev, _) = store_opt.take().unwrap();
-            let mut io = Io::new(dev, sealer);
-            match Self::open_commit(&mut io, &c.header, &body) {
-                Ok((space, fs_tree, meta)) => {
-                    let store = Store {
-                        io,
-                        space,
-                        cache: NodeCache::new(opts.cache_nodes),
-                        latest_snap_gen: body.latest_snap_gen,
-                        dead_pending: Vec::new(),
-                    };
-                    let mut header = c.header.clone();
-                    header.generation = body.generation;
-                    return Ok(Filesystem {
-                        store,
-                        fs_tree,
-                        meta,
-                        header,
-                        next_ino: body.next_ino,
-                        next_snap_id: body.next_snap_id,
-                        live_deadlist: body.live_deadlist,
-                        next_deadlist: body.next_deadlist,
-                        body,
-                        dirty_data: BTreeMap::new(),
-                        dirty_blocks: 0,
-                        txn_dirty: false,
-                        poisoned: false,
-                        read_only: opts.read_only,
-                        dirty_limit_blocks: (opts.dirty_limit_bytes / BLOCK_SIZE).max(16),
-                        clock,
-                    });
+            floor = floor.max(body.generation);
+            for h in &body.history {
+                commits.push((h.clone(), c.header.clone(), master.clone(), true));
+            }
+            commits.push((body, c.header.clone(), master, false));
+        }
+        // Newest first; for one generation prefer a superblock's own copy.
+        commits.sort_by_key(|(b, _, _, hist)| (core::cmp::Reverse(b.generation), *hist));
+        commits.dedup_by_key(|(b, _, _, _)| b.generation);
+
+        // Pass 0 needs every block born in a candidate's window, data
+        // included, to verify: recent blocks that fail after an unclean
+        // shutdown are lost writes, so an older commit is the right answer.
+        // If no candidate passes, pass 1 accepts the newest one whose
+        // metadata verifies and reports the files with lost data.
+        let mut dev = Some(dev);
+        let passes: &[bool] = if opts.verify_recent_data {
+            &[true, false]
+        } else {
+            &[false]
+        };
+        for (body, header, master, from_history, strict) in passes.iter().flat_map(|&p| {
+            commits
+                .iter()
+                .cloned()
+                .map(move |(b, h, m, f)| (b, h, m, f, p))
+        }) {
+            let sealer = Sealer::new(header.uuid, master.as_ref(), rng);
+            let mut io = Io::new(dev.take().unwrap(), sealer);
+            let clean = body.flags & superblock::FLAG_CLEAN != 0 && !from_history;
+            // After an unclean shutdown both copies of every block read
+            // during the check must be good (a bad one is repaired).
+            io.copy_mode = if clean {
+                CopyMode::Either
+            } else {
+                CopyMode::Both
+            };
+            io.repair_enabled = !opts.read_only;
+            let mut body = body;
+            let (mut space, fs_tree, meta) = match Self::open_commit(&mut io, &header, &mut body) {
+                Ok(x) => x,
+                Err(e) => {
+                    last_err = e;
+                    dev = Some(io.dev);
+                    continue;
+                }
+            };
+            space.quarantine_min_ns = opts.quarantine_min_ns;
+            let generation = body.generation;
+            let mut header = header;
+            header.generation = generation;
+            let mut fs = Filesystem {
+                store: Store {
+                    io,
+                    space,
+                    cache: NodeCache::new(opts.cache_nodes),
+                    latest_snap_gen: body.latest_snap_gen,
+                    dead_pending: Vec::new(),
+                },
+                fs_tree,
+                meta,
+                header,
+                next_ino: body.next_ino,
+                next_snap_id: body.next_snap_id,
+                live_deadlist: body.live_deadlist,
+                next_deadlist: body.next_deadlist,
+                body,
+                dirty_data: BTreeMap::new(),
+                dirty_blocks: 0,
+                txn_dirty: false,
+                poisoned: false,
+                read_only: opts.read_only,
+                dirty_limit_blocks: (opts.dirty_limit_bytes / BLOCK_SIZE).max(16),
+                clock,
+                gen_floor: 0,
+                next_flags: 0,
+                rewrite_all_slots: false,
+                fell_back_from: None,
+                recovery: None,
+                replay_bump: false,
+            };
+            let check = if clean {
+                Ok(())
+            } else {
+                let min_birth = fs.body.window_gen;
+                crate::recover::verify_since(&mut fs, min_birth, opts.verify_recent_data, strict)
+                    .map(|st| fs.recovery = Some(st))
+            };
+            let check = check.and_then(|()| {
+                if opts.fsck_on_mount {
+                    let r = crate::fsck::check(&mut fs, true)?;
+                    if !r.ok() {
+                        return Err(Error::Corrupt("fsck at mount found errors", generation));
+                    }
+                }
+                Ok(())
+            });
+            fs.store.io.copy_mode = CopyMode::Either;
+            match check {
+                Ok(()) => {
+                    if generation < floor {
+                        // Newer commits exist on disk but did not fully land.
+                        // Number new commits above them so they never outrank
+                        // ours. Their blocks are free in this commit's map and
+                        // will be reused; that is safe because every block they
+                        // could still need was born inside their window, which
+                        // mount verifies (a reused block fails its MAC). As
+                        // defence in depth the first commit also overwrites
+                        // every superblock slot, so no stale copy lingers.
+                        fs.gen_floor = floor;
+                        fs.rewrite_all_slots = true;
+                        fs.fell_back_from = Some(floor);
+                    }
+                    return Ok(fs);
                 }
                 Err(e) => {
                     last_err = e;
-                    store_opt = Some((io.dev, None));
+                    clock = fs.clock_take();
+                    dev = Some(fs.into_device());
                 }
             }
         }
         Err(last_err)
     }
 
-    fn open_commit(io: &mut Io<D>, h: &Header, body: &Body) -> Result<(Space, Tree, Tree)> {
+    fn clock_take(&mut self) -> Box<dyn Clock> {
+        core::mem::replace(&mut self.clock, Box::new(ZeroClock))
+    }
+
+    /// The newer generation mount had to skip, if it fell back.
+    pub fn fell_back_from(&self) -> Option<u64> {
+        self.fell_back_from
+    }
+
+    /// What mount's recovery check read (None after a clean unmount).
+    pub fn recovery_stats(&self) -> Option<&crate::recover::RecoveryStats> {
+        self.recovery.as_ref()
+    }
+
+    /// The anti-rollback counter of the mounted commit.
+    pub fn replay_value(&self) -> u64 {
+        self.body.replay_value
+    }
+
+    /// Raises the anti-rollback counter by one in a commit written to all
+    /// four superblock slots (both pairs, each flushed), so every copy that
+    /// mount could pick carries the new value. Only after this returns may
+    /// the caller advance its TPM monotonic counter; a crash before that
+    /// leaves the old value, which the TPM still accepts. Returns the new value.
+    pub fn bump_replay(&mut self) -> Result<u64> {
+        self.check_writable()?;
+        self.replay_bump = true;
+        self.txn_dirty = true;
+        let r = self.commit();
+        self.replay_bump = false;
+        r?;
+        Ok(self.body.replay_value)
+    }
+
+    /// Commits any pending changes and marks the volume cleanly unmounted,
+    /// which lets the next mount skip the recovery check. Returns the device.
+    pub fn unmount(mut self) -> Result<D> {
+        if !self.read_only && !self.poisoned {
+            self.next_flags = superblock::FLAG_CLEAN;
+            self.txn_dirty = true;
+            self.commit()?;
+        }
+        Ok(self.store.io.dev)
+    }
+
+    /// Opens commit `body` (a core from a superblock or its history):
+    /// its chunk table, its root block (filling the rest of `body`), its
+    /// space map, and checks its tree roots read back.
+    fn open_commit(io: &mut Io<D>, h: &Header, body: &mut Body) -> Result<(Space, Tree, Tree)> {
         let total = io.num_blocks();
+        let mut space = Space::open(io, total, h.chunk_shift, body.chunk_root, body.chunk_depth)?;
+        let rb = space.read_meta(io, BlockKind::Root, &body.root_block)?;
+        body.apply_root(&rb[..])?;
         if body.fs_root.is_null()
             || body.space_root.is_null()
             || body.next_ino <= ROOT_INO
             || body.live_deadlist >= body.next_deadlist
         {
-            return Err(Error::Corrupt("superblock fields", 0));
+            return Err(Error::Corrupt("root block fields", body.generation));
         }
-        let _ = h;
-        let space = Space::open(io, total, body.space_root, body.free_log)?;
+        space.attach(io, body.space_root, body.free_log)?;
         let fs_tree = Tree::new(TreeId::Fs, body.fs_root)?;
         let meta = Tree::new(TreeId::Meta, body.meta_root)?;
         // Make sure the roots themselves are readable now, so a damaged
         // newest commit falls back to the previous one instead of failing later.
-        let mut b = io.read_sealed(BlockKind::Node, &body.fs_root)?;
+        let mut b = space.read_meta(io, BlockKind::Node, &body.fs_root)?;
         crate::tree::Node::decode(&b[..], TreeId::Fs, &body.fs_root)?;
         if !body.meta_root.is_null() {
-            b = io.read_sealed(BlockKind::Node, &body.meta_root)?;
+            b = space.read_meta(io, BlockKind::Node, &body.meta_root)?;
             crate::tree::Node::decode(&b[..], TreeId::Meta, &body.meta_root)?;
         }
         Ok((space, fs_tree, meta))
@@ -574,9 +810,94 @@ impl<D: BlockDevice> Filesystem<D> {
         &self.store.io.dev
     }
 
+    /// Makes the allocator continue its search at block `b` (tests use it
+    /// to put data in far regions of huge volumes).
+    #[doc(hidden)]
+    pub fn set_alloc_cursor_for_tests(&mut self, b: u64) {
+        self.store.space.set_cursor(b);
+    }
+
+    /// Moves metadata chunk `id` to new physical blocks in the next commit
+    /// (both copies; pointers are logical, so nothing else changes). For
+    /// moving metadata off a failing region, balancing, and tests.
+    pub fn relocate_metadata_chunk(&mut self, id: u64) -> Result<()> {
+        self.check_writable()?;
+        if !self
+            .store
+            .space
+            .chunks
+            .entry(&mut self.store.io, id)?
+            .mapped()
+        {
+            return Err(Error::NotFound);
+        }
+        if !self.store.space.relocations.contains(&id) {
+            self.store.space.relocations.push(id);
+        }
+        self.txn_dirty = true;
+        Ok(())
+    }
+
+    /// Every mapped metadata chunk of the current state: (id, entry).
+    pub fn metadata_chunks(&mut self) -> Result<Vec<(u64, crate::chunk::Entry)>> {
+        self.store.space.chunks.all_entries(&mut self.store.io)
+    }
+
+    /// The volume's metadata chunk size in blocks.
+    pub fn metadata_chunk_blocks(&self) -> u64 {
+        self.store.space.chunks.chunk_blocks()
+    }
+
+    /// The logical address of slot `off` of metadata chunk `id`.
+    pub fn metadata_address(&self, id: u64, off: u64) -> u64 {
+        self.store.space.chunks.join(id, off)
+    }
+
+    #[doc(hidden)]
+    pub fn commit_forced_for_tests(&mut self) -> Result<()> {
+        self.commit_forced()
+    }
+
+    /// Physical blocks of copies 0 and 1 of logical metadata block `l`.
+    pub fn resolve_metadata(&mut self, l: u64) -> Result<(u64, u64)> {
+        self.store.space.chunks.resolve(&mut self.store.io, l)
+    }
+
+    /// Both copies of every chunk-table block (tests damage them).
+    #[doc(hidden)]
+    pub fn chunk_table_blocks_for_tests(&mut self) -> Result<Vec<(u64, u64)>> {
+        Ok(self
+            .store
+            .space
+            .chunks
+            .all_node_ptrs(&mut self.store.io)?
+            .iter()
+            .map(|(_, _, p)| (p.addr, p.aux))
+            .collect())
+    }
+
+    /// The committed root block and filesystem-tree root pointers (tests
+    /// use them to damage specific copies).
+    #[doc(hidden)]
+    pub fn roots_for_tests(&self) -> (u64, u64) {
+        (self.body.root_block.addr, self.body.fs_root.addr)
+    }
+
     #[doc(hidden)]
     pub fn next_ino_for_tests(&self) -> u64 {
         self.next_ino
+    }
+
+    /// The oldest generation the current commit's recovery check covers.
+    #[doc(hidden)]
+    pub fn window_gen_for_tests(&self) -> u64 {
+        self.body.window_gen
+    }
+
+    /// The newest commit that moved a run of live metadata blocks.
+    #[doc(hidden)]
+    pub fn last_move_gen_for_tests(&self) -> u64 {
+        self.body.last_move_gen
     }
 
     pub fn generation(&self) -> u64 {
@@ -608,7 +929,7 @@ impl<D: BlockDevice> Filesystem<D> {
     }
 
     pub(crate) fn txn_generation(&self) -> u64 {
-        self.body.generation + 1
+        self.body.generation.max(self.gen_floor) + 1
     }
 
     fn check_writable(&self) -> Result<()> {
@@ -634,19 +955,23 @@ impl<D: BlockDevice> Filesystem<D> {
         if self.store.space.allocatable_blocks() >= need(self) {
             return Ok(());
         }
-        // Quarantined blocks become usable after two commits.
+        // Quarantined blocks become usable once they are QUARANTINE_COMMITS
+        // commits and the minimum time old. Cycle commits while that could
+        // still help; past the time window the caller must wait and retry.
         if self.txn_dirty {
             self.commit()?;
-            if self.store.space.allocatable_blocks() >= need(self) {
-                return Ok(());
+        }
+        let mut cycles = 0;
+        while self.store.space.allocatable_blocks() < need(self) {
+            let could =
+                self.store.space.allocatable_blocks() + self.store.space.quarantined_blocks();
+            if could < need(self) || cycles > crate::space::QUARANTINE_COMMITS {
+                return Err(Error::NoSpace);
             }
+            self.commit_forced()?;
+            cycles += 1;
         }
-        self.commit_forced()?;
-        if self.store.space.allocatable_blocks() >= need(self) {
-            Ok(())
-        } else {
-            Err(Error::NoSpace)
-        }
+        Ok(())
     }
 
     // ---- inode helpers ----
@@ -1201,6 +1526,30 @@ impl<D: BlockDevice> Filesystem<D> {
         }
     }
 
+    /// Reads and verifies every block of an extent (recovery checks).
+    pub(crate) fn verify_extent(&mut self, ino: u64, e: &Extent) -> Result<()> {
+        if e.phys
+            .checked_add(e.len)
+            .is_none_or(|end| end > self.store.space.total_blocks())
+        {
+            return Err(Error::Corrupt("extent out of range", ino));
+        }
+        let mut buf = vec![0u8; BLOCK_SIZE];
+        for r in 0..e.len {
+            self.store.io.read_raw(e.phys + r, &mut buf)?;
+            let nonce = crypto::nonce_add(&e.nonce, r);
+            self.store.io.sealer.open(
+                BlockKind::Data,
+                e.phys + r,
+                e.birth,
+                &nonce,
+                &e.macs[r as usize],
+                &mut buf,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Reads committed (on-disk) data for file blocks `[idx, idx+n)` into `out`.
     fn read_disk_blocks(&mut self, ino: u64, idx: u64, n: u64, out: &mut [u8]) -> Result<()> {
         let mut i = 0;
@@ -1528,7 +1877,9 @@ impl<D: BlockDevice> Filesystem<D> {
         if self.poisoned {
             return Err(Error::Poisoned);
         }
-        if !self.txn_dirty {
+        // Queued repairs of bad metadata copies are written by the next
+        // commit even when nothing else changed.
+        if !self.txn_dirty && self.store.io.pending_repairs() == 0 {
             return Ok(());
         }
         self.check_writable()?;
@@ -1539,6 +1890,7 @@ impl<D: BlockDevice> Filesystem<D> {
                 // in-memory state is half-written. Refuse further work.
                 self.poisoned = true;
                 self.store.io.discard_batch();
+                self.store.io.discard_repairs();
                 Err(e)
             }
         }
@@ -1552,14 +1904,33 @@ impl<D: BlockDevice> Filesystem<D> {
 
     fn commit_inner(&mut self) -> Result<()> {
         let generation = self.txn_generation();
+        // Repairs and chunk moves first, while nothing else is queued.
+        if self.store.io.repair_enabled {
+            self.store.space.repair_copies(&mut self.store.io)?;
+        }
+        for id in core::mem::take(&mut self.store.space.relocations) {
+            self.store.space.relocate_chunk(&mut self.store.io, id)?;
+        }
         self.flush_data()?;
         let fs_root = self.fs_tree.write(&mut self.store, generation)?;
         crate::snapshot::flush_deadlist(self)?;
         let meta_root = self.meta.write(&mut self.store, generation)?;
-        let (space_root, free_log) = self.store.space.write(&mut self.store.io, generation)?;
-        self.store.io.write_batch()?;
-        let body = Body {
+        let now = self.clock.now_ns();
+        // A new root block every commit; the old one is quarantined.
+        if !self.body.root_block.is_null() {
+            let old = self.body.root_block.addr;
+            self.store.space.free(&mut self.store.io, old, 1)?;
+        }
+        let root_addr = self.store.space.alloc_meta(&mut self.store.io, 1)?[0].0;
+        let (space_root, free_log, chunk_root) =
+            self.store
+                .space
+                .write(&mut self.store.io, generation, now)?;
+        let mut body = Body {
             generation,
+            chunk_root,
+            chunk_depth: self.store.space.chunks.depth(),
+            root_block: BlockPtr::NULL,
             fs_root,
             meta_root,
             space_root,
@@ -1569,12 +1940,49 @@ impl<D: BlockDevice> Filesystem<D> {
             live_deadlist: self.live_deadlist,
             next_deadlist: self.next_deadlist,
             latest_snap_gen: self.store.latest_snap_gen,
-            commit_time_ns: self.clock.now_ns(),
+            last_move_gen: if core::mem::take(&mut self.store.space.moved_live_run) {
+                generation
+            } else {
+                self.body.last_move_gen
+            },
+            commit_time_ns: now,
+            replay_value: self.body.replay_value + self.replay_bump as u64,
+            flags: self.next_flags,
+            window_gen: self
+                .store
+                .space
+                .oldest_held()
+                .unwrap_or(generation)
+                .min(generation.saturating_sub(crate::space::QUARANTINE_COMMITS - 1))
+                .max(1),
+            log_root: BlockPtr::NULL,
+            // Generation 0 is format's starting state, never a commit.
+            history: core::iter::once(self.body.core())
+                .filter(|c| c.generation > 0)
+                .chain(self.body.history.iter().cloned())
+                .take(superblock::HISTORY)
+                .collect(),
         };
-        superblock::commit(&mut self.store.io, &self.header, &body)?;
+        body.root_block = self.store.space.write_meta(
+            &mut self.store.io,
+            BlockKind::Root,
+            root_addr,
+            generation,
+            body.encode_root(),
+            0,
+        )?;
+        self.store.io.write_batch()?;
+        superblock::commit(
+            &mut self.store.io,
+            &self.header,
+            &body,
+            self.rewrite_all_slots || self.replay_bump,
+        )?;
+        self.rewrite_all_slots = false;
+        self.replay_bump = false;
         self.header.generation = generation;
         self.body = body;
-        self.store.space.committed();
+        self.store.space.committed(generation, now);
         self.txn_dirty = false;
         Ok(())
     }
