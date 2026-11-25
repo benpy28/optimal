@@ -53,8 +53,14 @@ pub const GOAL_PPB: u64 = 10_000;
 pub const BOOT_WINDOW_NS: u64 = 100_000_000;
 /// A new end sample this often.
 const STEP_NS: u64 = 10_000_000;
-/// A TSC bound wider than this (100 ppm) is reported as a warning.
-const WARN_PPB: u64 = 100_000;
+/// A boot measurement of the TSC looser than this (1000 ppm, a millisecond
+/// a second) is reported as a warning: past it, timers armed from the
+/// TSC before the refinement would be visibly off. Anything tighter is a
+/// good enough starting value, because the 10 s refinement (1c3b), not the
+/// boot measurement, is what holds the clock to the ROADMAP's 1 ppm. In
+/// nested VMs (GitHub's KVM runners) every HPET read is a slow exit, and
+/// 100 ms only reaches about 100 ppm there.
+const WARN_PPB: u64 = 1_000_000;
 /// How far the PM timer may be from its nominal frequency, measured with
 /// the HPET, before the HPET is distrusted: 500 ppm. Both normally come
 /// from the same 14.318 MHz crystal and agree to within a few ppm; a
