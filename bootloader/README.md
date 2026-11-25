@@ -23,4 +23,4 @@ swtpm, and a Limine binary release in `../build/limine`):
 
     scripts/conformance-case.sh r5
 
-Design and security model: [DESIGN.md](DESIGN.md) (coming with the loader).
+Design and security model: [DESIGN.md](DESIGN.md).

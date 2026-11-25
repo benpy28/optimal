@@ -46,7 +46,7 @@ for m in "${MUTANTS[@]}"; do
         echo "mutant $name: SURVIVED ($case_name still passes)"
         survived+=("$name")
     else
-        why=$(grep -a "^FAIL\|did not take\|no result\|needs KVM" "../build/ob/mutant-$name.out" | head -2 | tr '\n' ' ')
+        why=$(grep -a "^FAIL\|did not take\|no result\|needs KVM\|skipped the local APIC" "../build/ob/mutant-$name.out" | head -2 | tr '\n' ' ')
         echo "mutant $name: killed by $case_name: $why"
         if grep -aq "needs KVM\|did not take\|error\[" "../build/ob/mutant-$name.out"; then
             echo "  (but not by a check: the run could not test it)"; survived+=("$name")
