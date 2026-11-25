@@ -141,6 +141,8 @@ scenario() {
             # say where it died.
             head -n 25 "$log" 2>/dev/null
             echo "[...]"
+            # The failing test and its message, wherever they are.
+            grep -aE -A4 "KTEST FAIL|KERNEL PANIC" "$log" 2>/dev/null
             grep -E "KVM internal error|Suberror|emulation failure|extra data" "$log" 2>/dev/null
             tail -n 40 "$log" 2>/dev/null
         fi

@@ -89,17 +89,31 @@ ktest!(hpet_runs_with_every_comparator_quiet, {
             "comparator {n}: {c:#x}"
         );
     }
-    // Counting up, and at about its rate: 1 ms of TSC is between 0.5 ms and
-    // 2 ms of HPET (loose: this checks direction and scale, not accuracy).
+    // Counting up, and at about its rate. The HPET reads come before and
+    // after the TSC reads, so the HPET interval always contains the TSC
+    // one: at least 1 ms of TSC is never under 0.5 ms of HPET. A vCPU
+    // descheduled between the reads (a loaded host) can only make the HPET
+    // interval longer, so the upper check takes the shortest of 20 tries:
+    // under 2 ms. Loose on purpose: this checks direction and scale, not
+    // accuracy.
     let tsc = boot_tsc(time()).freq;
-    let (a, t0) = (h.counter(), cpu::rdtsc_ordered());
-    while cpu::rdtsc_ordered() - t0 < tsc.ns_to_ticks_ceil(1_000_000) {}
-    let b = h.counter();
-    let ticks = optimal_time::counter::delta(a, b, h.caps.counter_bits());
-    let ns = h.caps.freq().ticks_to_ns(ticks);
+    let one_ms = tsc.ns_to_ticks_ceil(1_000_000);
+    let shortest = (0..20)
+        .map(|_| {
+            let a = h.counter();
+            let t0 = cpu::rdtsc_ordered();
+            while cpu::rdtsc_ordered() - t0 < one_ms {}
+            let b = h.counter();
+            let ticks = optimal_time::counter::delta(a, b, h.caps.counter_bits());
+            let ns = h.caps.freq().ticks_to_ns(ticks);
+            assert!(ns >= 500_000, "1 ms of TSC was only {ns} ns of HPET");
+            ns
+        })
+        .min()
+        .unwrap();
     assert!(
-        (500_000..2_000_000).contains(&ns),
-        "1 ms of TSC was {ns} ns of HPET"
+        shortest < 2_000_000,
+        "1 ms of TSC was at least {shortest} ns of HPET"
     );
 });
 
