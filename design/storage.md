@@ -845,6 +845,15 @@ install. So:
   reported unrecoverable and opened with the read-only rescue mount
   (below). ext4 overwrites in place and has no such fallback, so for
   ext4 the only promise is that the volume is clean after `e2fsck -fy`.
+  Snapshots, rollback and fallback never rewrite a MAC: a snapshot is a
+  retained root set, copy-on-write never overwrites a block any retained
+  root reaches, and deleting a snapshot frees only blocks no remaining root
+  reaches (after the K-commit quarantine). Rolling back to a snapshot is a
+  new commit whose root is the old one, guarded by the replay counter, so
+  every root's path verifies with no re-hashing. Test (own file system
+  gate): a seeded random mix of writes, snapshot create, delete and
+  rollback under the crash-state enumerator above, after which the checker
+  verifies every MAC reachable from every root.
   After an unclean shutdown the own file system verifies every block born
   inside the window; a relocated metadata run keeps its old birth, so the
   root block records the last generation that moved one, and when that
@@ -868,14 +877,16 @@ install. So:
   raised. A night below the target fails the nightly job; the target is
   never lowered to fit.
 - **Real power cuts.** Before each release: a relay-controlled power-cut rig,
-  at least 1,000 cuts on at least 3 drive models (Phase 4a included), with
+  at least 1,000 cuts on at least 3 drive models, at least one of them a
+  consumer drive with a volatile write cache (VWC=1) and no power-loss
+  protection, results published per drive model (Phase 4a included), with
   the same oracle; from the own file system's first rig run on, it also
   records the fallback depths that set K (above). The first run is on ext4 over LUKS2, before the first release with read-write
   ext4 (Phase 4a); the own file system gets its own before it becomes the
   default. This needs physical hardware and is listed as a hardware need in
   the roadmap.
 
-## Benchmarks (so "within 10%" and "beats ext4" mean something)
+## Benchmarks (so "within 10%" means something)
 
 All storage comparisons run with encryption on for both systems (Linux with
 dm-crypt AES-XTS in stage 1, with `no_read_workqueue` and `no_write_workqueue`

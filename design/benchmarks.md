@@ -432,13 +432,14 @@ the sample column gives the rest.
 |---|---|---|---|
 | Wake-up latency of a real-time thread with all cores saturated (default boot, no isolated CPUs). Load in Phase 2: a spinning thread per CPU plus IPI and timer storms; at 4a also storage load and device stalls (the real-time gate under device stalls, [scheduler.md](scheduler.md) "Device stalls"); from Phase 5: hackbench, a pinned compile, fio on NVMe and memory pressure together | P99 < 50 µs, P99.9 < 100 µs | 20 boots, 4 min at 1 kHz each (2.4 × 10^5 wake-ups per boot) | 2 (re-gated at 4a, 5 and 7, then nightly) |
 | Longest preempt-off or IRQ-off section, excluding SMI-overlapped sections (counted and published) | < 50 µs (20 µs from Phase 10): no section above it in any stress boot | every stress boot (at least 20 per gate) | 2 |
-| Audio underruns at 128 frames, 48 kHz, under full CPU and I/O load | 0 observed in ≥ 24 h, 95% upper bound ≤ 0.125 per hour (also reported at 64 and 256 frames, under load) | 24 h per buffer size and load condition | 6 |
+| Audio underruns at 128 frames, 48 kHz, under full CPU and I/O load (the wake-up latency row's load for the phase; PipeWire playing a sine through the reference desktop's onboard codec, counted from PipeWire's xrun counter) | 0 observed in ≥ 24 h, 95% upper bound ≤ 0.125 per hour (also reported at 64 and 256 frames, under load) | 24 h per buffer size and load condition | 6 |
 | Input-to-display latency under full CPU load | P99 no more than 1.5 times its idle P99 (nightly gate); P99.9 no more than 1.5 times its idle P99.9 (release gate); both no worse than matched Linux | one nightly window: 40 boots Optimal, 20 per Linux kernel, 5,000 events per condition per boot | 7 |
 | Frame time P99 in the frame-pacing test at 60 Hz (bare metal, llvmpipe over simple framebuffer, against Linux booted `nomodeset` with simpledrm and llvmpipe; virtio-gpu trend-only) | ≤ refresh period + 1 ms | 20 boots, 5 min (18,000 frames) per boot | 7 |
 | Frame time P99 at 144 Hz on the reference discrete GPU | ≤ refresh period + 1 ms | 20 boots, 5 min (43,200 frames) per boot | 8 |
 | Foreground input latency P99 while a large copy or compile runs | ≤ 1.25 times idle | one nightly window, as above | 7 |
 | Memory pressure test (8 GiB usable RAM as measured, 50 browser pages and a compile, [scheduler.md](scheduler.md)) | the compile finishes; input latency P99 ≤ 1.5 times idle; frame time P99 ≤ refresh period + 2 ms; 0 OOM kills of the foreground app or the compositor; each, and the compile's wall time and the count of background-app kills (both published), no worse than matched Linux | 20 memory-pressure boots | 7 |
-| Boot time, from the TSC stamp taken at kernel entry from Limine to the kernel's named `kernel ready` event (boot initialisation done, before the first task starts) | mean < 300 ms (a Phase 1 done-when item) | 20 boots, run in CI on the dedicated KVM host in Phase 1, on the reference desktop from Phase 2 | 1 |
+| Kernel initialisation time, from the TSC stamp taken at kernel entry from Limine to the kernel's named `kernel ready` event (boot initialisation done, before the first task starts) | mean < 300 ms (a Phase 1 done-when item) | 20 boots, run in CI on the dedicated KVM host in Phase 1, on the reference desktop from Phase 2 | 1 |
+| Boot to login screen, from the loader's first instruction to the first frame of the login screen (unencrypted install, so no PIN wait) | P95 no worse than matched Linux to its login screen with the same compositor | 20 boots per OS | 7 |
 | Total OS memory at an idle desktop (Phase 7 done-when) | ≤ 60% of the lightest mainstream Linux desktop on the same machine | 20 boots per OS | 7 |
 | Idle CPU over the defined window (Phase 7 done-when) | < 0.5% and no worse than matched Linux | 20 boots, one window each | 7 |
 | Latency tracer cost when off, on the `getppid` round trip, kernel-thread context switch, 4 KiB anonymous fault and slab allocate/free (futex ping-pong from 5) | each ≤ 0.5% against a build with the tracer compiled out, both with the fixed code layout | 40 boots per build, 7 runs each (SE ≤ 0.15%) | 3 |
@@ -549,15 +550,23 @@ the CPU has it), so a win bought with extra watts is visible.
 2. **Background services:** everything in user space that runs with no app
    open.
 3. **Total OS memory:** 1 + 2, at an idle desktop, measured 2 minutes after
-   login settles.
+   the `login done` event (the shell's first frame after login). Optimal's
+   reclaimable set uses Linux's rule (page cache, reclaimable slab) and is
+   checked by a drop-caches test: memory freed by dropping caches must
+   equal the reclaimable figure within 2%. The scorecard lists every
+   process running in each session measured.
 4. **Available to applications:** what a new app can actually allocate
    without swapping, at that same moment.
 
 Reclaimable caches are reported separately and never counted as "used".
+On both kernels the number is total RAM minus `MemAvailable`-equivalent
+(free plus reclaimable), sampled each second for 60 s and averaged, with
+each desktop's default session on the same distribution release, no
+autostart entries added, the same display resolution and the same machine.
 Memory is reported from Phase 3 (kernel only) and in full from Phase 7, when
 there is a desktop to measure; the idle-desktop target below is a Phase 7
 done-when item.
-Measured on each reference machine and on the CI VM. Targets: total OS memory
+Measured on each reference machine (the CI VM is trend only). Targets: total OS memory
 at an idle desktop at most 60% of the lightest mainstream Linux desktop
 measured on the same machine, tightened as data comes in.
 
