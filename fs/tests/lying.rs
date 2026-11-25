@@ -29,6 +29,12 @@ struct Tally {
     fallbacks: u64,
     damaged: u64,
     second_round: u64,
+    /// Metadata chunks moved while the drive was lying.
+    relocations: u64,
+    /// How many commits back each fallback landed (index = depth).
+    depths: [u64; K as usize + 1],
+    /// Move a chunk at roughly this share of lying operations (0 = never).
+    relocate_one_in: u64,
 }
 
 fn lying_case(seed: u64, enc: bool, honest_ops: usize, lies: u64, images: u64, t: &mut Tally) {
@@ -67,6 +73,14 @@ fn lie_and_check(
             gen_op(&mut r, &h.model, &cfg())
         };
         h.apply(&op).unwrap();
+        // Chunk moves inside the window: the lost commits map chunks to new
+        // runs, the commit mount falls back to must still find the old ones.
+        if t.relocate_one_in > 0 && r.chance(1, t.relocate_one_in) {
+            let chunks = h.fs().metadata_chunks().unwrap();
+            let (id, _) = chunks[r.below(chunks.len() as u64) as usize];
+            h.fs().relocate_metadata_chunk(id).unwrap();
+            t.relocations += 1;
+        }
         guard += 1;
         assert!(guard < 10_000);
     }
@@ -112,6 +126,7 @@ fn lie_and_check(
         if g < newest {
             t.fallbacks += 1;
         }
+        t.depths[(newest - g).min(K) as usize] += 1;
         let damaged: BTreeSet<u64> = fs
             .recovery_stats()
             .map(|s| s.damaged.iter().map(|&(ino, _)| ino).collect())
@@ -165,19 +180,62 @@ fn lie_and_check(
 fn lost_commits_one_to_k() {
     let scale = scale();
     let base = base_seed();
-    let mut t = Tally::default();
+    let mut t = Tally {
+        relocate_one_in: 25,
+        ..Default::default()
+    };
     for lies in 1..=K {
         for i in 0..scale.max(1) * 2 {
             let seed = base ^ (lies << 40) ^ (i * 0x9e37_79b9);
             lying_case(seed, i % 2 == 1, 40, lies, 6, &mut t);
         }
     }
-    eprintln!(
-        "lying drives: {} fallbacks, {} damaged-file reports, {} second rounds",
-        t.fallbacks, t.damaged, t.second_round
-    );
+    report(&t);
     // The adversary must actually have forced fallbacks, or this tested nothing.
     assert!(t.fallbacks > 10 && t.second_round > 2, "too few fallbacks");
+    assert!(t.relocations > 5, "too few chunk moves: {}", t.relocations);
+}
+
+/// Prints the tally, including how deep each fallback went (the design
+/// asks for this distribution to be published: K must stay at least twice
+/// the deepest fallback seen).
+fn report(t: &Tally) {
+    eprintln!(
+        "lying drives: {} fallbacks, {} damaged-file reports, {} second rounds, {} chunk moves",
+        t.fallbacks, t.damaged, t.second_round, t.relocations
+    );
+    eprintln!(
+        "commits back from the newest copy each mount landed: {:?}",
+        t.depths
+    );
+}
+
+#[test]
+fn lost_commits_with_chunk_moves_in_every_window() {
+    // Every lying window moves chunks (about one op in four), with tiny
+    // chunks so a move shifts many tables and slots at once.
+    let base = base_seed() ^ 0xc4a1;
+    let mut t = Tally {
+        relocate_one_in: 4,
+        ..Default::default()
+    };
+    for lies in 1..=K {
+        for i in 0..scale().max(1) * 2 {
+            let seed = base ^ (lies << 40) ^ (i * 0x51_7cc1);
+            let enc = i % 2 == 0;
+            let mut h =
+                Harness::new_chunked(1500, enc, seed, [1, 2, 4, 0][(i % 4) as usize]).unwrap();
+            let mut r = Rng::new(seed);
+            for _ in 0..40 {
+                let op = gen_op(&mut r, &h.model, &cfg());
+                h.apply(&op).unwrap();
+            }
+            lie_and_check(h, seed, enc, lies, 6, 1, &mut t);
+        }
+    }
+    report(&t);
+    assert!(t.fallbacks > 10, "too few fallbacks");
+    assert!(t.relocations > 30, "too few chunk moves: {}", t.relocations);
 }
 
 #[test]

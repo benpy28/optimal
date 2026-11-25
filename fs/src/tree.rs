@@ -300,7 +300,7 @@ impl<D: BlockDevice> Store<D> {
         if let Some(n) = self.cache.get(p) {
             return Ok(n);
         }
-        let b = self.io.read_sealed(BlockKind::Node, p)?;
+        let b = self.space.read_meta(&mut self.io, BlockKind::Node, p)?;
         let n = Arc::new(Node::decode(&b[..], tree, p)?);
         self.cache.put(*p, n.clone());
         Ok(n)
@@ -495,7 +495,7 @@ impl Tree {
             Some(Child::Clean(p)) => Ok(*p),
             Some(root) => {
                 let n = count_dirty(root);
-                let runs = s.space.alloc_many(&mut s.io, n)?;
+                let runs = s.space.alloc_meta(&mut s.io, n)?;
                 let mut addrs = runs.into_iter().flat_map(|(a, l)| a..a + l);
                 write_rec(root, s, id, generation, &mut addrs)?;
                 debug_assert!(addrs.next().is_none());
@@ -691,8 +691,14 @@ fn write_rec<D: BlockDevice>(
     }
     let addr = addrs.next().expect("allocated too few node blocks");
     let b = node.encode(tree, generation);
-    let p =
-        s.io.write_sealed(BlockKind::Node, addr, generation, b, node.level as u64);
+    let p = s.space.write_meta(
+        &mut s.io,
+        BlockKind::Node,
+        addr,
+        generation,
+        b,
+        node.level as u64,
+    )?;
     let node = core::mem::take(&mut **node);
     s.cache.put(p, Arc::new(node));
     *c = Child::Clean(p);

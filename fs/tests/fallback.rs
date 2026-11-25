@@ -21,6 +21,7 @@ fn previous_commit_survives_remount_and_reuse() {
         passphrase: None,
         kdf: KdfParams::INSECURE_FAST_FOR_TESTS,
         quarantine_min_ns: 0,
+        meta_chunk_blocks: 0,
     };
     let mut fs = Filesystem::format(
         CrashDevice::new(blocks, 1),

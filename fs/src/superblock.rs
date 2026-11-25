@@ -67,6 +67,8 @@ pub struct Header {
     pub compat: u32,
     pub ro_compat: u32,
     pub incompat: u32,
+    /// log2 of the metadata chunk size in blocks (0..=6), fixed at format.
+    pub chunk_shift: u32,
     /// Not part of the header bytes: from the slot's trailer.
     pub generation: u64,
     pub slot: u32,
@@ -76,9 +78,21 @@ pub struct Header {
 }
 
 /// The commit state a superblock records.
+///
+/// The superblock itself stores each commit's *core*: generation, time,
+/// replay value, flags, window, the chunk table root and depth, and a
+/// pointer to the commit's root block. The root block (a duplicated
+/// metadata block, read through that commit's chunk table) holds the tree
+/// and space-map roots and the counters, which fill the remaining fields
+/// once it is read ([`Body::apply_root`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Body {
     pub generation: u64,
+    /// Chunk table root: copy 0 at `addr`, copy 1 at `aux`.
+    pub chunk_root: BlockPtr,
+    pub chunk_depth: u32,
+    /// The root block (logical address).
+    pub root_block: BlockPtr,
     pub fs_root: BlockPtr,
     pub meta_root: BlockPtr,
     pub space_root: BlockPtr,
@@ -142,7 +156,7 @@ impl Header {
         w.zeros(3);
         w.u32(self.compat);
         w.u32(self.ro_compat);
-        w.zeros(4);
+        w.u32(1 << self.chunk_shift);
         w.u32(self.kdf.mem_kib);
         w.u32(self.kdf.iterations);
         w.u32(self.kdf.lanes);
@@ -180,9 +194,11 @@ impl Header {
         r.skip(3)?;
         let compat = r.u32()?;
         let ro_compat = r.u32()?;
-        if r.u32()? != 0 {
+        let chunk = r.u32()?;
+        if !chunk.is_power_of_two() || chunk > 1 << crate::chunk::MAX_CHUNK_SHIFT {
             return Err(r.err());
         }
+        let chunk_shift = chunk.trailing_zeros();
         let kdf = KdfParams {
             mem_kib: r.u32()?,
             iterations: r.u32()?,
@@ -210,6 +226,7 @@ impl Header {
             compat,
             ro_compat,
             incompat,
+            chunk_shift,
             generation: 0,
             slot: 0,
             kdf,
@@ -262,9 +279,100 @@ impl Header {
     }
 }
 
+/// Magic at the start of a root block: "ROOT".
+const ROOT_MAGIC: u32 = 0x544f_4f52;
+
 impl Body {
+    /// A body with only the core fields known (the rest from the root block).
+    #[allow(clippy::too_many_arguments)]
+    fn from_core(
+        generation: u64,
+        commit_time_ns: i64,
+        replay_value: u64,
+        flags: u64,
+        window_gen: u64,
+        chunk_root: BlockPtr,
+        chunk_depth: u32,
+        root_block: BlockPtr,
+    ) -> Body {
+        Body {
+            generation,
+            chunk_root,
+            chunk_depth,
+            root_block,
+            fs_root: BlockPtr::NULL,
+            meta_root: BlockPtr::NULL,
+            space_root: BlockPtr::NULL,
+            free_log: BlockPtr::NULL,
+            next_ino: 0,
+            next_snap_id: 0,
+            live_deadlist: 0,
+            next_deadlist: 0,
+            latest_snap_gen: 0,
+            commit_time_ns,
+            replay_value,
+            flags,
+            window_gen,
+            log_root: BlockPtr::NULL,
+            history: Vec::new(),
+        }
+    }
+
     /// The commit-state fields shared by a body and its history entries.
     fn encode_core(&self, w: &mut Writer) {
+        w.u64(self.generation);
+        w.i64(self.commit_time_ns);
+        w.u64(self.replay_value);
+        w.u64(self.flags);
+        w.u64(self.window_gen);
+        self.chunk_root.encode(w);
+        w.u32(self.chunk_depth);
+        w.u32(0);
+        self.root_block.encode(w);
+    }
+
+    fn decode_core(r: &mut Reader) -> Result<Body> {
+        let generation = r.u64()?;
+        let commit_time_ns = r.i64()?;
+        let replay_value = r.u64()?;
+        let flags = r.u64()?;
+        let window_gen = r.u64()?;
+        let chunk_root = BlockPtr::decode(r)?;
+        let chunk_depth = r.u32()?;
+        if r.u32()? != 0 {
+            return Err(r.err());
+        }
+        let root_block = BlockPtr::decode(r)?;
+        if flags & !FLAG_CLEAN != 0 {
+            return Err(Error::Unsupported("superblock flags"));
+        }
+        if window_gen > generation
+            || chunk_depth > crate::chunk::MAX_DEPTH
+            || chunk_root.is_null()
+            || root_block.is_null()
+            || root_block.birth != generation
+            || chunk_root.birth > generation
+        {
+            return Err(Error::Corrupt("superblock core", generation));
+        }
+        Ok(Body::from_core(
+            generation,
+            commit_time_ns,
+            replay_value,
+            flags,
+            window_gen,
+            chunk_root,
+            chunk_depth,
+            root_block,
+        ))
+    }
+
+    /// The root block's contents for this commit.
+    pub fn encode_root(&self) -> crate::io::Block {
+        let mut b = zero_block();
+        let mut w = Writer::new(&mut b[..]);
+        w.u32(ROOT_MAGIC);
+        w.u32(0);
         w.u64(self.generation);
         for p in [
             &self.fs_root,
@@ -272,50 +380,36 @@ impl Body {
             &self.space_root,
             &self.free_log,
         ] {
-            p.encode(w);
+            p.encode(&mut w);
         }
         w.u64(self.next_ino);
         w.u64(self.next_snap_id);
         w.u64(self.live_deadlist);
         w.u64(self.next_deadlist);
         w.u64(self.latest_snap_gen);
-        w.i64(self.commit_time_ns);
-        w.u64(self.replay_value);
-        w.u64(self.flags);
-        w.u64(self.window_gen);
+        b
     }
 
-    fn decode_core(r: &mut Reader) -> Result<Body> {
-        let generation = r.u64()?;
-        let fs_root = BlockPtr::decode(r)?;
-        let meta_root = BlockPtr::decode(r)?;
-        let space_root = BlockPtr::decode(r)?;
-        let free_log = BlockPtr::decode(r)?;
-        let b = Body {
-            generation,
-            fs_root,
-            meta_root,
-            space_root,
-            free_log,
-            next_ino: r.u64()?,
-            next_snap_id: r.u64()?,
-            live_deadlist: r.u64()?,
-            next_deadlist: r.u64()?,
-            latest_snap_gen: r.u64()?,
-            commit_time_ns: r.i64()?,
-            replay_value: r.u64()?,
-            flags: r.u64()?,
-            window_gen: r.u64()?,
-            log_root: BlockPtr::NULL,
-            history: Vec::new(),
-        };
-        if b.flags & !FLAG_CLEAN != 0 {
-            return Err(Error::Unsupported("superblock flags"));
+    /// Fills the fields stored in the root block (already verified).
+    pub fn apply_root(&mut self, b: &[u8]) -> Result<()> {
+        let at = self.root_block.addr;
+        let mut r = Reader::new(b, "root block", at);
+        if r.u32()? != ROOT_MAGIC || r.u32()? != 0 || r.u64()? != self.generation {
+            return Err(Error::Corrupt("root block header", at));
         }
-        if b.window_gen > b.generation {
-            return Err(Error::Corrupt("superblock window", generation));
+        self.fs_root = BlockPtr::decode(&mut r)?;
+        self.meta_root = BlockPtr::decode(&mut r)?;
+        self.space_root = BlockPtr::decode(&mut r)?;
+        self.free_log = BlockPtr::decode(&mut r)?;
+        self.next_ino = r.u64()?;
+        self.next_snap_id = r.u64()?;
+        self.live_deadlist = r.u64()?;
+        self.next_deadlist = r.u64()?;
+        self.latest_snap_gen = r.u64()?;
+        if r.bytes(r.remaining())?.iter().any(|&x| x != 0) {
+            return Err(Error::Corrupt("root block padding", at));
         }
-        Ok(b)
+        Ok(())
     }
 
     fn encode(&self, header_hash: &[u8; 32], w: &mut Writer) {
@@ -526,5 +620,6 @@ pub fn commit<D: BlockDevice>(
 }
 
 /// Bytes of one history entry / the core of a body.
-const CORE_LEN: usize = 8 + 4 * 64 + 10 * 8;
+const CORE_LEN: usize = 5 * 8 + 64 + 8 + 64;
+const _: () = assert!(CORE_LEN == 176);
 const _: () = assert!(BODY_LEN >= 32 + CORE_LEN + 64 + 8 + HISTORY * CORE_LEN);

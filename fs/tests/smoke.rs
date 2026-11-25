@@ -7,6 +7,7 @@ fn fmt(blocks: u64, enc: bool) -> Filesystem<MemDevice> {
         passphrase: enc.then(|| b"pw".to_vec()),
         kdf: KdfParams::INSECURE_FAST_FOR_TESTS,
         quarantine_min_ns: 0,
+        meta_chunk_blocks: 0,
     };
     Filesystem::format(MemDevice::new(blocks), &opts, &mut rng, Box::new(ZeroClock)).unwrap()
 }
