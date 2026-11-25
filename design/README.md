@@ -120,3 +120,4 @@ One line each: what was chosen, why, and what was rejected.
 - Panic with something to keep powers off; rejected: panic hibernate, whose resume path was a second unlock route.
 - The rollback floor is max(built-in minimum, counter minus base) with no ESP term; rejected: the ESP term, which could floor out every bootable slot.
 - F2 uses one system NV ratchet index with per-user keys derived from it; rejected: a per-user NV pool, which capped users at 8.
+- The EBS gap counts as clean only when translation stays on through `ExitBootServices`, and the firmware display keeps BME only for a framebuffer in system RAM; rejected: trusting PMRs to cover the gap, which can't stop patched firmware code copying the pool out.

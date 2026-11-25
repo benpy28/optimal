@@ -84,7 +84,9 @@ firmware I/O (loader-state writes, the platform-hierarchy disable) and
 before `ExitBootServices`, the loader enables Intel VT-d PMRs over the
 pool, the loader and the kernel, then clears Bus Master Enable on every
 bridge and root port (both vendors) except those on the firmware display's
-path (the named exposure "firmware display DMA", [drivers.md](drivers.md)).
+path when the GOP framebuffer lies in system RAM (the named exposure
+"firmware display DMA", which names every function below a kept bridge,
+[drivers.md](drivers.md)).
 Then it calls `ExitBootServices`
 (whose handlers may turn translation off; EDK2's `IntelVTdDxe` does by
 default), then loads its own tables: deny-all except the firmware's
@@ -95,8 +97,9 @@ kernel, in the translation mode the kernel will use (the rule in
 in place through the blocking intermediates in [drivers.md](drivers.md),
 never V=0 on a live device. Bridge BME stays clear; the kernel re-enables
 it per device. Root-complex integrated devices have no bridge, so the
-scorecard names the "EBS-gap window (integrated devices)" unless PMRs
-cover the pool. Proof target 10 extends to the table builder at 4b
+scorecard names the "EBS-gap window (integrated devices)" unless
+translation stays on through `ExitBootServices` (PMRs block device reads
+of the pool, not firmware code that a device patched copying it out). Proof target 10 extends to the table builder at 4b
 (B/T). Where the loader can't program translation, the PMRs stay on, the
 hand-off names the covered ranges, and the kernel allocates only inside
 them until its own tables are live. The kernel checks at entry (from the
@@ -519,7 +522,7 @@ entry (path 2) must each stop an old signed loader.
   things are used after capping, each with `TPM2_PolicySecret` against the
   service key in its policy, so only the kernel of a boot that passed the
   pre-cap check can use them, at any time later: per-user home-volume keys
-  (whose object also needs `TPM2_PolicyAuthValue` with one half of the
+  (whose `noDA` object also needs `TPM2_PolicyAuthValue` with one half of the
   user's stretched secret, the wrap key being HKDF(R_u ‖ the other half),
   [storage.md](storage.md)); the storage replay NV counter, whose value is counter − its own
   write-once base, defined like the anti-rollback base

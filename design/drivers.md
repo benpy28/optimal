@@ -263,8 +263,10 @@ address; a tier-3 driver sees only IOVAs in its own domain.
   intermediates, "Multi-word entries" below), before handing over. Bridge
   BME stays clear; the kernel sets it again per device (bring-up order,
   below). Root-complex integrated devices have no bridge, so in the gap
-  around `ExitBootServices` they are stopped only by PMRs over the pool;
-  without them the boot names an "EBS-gap window (integrated devices)".
+  around `ExitBootServices` nothing stops them unless
+  translation stays on through it; otherwise the boot names an
+  "EBS-gap window (integrated devices)" (PMRs over the pool block device
+  reads, not patched firmware code copying the pool out).
   The menu, the disk-read order and fallback are in [boot.md](boot.md)
   "DMA before the kernel".
   A machine that meets every other D1 condition but lacks per-buffer
@@ -383,8 +385,11 @@ address; a tier-3 driver sees only IOVAs in its own domain.
   Functional tests (1c gate): QEMU `intel-iommu` and `amd-iommu` rewriting
   live entries while the test-only DMA driver (below) runs DMA; 0 writes
   land outside the domain.
-- **Firmware display.** The device scanning out the firmware framebuffer,
-  and the bridges on its path, keep BME so the screen stays on. Once the
+- **Firmware display.** When the GOP framebuffer lies in system RAM, the
+  device scanning it out and the bridges on its path keep BME so the screen
+  stays on; every function below a kept bridge is named in the exposure and
+  counts in the EBS-gap window. A framebuffer in a device BAR needs no
+  exception. Once the
   IOMMU is live, its domain maps only the framebuffer range, read-only, plus
   its RMRRs. Until then (and always on D2) this is a named exposure,
   "firmware display DMA", in the boot log and on the scorecard.

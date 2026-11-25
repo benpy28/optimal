@@ -422,8 +422,9 @@ fails closed and the in-kernel input paths in
   write-protect throttling), are capped at max(bound, 1 s) times the
   device's measured write bandwidth, the bound being 1 s by default, a
   setting from 0 to 10 s. Writeback stops at the bound plus 2 s; any page
-  still dirty is encrypted in place under P (with several sessions, the
-  active session's P; such pages stay unreadable until that user unlocks)
+  still dirty is encrypted in place under the P of the user owning its volume
+  (system-volume pages under the active session's P, readable from any
+  user's blob)
   and written back after unlock. The volumes are then frozen. (5) The keys are wiped. (6) Every
   PTE mapping a page-cache page of an encrypted volume is unmapped
   (through the reverse map, with a TLB shootdown), and the pages, except

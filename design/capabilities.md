@@ -286,9 +286,11 @@ produces them for removed devices and network file systems.
   floor prompt naming the app. Of fds 0 to 2, those that are ttys get a
   fresh pty that the relay connects to the caller's tty (with the escape
   filter above); the others pass as their open file descriptions, so pipes
-  and redirections are untouched. The relay forwards `SIGINT`, `SIGTSTP`,
-  `SIGCONT`, `SIGWINCH` and `SIGHUP` to its app, exempt from the
-  terminal's signal limit toward other identities ([compat.md](compat.md)).
+  and redirections are untouched. The relay forwards every catchable signal to its app, exempt from the
+  terminal's signal limit toward other identities ([compat.md](compat.md));
+  if the stub dies (`SIGKILL` included) the launcher kills the app through
+  its pidfd, and the stub re-raises the app's fatal signal so
+  `WIFSIGNALED` holds.
   The exec is a direct channel terminal → app (`launch-relay` in
   channels.toml): it needs the combined approval like any other channel,
   asked once per app ("your home, through Terminal → *App*"), a floor
@@ -376,8 +378,7 @@ produces them for removed devices and network file systems.
 - **Apps that launch apps.** A launcher like Steam can start children under a
   **child identity** (`steam/<game id>`): the child gets its own capability
   set and file view (by default its own private home and the folders the
-  parent declares for it, never the parent's tokens or data), but stays in a
-  PID namespace below the parent's, so the parent can `wait` for it
+  parent declares for it, never the parent's tokens or data), and the parent can `wait` for it
   (through the identity exec's stub, above), track it with a pidfd and
   signal it. The parent's manifest declares the **shared
   channels** each child gets, all mediated: read-only paths (the Steam
@@ -455,8 +456,9 @@ produces them for removed devices and network file systems.
   human is needed, the lookup, `connect` or send waits up to 30 s for
   the decision (an `O_NONBLOCK` connect returns `EINPROGRESS` and
   completes or fails later; an `O_NONBLOCK` send returns `EAGAIN`). A
-  pending socket reports no `POLLOUT` until the decision, then wakes with
-  `EPOLLOUT`, or `EPOLLERR` with `ENETUNREACH`. The triggers are TCP
+  pending socket reports no `POLLOUT` until the decision; on approval the
+  call proceeds normally (TCP: `EPOLLOUT` at connection completion), on
+  denial `EPOLLERR` with `ENETUNREACH`. The triggers are TCP
   `connect` and every send path: `sendto`, `sendmsg`, `sendmmsg`, `write`
   on a connected socket, io_uring sends and `MSG_FASTOPEN`; a UDP
   `connect` sends nothing and never triggers.

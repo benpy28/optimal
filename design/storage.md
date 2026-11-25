@@ -443,9 +443,8 @@ service key. While panic lock is enabled, dirty pages of encrypted volumes
 are capped at max(writeback bound, 1 s) times the device's measured write
 bandwidth, dirty `MAP_SHARED` pages counted through write-protect
 throttling ([features.md](features.md) F4 has the hard writeback limit;
-a page still dirty at it is encrypted in place under P, with several
-sessions the active session's P, and stays unreadable until that user
-unlocks),
+a page still dirty at it is encrypted in place under the P of the user
+owning its volume, system-volume pages under the active session's P),
 and the Argon2id unlock memory (up to 1 GiB) stays reserved.
 
 Tests (Phase 10): suspend, then scan memory for every canary of the
@@ -479,7 +478,7 @@ its tag checks. Its user count and per-user sizes are plaintext metadata
 and are listed as such on the scorecard. Each home volume is a
 LUKS2 volume with its own volume key and key slots, unwrapped at that
 user's login. Its passphrase wrap (60-bit rule above) opens it; on B1
-it also has a TPM wrap: a random R_u sealed in a home object whose policy
+it also has a TPM wrap: a random R_u sealed in a `noDA` home object whose policy
 is `PolicySecret` on the service key (S, the post-cap path in
 [boot.md](boot.md)) AND `PolicyAuthValue` (one half of the user's
 stretched login secret), the wrap key being HKDF(R_u ‖ the other half),
