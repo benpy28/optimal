@@ -1062,7 +1062,7 @@ view in [capabilities.md](capabilities.md)):
   while locked; travel folders' snapshots are under the travel key (F5).
 - "Delete from history" removes a file from every snapshot (a requirement
   for `fs/docs/DESIGN.md`); its blocks are freed after the K-commit
-  quarantine ([storage.md](storage.md), K set from the power-cut rig).
+  quarantine ([storage.md](storage.md), K = 8).
   Marking a folder as a travel folder (F5) runs it on the folder's earlier
   contents.
 

@@ -62,7 +62,7 @@ audio keeps up under load. This file is the design that the targets in
   scorecard says so). User mappings of a hot-removable device's BARs (a
   Mesa CPU mapping of an external GPU's VRAM, a tier-3 driver process) can
   stall whichever CPU reads them; they are outside the gate below and named
-  as an exposure on the scorecard. **The real-time gate under device stalls** (the one
+  as the exposure "removable-device BAR stalls" on the scorecard. **The real-time gate under device stalls** (the one
   definition; [drivers.md](drivers.md) and [storage.md](storage.md) cite
   it): the wake-up target of [benchmarks.md](benchmarks.md) (P99 < 50 µs,
   P99.9 < 100 µs) holds for real-time threads on every CPU except the

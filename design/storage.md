@@ -191,7 +191,7 @@ workload join the Linux compatibility suite (milestone 4 in
   page cache of an encrypted volume or belonged to a vault or travel
   identity (F3, F5), is zeroed when it is freed (eviction, truncate,
   delete, exit, slab release), the equivalent of Linux `init_on_free`, so
-  plaintext never sits in the free lists and no sweep is needed
+  plaintext never sits in the free lists
   ([scheduler.md](scheduler.md) "Frame allocator"; from Phase 4a, cost
   published with the 4a storage set; the first canary gate is Phase 5,
   [features.md](features.md) F4, then the class-C lock test below).
@@ -246,7 +246,8 @@ copies of them. So in stage 1:
 **What is parsed before capping.** Before capping ([boot.md](boot.md)) the
 kernel parses only the fixed-format Optimal header block of the system
 volume (the last 16 KiB before the 16 MiB LUKS2 data offset, two 8 KiB
-copies with version and CRC-32C, layout in [boot.md](boot.md)). It holds
+copies with version and CRC-32C, each 512 bytes of fixed fields then 14
+fixed 512-byte slots, layout in [boot.md](boot.md)). It holds
 the sealed blobs, every wrapped copy of the volume key that Optimal opens
 (the TPM wrap, the passphrase wrap and the recovery-key wrap), S wrapped
 under the recovery key, and the volume tags. The header block and its passphrase and recovery-key wraps
@@ -263,7 +264,7 @@ the pre-cap PCR 8 and 9 policy.
 primary (binary header and JSON area), one over the secondary. Each is
 HMAC-SHA-256 under a key derived from the volume key ([boot.md](boot.md))
 and also covers every header-block field (the version included) except the
-tags themselves, the CRC and the blob area. Once the volume key is unwrapped, the kernel checks the tags
+tags themselves, the CRC and the blob area (the 14 slots). Once the volume key is unwrapped, the kernel checks the tags
 over the bytes as read, before S is unsealed and before any JSON is
 parsed, and uses the primary if its own tag verifies, otherwise the
 secondary; it never selects a copy by seqid. A copy whose tag fails is
@@ -441,7 +442,10 @@ key, so a recovery-key boot reopens S and only a TPM clear recreates the
 service key. While panic lock is enabled, dirty pages of encrypted volumes
 are capped at max(writeback bound, 1 s) times the device's measured write
 bandwidth, dirty `MAP_SHARED` pages counted through write-protect
-throttling ([features.md](features.md) F4 has the hard writeback limit),
+throttling ([features.md](features.md) F4 has the hard writeback limit;
+a page still dirty at it is encrypted in place under P, with several
+sessions the active session's P, and stays unreadable until that user
+unlocks),
 and the Argon2id unlock memory (up to 1 GiB) stays reserved.
 
 Tests (Phase 10): suspend, then scan memory for every canary of the
@@ -516,11 +520,13 @@ under it. Before capping the kernel parses only a **fixed plaintext header
 area** outside the file system's allocatable space, at the same device
 offset as the stage-1 header block and in exactly its format (16 KiB, two
 8 KiB copies, each with a version and a CRC-32C, holding the sealed blobs,
-the wrapped volume keys and the volume tag). The superblock's generation
+the key slots (LUKS-style: the volume key AEAD-wrapped under each
+Argon2id-stretched human secret, the recovery key and the TPM key-slot
+key) and the volume tag). The superblock's generation
 and slot number live in its encrypted body, never in that area, so the
 area's bytes are identical whichever superblock slot is newest, and the
-volume tag covers only its frozen bytes (everything but the tag and the
-blob slots); first-boot sealing, a floor raise or a hibernation blob
+volume tag covers only its frozen bytes (everything but the tags, the
+CRC and the blob slots); first-boot sealing, a floor raise or a hibernation blob
 rewrites the area without a file-system commit. A fixed magic at the
 start of each copy says which stage the volume is in, and the kernel reads
 it before capping to pick the parser; nothing else is read before
@@ -822,11 +828,10 @@ install. So:
   pointers, the chunk mappings they resolve through, and every block of
   the last K commits' trees survive even when only the newest superblock
   pair lands; within that window it must still mount at its last commit
-  before the drop point, losing only commits after it. **K = 8**, or twice
-  the deepest fallback the power-cut rig (below) has recorded, whichever
-  is larger: each rig run records how many commits back each fallback
-  landed and publishes the distribution, and K is raised before the next
-  release if the worst case seen exceeds K/2. Full commits are
+  before the drop point, losing only commits after it. **K = 8**, fixed,
+  raised before the next release only if the power-cut rig (below)
+  records a fallback deeper than K/2 (each rig run publishes how many
+  commits back each fallback landed). Full commits are
   rate-limited to at most one per second, and `fsync` calls between them
   and directory `fsync`s go to the intent log, so an `fsync` burst can't push the drop
   point out of the window in milliseconds. Every fallback is reported to

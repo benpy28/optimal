@@ -83,10 +83,13 @@ and the pages for the PIN and every value it unseals. After the last
 firmware I/O (loader-state writes, the platform-hierarchy disable) and
 before `ExitBootServices`, the loader enables Intel VT-d PMRs over the
 pool, the loader and the kernel, then clears Bus Master Enable on every
-bridge and root port (both vendors). Then it calls `ExitBootServices`
+bridge and root port (both vendors) except those on the firmware display's
+path (the named exposure "firmware display DMA", [drivers.md](drivers.md)).
+Then it calls `ExitBootServices`
 (whose handlers may turn translation off; EDK2's `IntelVTdDxe` does by
 default), then loads its own tables: deny-all except the firmware's
-RMRR/IVMD identity maps, built by the pure table crate shared with the
+RMRR/IVMD identity maps and the firmware display's framebuffer
+(read-only), built by the pure table crate shared with the
 kernel, in the translation mode the kernel will use (the rule in
 [drivers.md](drivers.md)); on AMD an inherited device table is rewritten
 in place through the blocking intermediates in [drivers.md](drivers.md),
@@ -102,8 +105,8 @@ the loader occupy is covered; a machine that fails that check, or has no
 usable IOMMU (D2), shows the "boot DMA window" exposure
 ([threat-model.md](threat-model.md), [drivers.md](drivers.md)). A Limine
 boot closes no `ExitBootServices` gap, so it is clean D1 only on firmware
-that keeps translation on through `ExitBootServices` (GSTS.TES or IommuEn
-set at kernel entry) and shows the boot DMA window otherwise. DMA is
+that keeps translation or covering PMRs on through `ExitBootServices`
+(GSTS.TES, IommuEn or PMEN set at kernel entry) and shows the boot DMA window otherwise. DMA is
 stopped by the bridge or root-port Bus Master Enable plus the IOMMU, never
 by a device's own BME. Tests (Phase 4b): on QEMU's `intel-iommu` with OVMF
 built with `IntelVTdDxe`, the hostile-device emulator (the vfio-user device
@@ -516,8 +519,9 @@ entry (path 2) must each stop an old signed loader.
   things are used after capping, each with `TPM2_PolicySecret` against the
   service key in its policy, so only the kernel of a boot that passed the
   pre-cap check can use them, at any time later: per-user home-volume keys
-  (whose object also needs `TPM2_PolicyAuthValue` with the user's stretched
-  secret, [storage.md](storage.md)); the storage replay NV counter, whose value is counter − its own
+  (whose object also needs `TPM2_PolicyAuthValue` with one half of the
+  user's stretched secret, the wrap key being HKDF(R_u ‖ the other half),
+  [storage.md](storage.md)); the storage replay NV counter, whose value is counter − its own
   write-once base, defined like the anti-rollback base
   ([storage.md](storage.md)); the PIN-epoch index (Changing credentials,
   below); F2's ratchet index; and the lock-screen PIN object. A substituted volume fails the
@@ -578,16 +582,17 @@ entry (path 2) must each stop an old signed loader.
   and records in the
   loader state which slot made the image, and the loader boots that slot
   for the resume boot even if an update made the other slot active; the
-  image of another release is refused ([storage.md](storage.md) has the
-  image location and its generation and replay checks). The boot kernel
+  image of another release is refused. Before any wipe it builds the full
+  next header-block copy (version, CRC, tags, the object 4 blob) and,
+  after the snapshot, writes it over the older copy ([storage.md](storage.md)
+  "Hibernation" has the order, the image location and its generation and
+  replay checks). The boot kernel
   unseals R1, R2 and R4 before capping, caps, authenticates the image, and
   writes the volume key, S and 256 random bits for the restored kernel's
   generator ([core.md](core.md)) into a reserved hand-over page named in
   the image header. The restored kernel reads the page, wipes it, erases
   the image blob from both header-block copies and flushes before thawing.
-  A floor-raise request stays pending until the next normal boot. There is
-  no panic hibernate: F4's panic with anything to keep is a panic
-  power-off ([features.md](features.md)).
+  A floor-raise request stays pending until the next normal boot.
 
 ### The sealing policy, step by step
 
@@ -638,7 +643,7 @@ machines step 3 carries that check and the `-pm` references keep PCR
 in PCR 8 covers old loaders whose hash was approved before. The
 composition of these policies (every object, NV index and signing
 reference) is proof target 17 ([verification.md](verification.md)),
-checked (B/T) per object against these rows, each implied by every session
+checked (B/T) per object against its row of this per-object table, each implied by every session
 that satisfies the object's authPolicy. *Objects 1 to 3:* PCR 4 matched
 (signed or per machine); PCR 8 and 9 match a digest the disk policy key
 signed under the reference matching the machine's PCR 4 shape and floor
@@ -709,7 +714,8 @@ announced, and every machine reseals to the next key at its next update.
   authorisation set to an unknown value) installs, seals and unseals, and
   no lockout reset is issued.
 - **F2's ratchet index.** First-boot sealing defines one system NV index
-  of 32 bytes holding F2's daily ratchet key ([features.md](features.md)),
+  of 32 bytes holding F2's ratchet key of the oldest day any user retains
+  ([features.md](features.md)),
   written once a day by a kernel operation and read, both only under
   `PolicySecret` on the service key; each user's day key is HKDF(ratchet
   key, user ID). With the other six indexes that is 7 indexes holding 80
@@ -864,7 +870,8 @@ announced, and every machine reseals to the next key at its next update.
   Every on-disk passphrase wrap (the system volume's header-block wrap and
   LUKS2 passphrase slot, each home's wrap, F4's P blob) is an offline
   Argon2id target with no TPM in the way, so it requires that 60-bit floor
-  on every tier, PIN machines included.
+  on every tier, PIN machines included, or the scorecard publishes the
+  stolen-disk strength as that of the weakest wrap ([storage.md](storage.md)).
 - **Changing credentials** (Phase 4b), on the trusted path after the
   current PIN is checked through the lock-screen PIN object. *PIN:* the
   kernel draws new R1 and R2, stretches the new PIN, re-encrypts the TPM

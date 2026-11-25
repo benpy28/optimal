@@ -138,7 +138,8 @@ address; a tier-3 driver sees only IOVAs in its own domain.
   no read of a PCIe endpoint BAR or of ECAM is issued in any
   non-preemptible section (interrupts off, preemption off, or a spinlock
   held; LAPIC, I/O APIC, HPET and IOMMU registers are not PCIe reads and
-  are exempt); and the handler threads of devices that can be hot-removed
+  are exempt; the IPI-acknowledgement spin with preemption off lasts at
+  most 20 µs, [scheduler.md](scheduler.md) "Device stalls"); and the handler threads of devices that can be hot-removed
   (below an external port or a hotplug-capable port) run on the
   "removable-device core" ([scheduler.md](scheduler.md) "Device stalls").
   Platforms that escalate a

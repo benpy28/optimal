@@ -506,7 +506,7 @@ recorded and rerun) and restores only the 64 GiB test partition at block
 level before each pass (at most 2 min, measured and recorded); then every
 entry runs 3 times in table order. **Time** is per run, setup and cache
 drop included; for fixed-work entries it is a cap, and a run that hits it
-fails that entry. One pass is 25 min (20 min before Phase 5). Every entry
+fails that entry. One pass is 26 min (21 min before Phase 5). Every entry
 compared against Linux runs the same binary on both (a static binary in
 4a). The Phase 4a done-when is "every 4a entry compared against Linux is
 within 10% of matched Linux": the worse end of its Holm-corrected 95%
@@ -531,12 +531,13 @@ number of flushes the full log forced is published with each result.
 | fsync latency P50, P99, P99.9 of a 4 KiB file while a background writer streams 1M sequential writes | yes | 20 s | 4a |
 | SQLite in WAL mode, static binary (insert and point-query mix) | yes | 30 s | 4a |
 | untar of a pinned source tree, static binary | yes | 30 s | 4a |
+| dpkg-style loop: create a 4 KiB file, `fsync` it, rename it over its target, `fsync` the directory, 10,000 times (namespace operations through the intent log, [storage.md](storage.md)) | yes | 20 s | 4a |
 | metadata: create, stat, unlink of 1 million small files | yes | 90 s | 4a |
 | in-kernel block benchmark at QD32 | no: Optimal against itself only (there is no identical program on Linux) | 20 s | 4a |
 | fio `io_uring`, 4k random read and overwrite at QD32 | yes | 40 s | 5 |
 | pgbench | yes | 30 s | 5 |
 | git checkout and `git status` on a pinned large repository | yes | 30 s | 5 |
-| the whole set above, rerun on a per-user home volume ([storage.md](storage.md)); each entry within 10% of the same entry on the system volume path | yes (Linux: ext4 on dm-crypt over `dm-linear` with the same extents) | 25 min a pass | 5 |
+| the whole set above, rerun on a per-user home volume ([storage.md](storage.md)); each entry within 10% of the same entry on the system volume path | yes (Linux: ext4 on dm-crypt over `dm-linear` with the same extents) | 26 min a pass | 5 |
 
 Power is reported next to every throughput result (RAPL package power where
 the CPU has it), so a win bought with extra watts is visible.
@@ -590,9 +591,9 @@ is on in the image people actually download:
   window on D2, "pre-loader DMA window (firmware code)" without per-buffer
   firmware pre-boot DMA protection, such a machine having its own column,
   "D1 with pre-loader window", never counted as D1, "EBS-gap window
-  (integrated devices)", S3 resume DMA window, remote DMA exposure, user
-  mappings of hot-removable devices' BARs (outside the real-time gate under
-  device stalls, [scheduler.md](scheduler.md)), SMT on affected CPUs, "out-of-band remote management: on"), the ATS-enabled devices and their firmware (part of the
+  (integrated devices)", S3 resume DMA window, remote DMA exposure, "removable-device
+  BAR stalls" (user mappings of hot-removable devices' BARs, outside the
+  real-time gate under device stalls, [scheduler.md](scheduler.md)), SMT on affected CPUs, "out-of-band remote management: on"), the ATS-enabled devices and their firmware (part of the
   trusted base), the B2 anti-rollback scope: "holds against OS-level
   attackers only" (against physical attackers only with owner keys), and
   "B4: no automatic rollback, no floor" until Optimal Boot's BIOS stage
