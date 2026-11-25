@@ -15,6 +15,7 @@ mod backtrace;
 mod boot;
 mod bootinfo;
 mod crashtest;
+mod irq;
 #[cfg(feature = "ktest")]
 mod ktest;
 mod mm;
@@ -91,6 +92,11 @@ extern "C" fn kmain_on_own_tables() -> ! {
         l.boot_stack_top
     );
     acpi::report(acpi::init(info));
+    #[cfg(feature = "ktest")]
+    if let Some(words) = boot::arg(info.cmdline(), "irqdirt") {
+        irq::dirt::apply(info, words);
+    }
+    irq::report(irq::init(info));
     paint_screen(info);
 
     let cmdline = info.cmdline();

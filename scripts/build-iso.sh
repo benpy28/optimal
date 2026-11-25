@@ -45,6 +45,9 @@ cp "$TARGET" "$BUILD/optimal-kernel"
 
 make_iso "$BUILD/optimal-kernel" "$BUILD/optimal.iso"
 make_iso "$BUILD/optimal-kernel-ktest" "$BUILD/optimal-ktest.iso"
+# The test suite after the kernel itself dirties the 8259s, I/O APICs and
+# local APIC the way sloppy firmware leaves them (kernel/src/irq/dirt.rs).
+make_iso "$BUILD/optimal-kernel-ktest" "$BUILD/optimal-ktest-irqdirt.iso" "irqdirt=pic,ioapic,lapic"
 for name in "${!CRASHTESTS[@]}"; do
     make_iso "$BUILD/optimal-kernel" "$BUILD/crash-$name.iso" "crashtest=$name"
 done

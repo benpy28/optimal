@@ -11,6 +11,8 @@ limine = "0.5"
 optimal-mm = { path = "../crates/mm" }
 # ACPI table parsing, tested on the host.
 optimal-acpi = { path = "../crates/acpi" }
+# Interrupt controller logic (APIC modes, register encodings, routing), tested on the host.
+optimal-apic = { path = "../crates/apic" }
 
 [features]
 # Build the in-kernel test suite into the image (CI boots this build).

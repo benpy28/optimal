@@ -118,10 +118,6 @@ pub struct Acpi {
     pub facs: Option<(u64, u64)>,
 }
 
-#[cfg_attr(
-    not(feature = "ktest"),
-    expect(dead_code, reason = "first user outside tests is 1c2 (AML later)")
-)]
 impl Acpi {
     pub fn table(&self, sig: &[u8; 4]) -> Option<&Table> {
         self.tables.iter().find(|t| &t.signature == sig)
@@ -142,13 +138,6 @@ pub enum Absent {
 static ACPI: Once<Result<Acpi, Absent>> = Once::new();
 
 /// The result of [`init`]. Panics before it.
-#[cfg_attr(
-    not(feature = "ktest"),
-    expect(
-        dead_code,
-        reason = "first user outside tests is 1c2 (APIC setup from the MADT)"
-    )
-)]
 pub fn get() -> &'static Result<Acpi, Absent> {
     ACPI.get().expect("ACPI read before init")
 }

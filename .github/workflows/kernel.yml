@@ -245,3 +245,54 @@ jobs:
           name: acpi-mutants
           path: crates/acpi/mutants.out/
           retention-days: 14
+
+  apic-tests:
+    # optimal-apic: hand-worked register values, reference models of the
+    # 8259, the I/O APIC's register pair and the SDM's IA32_APIC_BASE
+    # transitions, random MADTs against the routing rules (50,000 cases
+    # per property), then mutation tests: every mutant must make a test
+    # fail or hang. Equivalent mutants are excluded, each with its reason,
+    # in crates/apic/.cargo/mutants.toml.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: crates/apic
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint and kernel-target build
+        run: |
+          rustup component add clippy rustfmt
+          rustup target add x86_64-unknown-none
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+          cargo build --release --target x86_64-unknown-none
+
+      - name: Unit and property tests (many more random cases than locally)
+        env:
+          PROPTEST_CASES: "50000"
+        run: cargo test --release
+
+      - name: Install cargo-mutants
+        run: cargo install --locked cargo-mutants --version 27.1.0
+
+      - name: Mutation tests (any surviving mutant fails the job)
+        env:
+          PROPTEST_CASES: "300"
+        run: |
+          ulimit -v 3145728
+          code=0
+          cargo mutants -j 4 --timeout 180 || code=$?
+          echo "cargo-mutants exit code $code"
+          cat mutants.out/missed.txt
+          [ "$code" -eq 0 ] || [ "$code" -eq 3 ]
+          [ ! -s mutants.out/missed.txt ]
+
+      - name: Upload mutation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apic-mutants
+          path: crates/apic/mutants.out/
+          retention-days: 14
