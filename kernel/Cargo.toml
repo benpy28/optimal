@@ -13,6 +13,8 @@ optimal-mm = { path = "../crates/mm" }
 optimal-acpi = { path = "../crates/acpi" }
 # Interrupt controller logic (APIC modes, register encodings, routing), tested on the host.
 optimal-apic = { path = "../crates/apic" }
+# Clocks, frequencies and calibration maths, tested on the host.
+optimal-time = { path = "../crates/time" }
 
 [features]
 # Build the in-kernel test suite into the image (CI boots this build).

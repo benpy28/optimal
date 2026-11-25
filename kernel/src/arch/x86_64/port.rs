@@ -25,3 +25,15 @@ pub unsafe fn inb(port: u16) -> u8 {
     };
     value
 }
+
+/// # Safety
+/// As for [`inb`].
+#[inline]
+pub unsafe fn inl(port: u16) -> u32 {
+    let value: u32;
+    // SAFETY: the caller guarantees the port read is valid.
+    unsafe {
+        asm!("in eax, dx", out("eax") value, in("dx") port, options(nomem, nostack, preserves_flags))
+    };
+    value
+}

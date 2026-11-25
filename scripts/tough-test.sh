@@ -12,11 +12,12 @@
 #     core, and the whole host loaded with stress-ng
 #
 # A "boot" scenario passes only if the full kernel test suite passes with zero
-# failures, the kernel's ACPI line is there and reports no warnings, and
-# interrupts came on with no warnings; a "boot:<regex>[ && <regex>...]"
+# failures, the kernel's ACPI line is there and reports no warnings,
+# interrupts came on with no warnings, and the clocks came up with no
+# warnings; a "boot:<regex>[ && <regex>...]"
 # scenario instead needs every regex to match a line of the log (the
 # machine's expected ACPI summary and warnings), and the same `interrupts:`
-# line unless one of its regexes names its own. A "refuse" scenario (Secure Boot attacks) passes only if the
+# and `time:` lines unless one of its regexes names its own. A "refuse" scenario (Secure Boot attacks) passes only if the
 # firmware or bootloader refuses it with the expected message and the kernel
 # never runs. Nothing may hang, and nothing may panic.
 #
@@ -140,6 +141,8 @@ scenario() {
             # say where it died.
             head -n 25 "$log" 2>/dev/null
             echo "[...]"
+            # The failing test and its message, wherever they are.
+            grep -aE -A4 "KTEST FAIL|KERNEL PANIC" "$log" 2>/dev/null
             grep -E "KVM internal error|Suberror|emulation failure|extra data" "$log" 2>/dev/null
             tail -n 40 "$log" 2>/dev/null
         fi
@@ -165,11 +168,14 @@ boot_ok() {
     if [[ "$rest" != *"interrupts:"* ]]; then
         rest="$rest && ^interrupts: on; 0 warnings\$"
     fi
+    if [[ "$rest" != *"time:"* ]]; then
+        rest="$rest && ^time: reference .*; 0 warnings\$"
+    fi
     while :; do
         re="${rest%% && *}"
         if ! grep -qE -- "$re" "$log"; then
             echo "EXPECTED a line matching: $re"
-            grep -E "^(acpi|apic|ioapic|pic|interrupts|irqdirt|OPTIMAL-QUIRK)" "$log"
+            grep -E "^(acpi|apic|ioapic|pic|interrupts|irqdirt|time|OPTIMAL-QUIRK)" "$log"
             return 1
         fi
         [ "$re" = "$rest" ] && return 0
@@ -280,12 +286,41 @@ has_uefi && scenario "mem-extra-dimms-uefi" boot "$ISO" uefi q35 1G,slots=4,maxm
 # ---------------------------------------------------------------------------
 # Firmware quirks.
 # ---------------------------------------------------------------------------
-scenario "fw-no-hpet" "boot:^acpi: .*, HPET none, .*; 0 warnings$" "$ISO" bios q35,hpet=off 512M 2 30 kvm
-has_uefi && scenario "fw-no-hpet-uefi" "boot:^acpi: XSDT .*, HPET none, .*; 0 warnings$" "$ISO" uefi q35,hpet=off 512M 2 30 kvm
-scenario "fw-no-hpet-pc" "boot:^acpi: .*, HPET none, .*; 0 warnings$" "$ISO" bios pc,hpet=off 512M 2 30 kvm
+# Without an HPET the PM timer is the reference, and the clock unless the
+# TSC is invariant.
+PMREF='^time: reference pm-timer \(io 0x[0-9a-f]+, 24-bit\); tsc [0-9.]+ MHz .*; clock (tsc|pm-timer); 0 warnings$'
+scenario "fw-no-hpet" "boot:^acpi: .*, HPET none, .*; 0 warnings$ && $PMREF" "$ISO" bios q35,hpet=off 512M 2 30 kvm
+has_uefi && scenario "fw-no-hpet-uefi" "boot:^acpi: XSDT .*, HPET none, .*; 0 warnings$ && $PMREF" "$ISO" uefi q35,hpet=off 512M 2 30 kvm
+scenario "fw-no-hpet-pc" "boot:^acpi: .*, HPET none, .*; 0 warnings$ && $PMREF" "$ISO" bios pc,hpet=off 512M 2 30 kvm
+scenario "fw-no-hpet-tcg-smp4" "boot:^acpi: .*, HPET none, .*; 0 warnings$ && $PMREF" "$ISO" bios q35,hpet=off 1G 4 40 tcg -- -cpu max
 # No ACPI means no MADT: the local APIC and the 8259s are still set up,
 # but no I/O APIC is known, which is the one warning.
-scenario "fw-no-acpi" "boot:^acpi: none \(no RSDP from the bootloader\)$ && ^apic: warning: no MADT: no I/O APIC routes, LINT pins masked$ && ^interrupts: on; 1 warnings$" "$ISO" bios pc,acpi=off 512M 1 30 kvm
+# Without ACPI there is no HPET or PM timer either: the PIT's channel 2 is
+# the reference. With a TSC that is not invariant there is then no good
+# clock, which is the time warning.
+NOACPI='^acpi: none \(no RSDP from the bootloader\)$ && ^apic: warning: no MADT: no I/O APIC routes, LINT pins masked$ && ^interrupts: on; 1 warnings$'
+NOINV='^time: reference pit; tsc [0-9.]+ MHz .*, not invariant, .*; clock tsc \(not invariant\); 1 warnings$ && ^time: warning: the only clock is a TSC that is not invariant; time may drift with CPU power states$'
+scenario "fw-no-acpi" "boot:$NOACPI && $NOINV" "$ISO" bios pc,acpi=off 512M 1 30 kvm -- -cpu host,-invtsc
+scenario "fw-no-acpi-tcg-qemu64" "boot:$NOACPI && $NOINV" "$ISO" bios pc,acpi=off 512M 1 40 tcg -- -cpu qemu64
+# Clocks. QEMU's HPET has 3 comparators unless told otherwise, and its ACPI
+# HPET table always says 3: with more, the table and the hardware disagree
+# and the kernel uses the hardware's count.
+for n in 8 32; do
+    scenario "time-hpet-$n-comparators" "boot:^time: reference hpet 100\.000000 MHz \(64-bit, $n comparators\); .*; 1 warnings$ && ^time: warning: the ACPI HPET table says 3 comparators, the HPET has $n; using $n$" "$ISO" bios q35 512M 2 30 kvm -- -global "hpet.timers=$n"
+done
+scenario "time-no-invtsc" "boot:^time: reference hpet .*, not invariant, .*; clock hpet; 0 warnings$" "$ISO" bios q35 512M 2 30 kvm -- -cpu host,-invtsc
+# An invariant TSC is the clock. KVM can only offer it when the host has
+# one (constant_tsc and nonstop_tsc).
+if [ "$KVM" = yes ] && grep -qw constant_tsc /proc/cpuinfo && grep -qw nonstop_tsc /proc/cpuinfo; then
+    scenario "time-invtsc" "boot:^time: reference hpet .*, invariant, .*; clock tsc; 0 warnings$" "$ISO" bios q35 512M 2 30 kvm -- -cpu host,+invtsc
+    scenario "time-invtsc-no-acpi" "boot:$NOACPI && ^time: reference pit; tsc .*, invariant, .*; clock tsc; 0 warnings$" "$ISO" bios pc,acpi=off 512M 1 30 kvm -- -cpu host,+invtsc
+else
+    echo "SKIP: time-invtsc (the host has no invariant TSC for KVM to offer)"
+    skipped=$((skipped + 1))
+fi
+# Timer skew: four slow emulated CPUs taking host time from each other
+# while the boot CPU calibrates.
+scenario "time-tcg-smp4-skew" boot "$ISO" bios q35 1G 4 40 tcg -- -cpu max
 scenario "fw-pc-no-smbus-no-sata" boot "$ISO" bios pc,smbus=off,sata=off 256M 1 30 kvm
 # Quirky ACPI tables, added with -acpitable (scripts/acpi-quirk-tables.py).
 # A second MADT full of junk, plus tables with unknown signatures: the first

@@ -246,3 +246,27 @@ pub fn rdtsc() -> u64 {
     };
     (u64::from(hi) << 32) | u64::from(lo)
 }
+
+/// RDTSC ordered against the loads and stores around it: MFENCE then
+/// LFENCE make every earlier instruction finish first (the SDM's and AMD's
+/// recommended sequence; LFENCE alone does not wait for stores, and on
+/// some AMD processors is not dispatch-serializing), and the LFENCE after
+/// stops later loads (such as the next read of a reference clock) from
+/// running before it. For calibration, where a reading must really fall
+/// between the reference reads either side of it.
+pub fn rdtsc_ordered() -> u64 {
+    let (lo, hi): (u32, u32);
+    // SAFETY: fences and RDTSC have no side effects beyond ordering.
+    unsafe {
+        asm!(
+            "mfence",
+            "lfence",
+            "rdtsc",
+            "lfence",
+            out("eax") lo,
+            out("edx") hi,
+            options(nostack, preserves_flags)
+        )
+    };
+    (u64::from(hi) << 32) | u64::from(lo)
+}

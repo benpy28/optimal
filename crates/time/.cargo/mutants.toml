@@ -1,0 +1,12 @@
+# cargo-mutants settings for optimal-time.
+#
+# Excluded on purpose, with the reason:
+# - `replace | with ^` in halted and quiet: each ORs together single-bit
+#   masks that cannot overlap (ENABLE and LEGACY_ROUTE are bits 0 and 1;
+#   INT_ENB, TYPE, VAL_SET and FSB_EN are bits 2, 3, 6 and 14), and on
+#   disjoint bits OR and XOR give the same value, so these mutants are
+#   equivalent. The results are pinned bit for bit by hpet::start_hand_worked
+#   and config_bits_only_touch_their_own in src/suite.
+exclude_re = [
+    "replace \\| with \\^ in (halted|quiet)",
+]
