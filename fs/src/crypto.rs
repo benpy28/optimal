@@ -63,13 +63,42 @@ pub struct KdfParams {
 }
 
 impl KdfParams {
-    /// Default for real volumes: 256 MiB, 3 passes. About a second on a
-    /// mid-range CPU, which makes offline guessing very expensive.
+    /// Default for real volumes on machines with at least 4 GiB of RAM:
+    /// 1 GiB, 4 passes (about 2 s on a mid-range CPU). Use
+    /// [`KdfParams::for_ram`] to size it for the machine.
     pub const DEFAULT: KdfParams = KdfParams {
-        mem_kib: 256 * 1024,
-        iterations: 3,
+        mem_kib: 1024 * 1024,
+        iterations: 4,
         lanes: 1,
     };
+    /// The storage design's floor: at least 64 MiB and 4 passes.
+    pub const FLOOR_MEM_KIB: u32 = 64 * 1024;
+    pub const FLOOR_ITERATIONS: u32 = 4;
+
+    /// Parameters for a machine with `ram_bytes` of memory: memory
+    /// min(1 GiB, RAM / 4) but at least 64 MiB, and passes raised so the
+    /// memory-time product (and so the time, about 2 s) stays that of
+    /// 1 GiB x 4 passes, capped at [`KdfParams::MAX_ITERATIONS`].
+    pub fn for_ram(ram_bytes: u64) -> KdfParams {
+        let mem_kib = (ram_bytes / 4 / 1024).clamp(Self::FLOOR_MEM_KIB as u64, 1024 * 1024) as u32;
+        let work = 1024 * 1024 * 4u64;
+        let iterations = work
+            .div_ceil(mem_kib as u64)
+            .clamp(Self::FLOOR_ITERATIONS as u64, Self::MAX_ITERATIONS as u64)
+            as u32;
+        KdfParams {
+            mem_kib,
+            iterations,
+            lanes: 1,
+        }
+    }
+
+    /// Whether these meet the floor ([`KdfParams::INSECURE_FAST_FOR_TESTS`]
+    /// is the only weaker setting format accepts).
+    pub fn meets_floor(&self) -> bool {
+        self.mem_kib >= Self::FLOOR_MEM_KIB && self.iterations >= Self::FLOOR_ITERATIONS
+    }
+
     /// Cheap parameters for tests only. Never use for real data.
     pub const INSECURE_FAST_FOR_TESTS: KdfParams = KdfParams {
         mem_kib: 64,
