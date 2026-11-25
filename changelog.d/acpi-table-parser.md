@@ -1,0 +1,3 @@
+- New crate `optimal-acpi` (no_std, no unsafe code): reads the ACPI tables the kernel needs next, written from the ACPI 6.5 and HPET specifications. It finds tables through the RSDP and the XSDT (falling back to the RSDT when the XSDT is broken), and parses the MADT (CPUs, I/O APICs, interrupt overrides, NMIs, x2APIC), the HPET table and the FADT (PM timer, boot flags).
+- Broken firmware is handled on purpose: wrong checksums are reported but the table is still used, and duplicate CPUs, duplicate I/O APICs, short entries and tables that end mid-entry are skipped and counted, never guessed at.
+- Tested with hand-worked tables, round trips against a reference model, every kind of truncation and single-byte corruption, and mutation testing in a new CI job, `acpi-tests`.

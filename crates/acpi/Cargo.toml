@@ -1,0 +1,12 @@
+[package]
+name = "optimal-acpi"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "ACPI table parsing for the Optimal kernel: RSDP, RSDT/XSDT, MADT, HPET and FADT. Pure, safe Rust with no hardware access, written from the ACPI 6.5 specification and tested on the host with hand-worked tables, random tables and corrupted tables."
+
+[dependencies]
+
+[dev-dependencies]
+# Property-based testing (MIT OR Apache-2.0).
+proptest = { version = "1", default-features = false, features = ["std"] }

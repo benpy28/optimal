@@ -3,3 +3,5 @@
 /bootloader/target/
 /bootloader/build/
 /fs/target/
+/crates/*/target/
+/crates/*/mutants.out*/
