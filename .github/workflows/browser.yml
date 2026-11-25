@@ -1,0 +1,122 @@
+name: Browser engine
+
+# Builds and tests the browser engine crates in browser/ on the host. Every
+# conformance suite runs on every change, and its pass rate is written to the
+# run summary. Mutation testing runs too, so tests that miss deliberate bugs
+# are found. Long runs are intended: thoroughness over speed.
+on:
+  push:
+    branches: [main]
+    paths: ["browser/**", ".github/workflows/browser.yml"]
+  pull_request:
+    paths: ["browser/**", ".github/workflows/browser.yml"]
+  schedule:
+    - cron: "30 18 * * *" # nightly deep run, 2:30 AM Perth
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: browser
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable, from browser/rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Docs build without warnings
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps
+      - name: Generated entity table is up to date
+        run: |
+          python3 tools/gen_entities.py
+          git diff --exit-code -- crates/html/src/entities_table.rs
+
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Fetch conformance suites (pinned commits)
+        run: ./scripts/fetch-test-suites.sh
+      - name: Unit, property and conformance tests (debug, overflow checks on)
+        run: cargo test --workspace
+      - name: Deep run (release, many more random cases and chunkings)
+        env:
+          PROPTEST_CASES: ${{ github.event_name == 'schedule' && '2000000' || '200000' }}
+          TOKENIZER_RANDOM_ROUNDS: ${{ github.event_name == 'schedule' && '200' || '25' }}
+          CONFORMANCE_OUT: ${{ github.workspace }}/browser/build/html5lib-tokenizer.json
+        run: cargo test --workspace --release -- --nocapture 2>&1 | tee build/test-output.txt
+      - name: Conformance summary
+        if: always()
+        run: |
+          {
+            echo "## Browser engine conformance"
+            echo
+            echo '```'
+            sed -n '/results (seed/,/TOTAL/p' build/test-output.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: browser-conformance
+          path: |
+            browser/build/*.json
+            browser/build/test-output.txt
+
+  mutants:
+    # Sharded, two builds at a time per runner: four parallel mutant builds
+    # ran a hosted runner out of memory (it was shut down mid-run).
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    name: mutants (shard ${{ matrix.shard }} of 8)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked --version 27.1.0
+      - name: Fetch conformance suites
+        run: ./scripts/fetch-test-suites.sh
+      - name: Mutation testing (any surviving mutant fails; harmless ones are excluded with a reason in .cargo/mutants.toml)
+        env:
+          PROPTEST_CASES: "512"
+          TOKENIZER_RANDOM_ROUNDS: "1"
+        run: |
+          # Exit 0: every mutant caught. Exit 3: some mutants only hung until
+          # the timeout, which the tests also catch (an infinite loop is a failure). Anything else fails.
+          # A mutant can turn a loop into one that allocates forever; cap each
+          # process's address space so it fails alone instead of taking the
+          # runner down (that happened twice with no cap).
+          ulimit -v 6000000
+          set +e
+          cargo mutants --workspace -j 2 --timeout 120 --shard ${{ matrix.shard }}/8
+          code=$?
+          set -e
+          cat mutants.out/missed.txt || true
+          [ "$code" = 0 ] || [ "$code" = 3 ]
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutants-shard-${{ matrix.shard }}
+          path: browser/mutants.out/
