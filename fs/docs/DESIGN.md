@@ -313,11 +313,11 @@ the file system track is done.
 | Copy-on-write never overwrites a live block (proof target) | Crash consistency; Duplicated metadata (repair moves) | done; Kani proof open |
 | Commits are atomic (proof target) | Crash consistency | done, power-cut tested at every write point; Kani proof open |
 | Torn-write model: any subset of unflushed writes, torn per 512 bytes | Crash consistency; `sim::CrashDevice` | done |
-| Lying drives: K = max(8, 2 x deepest recorded fallback), fallback within K, rescue beyond | Crash consistency ("Lying drives"); FORMAT "Lying drives" | done; distribution printed by the lying suite; rig data needs hardware; rescue mount open |
+| Lying drives: K = 8 commits (raised if the power-cut rig ever records a fallback deeper than K / 2), fallback within K, rescue beyond | Crash consistency ("Lying drives"); FORMAT "Lying drives" | done; distribution printed by the lying suite; rig data needs hardware; rescue mount open |
 | Root history: previous K commits' full root sets, each with the chunk table root | FORMAT "Body" (core) | done |
 | Free-block and chunk-free quarantine for K commits | Crash consistency; Duplicated metadata | done |
 | Lying-drive test with a metadata-chunk move inside the window | Testing ("Duplicated metadata") | done |
-| Fixed plaintext header area, generation and slot in the body | FORMAT "Superblock" | done |
+| Fixed plaintext header area (bytes 0..512, unused bytes reserved and zero), generation and slot in the authenticated trailer | FORMAT "Superblock" | done |
 | Stage-1 header-block format and stage magic | | open, stage 2 migration |
 | Nonce scheme: random per-mount prefix + counter | Integrity and encryption | done |
 | Replay value in the superblock, bump across all slots in two waves | Integrity and encryption | done (TPM binding with the kernel) |
@@ -330,7 +330,7 @@ the file system track is done.
 | Rate limit on full commits | VFS (Crash consistency notes it) | with the VFS |
 | Hibernation region, stage 1 to 2 migration | | open, kernel integration |
 | Optional features: vault region (F3), travel class key (F5), remove a file from every snapshot (F12) | | open |
-| Per-file fsync intent log, benchmarked under background writeback | FORMAT body (root reserved) | open (next but one) |
+| Per-file fsync intent log, benchmarked under background writeback; it also carries namespace operations (directory fsync, link, rename, O_TMPFILE plus linkat), syncfs latency has a published bound, and a dpkg-style create, fsync, rename, directory-fsync loop joins the tests | FORMAT body (root reserved) | open (next but one) |
 | Error policy: failed write retried at a new block, at most 3 writeback cycles | Errors | partly: commit rebuild after a write failure is next |
 | Metadata stored twice: 64-byte pointers with logical addresses, paired chunks, copy-on-write chunk table in every root set, MAC binds the logical address | Duplicated metadata; FORMAT "Duplicated metadata" | done |
 | The two copies differ; no (copy 1 key, nonce) pair repeats | Duplicated metadata; FORMAT "The second copy" | done (copy 1 checked through the parent's MAC rather than a trailer tag, as agreed in design review) |
