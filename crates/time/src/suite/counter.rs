@@ -38,6 +38,8 @@ fn extend_hand_worked() {
     assert_eq!(e.update(0xFF_FFFF), 1);
     assert_eq!(e.update(0x00_0001), 3);
     assert_eq!(e.update(0x00_1001), 0x1003);
+    assert_eq!(e.total(), 0x1003);
+    assert_eq!(Extend::new(24, 5).total(), 0);
     // High junk bits in readings are ignored, the first one too.
     let mut e = Extend::new(16, 0xDEAD_0010);
     assert_eq!(e.update(0xBEEF_0012), 2);
@@ -76,6 +78,7 @@ proptest! {
             truth = truth.wrapping_add(s);
             total = total.wrapping_add(s);
             prop_assert_eq!(e.update(truth), total);
+            prop_assert_eq!(e.total(), total);
         }
     }
 

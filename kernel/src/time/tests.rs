@@ -15,7 +15,7 @@ use optimal_time::hpet;
 use optimal_time::select::{Clock, HpetCheck, Reference};
 use optimal_time::{pit, pm};
 
-use super::{Counter, Time, TscFreq, get, measure, pit_read, pit_start, pit_stop};
+use super::{Counter, Time, get, measure, pit_read, pit_start, pit_stop};
 use crate::arch::cpu;
 use crate::ktest;
 
@@ -57,7 +57,6 @@ ktest!(boot_found_a_reference_and_a_clock, {
     if t.hpet.is_some() && t.pm.is_some() {
         assert_eq!(t.hpet_check, HpetCheck::Agrees);
     }
-    // An invariant TSC is the clock; otherwise the HPET or the PM timer.
     // An invariant TSC is the clock; otherwise the HPET or the PM timer,
     // and only without either a TSC that is not invariant.
     let clock = t.clock.unwrap();
@@ -133,18 +132,10 @@ ktest!(pm_timer_runs_at_its_specified_rate, {
     assert!(e.ppb <= super::WARN_PPB, "bound {} ppb", e.ppb);
 });
 
-/// The TSC's boot frequency as an estimate: a measurement as it is, a
-/// CPUID claim with its rounding plus the slack allowed against a
-/// reference crystal.
+/// The TSC's boot frequency as an estimate (Time::tsc_estimate).
 fn boot_tsc(t: &Time) -> Estimate {
-    match t.tsc.expect("the TSC's frequency is known on QEMU") {
-        TscFreq::Measured(e) => e,
-        TscFreq::Claimed(c) => Estimate {
-            freq: c.freq,
-            ppb: c.resolution_ppb + super::CPUID_SLACK_PPB,
-            window: 0,
-        },
-    }
+    t.tsc_estimate()
+        .expect("the TSC's frequency is known on QEMU")
 }
 
 ktest!(every_reference_agrees_about_the_tsc, {

@@ -7,6 +7,12 @@
 #   disjoint bits OR and XOR give the same value, so these mutants are
 #   equivalent. The results are pinned bit for bit by hpet::start_hand_worked
 #   and config_bits_only_touch_their_own in src/suite.
+# - `replace | with ^` in lapic's lvt, dcr and dcr_log2, for the same
+#   reason: lvt ORs the vector (bits 0 to 7), the mask (bit 16) and the
+#   mode (bits 17 and 18); dcr and dcr_log2 OR bits 0 and 1 with bit 2 or
+#   3. Pinned bit for bit by lapic::lvt_hand_worked and
+#   dcr_matches_the_sdm_table, and the round-trip properties.
 exclude_re = [
     "replace \\| with \\^ in (halted|quiet)",
+    "replace \\| with \\^ in (lvt|dcr|dcr_log2)",
 ]

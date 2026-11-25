@@ -171,11 +171,14 @@ boot_ok() {
     if [[ "$rest" != *"time:"* ]]; then
         rest="$rest && ^time: reference .*; 0 warnings\$"
     fi
+    if [[ "$rest" != *"timer:"* ]]; then
+        rest="$rest && ^timer: lapic [0-9.]+ MHz .*; events (tsc-deadline|lapic one-shot); .*; 0 warnings\$"
+    fi
     while :; do
         re="${rest%% && *}"
         if ! grep -qE -- "$re" "$log"; then
             echo "EXPECTED a line matching: $re"
-            grep -E "^(acpi|apic|ioapic|pic|interrupts|irqdirt|time|OPTIMAL-QUIRK)" "$log"
+            grep -E "^(acpi|apic|ioapic|pic|interrupts|irqdirt|time|timer|OPTIMAL-QUIRK)" "$log"
             return 1
         fi
         [ "$re" = "$rest" ] && return 0
@@ -308,11 +311,20 @@ scenario "fw-no-acpi-tcg-qemu64" "boot:$NOACPI && $NOINV" "$ISO" bios pc,acpi=of
 for n in 8 32; do
     scenario "time-hpet-$n-comparators" "boot:^time: reference hpet 100\.000000 MHz \(64-bit, $n comparators\); .*; 1 warnings$ && ^time: warning: the ACPI HPET table says 3 comparators, the HPET has $n; using $n$" "$ISO" bios q35 512M 2 30 kvm -- -global "hpet.timers=$n"
 done
-scenario "time-no-invtsc" "boot:^time: reference hpet .*, not invariant, .*; clock hpet; 0 warnings$" "$ISO" bios q35 512M 2 30 kvm -- -cpu host,-invtsc
+# Timer events follow the clock: TSC-deadline mode only when an invariant
+# TSC is the clock, otherwise the LAPIC timer counting down at the rate
+# measured against the clock's own counter.
+scenario "time-no-invtsc" "boot:^time: reference hpet .*, not invariant, .*; clock hpet; 0 warnings$ && ^timer: lapic [0-9.]+ MHz .* against the hpet .*; events lapic one-shot; .*; 0 warnings$" "$ISO" bios q35 512M 2 30 kvm -- -cpu host,-invtsc
+# The PM timer as the clock is a 24-bit counter that wraps every 4.7 s:
+# only the timer's housekeeping keeps it extended, which a kernel test
+# checks across two wraps.
+scenario "time-pm-timer-clock" "boot:^time: reference pm-timer .*; clock pm-timer; 0 warnings$ && ^timer: lapic .* against the pm-timer .*; events lapic one-shot; .*; 0 warnings$" "$ISO" bios q35,hpet=off 512M 2 30 kvm -- -cpu host,-invtsc
 # An invariant TSC is the clock. KVM can only offer it when the host has
 # one (constant_tsc and nonstop_tsc).
 if [ "$KVM" = yes ] && grep -qw constant_tsc /proc/cpuinfo && grep -qw nonstop_tsc /proc/cpuinfo; then
-    scenario "time-invtsc" "boot:^time: reference hpet .*, invariant, .*; clock tsc; 0 warnings$" "$ISO" bios q35 512M 2 30 kvm -- -cpu host,+invtsc
+    scenario "time-invtsc" "boot:^time: reference hpet .*, invariant, TSC-deadline; clock tsc; 0 warnings$ && ^timer: lapic .* against the tsc .*; events tsc-deadline; .*; 0 warnings$" "$ISO" bios q35 512M 2 30 kvm -- -cpu host,+invtsc
+    # The same without TSC-deadline mode: one-shot, measured against the TSC.
+    scenario "time-invtsc-no-deadline" "boot:^time: reference hpet .*, invariant, no TSC-deadline; clock tsc; 0 warnings$ && ^timer: lapic .* against the tsc .*; events lapic one-shot; .*; 0 warnings$" "$ISO" bios q35 512M 2 30 kvm -- -cpu host,+invtsc,-tsc-deadline
     scenario "time-invtsc-no-acpi" "boot:$NOACPI && ^time: reference pit; tsc .*, invariant, .*; clock tsc; 0 warnings$" "$ISO" bios pc,acpi=off 512M 1 30 kvm -- -cpu host,+invtsc
 else
     echo "SKIP: time-invtsc (the host has no invariant TSC for KVM to offer)"

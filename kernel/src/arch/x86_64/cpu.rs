@@ -238,6 +238,13 @@ pub fn rdrand() -> Option<u64> {
     None
 }
 
+/// MFENCE: every earlier load and store is globally visible before any
+/// later one, including an MMIO write before a later WRMSR.
+pub fn mfence() {
+    // SAFETY: a fence has no effect beyond ordering.
+    unsafe { asm!("mfence", options(nostack, preserves_flags)) };
+}
+
 pub fn rdtsc() -> u64 {
     let (lo, hi): (u32, u32);
     // SAFETY: RDTSC has no side effects (CR4.TSD is clear at ring 0 anyway).

@@ -41,6 +41,11 @@ impl Extend {
         self.last = raw;
         self.total
     }
+
+    /// Ticks since the first reading, as of the last update.
+    pub const fn total(&self) -> u64 {
+        self.total
+    }
 }
 
 /// Three back-to-back reads `a`, `b`, `c` of a `bits`-bit up-counter are

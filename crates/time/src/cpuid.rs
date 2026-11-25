@@ -105,3 +105,11 @@ pub fn best(
 ) -> Option<Claimed> {
     crystal.or(hypervisor).or(base)
 }
+
+/// Leaf 06h EAX bit 2 (ARAT): the local APIC timer keeps running in deep
+/// C-states. Without it the timer stops there, so idle states deeper than
+/// C1 must not be entered while it is the only timer (power management
+/// will need this; the kernel only halts, which is C1, for now).
+pub const fn arat(leaf6_eax: u32) -> bool {
+    leaf6_eax & (1 << 2) != 0
+}

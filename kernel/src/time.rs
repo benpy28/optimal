@@ -28,14 +28,17 @@ use core::arch::x86_64::__cpuid_count;
 use core::fmt::Write;
 
 use optimal_acpi::fadt::PmTimer;
+use optimal_apic::lapic;
 use optimal_time::calibrate::{self, Estimate, Refused, Sample};
 use optimal_time::counter::{self, Extend};
 use optimal_time::cpuid::{self, Claimed, Source as CpuidSource};
 use optimal_time::freq::Freq;
 use optimal_time::hpet::{self, Capabilities};
+use optimal_time::lapic as lapic_timer;
 use optimal_time::select::{self, Clock, HpetCheck, Reference};
 use optimal_time::{pit, pm};
 
+use crate::arch::apic::Lapic;
 use crate::arch::cpu;
 use crate::arch::port::{inb, inl, outb};
 use crate::bootinfo::BootInfo;
@@ -69,10 +72,6 @@ const HPET_PM_SLACK_PPB: u64 = 500_000;
 /// How far a measured TSC may be from an exact CPUID claim (leaf 15h or
 /// the hypervisor's) beyond both their bounds: 200 ppm, for the
 /// reference's own crystal error.
-#[cfg_attr(
-    not(feature = "ktest"),
-    expect(dead_code, reason = "tests use it now; the refinement (1c3b) will")
-)]
 pub const CPUID_SLACK_PPB: u64 = 200_000;
 /// Samples taken back to back at each end of a window; the tightest is
 /// used.
@@ -185,25 +184,34 @@ pub enum Counter<'a> {
     Pm(&'a Pm),
     /// Channel 2, already started with [`pit_start`].
     Pit,
+    /// The TSC, frequency unknown (the target of a measurement).
     Tsc,
+    /// The TSC as a reference, at this frequency (the kernel clock's).
+    TscAt(Freq),
+    /// The local APIC timer as an up-counter: it must be counting down
+    /// in one-shot mode from u32::MAX (crate::timer arms it so).
+    Lapic(Lapic),
 }
 
 impl Counter<'_> {
-    fn bits(self) -> u32 {
+    pub fn bits(self) -> u32 {
         match self {
             Counter::Hpet(h) => h.caps.counter_bits(),
             Counter::Pm(p) => p.bits,
             Counter::Pit => 16,
-            Counter::Tsc => 64,
+            // The LAPIC's up-count never wraps: it stops at u32::MAX.
+            Counter::Tsc | Counter::TscAt(_) | Counter::Lapic(_) => 64,
         }
     }
 
-    fn raw(self) -> Option<u64> {
+    pub fn raw(self) -> Option<u64> {
         match self {
             Counter::Hpet(h) => Some(h.counter()),
             Counter::Pm(p) => p.read(),
             Counter::Pit => Some(pit_read()),
-            Counter::Tsc => Some(cpu::rdtsc_ordered()),
+            Counter::Tsc | Counter::TscAt(_) => Some(cpu::rdtsc_ordered()),
+            // None once it reaches zero: then it says nothing more.
+            Counter::Lapic(l) => lapic_timer::elapsed(u32::MAX, l.read(lapic::TIMER_CURRENT)),
         }
     }
 
@@ -213,7 +221,8 @@ impl Counter<'_> {
             Counter::Hpet(h) => Some(h.caps.freq()),
             Counter::Pm(_) => Some(pm::FREQ),
             Counter::Pit => Some(pit::FREQ),
-            Counter::Tsc => None,
+            Counter::TscAt(f) => Some(f),
+            Counter::Tsc | Counter::Lapic(_) => None,
         }
     }
 
@@ -222,7 +231,8 @@ impl Counter<'_> {
             Counter::Hpet(_) => "the HPET",
             Counter::Pm(_) => "the PM timer",
             Counter::Pit => "the PIT",
-            Counter::Tsc => "the TSC",
+            Counter::Tsc | Counter::TscAt(_) => "the TSC",
+            Counter::Lapic(_) => "the LAPIC timer",
         }
     }
 }
@@ -249,7 +259,10 @@ impl<'a> Reader<'a> {
 }
 
 fn unreadable(c: Counter) -> String {
-    format!("{} gave no consistent reading in 100 tries", c.name())
+    match c {
+        Counter::Lapic(_) => String::from("the LAPIC timer's count ran out"),
+        c => format!("{} gave no consistent reading in 100 tries", c.name()),
+    }
 }
 
 /// The tightest of [`SAMPLE_TRIES`] samples, with interrupts off.
@@ -290,6 +303,16 @@ const STUCK_TSC: u64 = 1 << 34;
 /// Measure `target` against `reference` (see the module documentation),
 /// for at most about `max_ns` of the reference.
 pub fn measure(reference: Counter, target: Counter, max_ns: u64) -> Result<Estimate, String> {
+    measure_to(reference, target, GOAL_PPB, max_ns)
+}
+
+/// [`measure`], stopping once the bound is within `goal_ppb`.
+pub fn measure_to(
+    reference: Counter,
+    target: Counter,
+    goal_ppb: u64,
+    max_ns: u64,
+) -> Result<Estimate, String> {
     let rf = reference.freq().expect("a reference has a known frequency");
     let step = rf.ns_to_ticks_ceil(STEP_NS);
     let max = rf.ns_to_ticks_ceil(max_ns);
@@ -314,7 +337,7 @@ pub fn measure(reference: Counter, target: Counter, max_ns: u64) -> Result<Estim
         let s1 = sample(&mut r, &mut t)?;
         let done = s1.after - s0.before >= max;
         match calibrate::estimate(rf, s0, s1) {
-            Ok(e) if e.ppb <= GOAL_PPB || done => return Ok(e),
+            Ok(e) if e.ppb <= goal_ppb || done => return Ok(e),
             Ok(_) => {}
             // Too early to tell: keep going, unless out of time.
             Err(Refused::WindowTooShort | Refused::TargetStopped) if !done => {}
@@ -359,16 +382,29 @@ static STATE: Once<Time> = Once::new();
 
 #[cfg_attr(
     not(feature = "ktest"),
-    expect(
-        dead_code,
-        reason = "first user outside tests is the LAPIC timer (1c3b)"
-    )
+    expect(dead_code, reason = "tests read it; the refinement (1c3b2) will")
 )]
 pub fn get() -> Option<&'static Time> {
     STATE.get()
 }
 
 impl Time {
+    /// The TSC's frequency as an estimate: a measurement as it is, a
+    /// CPUID claim with its rounding plus [`CPUID_SLACK_PPB`] for the
+    /// crystal it came from. `None` when it is unknown, or known only from
+    /// leaf 16h's base frequency.
+    pub fn tsc_estimate(&self) -> Option<Estimate> {
+        match self.tsc? {
+            TscFreq::Measured(e) => Some(e),
+            TscFreq::Claimed(c) if c.source != CpuidSource::BaseFrequency => Some(Estimate {
+                freq: c.freq,
+                ppb: c.resolution_ppb.saturating_add(CPUID_SLACK_PPB),
+                window: 0,
+            }),
+            TscFreq::Claimed(_) => None,
+        }
+    }
+
     /// The reference counter in use.
     pub fn reference_counter(&self) -> Option<Counter<'_>> {
         match self.reference? {
@@ -624,8 +660,7 @@ pub fn init(info: &BootInfo) -> &'static Time {
     }
     // A TSC counts as calibrated when it was measured or an exact CPUID
     // claim gave its frequency (not leaf 16h's base frequency alone).
-    let calibrated = matches!(t.tsc, Some(TscFreq::Measured(_)))
-        || matches!(t.tsc, Some(TscFreq::Claimed(c)) if c.source != CpuidSource::BaseFrequency);
+    let calibrated = t.tsc_estimate().is_some();
     t.clock = select::clock(
         calibrated,
         tsc_features.invariant,
@@ -643,7 +678,7 @@ pub fn init(info: &BootInfo) -> &'static Time {
 }
 
 /// ppb shown as ppm with one decimal, rounded up (it is a bound).
-struct Ppb(u64);
+pub struct Ppb(pub u64);
 
 impl core::fmt::Display for Ppb {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
@@ -653,7 +688,7 @@ impl core::fmt::Display for Ppb {
 }
 
 /// A frequency in MHz to the hertz.
-struct Mhz(Freq);
+pub struct Mhz(pub Freq);
 
 impl core::fmt::Display for Mhz {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {

@@ -76,7 +76,8 @@ ktest!(lapic_id_matches_cpuid, {
 });
 
 // Every register setup() wrote reads back as written (in the bits the
-// encoders define), the timer is stopped, and no error is latched.
+// encoders define), and no error is latched. The timer's LVT entry and
+// count belong to crate::timer once it starts (its tests check them).
 ktest!(lapic_registers_as_planned, {
     let Some(c) = ctl() else { return };
     let l = c.lapic;
@@ -86,13 +87,8 @@ ktest!(lapic_registers_as_planned, {
             lapic::SVR => assert_eq!(got & 0x13FF, v, "SVR"),
             lapic::TPR => assert_eq!(got & 0xFF, 0, "TPR"),
             lapic::ESR => {}
-            lapic::TIMER_INITIAL => assert_eq!(got, 0, "timer initial count"),
-            r => {
-                assert_eq!(got & 0x1_A7FF, v, "LVT {r:#x}");
-                if r == lapic::LVT_TIMER {
-                    assert_eq!(got & (3 << 17), 0, "timer mode");
-                }
-            }
+            lapic::TIMER_INITIAL | lapic::LVT_TIMER => {}
+            r => assert_eq!(got & 0x1_A7FF, v, "LVT {r:#x}"),
         }
     }
     assert_eq!(l.esr(), 0, "local APIC error status");
