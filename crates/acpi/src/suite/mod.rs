@@ -4,6 +4,7 @@
 mod fadt;
 mod hpet;
 mod madt;
+mod mcfg;
 mod reach;
 mod tables;
 

@@ -59,7 +59,7 @@ QEMU_WRAP=()
 QEMU_ACCEL=("${ACCEL[@]}")
 OVMF_SECBOOT=/usr/share/OVMF/OVMF_CODE_4M.secboot.fd
 
-# run_qemu <iso> <log> <firmware> <machine> <mem> <smp> <timeout seconds>
+# run_qemu <iso or .img> <log> <firmware> <machine> <mem> <smp> <timeout seconds>
 # Firmware is one of:
 #   bios              SeaBIOS, QEMU's default
 #   uefi              OVMF from the distro
@@ -95,8 +95,12 @@ run_qemu() {
         *) echo "run_qemu: unknown firmware $fw" >&2; return 1 ;;
     esac
     rm -f "$log"
+    # A .img is a disk (scripts/quirk-image.sh), booted from a throwaway
+    # overlay so a run can never change it; anything else is a CD.
+    local media=(-cdrom "$iso")
+    [[ "$iso" == *.img ]] && media=(-drive "format=raw,file=$iso,snapshot=on")
     "${QEMU_WRAP[@]}" qemu-system-x86_64 "${QEMU_ACCEL[@]}" -M "$machine" -m "$mem" -smp "$smp" \
-        -cdrom "$iso" -display none -serial "file:$log" -no-reboot "${fw_args[@]}" \
+        "${media[@]}" -display none -serial "file:$log" -no-reboot "${fw_args[@]}" \
         -monitor "unix:$log.mon,server,nowait" -d guest_errors,cpu_reset \
         "${QEMU_EXTRA[@]}" >"$log.qemu" 2>&1 &
     local qemu=$!

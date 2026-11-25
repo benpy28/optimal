@@ -9,6 +9,15 @@
 //! table address can therefore never make the kernel read its own RAM, a
 //! device register, or an unmapped page.
 //!
+//! PCI Express configuration space (ECAM) is device registers too, but
+//! firmware memory maps call it reserved, like the memory SeaBIOS keeps its
+//! tables in, so the memory map alone can't rule it out. The MCFG says
+//! where it is, so the MCFG is read first and its ranges (see
+//! `optimal_acpi::mcfg::Mcfg::refused`) are refused for everything after:
+//! every table copy, the DSDT and the FACS. Before the MCFG is known only
+//! the RSDP, the root table and each root entry's 36-byte header can have
+//! been read; a root entry that points into ECAM gets its table refused.
+//!
 //! After [`init`], nothing points into firmware memory: every table lives in
 //! a heap copy, so reclaiming the memory is safe. The one structure the OS
 //! must leave in place, the FACS (it holds the firmware waking vector), is
@@ -21,6 +30,7 @@ use core::fmt::Write;
 use optimal_acpi::fadt::{Fadt, PmTimer};
 use optimal_acpi::hpet::Hpet;
 use optimal_acpi::madt::Madt;
+use optimal_acpi::mcfg::Mcfg;
 use optimal_acpi::reach::{PAGE, Reach, Readable, Span};
 use optimal_acpi::tables::{PhysRead, Root, TableRef, Tables};
 use optimal_acpi::{Error, checksum};
@@ -89,6 +99,16 @@ pub struct Acpi {
     pub madt: Option<Madt>,
     pub hpet: Option<Hpet>,
     pub fadt: Option<Fadt>,
+    /// The first MCFG (PCI Express configuration space).
+    #[cfg_attr(
+        not(feature = "ktest"),
+        expect(dead_code, reason = "first user outside tests is PCI")
+    )]
+    pub mcfg: Option<Mcfg>,
+    /// Physical ranges that may be PCI configuration space, from every MCFG
+    /// listed: refused for every read after the MCFG was read.
+    #[cfg_attr(not(feature = "ktest"), expect(dead_code, reason = "tests read it"))]
+    pub pci_config: Vec<Span>,
     pub warnings: Warnings,
     /// Bytes of ACPI reclaimable memory given to the frame allocator.
     pub reclaimed: u64,
@@ -151,8 +171,14 @@ static WINDOW_LOCK: IrqSpinLock<()> = IrqSpinLock::new(());
 impl FirmwareMem {
     /// The reader for this machine. With `include_reclaimable` false, ACPI
     /// reclaimable memory is refused too (it belongs to the allocator once
-    /// reclaimed).
-    pub fn new(info: &BootInfo, include_reclaimable: bool, window: u64) -> FirmwareMem {
+    /// reclaimed). `refused` is refused as well, whatever the map says
+    /// (PCI configuration space).
+    pub fn new(
+        info: &BootInfo,
+        include_reclaimable: bool,
+        window: u64,
+        refused: &[Span],
+    ) -> FirmwareMem {
         assert!(
             !(include_reclaimable && RECLAIMED.load(core::sync::atomic::Ordering::SeqCst)),
             "ACPI reclaimable memory read after it was reclaimed"
@@ -196,6 +222,7 @@ impl FirmwareMem {
             });
         }
         forbidden.push(DEVICE_WINDOW);
+        forbidden.extend_from_slice(refused);
         let mut direct = Vec::new();
         paging::for_each_direct_span(info, |start, end| direct.push(Span { start, end }));
         FirmwareMem {
@@ -294,12 +321,27 @@ pub fn init(info: &BootInfo) -> &'static Result<Acpi, Absent> {
 
 fn discover(info: &BootInfo) -> Result<Acpi, Absent> {
     let rsdp = info.rsdp.ok_or(Absent::NoRsdp)?;
-    let mem = FirmwareMem::new(info, true, window_page());
-    if !mem.allows(rsdp, 20) {
+    let first_mem = FirmwareMem::new(info, true, window_page(), &[]);
+    if !first_mem.allows(rsdp, 20) {
         return Err(Absent::RsdpRefused(rsdp));
     }
-    let found = Tables::discover(&mem, rsdp).map_err(Absent::Broken)?;
+    let found = Tables::discover(&first_mem, rsdp).map_err(Absent::Broken)?;
     let mut w = Warnings::default();
+    // PCI configuration space, from every MCFG listed (a second one may be
+    // the right one), before anything else is read. A broken MCFG is
+    // reported when it is parsed again below.
+    let mut pci_config = Vec::new();
+    for &t in found.list.iter().filter(|t| &t.signature == b"MCFG") {
+        if let Some(Ok(m)) = Tables::copy(&first_mem, t).map(|b| Mcfg::parse(&b)) {
+            pci_config.extend(m.refused());
+        }
+    }
+    drop(first_mem);
+    let mem = FirmwareMem::new(info, true, window_page(), &pci_config);
+    let in_pci_config = |phys: u64, len: u64| {
+        let end = phys.saturating_add(len);
+        pci_config.iter().any(|s| phys < s.end && s.start < end)
+    };
     if found.rsdp.extended_broken {
         warn!(
             w,
@@ -329,6 +371,16 @@ fn discover(info: &BootInfo) -> Result<Acpi, Absent> {
     let mut tables: Vec<Table> = Vec::new();
     let mut copy = |t: TableRef, w: &mut Warnings, tables: &mut Vec<Table>| {
         let len = u64::from(t.len);
+        if in_pci_config(t.phys, len) {
+            warn!(
+                w,
+                "{} at {:#x} (+{}) is in PCI configuration space (MCFG); refused",
+                sig_str(&t.signature),
+                t.phys,
+                len
+            );
+            return;
+        }
         if len > budget {
             warn!(
                 w,
@@ -365,7 +417,7 @@ fn discover(info: &BootInfo) -> Result<Acpi, Absent> {
     for &t in &found.list {
         copy(t, &mut w, &mut tables);
     }
-    for sig in [b"APIC", b"FACP", b"HPET", b"DSDT", b"FACS"] {
+    for sig in [b"APIC", b"FACP", b"HPET", b"DSDT", b"FACS", b"MCFG"] {
         let n = found.count(sig);
         if n > 1 {
             warn!(w, "{n} {} tables listed; using the first", sig_str(sig));
@@ -401,7 +453,12 @@ fn discover(info: &BootInfo) -> Result<Acpi, Absent> {
         match f.dsdt {
             Some(p) if found.count(b"DSDT") == 0 => {
                 let mut h = [0u8; 8];
-                if !mem.read(p, &mut h) || &h[..4] != b"DSDT" {
+                if in_pci_config(p, 8) {
+                    warn!(
+                        w,
+                        "DSDT at {p:#x} is in PCI configuration space (MCFG); refused"
+                    );
+                } else if !mem.read(p, &mut h) || &h[..4] != b"DSDT" {
                     warn!(w, "DSDT at {p:#x} unreadable or not a DSDT; skipped");
                 } else if let len @ 36..=optimal_acpi::MAX_TABLE_LEN =
                     u32::from_le_bytes([h[4], h[5], h[6], h[7]])
@@ -428,7 +485,12 @@ fn discover(info: &BootInfo) -> Result<Acpi, Absent> {
         // remember where, so its pages are never reclaimed.
         if let Some(p) = f.facs {
             let mut h = [0u8; 8];
-            if mem.read(p, &mut h) && &h[..4] == b"FACS" {
+            if in_pci_config(p, 8) {
+                warn!(
+                    w,
+                    "FACS at {p:#x} is in PCI configuration space (MCFG); refused"
+                );
+            } else if mem.read(p, &mut h) && &h[..4] == b"FACS" {
                 // At least the 64 bytes the specification fixes; a corrupt
                 // length can only keep more pages out of the allocator.
                 let len =
@@ -475,6 +537,25 @@ fn discover(info: &BootInfo) -> Result<Acpi, Absent> {
             }
         }
     }
+    let mcfg = first(&tables, b"MCFG").and_then(|i| match Mcfg::parse(&tables[i].bytes) {
+        Ok(m) => Some(m),
+        Err(e) => {
+            warn!(w, "MCFG unusable: {e:?}");
+            None
+        }
+    });
+    if let Some(m) = &mcfg {
+        if !m.bad.is_empty() {
+            warn!(
+                w,
+                "MCFG: {} entries unusable (zero or misaligned base, bad bus range, or overlapping)",
+                m.bad.len()
+            );
+        }
+        if m.partial_entry {
+            warn!(w, "MCFG ends in a partial entry");
+        }
+    }
     let hpet = first(&tables, b"HPET").and_then(|i| match Hpet::parse(&tables[i].bytes) {
         Ok(h) => Some(h),
         Err(e) => {
@@ -490,6 +571,8 @@ fn discover(info: &BootInfo) -> Result<Acpi, Absent> {
         madt,
         hpet,
         fadt,
+        mcfg,
+        pci_config,
         warnings: w,
         reclaimed: 0,
         free_around_reclaim: (0, 0),

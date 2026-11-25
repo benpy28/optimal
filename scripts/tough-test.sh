@@ -22,7 +22,12 @@
 # (failed frame allocations, 1b) and checks of the ACPI reader (1c). Quirky
 # ACPI tables (duplicates, unknown signatures, a long root table, a 64 KiB
 # table) are added with -acpitable, and each such run must print exactly the
-# ACPI summary and warnings expected. More conditions join as the kernel
+# ACPI summary and warnings expected. Broken ACPI tables (bad checksums, a
+# broken XSDT or RSDP, junk in the MADT, a misaligned HPET, FADT pointers
+# that disagree or point into PCI configuration space) are made in RAM by
+# the firmware-quirk injector (bootloader/quirk) just before the kernel
+# starts, on UEFI disk images from scripts/quirk-image.sh; each must print
+# exactly the expected summary and warnings too. More conditions join as the kernel
 # grows: timer jitter and spurious interrupts (1c), disk power cuts and IO
 # errors (Phase 4).
 #
@@ -292,6 +297,66 @@ big_ssdt=(-acpitable "file=$AQ/ssdt-big.bin")
 scenario "acpi-64K-table" "boot:^acpi: RSDT .* SSDT DSDT\]; .*; 0 warnings$" "$ISO" bios q35 512M 2 30 kvm -- "${big_ssdt[@]}"
 has_uefi && scenario "acpi-64K-table-uefi" "boot:^acpi: XSDT .* SSDT BGRT DSDT\]; .*; (1[3-9][0-9]|[2-9][0-9]{2}) KiB reclaimed; 0 warnings$" "$ISO" uefi q35 512M 2 30 kvm -- "${big_ssdt[@]}"
 
+# Broken ACPI tables, made in RAM by the firmware-quirk injector after
+# ExitBootServices (so no firmware code can repair them), UEFI only. QEMU
+# builds the tables and OVMF installs them, so every OVMF build lays them
+# out the same way. A run passes only if the injector reports every word
+# applied, the kernel's test suite passes in full, and the kernel prints
+# exactly the expected summary and warnings.
+QUIRK_EFI="${QUIRK_EFI:-bootloader/target/x86_64-unknown-uefi/release/optimal-boot-quirk.efi}"
+QDIR=build/quirk-images
+mkdir -p "$QDIR"
+# quirk_img <name> <words...>: builds $QDIR/<name>.img (the ktest kernel).
+quirk_img() {
+    local name="$1"
+    shift
+    QUIRK_EFI="$QUIRK_EFI" scripts/quirk-image.sh build/optimal-kernel-ktest "$QDIR/$name.img" "$@"
+}
+# What every injector run must print: every word applied, none missed.
+quirk_lines() { echo "^OPTIMAL-QUIRK: applied: $*\$ && ^OPTIMAL-QUIRK: not applied:\$"; }
+X='^acpi: XSDT rev 2, '
+W='^acpi: warning: '
+# The ACPI words, each on its own, each with the one warning it must cause.
+# word | CPUs | expected lines (after the injector's own)
+ACPI_CASES=(
+    "acpi-madt-checksum|2|${X}.*; 1 warnings\$ && ${W}APIC checksum wrong \(used anyway\)\$"
+    "acpi-fadt-checksum|2|${X}.*; 1 warnings\$ && ${W}FACP checksum wrong \(used anyway\)\$"
+    "acpi-xsdt-signature|2|^acpi: RSDT rev 2, .*; 1 warnings\$ && ${W}XSDT unusable; using the RSDT\$"
+    "acpi-rsdp-checksum|2|^acpi: RSDT rev 2, .*; 1 warnings\$ && ${W}RSDP extended part unusable \(length or checksum\); using the RSDT\$"
+    "acpi-madt-junk|4|${X}.*; 2 CPUs \(0 off, 0 hot-add, 0 x2APIC\), 1 I/O APIC, 5 overrides, 0 LAPIC NMI, .*; 2 warnings\$ && ${W}MADT: 2 entries skipped \(short, duplicate or invalid\)\$ && ${W}MADT entry list truncated\$"
+    "acpi-hpet-misaligned|2|${X}.*, HPET none, .*; 1 warnings\$ && ${W}HPET table unusable: BadField\$"
+    "acpi-dsdt-clash|2|${X}.* DSDT\]; .*; 1 warnings\$ && ${W}FADT DSDT and X_DSDT disagree; using X_DSDT\$"
+    "acpi-dsdt-in-ecam|2|${X}[0-9]+ tables \[FACP APIC HPET MCFG WAET( BGRT)?\]; .*; 1 warnings\$ && ${W}DSDT at 0x[0-9a-f]+ is in PCI configuration space \(MCFG\); refused\$"
+)
+# Everything at once, two ways (the RSDT fallback and the DSDT edit each
+# have two words that would hide each other).
+ALL1="acpi-madt-junk acpi-hpet-misaligned acpi-dsdt-clash acpi-madt-checksum acpi-fadt-checksum acpi-xsdt-signature"
+ALL1_EXPECT="^acpi: RSDT rev 2, .* DSDT\]; 2 CPUs \(0 off, 0 hot-add, 0 x2APIC\), 1 I/O APIC, 5 overrides, 0 LAPIC NMI, HPET none, .*; 7 warnings\$ && ${W}XSDT unusable; using the RSDT\$ && ${W}APIC checksum wrong \(used anyway\)\$ && ${W}FACP checksum wrong \(used anyway\)\$ && ${W}FADT DSDT and X_DSDT disagree; using X_DSDT\$ && ${W}MADT: 2 entries skipped \(short, duplicate or invalid\)\$ && ${W}MADT entry list truncated\$ && ${W}HPET table unusable: BadField\$"
+ALL2="acpi-madt-junk acpi-hpet-misaligned acpi-dsdt-in-ecam acpi-madt-checksum acpi-fadt-checksum acpi-rsdp-checksum"
+ALL2_EXPECT="^acpi: RSDT rev 2, [0-9]+ tables \[FACP APIC HPET MCFG WAET( BGRT)?\]; 2 CPUs \(0 off, 0 hot-add, 0 x2APIC\), 1 I/O APIC, 5 overrides, 0 LAPIC NMI, HPET none, .*; 7 warnings\$ && ${W}RSDP extended part unusable \(length or checksum\); using the RSDT\$ && ${W}APIC checksum wrong \(used anyway\)\$ && ${W}FACP checksum wrong \(used anyway\)\$ && ${W}DSDT at 0x[0-9a-f]+ is in PCI configuration space \(MCFG\); refused\$ && ${W}MADT: 2 entries skipped \(short, duplicate or invalid\)\$ && ${W}MADT entry list truncated\$ && ${W}HPET table unusable: BadField\$"
+if has_uefi && [ ! -f "$QUIRK_EFI" ]; then
+    # Never a quiet skip: CI builds the injector, so a missing one is a
+    # broken job, not a weaker test.
+    echo "FAIL: broken-ACPI scenarios ($QUIRK_EFI not built)"
+    fail=$((fail + 1))
+    failed+=("acpi-ram-*: injector not built")
+elif has_uefi; then
+    for c in "${ACPI_CASES[@]}"; do
+        IFS='|' read -r word cpus expect <<<"$c"
+        name="acpi-ram-${word#acpi-}"
+        quirk_img "$name" "$word"
+        scenario "$name" "boot:$(quirk_lines "$word") && $expect" "$QDIR/$name.img" uefi q35 512M "$cpus" 30 kvm
+    done
+    # shellcheck disable=SC2086 # one word per argument
+    quirk_img acpi-ram-all-1 $ALL1
+    # shellcheck disable=SC2086
+    quirk_img acpi-ram-all-2 $ALL2
+    scenario "acpi-ram-all-1" "boot:$(quirk_lines "$ALL1") && $ALL1_EXPECT" "$QDIR/acpi-ram-all-1.img" uefi q35 512M 4 30 kvm
+    scenario "acpi-ram-all-2" "boot:$(quirk_lines "$ALL2") && $ALL2_EXPECT" "$QDIR/acpi-ram-all-2.img" uefi q35 512M 4 30 kvm
+    # The same on an emulated CPU, which also makes the firmware slow.
+    scenario "acpi-ram-all-1-tcg" "boot:$(quirk_lines "$ALL1") && $ALL1_EXPECT" "$QDIR/acpi-ram-all-1.img" uefi q35 512M 4 40 tcg -- -cpu qemu64
+fi
+
 # Other OVMF builds (older and newer edk2), fetched by scripts/fetch-firmware.sh.
 for code in build/firmware/*/OVMF_CODE*.fd; do
     [ -f "$code" ] || continue
@@ -311,6 +376,10 @@ for code in build/firmware/*/OVMF_CODE*.fd; do
     # Same firmware on an emulated CPU (different CPUID, no KVM): firmware
     # bugs often depend on exactly what the CPU reports.
     scenario "fw-ovmf-$ver-tcg-qemu64" boot "$ISO" "ovmf=$code" q35 512M 2 40 tcg -- -cpu qemu64
+    # Every ACPI break at once, under this firmware's own RSDP and XSDT.
+    if [ -f "$QDIR/acpi-ram-all-1.img" ]; then
+        scenario "fw-ovmf-$ver-acpi-ram-all-1" "boot:$(quirk_lines "$ALL1") && $ALL1_EXPECT" "$QDIR/acpi-ram-all-1.img" "ovmf=$code" q35 512M 4 40 tcg -- -cpu qemu64
+    fi
 done
 
 # ---------------------------------------------------------------------------

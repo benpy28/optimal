@@ -22,13 +22,19 @@
 //! IOMMU the machine does not have) stops the boot with
 //! `OPTIMAL-QUIRK: FATAL`, rather than running a weaker test than asked.
 //!
-//! Never shipped: it exists only to test loaders.
+//! The `acpi-*` words break the firmware's ACPI tables in RAM instead (see
+//! `acpi_edit`), for testing what an OS makes of them; they are applied in
+//! the same hook and reported in the same lines.
+//!
+//! Never shipped: it exists only to test loaders and the kernel.
 
 #![no_std]
 #![no_main]
 
 #[path = "../../loader/src/efi.rs"]
 mod efi;
+
+mod acpi_edit;
 
 use core::arch::asm;
 use core::cell::UnsafeCell;
@@ -58,9 +64,31 @@ enum Quirk {
     Vtd,
     /// Every AMD-Vi IOMMU enabled over an empty device table.
     Amdvi,
+    /// First MADT: the second CPU (Processor Local APIC) entry gets the
+    /// first one's APIC ID, the third gets the broadcast ID 0xff, and the
+    /// last entry gets length 0. Checksum fixed. Needs 3 or more CPUs.
+    AcpiMadtJunk,
+    /// HPET table: the register block address moved 512 bytes, off its
+    /// required 1 KiB alignment. Checksum fixed.
+    AcpiHpetMisaligned,
+    /// FADT: X_DSDT kept, the 32-bit DSDT field pointed a page away, so the
+    /// two disagree. Checksum fixed.
+    AcpiDsdtClash,
+    /// FADT: DSDT and X_DSDT both pointed at PCIe configuration space (the
+    /// first ECAM bus in the MCFG). Checksum fixed.
+    AcpiDsdtInEcam,
+    /// First MADT: checksum wrong by one.
+    AcpiMadtChecksum,
+    /// FADT: checksum wrong by one.
+    AcpiFadtChecksum,
+    /// XSDT signature broken, so the OS must fall back to the RSDT.
+    AcpiXsdtSignature,
+    /// RSDP extended checksum wrong by one (the first 20 bytes stay
+    /// right), so the XSDT address can't be trusted: RSDT fallback.
+    AcpiRsdpChecksum,
 }
 
-const ALL: [(Quirk, &str); 7] = [
+const ALL: [(Quirk, &str); 15] = [
     (Quirk::Pic, "pic"),
     (Quirk::Ioapic, "ioapic"),
     (Quirk::Lapic, "lapic"),
@@ -68,6 +96,14 @@ const ALL: [(Quirk, &str); 7] = [
     (Quirk::ApicOff, "apic-off"),
     (Quirk::Vtd, "vtd"),
     (Quirk::Amdvi, "amdvi"),
+    (Quirk::AcpiMadtJunk, "acpi-madt-junk"),
+    (Quirk::AcpiHpetMisaligned, "acpi-hpet-misaligned"),
+    (Quirk::AcpiDsdtClash, "acpi-dsdt-clash"),
+    (Quirk::AcpiDsdtInEcam, "acpi-dsdt-in-ecam"),
+    (Quirk::AcpiMadtChecksum, "acpi-madt-checksum"),
+    (Quirk::AcpiFadtChecksum, "acpi-fadt-checksum"),
+    (Quirk::AcpiXsdtSignature, "acpi-xsdt-signature"),
+    (Quirk::AcpiRsdpChecksum, "acpi-rsdp-checksum"),
 ];
 
 fn bit(q: Quirk) -> u32 {
@@ -94,6 +130,14 @@ fn parse(text: &[u8]) -> Result<u32, &[u8]> {
     }
     if set & bit(Quirk::ApicOff) != 0 && set & (bit(Quirk::Lapic) | bit(Quirk::X2apic)) != 0 {
         return Err(b"apic-off together with lapic or x2apic");
+    }
+    // Two edits of the same FADT fields, or two ways to the RSDT fallback
+    // (the second would never be looked at): either hides the other.
+    if set & bit(Quirk::AcpiDsdtClash) != 0 && set & bit(Quirk::AcpiDsdtInEcam) != 0 {
+        return Err(b"acpi-dsdt-clash together with acpi-dsdt-in-ecam");
+    }
+    if set & bit(Quirk::AcpiXsdtSignature) != 0 && set & bit(Quirk::AcpiRsdpChecksum) != 0 {
+        return Err(b"acpi-xsdt-signature together with acpi-rsdp-checksum");
     }
     if set == 0 {
         return Err(b"(no quirks listed)");
@@ -286,6 +330,8 @@ struct State {
     /// AMD-Vi device table. All-zero entries mean "not present": every DMA
     /// and remapped interrupt is blocked (VT-d) or passed through (AMD-Vi).
     tables: u64,
+    acpi_want: acpi_edit::Want,
+    acpi_plan: acpi_edit::Plan,
     applied: bool,
 }
 
@@ -306,6 +352,29 @@ static STATE: Shared = Shared(UnsafeCell::new(State {
     amd: [0; acpi::MAX_IOMMUS],
     amd_count: 0,
     tables: 0,
+    acpi_want: acpi_edit::Want {
+        madt_junk: false,
+        hpet_misaligned: false,
+        dsdt_clash: false,
+        dsdt_in_ecam: false,
+        madt_checksum: false,
+        fadt_checksum: false,
+        xsdt_signature: false,
+        rsdp_ext_checksum: false,
+    },
+    acpi_plan: acpi_edit::Plan {
+        rsdp: 0,
+        madt: (0, 0),
+        fadt: (0, 0),
+        hpet: (0, 0),
+        xsdt: 0,
+        madt_cpu1: 0,
+        madt_cpu2: 0,
+        madt_cpu3: 0,
+        madt_last: 0,
+        dsdt: 0,
+        ecam: 0,
+    },
     applied: false,
 }));
 
@@ -335,7 +404,7 @@ fn apply(st: &State) {
     // SAFETY: ring 0; disabling interrupts is always allowed.
     unsafe { asm!("cli", options(nomem, nostack)) };
     let mut out = Serial;
-    let mut ok = [false; 7];
+    let mut ok = [false; ALL.len()];
     let mut detail = Detail::default();
     let has = |q: Quirk| st.quirks & bit(q) != 0;
     let (_, d1) = cpuid1();
@@ -449,6 +518,20 @@ fn apply(st: &State) {
         }
     }
 
+    let acpi = acpi_edit::apply(&st.acpi_plan, st.acpi_want);
+    for (q, done) in [
+        (Quirk::AcpiMadtJunk, acpi.madt_junk),
+        (Quirk::AcpiHpetMisaligned, acpi.hpet_misaligned),
+        (Quirk::AcpiDsdtClash, acpi.dsdt_clash),
+        (Quirk::AcpiDsdtInEcam, acpi.dsdt_in_ecam),
+        (Quirk::AcpiMadtChecksum, acpi.madt_checksum),
+        (Quirk::AcpiFadtChecksum, acpi.fadt_checksum),
+        (Quirk::AcpiXsdtSignature, acpi.xsdt_signature),
+        (Quirk::AcpiRsdpChecksum, acpi.rsdp_ext_checksum),
+    ] {
+        ok[q as usize] = has(q) && done;
+    }
+
     let _ = write!(out, "\r\nOPTIMAL-QUIRK: applied:");
     for (q, n) in ALL {
         if has(q) && ok[q as usize] {
@@ -461,11 +544,36 @@ fn apply(st: &State) {
             let _ = write!(out, " {n}");
         }
     }
-    let _ = write!(
-        out,
-        "\r\nOPTIMAL-QUIRK: detail: {} I/O APIC pins unmasked, {} LVTs unmasked, SVR {:#x}, TPR {:#x}, VT-d {} TE {} IRE, AMD-Vi {} on\r\n",
-        detail.pins, detail.lvts, detail.svr, detail.tpr, detail.vtd_te, detail.vtd_ire, detail.amd
-    );
+    let hardware = ALL.iter().any(|(q, n)| has(*q) && !n.starts_with("acpi-"));
+    let _ = write!(out, "\r\n");
+    if hardware {
+        let _ = write!(
+            out,
+            "OPTIMAL-QUIRK: detail: {} I/O APIC pins unmasked, {} LVTs unmasked, SVR {:#x}, TPR {:#x}, VT-d {} TE {} IRE, AMD-Vi {} on\r\n",
+            detail.pins,
+            detail.lvts,
+            detail.svr,
+            detail.tpr,
+            detail.vtd_te,
+            detail.vtd_ire,
+            detail.amd
+        );
+    }
+    let p = &st.acpi_plan;
+    if has(Quirk::AcpiMadtJunk) {
+        let _ = write!(
+            out,
+            "OPTIMAL-QUIRK: detail: MADT at {:#x}: APIC IDs {} and {} of CPU entries 2 and 3 now copy entry 1 and 0xff; last entry (type {}) now length 0\r\n",
+            p.madt.0, acpi.apic_ids.0, acpi.apic_ids.1, acpi.last_kind
+        );
+    }
+    if has(Quirk::AcpiDsdtInEcam) {
+        let _ = write!(
+            out,
+            "OPTIMAL-QUIRK: detail: FADT DSDT and X_DSDT now {:#x} (PCIe config space; the DSDT is at {:#x})\r\n",
+            p.ecam, p.dsdt
+        );
+    }
 }
 
 #[derive(Default)]
@@ -624,8 +732,25 @@ extern "efiapi" fn efi_main(image: efi::Handle, st: *mut efi::SystemTable) -> St
             s.amd_count = acpi::ivrs_units(&mem, p, l, &mut s.amd);
         }
     }
-    let (c1, d1) = cpuid1();
     let has = |q: Quirk| quirks & bit(q) != 0;
+    let want = acpi_edit::Want {
+        madt_junk: has(Quirk::AcpiMadtJunk),
+        hpet_misaligned: has(Quirk::AcpiHpetMisaligned),
+        dsdt_clash: has(Quirk::AcpiDsdtClash),
+        dsdt_in_ecam: has(Quirk::AcpiDsdtInEcam),
+        madt_checksum: has(Quirk::AcpiMadtChecksum),
+        fadt_checksum: has(Quirk::AcpiFadtChecksum),
+        xsdt_signature: has(Quirk::AcpiXsdtSignature),
+        rsdp_ext_checksum: has(Quirk::AcpiRsdpChecksum),
+    };
+    if ALL.iter().any(|(q, n)| has(*q) && n.starts_with("acpi-")) {
+        match acpi_edit::plan(rsdp, want) {
+            Ok(p) => s.acpi_plan = p,
+            Err(why) => fatal!(con, "ACPI quirks asked for, but {why}"),
+        }
+    }
+    s.acpi_want = want;
+    let (c1, d1) = cpuid1();
     for (q, missing) in [
         (Quirk::Ioapic, s.ioapic_count == 0),
         (Quirk::Vtd, s.vtd_count == 0),
