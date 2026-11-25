@@ -119,3 +119,123 @@ fn tree_errors_are_reported() {
     let p = parse_document("<!DOCTYPE html><p>x</p>", options(false));
     assert!(p.errors.is_empty(), "{:?}", p.errors);
 }
+
+fn doc(input: &str) -> (String, Vec<&'static str>) {
+    let p = parse_document(input, options(false));
+    p.document.check_invariants();
+    (dump(&p), tree_errors(&p.errors))
+}
+
+/// Which mode reports an error, and where a comment lands, show which rule
+/// handled a token. In each case below the wrong rule would build the same
+/// elements, so the comment or the error is what tells them apart.
+#[test]
+fn head_modes_by_hand() {
+    // "before html": a DOCTYPE and a stray end tag are ignored right there.
+    let base = "| <!DOCTYPE html>\n| <html>\n|   <head>\n|   <body>";
+    assert_eq!(
+        doc("<!DOCTYPE html><!DOCTYPE html>"),
+        (base.into(), vec!["DOCTYPE in before html"])
+    );
+    assert_eq!(
+        doc("<!DOCTYPE html></p>"),
+        (base.into(), vec!["end tag in before html"])
+    );
+    // "before head": a DOCTYPE is ignored; <html> goes to "in body", which
+    // merges attributes and leaves the mode alone, so the comment is a child
+    // of html, before head.
+    assert_eq!(
+        doc("<!DOCTYPE html><html><!DOCTYPE html>"),
+        (base.into(), vec!["DOCTYPE in before head"])
+    );
+    assert_eq!(
+        doc("<!DOCTYPE html><html><html a><!--x-->").0,
+        "| <!DOCTYPE html>\n| <html>\n|   a=\"\"\n|   <!-- x -->\n|   <head>\n|   <body>"
+    );
+    // "in head": <html> goes to "in body" without leaving head.
+    assert_eq!(
+        doc("<!DOCTYPE html><head><html a><!--x-->").0,
+        "| <!DOCTYPE html>\n| <html>\n|   a=\"\"\n|   <head>\n|     <!-- x -->\n|   <body>"
+    );
+    // "after head": a DOCTYPE is ignored; <html> and <head> leave the mode
+    // alone, so the comment lands between head and body; </template> goes
+    // to "in head".
+    assert_eq!(
+        doc("<!DOCTYPE html><head></head><!DOCTYPE html>"),
+        (base.into(), vec!["DOCTYPE after head"])
+    );
+    let between = "| <!DOCTYPE html>\n| <html>\n|   <head>\n|   <!-- x -->\n|   <body>";
+    assert_eq!(
+        doc("<!DOCTYPE html><head></head><head><!--x-->"),
+        (between.into(), vec!["head start tag after head"])
+    );
+    assert_eq!(
+        doc("<!DOCTYPE html><head></head><html a><!--x-->").0,
+        "| <!DOCTYPE html>\n| <html>\n|   a=\"\"\n|   <head>\n|   <!-- x -->\n|   <body>"
+    );
+    assert_eq!(
+        doc("<!DOCTYPE html><head></head></template>"),
+        (base.into(), vec!["template end tag with no template open"])
+    );
+}
+
+/// "in body" end tags dd and dt, and the select-related start tags, by the
+/// errors they report.
+#[test]
+fn in_body_errors_by_hand() {
+    let (_, e) = doc("<!DOCTYPE html><dl><dd><span></dd>");
+    assert_eq!(
+        e,
+        [
+            "dd/dt end tag: current node mismatch",
+            "EOF with elements open"
+        ]
+    );
+    let (_, e) = doc("<!DOCTYPE html><dl><dd></dd></dl>");
+    assert!(e.is_empty(), "{e:?}");
+    let (_, e) = doc("<!DOCTYPE html><dl><dt></dd>");
+    assert_eq!(
+        e,
+        [
+            "dd/dt end tag without element in scope",
+            "EOF with elements open"
+        ]
+    );
+    // An optgroup still in scope after the implied end tags (a span keeps it
+    // open) makes <hr> and <optgroup> errors; an option alone would too.
+    let (_, e) = doc("<!DOCTYPE html><select><optgroup><span><hr>");
+    assert_eq!(e, ["hr in option", "EOF with elements open"]);
+    let (_, e) = doc("<!DOCTYPE html><select><optgroup><span><optgroup>");
+    assert_eq!(e, ["optgroup in option", "EOF with elements open"]);
+    let (_, e) = doc("<!DOCTYPE html><select><option><span><hr>");
+    assert_eq!(e, ["hr in option", "EOF with elements open"]);
+}
+
+/// Adoption agency runs that reach the outer loop's limit of eight, so the
+/// bookmark decides where the last new formatting element goes in the list,
+/// and later text shows it through reconstruction. WPT has no such case.
+/// These trees are this parser's output (it passes every runnable WPT tree
+/// test), pinned so the bookmark handling cannot change unnoticed; each was
+/// checked to change under a wrong bookmark.
+#[test]
+fn adoption_agency_bookmark_cases() {
+    let cases: &[(&str, &str)] = &[
+        (
+            "<em><div><div><div><div><div><code><div><a><div><s><div></em>x</div>x",
+            "| <html>\n|   <head>\n|   <body>\n|     <em>\n|     <div>\n|       <em>\n|       <div>\n|         <em>\n|         <div>\n|           <em>\n|           <div>\n|             <em>\n|             <div>\n|               <em>\n|                 <code>\n|               <code>\n|                 <div>\n|                   <em>\n|                     <a>\n|                   <a>\n|                     <div>\n|                       <em>\n|                         <s>\n|                       <s>\n|                         <div>\n|                           <em>\n|                             \"x\"\n|                         <em>\n|                           \"x\"",
+        ),
+        (
+            "<s><div><div><div><em><div><div><div><div><div><div><b></s>xxx</b></em></div>x</div>x</em>y",
+            "| <html>\n|   <head>\n|   <body>\n|     <s>\n|     <div>\n|       <s>\n|       <div>\n|         <s>\n|         <div>\n|           <s>\n|             <em>\n|           <em>\n|           <div>\n|             <em>\n|               <s>\n|             <div>\n|               <em>\n|                 <s>\n|               <div>\n|                 <em>\n|                   <s>\n|                 <div>\n|                   <em>\n|                     <s>\n|                   <div>\n|                     <em>\n|                       <s>\n|                     <s>\n|                       <div>\n|                         <em>\n|                           <b>\n|                             \"xxx\"\n|                       \"x\"\n|                   <s>\n|                     \"xy\"",
+        ),
+        (
+            "<b><i><div><div><div><div><div><div><div><div><div></b></div></div>x",
+            "| <html>\n|   <head>\n|   <body>\n|     <b>\n|       <i>\n|     <i>\n|       <div>\n|         <b>\n|         <div>\n|           <b>\n|           <div>\n|             <b>\n|             <div>\n|               <b>\n|               <div>\n|                 <b>\n|                 <div>\n|                   <b>\n|                   <div>\n|                     <b>\n|                     <div>\n|                       <b>\n|                         <div>\n|                     <b>\n|                       \"x\"",
+        ),
+    ];
+    for (input, want) in cases {
+        let p = parse_document(input, options(false));
+        p.document.check_invariants();
+        assert_eq!(&dump(&p), want, "{input}");
+    }
+}

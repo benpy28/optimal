@@ -782,22 +782,24 @@ impl TreeBuilder {
         el
     }
 
+    /// The DOM's pre-insertion validity check, for an element: inserting
+    /// must not make a node its own ancestor, a document has at most one
+    /// element child, and the reference child must be a child of the parent.
+    /// Where it fails, the standard's insert steps are skipped.
+    fn can_insert_element(&self, el: NodeId, loc: Loc) -> bool {
+        !self.doc.would_cycle(el, loc.parent)
+            && !(loc.parent == Document::ROOT && self.doc.has_element_child(Document::ROOT))
+            && loc
+                .before
+                .is_none_or(|r| self.doc.parent(r) == Some(loc.parent))
+    }
+
     /// "insert an element at the adjusted insertion location"
     fn insert_element_at(&mut self, el: NodeId, location: Option<Loc>) {
         let loc = self.adjust(location.unwrap_or_else(|| self.appropriate_place(None)));
-        if self.doc.parent(el).is_some()
-            || self.doc.would_cycle(el, loc.parent)
-            || (loc.parent == Document::ROOT && self.doc.has_element_child(Document::ROOT))
-        {
-            return;
+        if self.doc.parent(el).is_none() && self.can_insert_element(el, loc) {
+            self.doc.insert_before(loc.parent, el, loc.before);
         }
-        if loc
-            .before
-            .is_some_and(|r| self.doc.parent(r) != Some(loc.parent))
-        {
-            return;
-        }
-        self.doc.insert_before(loc.parent, el, loc.before);
     }
 
     /// "insert a foreign element"
@@ -2130,7 +2132,10 @@ impl TreeBuilder {
             };
             let furthest_block = self.open[fb_stack];
             let common_ancestor = self.open[fe_stack - 1];
-            let mut bookmark = fe_index;
+            // The bookmark, kept as the entry it follows rather than as an
+            // index, so removals before it need no index arithmetic. None
+            // means the formatting element's own position.
+            let mut bookmark_after: Option<NodeId> = None;
             let mut node_index = fb_stack;
             let mut last_node = furthest_block;
             let mut inner = 0;
@@ -2146,9 +2151,6 @@ impl TreeBuilder {
                     && let Some(i) = afe_i
                 {
                     self.afe.remove(i);
-                    if i < bookmark {
-                        bookmark -= 1;
-                    }
                     afe_i = None;
                 }
                 let Some(ai) = afe_i else {
@@ -2162,7 +2164,7 @@ impl TreeBuilder {
                 self.afe.set_node(ai, new_el);
                 self.replace_open(node_index, new_el);
                 if last_node == furthest_block {
-                    bookmark = ai + 1;
+                    bookmark_after = Some(new_el);
                 }
                 if self.doc.parent(last_node).is_some() {
                     self.doc.remove(last_node);
@@ -2174,26 +2176,23 @@ impl TreeBuilder {
             if self.doc.parent(last_node).is_some() {
                 self.doc.remove(last_node);
             }
-            if !self.doc.is_inclusive_ancestor(last_node, loc.parent)
-                && !(loc.parent == Document::ROOT && self.doc.has_element_child(Document::ROOT))
-                && loc
-                    .before
-                    .is_none_or(|r| self.doc.parent(r) == Some(loc.parent))
-            {
+            if self.can_insert_element(last_node, loc) {
                 self.doc.insert_before(loc.parent, last_node, loc.before);
             }
             let new_el = self.create_element_for(&fe_tok, Namespace::Html, furthest_block);
             self.doc.move_children(furthest_block, new_el);
             self.doc.append(furthest_block, new_el);
-            // Replace the formatting element's entry at the bookmark.
+            // Remove the formatting element's entry and put the new element
+            // at the bookmark.
             let fe_now = self.afe_index(fe).expect("formatting element still listed");
-            self.afe.insert(bookmark, new_el, fe_tok);
-            let remove_at = if fe_now >= bookmark {
-                fe_now + 1
-            } else {
-                fe_now
-            };
-            self.afe.remove(remove_at);
+            match bookmark_after {
+                None => self.afe.set_node(fe_now, new_el),
+                Some(a) => {
+                    self.afe.remove(fe_now);
+                    let at = self.afe_index(a).expect("bookmark entry still listed") + 1;
+                    self.afe.insert(at, new_el, fe_tok);
+                }
+            }
             self.remove_from_stack(fe);
             let fb_now = self
                 .open
