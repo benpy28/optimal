@@ -36,8 +36,11 @@ Blocked tests are counted apart, never as passes:
 The suite's own README says only the number of parse errors matters, and
 its counts come from an older implementation's choices (for example one
 error per character of foster-parented text). The standard itself doesn't
-fix a count for runs of text. So the tree is the gate, and the count match
-rate is printed in every run (currently 2931 of 3890) to watch, not gated.
+fix a count for runs of text. So counts are gated against the suite where
+they match (currently 2931 of 3890), and every difference elsewhere is pinned
+in [`wpt-tree-error-counts.json`](wpt-tree-error-counts.json): a change to
+which errors the tree builder reports fails CI until that file is regenerated
+(`TREE_ERROR_COUNTS_OUT=<path>`) and the change reviewed.
 Our errors are deterministic: chunking never changes their number or order,
 which the harness and the property tests check.
 

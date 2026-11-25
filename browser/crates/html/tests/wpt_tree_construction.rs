@@ -16,9 +16,14 @@
 //! separately as blocked, never as passes. Corrections where the suite
 //! contradicts the standard live in `browser/conformance/wpt-tree-errata.json`.
 //!
-//! The parse error count is reported but not gated: the suite says only the
-//! count matters, and many expectations are known to be stale. The tree is
-//! the gate.
+//! Parse error counts are gated too, two ways. Where our count matches the
+//! suite's, it must keep matching. Where it differs (the suite's counts
+//! follow html5lib-python's per-character choices, and some are stale), the
+//! difference is pinned in `browser/conformance/wpt-tree-error-counts.json`,
+//! so any change to which errors the tree builder reports fails until that
+//! file is regenerated (`TREE_ERROR_COUNTS_OUT=<path>`) and the change is
+//! reviewed. Entries that match no test, or whose test now matches the
+//! suite, fail as stale.
 //!
 //! Suite location: `WPT_PARSING` (default
 //! `browser/build/wpt/html/syntax/parsing/resources`, filled by
@@ -243,6 +248,17 @@ fn wpt_tree_construction_suite() {
     let mut blocked_dom = 0;
     let mut error_diffs: std::collections::BTreeMap<i64, usize> = Default::default();
     let mut rng = Rng(seed);
+    let counts_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../conformance/wpt-tree-error-counts.json");
+    let counts: Value =
+        serde_json::from_str(&std::fs::read_to_string(&counts_path).unwrap()).unwrap();
+    assert!(
+        counts["reason"].is_string(),
+        "error count pins need a reason"
+    );
+    let pinned = counts["known_diffs"].as_object().unwrap().clone();
+    let mut pinned_used: std::collections::BTreeSet<String> = Default::default();
+    let mut new_pins = serde_json::Map::new();
 
     let mut per_file = Vec::new();
     let mut failures = Vec::new();
@@ -346,6 +362,23 @@ fn wpt_tree_construction_suite() {
                     if nerr == t.errors {
                         errors_match += 1;
                     }
+                    let key = format!("{name}:{}:{scripting}", t.line);
+                    let diff = nerr as i64 - t.errors as i64;
+                    let want_diff = pinned.get(&key).map_or(0, |v| v.as_i64().unwrap());
+                    if pinned.contains_key(&key) {
+                        pinned_used.insert(key.clone());
+                    }
+                    if diff != 0 {
+                        new_pins.insert(key.clone(), diff.into());
+                    }
+                    if diff != want_diff {
+                        failures.push(format!(
+                            "ERRORS {key}: ours minus the suite's error count is {diff}, pinned {want_diff}\n#data\n{}\n#expected\n{}\n#ours\n{}\n",
+                            t.data,
+                            t.error_lines.join("\n"),
+                            whole_errors.join("\n")
+                        ));
+                    }
                 } else {
                     failures.push(format!(
                         "FAIL {name}:{} ({how}, scripting {scripting}, fragment {:?})\n#data\n{}\n#want\n{want}\n#got\n{got}\n",
@@ -370,6 +403,18 @@ fn wpt_tree_construction_suite() {
             blocked_list[i]["data"]
         );
     }
+    for k in pinned.keys() {
+        if !pinned_used.contains(k) {
+            failures.push(format!(
+                "error count pin {k} matched no passing test: remove it"
+            ));
+        }
+    }
+    if let Ok(out) = std::env::var("TREE_ERROR_COUNTS_OUT") {
+        let mut c = counts.clone();
+        c["known_diffs"] = Value::Object(new_pins);
+        std::fs::write(out, serde_json::to_string_pretty(&c).unwrap() + "\n").unwrap();
+    }
     let runnable = total - blocked - blocked_dom;
     println!("WPT tree construction results (seed {seed:#x}):");
     for (n, p, t, b) in &per_file {
@@ -384,7 +429,9 @@ fn wpt_tree_construction_suite() {
         "TOTAL"
     );
     println!("  ours minus expected parse error count: {error_diffs:?}");
-    println!("  parse error count matches in {errors_match}/{passed} passing tests (not gated)");
+    println!(
+        "  parse error count matches in {errors_match}/{passed} passing tests (the rest are pinned)"
+    );
     if let Ok(out) = std::env::var("TREE_CONFORMANCE_OUT") {
         let report = serde_json::json!({
             "suite": "wpt/html/syntax/parsing (tree construction)",
