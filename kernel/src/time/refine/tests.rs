@@ -7,11 +7,12 @@ use optimal_time::calibrate::Estimate;
 use optimal_time::freq::Freq;
 use optimal_time::refine::{self as rf, Boot, Outcome};
 use optimal_time::select::{Clock, Events, Reference};
+use optimal_time::watchdog as wd;
 
 use super::{Skip, Status, WAIT_NS, WARN_PPB, report, status};
 use crate::clock;
 use crate::ktest;
-use crate::time::{self, fake};
+use crate::time::{self, fake, watchdog};
 use crate::timer;
 
 /// Slack on top of the boot bound when checking a faked claim's offset
@@ -77,19 +78,31 @@ ktest!(refinement_finishes_with_the_right_result, {
             assert_eq!(rf::decide(boot, measured), outcome);
             let boot_f = t.tsc_estimate().unwrap().freq;
             let rates = timer::rates();
+            // After a faked TSC fault the watchdog may have moved the
+            // clock off the TSC, carrying the LAPIC timer's rate across
+            // (crate::time::watchdog's tests check the rest).
+            let fell = watchdog::tests::fell_back();
+            let carried = |l: Option<Estimate>| match fell {
+                Some(bound) => l.map(|l| wd::carry(l, bound)),
+                None => l,
+            };
             if outcome.adopts() {
-                assert_eq!(clock::freq(), Some(measured.freq));
+                if fell.is_none() {
+                    assert_eq!(clock::freq(), Some(measured.freq));
+                }
                 // The LAPIC timer's rate moved by the same factor.
                 let want = tm
                     .lapic
                     .map(|l| rf::rescale(l, boot_f, measured.freq).unwrap());
-                assert_eq!(rates.lapic, want);
+                assert_eq!(rates.lapic, carried(want));
             } else {
-                assert_eq!(clock::freq(), Some(boot_f));
-                assert_eq!(rates.lapic, tm.lapic);
+                if fell.is_none() {
+                    assert_eq!(clock::freq(), Some(boot_f));
+                }
+                assert_eq!(rates.lapic, carried(tm.lapic));
             }
             // TSC-deadline mode arms with the clock's own frequency.
-            if tm.events == Some(Events::TscDeadline) {
+            if timer::events() == Some(Events::TscDeadline) && fell.is_none() {
                 assert_eq!(rates.tsc, clock::freq());
             }
             crate::println!(

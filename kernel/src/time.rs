@@ -380,10 +380,6 @@ pub struct Time {
 
 static STATE: Once<Time> = Once::new();
 
-#[cfg_attr(
-    not(feature = "ktest"),
-    expect(dead_code, reason = "tests read it; the scorecard will")
-)]
 pub fn get() -> Option<&'static Time> {
     STATE.get()
 }
@@ -795,6 +791,7 @@ pub fn report(t: &Time) {
 }
 
 pub mod refine;
+pub mod watchdog;
 
 #[cfg(feature = "ktest")]
 pub mod fake;

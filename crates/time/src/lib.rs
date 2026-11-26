@@ -29,6 +29,7 @@ pub mod pm;
 pub mod refine;
 pub mod select;
 pub mod timeline;
+pub mod watchdog;
 
 pub use freq::{Freq, Scale};
 

@@ -516,6 +516,11 @@ pub fn lines(s: Status) -> (String, Vec<String>) {
     (line, w)
 }
 
+/// Has [`report`] printed?
+pub fn reported() -> bool {
+    REPORTED.load(Ordering::SeqCst)
+}
+
 /// Print the `refine:` line and its warnings, once (the tests and the
 /// idle loop both ask).
 pub fn report() {
