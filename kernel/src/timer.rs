@@ -146,6 +146,8 @@ static CHUNK_CAP: AtomicU64 = AtomicU64::new(u64::MAX);
 
 static FIRES: AtomicU64 = AtomicU64::new(0);
 static EARLY: AtomicU64 = AtomicU64::new(0);
+/// One-shot armings that covered only a piece of their wait.
+static PIECES: AtomicU64 = AtomicU64::new(0);
 static PERIODIC_TICKS: AtomicU64 = AtomicU64::new(0);
 
 fn encode(e: Option<Events>) -> u8 {
@@ -375,6 +377,7 @@ fn program(a: &mut Armed) {
             a.hw = Some(if ns == wait {
                 due
             } else {
+                PIECES.fetch_add(1, Ordering::Relaxed);
                 now.saturating_add(ns - CONVERSION_PAD_NS.min(ns))
             });
             l.write(regs::TIMER_DIVIDE, arm.dcr());
@@ -526,6 +529,15 @@ pub fn cancel() {
 )]
 pub fn fires() -> (u64, u64) {
     (FIRES.load(Ordering::SeqCst), EARLY.load(Ordering::SeqCst))
+}
+
+/// One-shot armings so far that covered only a piece of their wait.
+#[cfg_attr(
+    not(feature = "ktest"),
+    expect(dead_code, reason = "tests read it; the scorecard will")
+)]
+pub fn pieces() -> u64 {
+    PIECES.load(Ordering::SeqCst)
 }
 
 /// Run the LAPIC timer periodically, every `period_ns` or a little more

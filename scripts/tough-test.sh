@@ -143,6 +143,10 @@ scenario() {
             echo "[...]"
             # The failing test and its message, wherever they are.
             grep -aE -A4 "KTEST FAIL|KERNEL PANIC" "$log" 2>/dev/null
+            # What the clock and timer chose, and the tests before it.
+            echo "[clock and timer lines, and the last tests]"
+            grep -aE "^(time|timer|refine|watchdog|tscfake):" "$log" 2>/dev/null
+            grep -aE "^(KTEST|ktest:)" "$log" 2>/dev/null | tail -n 12
             grep -E "KVM internal error|Suberror|emulation failure|extra data" "$log" 2>/dev/null
             tail -n 40 "$log" 2>/dev/null
         fi

@@ -49,18 +49,25 @@ ktest!(boot_chose_events_by_the_rules, {
     );
     let want = select::events(
         t.deadline_mode,
-        tm.tsc_estimate().is_some() && clock::kind() == Some(Clock::Tsc),
+        tm.tsc_estimate().is_some() && tm.clock == Some(Clock::Tsc),
         tm.tsc_features.invariant,
         t.lapic.is_some(),
     );
     assert_eq!(t.events, want);
-    assert_eq!(events_now(), want);
+    // Now: the boot choice, unless the watchdog fell back from the TSC,
+    // which moves TSC-deadline events to one-shot.
+    let now = if crate::time::watchdog::tests::fell_back().is_some() {
+        want.map(|_| Events::LapicOneShot)
+    } else {
+        want
+    };
+    assert_eq!(events_now(), now);
     // The LVT is in that mode, unmasked, on vector 0xF0.
     let l = t.lapic_regs.unwrap();
     let lvt = l.read(regs::LVT_TIMER);
     assert_eq!(lvt & 0xFF, 0xF0);
     assert_eq!(lvt & lt::LVT_MASKED, 0);
-    let mode = match want.unwrap() {
+    let mode = match now.unwrap() {
         Events::TscDeadline => lt::Mode::TscDeadline,
         Events::LapicOneShot => lt::Mode::OneShot,
     };
@@ -225,14 +232,21 @@ ktest!(every_event_mode_never_fires_early, {
     // In several armings: cap each at 3 ms, so 20 ms takes seven.
     CHUNK_CAP.store(3_000_000, Ordering::SeqCst);
     let (f0, _) = fires();
+    let p0 = super::pieces();
     never_early("lapic one-shot in 3 ms pieces");
     CHUNK_CAP.store(u64::MAX, Ordering::SeqCst);
     let (f1, _) = fires();
-    // 21 timers, and the six longer than one piece (5 and 20 ms) need at
-    // least two armings each. Not more: a piece that fires late can leave
+    let pieces = super::pieces() - p0;
+    // 21 timers, each run from an interrupt, and the six longer than one
+    // piece (5 and 20 ms) start with a piece each. Not more interrupts: a
+    // piece that fires late (a loaded host deschedules the vCPU) can leave
     // the deadline already passed, and then no further piece is needed.
-    assert!(f1 - f0 >= 21 + 6, "only {} interrupts", f1 - f0);
-    crate::println!("ktest: {} interrupts for 21 timers in 3 ms pieces", f1 - f0);
+    assert!(f1 - f0 >= 21, "only {} interrupts", f1 - f0);
+    assert!(pieces >= 6, "only {pieces} armings in pieces");
+    crate::println!(
+        "ktest: {} interrupts and {pieces} armings in pieces for 21 timers in 3 ms pieces",
+        f1 - f0
+    );
     modes += 1;
     force_events(was);
     crate::println!("ktest: {modes} ways of arming checked");
