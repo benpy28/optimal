@@ -47,19 +47,19 @@ use crate::sync::{IrqSpinLock, Once};
 
 /// A measurement stops once its bound is this tight: 10 ppm, 0.86 s a
 /// day. That takes tens of milliseconds against the HPET even under
-/// emulation; the LAPIC timer's periodic tick (1c3b) will refine it over
-/// a longer window without holding up boot.
+/// emulation; the 10 s refinement (time::refine) improves on it over a
+/// longer window without holding up boot.
 pub const GOAL_PPB: u64 = 10_000;
 /// At boot a measurement also stops after this long, with whatever bound
 /// it reached: boot time matters more than the last few ppm, which the
-/// periodic tick (1c3b) will win back without holding anything up.
+/// 10 s refinement (time::refine) wins back without holding anything up.
 pub const BOOT_WINDOW_NS: u64 = 100_000_000;
 /// A new end sample this often.
 const STEP_NS: u64 = 10_000_000;
 /// A boot measurement of the TSC looser than this (1000 ppm, a millisecond
 /// a second) is reported as a warning: past it, timers armed from the
 /// TSC before the refinement would be visibly off. Anything tighter is a
-/// good enough starting value, because the 10 s refinement (1c3b), not the
+/// good enough starting value, because the 10 s refinement (time::refine), not the
 /// boot measurement, is what holds the clock to the ROADMAP's 1 ppm. In
 /// nested VMs (GitHub's KVM runners) every HPET read is a slow exit, and
 /// 100 ms only reaches about 100 ppm there.
@@ -382,7 +382,7 @@ static STATE: Once<Time> = Once::new();
 
 #[cfg_attr(
     not(feature = "ktest"),
-    expect(dead_code, reason = "tests read it; the refinement (1c3b2) will")
+    expect(dead_code, reason = "tests read it; the scorecard will")
 )]
 pub fn get() -> Option<&'static Time> {
     STATE.get()
@@ -598,7 +598,14 @@ pub fn init(info: &BootInfo) -> &'static Time {
     let pit = pit_port_b.is_some();
     let reference = select::reference(hpet.is_some(), pm.is_some(), pit, hpet_check);
 
-    let (tsc_features, tsc_claimed) = tsc_features();
+    #[allow(unused_mut, reason = "only test builds change it")]
+    let (mut tsc_features, tsc_claimed) = tsc_features();
+    #[cfg(feature = "ktest")]
+    let fake = fake::get(info);
+    #[cfg(feature = "ktest")]
+    if fake.invariant {
+        tsc_features.invariant = true;
+    }
     let mut t = Time {
         hpet,
         hpet_check,
@@ -613,8 +620,11 @@ pub fn init(info: &BootInfo) -> &'static Time {
     // An exact CPUID claim (leaf 15h, or the hypervisor's leaf) is the
     // TSC's frequency at boot without spending any time on it (ROADMAP
     // 1c); the refinement against the reference over the first 10 s
-    // (1c3b) then checks it. Without one, the TSC is measured now.
+    // (time::refine) then checks it. Without one, the TSC is measured now.
     let exact = tsc_claimed.filter(|c| c.source != CpuidSource::BaseFrequency);
+    // A faked claim (tests) is made from a measurement, so measure.
+    #[cfg(feature = "ktest")]
+    let exact = exact.filter(|_| fake.claim_ppm.is_none());
     if !tsc_features.present {
         // Nothing to do: the clock will be the HPET or the PM timer.
     } else if let Some(c) = exact {
@@ -658,6 +668,10 @@ pub fn init(info: &BootInfo) -> &'static Time {
     if let Some(b) = pit_port_b {
         pit_stop(b);
     }
+    #[cfg(feature = "ktest")]
+    if let Some(ppm) = fake.claim_ppm {
+        t.tsc = fake::claim(&t, ppm).map(TscFreq::Claimed);
+    }
     // A TSC counts as calibrated when it was measured or an exact CPUID
     // claim gave its frequency (not leaf 16h's base frequency alone).
     let calibrated = t.tsc_estimate().is_some();
@@ -697,7 +711,7 @@ impl core::fmt::Display for Mhz {
     }
 }
 
-fn source_name(s: CpuidSource) -> &'static str {
+pub fn source_name(s: CpuidSource) -> &'static str {
     match s {
         CpuidSource::Crystal => "leaf 15h",
         CpuidSource::Hypervisor => "hypervisor leaf",
@@ -779,6 +793,11 @@ pub fn report(t: &Time) {
         crate::println!("time: warning: {w}");
     }
 }
+
+pub mod refine;
+
+#[cfg(feature = "ktest")]
+pub mod fake;
 
 #[cfg(feature = "ktest")]
 mod tests;

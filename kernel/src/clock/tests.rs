@@ -58,7 +58,7 @@ ktest!(clock_matches_the_reference, {
     // The clock is the TSC (measured against the reference, or claimed),
     // or it is the reference itself, which agrees exactly.
     let ppb = match kind().unwrap() {
-        Clock::Tsc | Clock::TscNotInvariant => t.tsc_estimate().unwrap().ppb,
+        Clock::Tsc | Clock::TscNotInvariant => time::refine::tsc_bound_ppb(),
         Clock::Hpet | Clock::PmTimer => 0,
     } + SLACK_PPB;
     let bits = r.bits();

@@ -8,6 +8,7 @@ mod freq;
 mod hpet;
 mod lapic;
 mod pit_pm;
+mod refine;
 mod select;
 mod timeline;
 

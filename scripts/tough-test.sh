@@ -174,11 +174,14 @@ boot_ok() {
     if [[ "$rest" != *"timer:"* ]]; then
         rest="$rest && ^timer: lapic [0-9.]+ MHz .*; events (tsc-deadline|lapic one-shot); .*; 0 warnings\$"
     fi
+    if [[ "$rest" != *"refine:"* ]]; then
+        rest="$rest && ^refine: .*; 0 warnings\$"
+    fi
     while :; do
         re="${rest%% && *}"
         if ! grep -qE -- "$re" "$log"; then
             echo "EXPECTED a line matching: $re"
-            grep -E "^(acpi|apic|ioapic|pic|interrupts|irqdirt|time|timer|OPTIMAL-QUIRK)" "$log"
+            grep -E "^(acpi|apic|ioapic|pic|interrupts|irqdirt|time|timer|refine|tscfake|OPTIMAL-QUIRK)" "$log"
             return 1
         fi
         [ "$re" = "$rest" ] && return 0
@@ -303,8 +306,18 @@ scenario "fw-no-hpet-tcg-smp4" "boot:^acpi: .*, HPET none, .*; 0 warnings$ && $P
 # clock, which is the time warning.
 NOACPI='^acpi: none \(no RSDP from the bootloader\)$ && ^apic: warning: no MADT: no I/O APIC routes, LINT pins masked$ && ^interrupts: on; 1 warnings$'
 NOINV='^time: reference pit; tsc [0-9.]+ MHz .*, not invariant, .*; clock tsc \(not invariant\); 1 warnings$ && ^time: warning: the only clock is a TSC that is not invariant; time may drift with CPU power states$'
-scenario "fw-no-acpi" "boot:$NOACPI && $NOINV" "$ISO" bios pc,acpi=off 512M 1 30 kvm -- -cpu host,-invtsc
-scenario "fw-no-acpi-tcg-qemu64" "boot:$NOACPI && $NOINV" "$ISO" bios pc,acpi=off 512M 1 40 tcg -- -cpu qemu64
+# ROADMAP 1c refines the TSC against the HPET or the PM timer only, so
+# with the PIT as the reference it keeps its boot measurement, a warning.
+REFPIT='^refine: none \(the reference is the pit\); 1 warnings$ && ^refine: warning: the TSC keeps its boot measurement \(\+/-[0-9.]+ ppm\): the refinement needs the HPET or the PM timer$'
+# What a refinement that ran says (see the TCG scenarios below).
+INV_ISO=build/optimal-ktest-tsc-invariant.iso
+CLAIM_ISO=build/optimal-ktest-tsc-claim.iso
+REFINED='^refine: tsc [0-9.]+ MHz \+/-[0-9.]+ ppm against the'
+REFINED_OK='over [0-9]+ ms; (refined the boot measurement .* by [-+][0-9.]+ ppm|kept the boot measurement .*|confirmed CPUID.*); 0 warnings$'
+CLAIMED='^tscfake: applied: invariant claim\+2000$ && ^time: reference .*; tsc [0-9.]+ MHz \(CPUID hypervisor leaf\), invariant, .*; clock tsc; 0 warnings$'
+CLAIM_WRONG="over [0-9]+ ms; CPUID's [0-9.]+ MHz \\(hypervisor leaf\\) is wrong; using the measurement; 1 warnings\$ && ^refine: warning: CPUID's TSC frequency [0-9.]+ MHz \\(hypervisor leaf\\) is wrong: the TSC runs -(199|200)[0-9]\\.[0-9] ppm from it\$"
+scenario "fw-no-acpi" "boot:$NOACPI && $NOINV && $REFPIT" "$ISO" bios pc,acpi=off 512M 1 30 kvm -- -cpu host,-invtsc
+scenario "fw-no-acpi-tcg-qemu64" "boot:$NOACPI && $NOINV && $REFPIT" "$ISO" bios pc,acpi=off 512M 1 40 tcg -- -cpu qemu64
 # Clocks. QEMU's HPET has 3 comparators unless told otherwise, and its ACPI
 # HPET table always says 3: with more, the table and the hardware disagree
 # and the kernel uses the hardware's count.
@@ -322,14 +335,31 @@ scenario "time-pm-timer-clock" "boot:^time: reference pm-timer .*; clock pm-time
 # An invariant TSC is the clock. KVM can only offer it when the host has
 # one (constant_tsc and nonstop_tsc).
 if [ "$KVM" = yes ] && grep -qw constant_tsc /proc/cpuinfo && grep -qw nonstop_tsc /proc/cpuinfo; then
-    scenario "time-invtsc" "boot:^time: reference hpet .*, invariant, TSC-deadline; clock tsc; 0 warnings$ && ^timer: lapic .* against the tsc .*; events tsc-deadline; .*; 0 warnings$" "$ISO" bios q35 512M 2 30 kvm -- -cpu host,+invtsc
+    scenario "time-invtsc" "boot:^time: reference hpet .*, invariant, TSC-deadline; clock tsc; 0 warnings$ && ^timer: lapic .* against the tsc .*; events tsc-deadline; .*; 0 warnings$ && $REFINED hpet $REFINED_OK" "$ISO" bios q35 512M 2 30 kvm -- -cpu host,+invtsc
+    # The refinement against a 24-bit PM timer, which wraps twice in the
+    # window: its wraps are counted from the TSC.
+    scenario "time-invtsc-pm-reference" "boot:^time: reference pm-timer .*, invariant, .*; clock tsc; 0 warnings$ && $REFINED pm-timer $REFINED_OK" "$ISO" bios q35,hpet=off 512M 2 30 kvm -- -cpu host,+invtsc
+    # A lying CPUID claim with TSC-deadline events: found and replaced,
+    # and the deadline rate moves with the clock.
+    scenario "time-claim-wrong-kvm" "boot:$CLAIMED && ^timer: .*; events tsc-deadline; .*; 0 warnings$ && $REFINED hpet $CLAIM_WRONG" "$CLAIM_ISO" bios q35 512M 2 40 kvm -- -cpu host,+invtsc
     # The same without TSC-deadline mode: one-shot, measured against the TSC.
     scenario "time-invtsc-no-deadline" "boot:^time: reference hpet .*, invariant, no TSC-deadline; clock tsc; 0 warnings$ && ^timer: lapic .* against the tsc .*; events lapic one-shot; .*; 0 warnings$" "$ISO" bios q35 512M 2 30 kvm -- -cpu host,+invtsc,-tsc-deadline
-    scenario "time-invtsc-no-acpi" "boot:$NOACPI && ^time: reference pit; tsc .*, invariant, .*; clock tsc; 0 warnings$" "$ISO" bios pc,acpi=off 512M 1 30 kvm -- -cpu host,+invtsc
+    scenario "time-invtsc-no-acpi" "boot:$NOACPI && ^time: reference pit; tsc .*, invariant, .*; clock tsc; 0 warnings$ && $REFPIT" "$ISO" bios pc,acpi=off 512M 1 30 kvm -- -cpu host,+invtsc
 else
     echo "SKIP: time-invtsc (the host has no invariant TSC for KVM to offer)"
     skipped=$((skipped + 1))
 fi
+# The 10 s refinement under TCG, where QEMU never sets the invariant-TSC
+# bit although its TSC is the host's: tscfake=invariant
+# (kernel/src/time/fake.rs) makes the TSC the clock, so the refinement
+# runs against the HPET and against the 24-bit PM timer, with one-shot
+# LAPIC events whose rate it carries across. Then a CPUID claim faked
+# 2000 ppm off, which it must find wrong and replace before the tests
+# run (they would fail on the wrong clock).
+scenario "time-refine-tcg" "boot:^tscfake: applied: invariant$ && ^time: .*; clock tsc; 0 warnings$ && $REFINED hpet $REFINED_OK" "$INV_ISO" bios q35 512M 2 40 tcg -- -cpu max
+scenario "time-refine-pm-reference-tcg" "boot:^time: reference pm-timer .*; clock tsc; 0 warnings$ && $REFINED pm-timer $REFINED_OK" "$INV_ISO" bios q35,hpet=off 512M 2 40 tcg -- -cpu max
+scenario "time-claim-wrong-tcg" "boot:$CLAIMED && $REFINED hpet $CLAIM_WRONG" "$CLAIM_ISO" bios q35 512M 2 40 tcg -- -cpu max
+scenario "time-claim-wrong-pm-reference-tcg" "boot:$CLAIMED && $REFINED pm-timer $CLAIM_WRONG" "$CLAIM_ISO" bios q35,hpet=off 512M 2 40 tcg -- -cpu max
 # Timer skew: four slow emulated CPUs taking host time from each other
 # while the boot CPU calibrates.
 scenario "time-tcg-smp4-skew" boot "$ISO" bios q35 1G 4 40 tcg -- -cpu max
