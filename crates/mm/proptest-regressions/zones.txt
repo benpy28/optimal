@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 0d6a92489bedf4cb2a831f0904d977a9e4905eacb6a3362ccf46595e417922ee # shrinks to parts = [(0, 3891200, false, true), (916975609543, 18866681413, false, false), (324270056245, 16785091683, false, true)], min = 0
+cc d3626204bdbcf3ed879f8cf63923b3573dbb6f98398633296c60208325f551fe # shrinks to parts = [(871699436, 25446091796, true, true), (925565453005, 3378, false, false)], min = 0

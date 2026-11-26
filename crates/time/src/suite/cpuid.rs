@@ -99,3 +99,11 @@ fn best_prefers_exact() {
     assert_eq!(best(None, None, None), None);
     assert_eq!(best(a, None, None), a);
 }
+
+#[test]
+fn arat_is_leaf6_eax_bit2_only() {
+    assert!(crate::cpuid::arat(1 << 2));
+    assert!(crate::cpuid::arat(0xFFFF_FFFF));
+    assert!(!crate::cpuid::arat(0));
+    assert!(!crate::cpuid::arat(!(1 << 2)));
+}

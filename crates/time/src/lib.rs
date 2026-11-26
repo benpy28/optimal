@@ -7,8 +7,9 @@
 //!
 //! Sources: the IA-PC HPET specification 1.0a, ACPI 6.5 section 4.8.3.3
 //! (the PM timer), the Intel 8254 datasheet (the PIT), and the Intel SDM
-//! Vol. 2A (CPUID leaves 01h, 15h, 16h and 80000007h) and Vol. 3B section
-//! 18.17 (the time-stamp counter).
+//! Vol. 2A (CPUID leaves 01h, 06h, 15h, 16h and 80000007h), Vol. 3A
+//! section 11.5.4 (the local APIC timer) and Vol. 3B section 18.17 (the
+//! time-stamp counter).
 //!
 //! Policy, as in optimal-acpi and optimal-apic: never guess. A frequency is
 //! an exact fraction, a measurement carries its proven error bound, and a
@@ -22,9 +23,11 @@ pub mod counter;
 pub mod cpuid;
 pub mod freq;
 pub mod hpet;
+pub mod lapic;
 pub mod pit;
 pub mod pm;
 pub mod select;
+pub mod timeline;
 
 pub use freq::{Freq, Scale};
 

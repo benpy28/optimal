@@ -14,6 +14,7 @@ mod arch;
 mod backtrace;
 mod boot;
 mod bootinfo;
+mod clock;
 mod crashtest;
 mod irq;
 #[cfg(feature = "ktest")]
@@ -24,6 +25,7 @@ mod sync;
 #[cfg(feature = "ktest")]
 mod tests;
 mod time;
+mod timer;
 
 use core::panic::PanicInfo;
 
@@ -98,7 +100,10 @@ extern "C" fn kmain_on_own_tables() -> ! {
         irq::dirt::apply(info, words);
     }
     irq::report(irq::init(info));
-    time::report(time::init(info));
+    let t = time::init(info);
+    time::report(t);
+    clock::init(t);
+    timer::report(timer::init(t));
     paint_screen(info);
 
     let cmdline = info.cmdline();

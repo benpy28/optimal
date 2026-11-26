@@ -149,6 +149,14 @@ pub fn dispatch(frame: &mut InterruptFrame) {
     match v {
         // A spurious interrupt is never in service: no EOI (SDM 11.9).
         vectors::SPURIOUS => {}
+        // Only the local APIC timer raises it (fixed delivery), so it is
+        // in service.
+        vectors::LAPIC_TIMER => {
+            crate::timer::interrupt();
+            if let Some(l) = lapic {
+                l.eoi();
+            }
+        }
         vectors::LAPIC_ERROR => {
             if let Some(l) = lapic {
                 LAST_ESR.store(l.esr(), Ordering::SeqCst);

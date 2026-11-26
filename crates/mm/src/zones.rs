@@ -131,15 +131,37 @@ fn merged<'a>(a: &'a [Range], b: &'a [Range], min_addr: u64) -> impl Iterator<It
     })
 }
 
-fn check_sorted(usable: &[Range]) -> Result<(), PlanError> {
+/// When walking two sorted lists in start order: does the next of `x`
+/// (from the first list) come before the next of `y`? Ties go to `x`; a
+/// tie between non-empty ranges is an overlap, refused whichever is first.
+fn first_list_next(x: Option<&&Range>, y: Option<&&Range>) -> bool {
+    match (x, y) {
+        (Some(x), Some(y)) => x.start <= y.start,
+        (x, _) => x.is_some(),
+    }
+}
+
+/// No two non-empty ranges overlap, within either list or across them,
+/// and each list is in address order. Checked on the ranges as given, not
+/// trimmed to pages, which would hide an overlap of under a page. Walking
+/// both lists in start order, any range that starts before the end of the
+/// one before it is an overlap or out of order.
+fn check_sorted(usable: &[Range], later: &[Range]) -> Result<(), PlanError> {
+    let mut a = usable.iter().filter(|r| !r.is_empty()).peekable();
+    let mut b = later.iter().filter(|r| !r.is_empty()).peekable();
     let mut prev_end = 0;
-    for r in usable.iter().filter(|r| !r.is_empty()) {
+    loop {
+        let next = if first_list_next(a.peek(), b.peek()) {
+            a.next()
+        } else {
+            b.next()
+        };
+        let Some(r) = next else { return Ok(()) };
         if r.start < prev_end {
             return Err(PlanError::Unsorted);
         }
         prev_end = r.end;
     }
-    Ok(())
 }
 
 /// Bytes of `piece` already carved for metadata (always a prefix).
@@ -166,15 +188,7 @@ pub fn plan(
     min_addr: u64,
     out: &mut [Zone],
 ) -> Result<usize, PlanError> {
-    check_sorted(usable)?;
-    check_sorted(later)?;
-    let mut prev_end = 0;
-    for p in merged(usable, later, 0) {
-        if p.start < prev_end {
-            return Err(PlanError::Unsorted);
-        }
-        prev_end = p.end;
-    }
+    check_sorted(usable, later)?;
     // Group pieces into zones.
     let mut n = 0;
     let mut last_end = 0;
@@ -455,6 +469,27 @@ mod tests {
         let mut out = [Zone::EMPTY; 4];
         assert_eq!(
             plan(&[r(8 * MIB, 16 * MIB)], &sub_page, 0, &mut out),
+            Err(PlanError::Unsorted)
+        );
+        // And across the two lists: a usable range ending one byte into a
+        // later range (found by CI's random maps). Trimmed to pages they
+        // only touch, but the map itself overlaps.
+        assert_eq!(
+            plan(
+                &[r(MIB + 0x123, 2 * MIB + 1)],
+                &[r(2 * MIB, 2 * MIB + 0x1000)],
+                0,
+                &mut out
+            ),
+            Err(PlanError::Unsorted)
+        );
+        assert_eq!(
+            plan(
+                &[r(2 * MIB + 0xFFF, 4 * MIB)],
+                &[r(MIB, 2 * MIB + 0x1000)],
+                0,
+                &mut out
+            ),
             Err(PlanError::Unsorted)
         );
         // Empty entries (firmware does list them) are skipped, wherever

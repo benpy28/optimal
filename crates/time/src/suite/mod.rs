@@ -6,8 +6,10 @@ mod counter;
 mod cpuid;
 mod freq;
 mod hpet;
+mod lapic;
 mod pit_pm;
 mod select;
+mod timeline;
 
 use proptest::test_runner::Config;
 

@@ -64,3 +64,35 @@ pub fn clock(tsc_calibrated: bool, tsc_invariant: bool, hpet: bool, pm: bool) ->
         None
     }
 }
+
+/// What programs timer events.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Events {
+    /// The local APIC timer in TSC-deadline mode: armed with one MSR
+    /// write, in TSC ticks, no division and no 32-bit count limit.
+    TscDeadline,
+    /// The local APIC timer counting down at its own calibrated rate.
+    LapicOneShot,
+}
+
+/// TSC-deadline mode when the CPU has it and the TSC is invariant with a
+/// known frequency; otherwise one-shot when the LAPIC timer's rate is
+/// known. A TSC that is not invariant can change rate with the CPU's
+/// power state, while the LAPIC timer's bus or crystal clock does not, so
+/// then the LAPIC timer's own count is the better measure. (ROADMAP 1c
+/// falls back further to the HPET and then the PIT; those come with their
+/// own step.)
+pub fn events(
+    deadline_mode: bool,
+    tsc_calibrated: bool,
+    tsc_invariant: bool,
+    lapic_calibrated: bool,
+) -> Option<Events> {
+    if deadline_mode && tsc_calibrated && tsc_invariant {
+        Some(Events::TscDeadline)
+    } else if lapic_calibrated {
+        Some(Events::LapicOneShot)
+    } else {
+        None
+    }
+}

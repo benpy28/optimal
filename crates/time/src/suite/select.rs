@@ -69,3 +69,32 @@ fn clock_every_case() {
         assert_eq!(clock(c, i, h, p), want);
     }
 }
+
+#[test]
+fn events_every_case() {
+    use Events::*;
+    for deadline in [false, true] {
+        for tsc in [false, true] {
+            for inv in [false, true] {
+                for lapic in [false, true] {
+                    let want = if deadline && tsc && inv {
+                        Some(TscDeadline)
+                    } else if lapic {
+                        Some(LapicOneShot)
+                    } else {
+                        None
+                    };
+                    assert_eq!(
+                        events(deadline, tsc, inv, lapic),
+                        want,
+                        "{deadline} {tsc} {inv} {lapic}"
+                    );
+                }
+            }
+        }
+    }
+    // Spelled out: a TSC that is not invariant never drives deadlines.
+    assert_eq!(events(true, true, false, true), Some(LapicOneShot));
+    assert_eq!(events(true, true, false, false), None);
+    assert_eq!(events(true, true, true, false), Some(TscDeadline));
+}
