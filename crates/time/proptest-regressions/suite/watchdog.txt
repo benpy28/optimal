@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 2b107601e537d3abb2212f770d760ef9a00bfd9e61960a8830f1ae299747fbad # shrinks to (rf, bits) = (Freq { num: 100000000, den: 1 }, 64), clock = 1000000000, plan = [Step { gap: 100000000, reads: [[20, 20, 20, 20], [1001152, 20, 20, 20], [20, 20, 20, 20]], err: 0 }]
+cc 35a5a36cc9d240c9477e4186bffe0535e692c0bda998ce397c87a159293d1519 # shrinks to (rf, bits) = (Freq { num: 100000000, den: 1 }, 64), clock = 100000000, before = 0, off = 700000, calm = 0, plan = [Step { gap: 500000000, reads: [[20, 20, 20, 20], [20, 20, 20, 20], [20, 20, 20, 20]], err: 0 }]

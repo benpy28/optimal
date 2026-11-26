@@ -329,9 +329,22 @@ pub fn status() -> Status {
 /// reference: the boot bound, or the refined one when the clock took it
 /// and it is wider. A test window spanning the rebase runs partly at each,
 /// so it is within the larger. A faked wrong claim (crate::time::fake) is
-/// always replaced before the tests start.
+/// always replaced before the tests start. A faked skew the watchdog
+/// leaves alone (crate::time::fake, under its limit) is added while the
+/// TSC is still the clock: the clock then really runs that far off.
 #[cfg(feature = "ktest")]
 pub fn tsc_bound_ppb() -> u64 {
+    let b = bound_before_skew();
+    match fake::current().fault {
+        Some(fake::Fault::Skew(ppm)) if clock::kind() == Some(optimal_time::select::Clock::Tsc) => {
+            optimal_time::lapic::compose_ppb(b, ppm.unsigned_abs() * 1000)
+        }
+        _ => b,
+    }
+}
+
+#[cfg(feature = "ktest")]
+fn bound_before_skew() -> u64 {
     let boot = super::get()
         .and_then(|t| t.tsc_estimate())
         .map_or(0, |e| e.ppb);
@@ -514,6 +527,11 @@ pub fn lines(s: Status) -> (String, Vec<String>) {
     }
     let _ = write!(line, "; {} warnings", w.len());
     (line, w)
+}
+
+/// Has [`report`] printed?
+pub fn reported() -> bool {
+    REPORTED.load(Ordering::SeqCst)
 }
 
 /// Print the `refine:` line and its warnings, once (the tests and the

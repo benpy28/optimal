@@ -143,6 +143,10 @@ scenario() {
             echo "[...]"
             # The failing test and its message, wherever they are.
             grep -aE -A4 "KTEST FAIL|KERNEL PANIC" "$log" 2>/dev/null
+            # What the clock and timer chose, and the tests before it.
+            echo "[clock and timer lines, and the last tests]"
+            grep -aE "^(time|timer|refine|watchdog|tscfake):" "$log" 2>/dev/null
+            grep -aE "^(KTEST|ktest:)" "$log" 2>/dev/null | tail -n 12
             grep -E "KVM internal error|Suberror|emulation failure|extra data" "$log" 2>/dev/null
             tail -n 40 "$log" 2>/dev/null
         fi
@@ -177,11 +181,14 @@ boot_ok() {
     if [[ "$rest" != *"refine:"* ]]; then
         rest="$rest && ^refine: .*; 0 warnings\$"
     fi
+    if [[ "$rest" != *"watchdog:"* ]]; then
+        rest="$rest && ^watchdog: .*; 0 warnings\$"
+    fi
     while :; do
         re="${rest%% && *}"
         if ! grep -qE -- "$re" "$log"; then
             echo "EXPECTED a line matching: $re"
-            grep -E "^(acpi|apic|ioapic|pic|interrupts|irqdirt|time|timer|refine|tscfake|OPTIMAL-QUIRK)" "$log"
+            grep -E "^(acpi|apic|ioapic|pic|interrupts|irqdirt|time|timer|refine|watchdog|tscfake|OPTIMAL-QUIRK)" "$log"
             return 1
         fi
         [ "$re" = "$rest" ] && return 0
@@ -309,6 +316,8 @@ NOINV='^time: reference pit; tsc [0-9.]+ MHz .*, not invariant, .*; clock tsc \(
 # ROADMAP 1c refines the TSC against the HPET or the PM timer only, so
 # with the PIT as the reference it keeps its boot measurement, a warning.
 REFPIT='^refine: none \(the reference is the pit\); 1 warnings$ && ^refine: warning: the TSC keeps its boot measurement \(\+/-[0-9.]+ ppm\): the refinement needs the HPET or the PM timer$'
+# Nor is there anything to watch the TSC against, or fall back to.
+REFPIT="$REFPIT"' && ^watchdog: none \(no hpet or pm timer to check the tsc against\); 1 warnings$ && ^watchdog: warning: the TSC is not watched for instability$'
 # What a refinement that ran says (see the TCG scenarios below).
 INV_ISO=build/optimal-ktest-tsc-invariant.iso
 CLAIM_ISO=build/optimal-ktest-tsc-claim.iso
@@ -360,6 +369,33 @@ scenario "time-refine-tcg" "boot:^tscfake: applied: invariant$ && ^time: .*; clo
 scenario "time-refine-pm-reference-tcg" "boot:^time: reference pm-timer .*; clock tsc; 0 warnings$ && $REFINED pm-timer $REFINED_OK" "$INV_ISO" bios q35,hpet=off 512M 2 40 tcg -- -cpu max
 scenario "time-claim-wrong-tcg" "boot:$CLAIMED && $REFINED hpet $CLAIM_WRONG" "$CLAIM_ISO" bios q35 512M 2 40 tcg -- -cpu max
 scenario "time-claim-wrong-pm-reference-tcg" "boot:$CLAIMED && $REFINED pm-timer $CLAIM_WRONG" "$CLAIM_ISO" bios q35,hpet=off 512M 2 40 tcg -- -cpu max
+# The clocksource watchdog (kernel/src/time/watchdog.rs) with the clock's
+# TSC readings faked wrong from 3 s after it starts (kernel/src/time/
+# fake.rs): 2000 ppm fast and 1500 ppm slow (caught by the 500 ppm rule
+# over 10 checks) and 3 s back (caught at once), against the HPET and the
+# 24-bit PM timer; the clock must fall back to that reference and the
+# whole test suite then runs on it. 200 ppm fast is under the limit and
+# must be left alone.
+WD_ON='^watchdog: watching the tsc against the'
+WD_FELL='; the clock is now the'
+wd_warn() { echo "^watchdog: warning: the TSC is unstable, so the clock fell back to the $1\$"; }
+WD_RATE='^watchdog: the tsc ran [-+][0-9]+\.[0-9] ppm from its frequency over 10 checks at [0-9]+ ms'
+WD_BACK='^watchdog: the tsc went backwards by [0-9]+ ns at [0-9]+ ms'
+WD_ONESHOT='events lapic one-shot; 1 warnings$'
+scenario "time-watchdog-fast-tcg" "boot:^tscfake: applied: invariant skew\+2000$ && $WD_ON hpet every 1 s; 0 warnings$ && $WD_RATE$WD_FELL hpet, $WD_ONESHOT && $(wd_warn hpet)" build/optimal-ktest-tsc-fast.iso bios q35 512M 2 50 tcg -- -cpu max
+scenario "time-watchdog-slow-pm-reference-tcg" "boot:^tscfake: applied: invariant skew-1500$ && $WD_ON pm-timer every 1 s; 0 warnings$ && $WD_RATE$WD_FELL pm-timer, $WD_ONESHOT && $(wd_warn pm-timer)" build/optimal-ktest-tsc-slow.iso bios q35,hpet=off 512M 2 50 tcg -- -cpu max
+scenario "time-watchdog-back-tcg" "boot:^tscfake: applied: invariant back$ && $WD_ON hpet every 1 s; 0 warnings$ && $WD_BACK$WD_FELL hpet, $WD_ONESHOT && $(wd_warn hpet)" build/optimal-ktest-tsc-back.iso bios q35 512M 2 50 tcg -- -cpu max
+scenario "time-watchdog-back-pm-reference-tcg" "boot:^tscfake: applied: invariant back$ && $WD_ON pm-timer every 1 s; 0 warnings$ && $WD_BACK$WD_FELL pm-timer, $WD_ONESHOT && $(wd_warn pm-timer)" build/optimal-ktest-tsc-back.iso bios q35,hpet=off 512M 2 50 tcg -- -cpu max
+scenario "time-watchdog-drift-tcg" "boot:^tscfake: applied: invariant skew\+200$ && $WD_ON hpet every 1 s; 0 warnings$" build/optimal-ktest-tsc-drift.iso bios q35 512M 2 50 tcg -- -cpu max
+# Under KVM with TSC-deadline events, which must become LAPIC one-shot
+# ones when the TSC is dropped.
+if [ "$KVM" = yes ] && grep -qw constant_tsc /proc/cpuinfo && grep -qw nonstop_tsc /proc/cpuinfo; then
+    scenario "time-watchdog-fast-kvm" "boot:^timer: .*; events tsc-deadline; .*; 0 warnings$ && $WD_ON hpet every 1 s; 0 warnings$ && $WD_RATE$WD_FELL hpet, $WD_ONESHOT && $(wd_warn hpet)" build/optimal-ktest-tsc-fast.iso bios q35 512M 2 50 kvm -- -cpu host,+invtsc
+    scenario "time-watchdog-back-kvm" "boot:^timer: .*; events tsc-deadline; .*; 0 warnings$ && $WD_ON hpet every 1 s; 0 warnings$ && $WD_BACK$WD_FELL hpet, $WD_ONESHOT && $(wd_warn hpet)" build/optimal-ktest-tsc-back.iso bios q35 512M 2 50 kvm -- -cpu host,+invtsc
+else
+    echo "SKIP: time-watchdog-*-kvm (the host has no invariant TSC for KVM to offer)"
+    skipped=$((skipped + 1))
+fi
 # Timer skew: four slow emulated CPUs taking host time from each other
 # while the boot CPU calibrates.
 scenario "time-tcg-smp4-skew" boot "$ISO" bios q35 1G 4 40 tcg -- -cpu max

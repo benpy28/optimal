@@ -110,6 +110,13 @@ extern "C" fn kmain_on_own_tables() -> ! {
     if time::fake::current().claim_ppm.is_some() && !time::refine::wait(time::refine::WAIT_NS) {
         panic!("the refinement did not finish");
     }
+    // With a faked TSC fault the tests run after the watchdog has dealt
+    // with it, so the whole suite runs on the clock it fell back to (or,
+    // for a fault under its limit, on the TSC it left alone).
+    #[cfg(feature = "ktest")]
+    if time::fake::current().fault.is_some() {
+        time::watchdog::tests::wait_for_the_fault();
+    }
     paint_screen(info);
 
     let cmdline = info.cmdline();
@@ -125,24 +132,26 @@ extern "C" fn kmain_on_own_tables() -> ! {
 }
 
 /// Nothing to run yet: wait for interrupts (the timer's events, which
-/// finish the clock's 10 s refinement), and report the refinement once it
-/// is done. With no interrupt controller in use, just halt.
+/// run the clock's 10 s refinement and then its watchdog), and report
+/// each of those as it has news. With no interrupt controller in use,
+/// just halt.
 fn idle() -> ! {
     if irq::controllers().is_none() {
         arch::cpu::halt_forever();
     }
     loop {
         // Checked with interrupts off, then enabled and halted in one
-        // step, so a refinement that finishes in between still wakes us.
+        // step, so news that arrives in between still wakes us.
         arch::cpu::interrupts_disable();
-        if time::refine::finished() {
+        let refined = time::refine::finished();
+        if refined && !time::refine::reported() || time::watchdog::pending() {
             arch::cpu::interrupts_enable();
-            time::refine::report();
-            break;
+            if refined {
+                time::refine::report();
+            }
+            time::watchdog::report();
+            continue;
         }
-        arch::cpu::enable_and_halt();
-    }
-    loop {
         arch::cpu::enable_and_halt();
     }
 }

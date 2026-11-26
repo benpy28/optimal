@@ -11,6 +11,7 @@ mod pit_pm;
 mod refine;
 mod select;
 mod timeline;
+mod watchdog;
 
 use proptest::test_runner::Config;
 

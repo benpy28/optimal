@@ -52,6 +52,13 @@ make_iso "$BUILD/optimal-kernel-ktest" "$BUILD/optimal-ktest-irqdirt.iso" "irqdi
 # CPUID claim 2000 ppm off (kernel/src/time/fake.rs).
 make_iso "$BUILD/optimal-kernel-ktest" "$BUILD/optimal-ktest-tsc-invariant.iso" "tscfake=invariant"
 make_iso "$BUILD/optimal-kernel-ktest" "$BUILD/optimal-ktest-tsc-claim.iso" "tscfake=invariant,claim+2000"
+# TSC faults for the clocksource watchdog, from 3 s after it starts: the
+# clock's TSC readings 2000 ppm fast, 1500 ppm slow, 200 ppm fast (under
+# the 500 ppm limit, so it must be left alone), and 3 s back.
+make_iso "$BUILD/optimal-kernel-ktest" "$BUILD/optimal-ktest-tsc-fast.iso" "tscfake=invariant,skew+2000"
+make_iso "$BUILD/optimal-kernel-ktest" "$BUILD/optimal-ktest-tsc-slow.iso" "tscfake=invariant,skew-1500"
+make_iso "$BUILD/optimal-kernel-ktest" "$BUILD/optimal-ktest-tsc-drift.iso" "tscfake=invariant,skew+200"
+make_iso "$BUILD/optimal-kernel-ktest" "$BUILD/optimal-ktest-tsc-back.iso" "tscfake=invariant,back"
 for name in "${!CRASHTESTS[@]}"; do
     make_iso "$BUILD/optimal-kernel" "$BUILD/crash-$name.iso" "crashtest=$name"
 done

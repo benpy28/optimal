@@ -7,9 +7,21 @@
 //!    TSC-deadline mode when the CPU has it and the TSC is the clock,
 //!    else one-shot at the measured rate.
 //! 3. Keep the hardware armed for the earliest of: the expiry hook's
-//!    deadline ([`arm_at`]) and, while the clock is a narrow counter, the
-//!    next housekeeping read (crate::clock::housekeeping_ns). With neither,
-//!    the timer is left disarmed: no tick runs when nothing is waiting.
+//!    deadline ([`arm_at`]), while the clock is a narrow counter the next
+//!    housekeeping read (crate::clock::housekeeping_ns), and the clock's
+//!    own upkeep: the 10 s refinement (crate::time::refine), then the
+//!    clocksource watchdog's checks (crate::time::watchdog). With none of
+//!    them, the timer is left disarmed: no tick runs when nothing is
+//!    waiting.
+//! 4. When the watchdog finds the TSC unstable, fall back ([`fall_back`]):
+//!    the clock moves to the HPET or PM timer, TSC-deadline events become
+//!    LAPIC one-shot ones, and the LAPIC timer's rate, measured against
+//!    the TSC, is carried across with the TSC's bound against the new
+//!    clock added. (Chosen: carry the rate across. Rejected: measure it
+//!    again against the new clock, which takes up to 50 ms and cannot be
+//!    done in interrupt context, where the watchdog fires; the carried
+//!    bound is exact, and only makes one-shot events a little later at
+//!    worst, never early.)
 //!
 //! Never early: arming rounds up at the fastest rate the bound allows
 //! (optimal_time::lapic), and on every interrupt the handler reads the
@@ -36,11 +48,13 @@ use optimal_time::cpuid;
 use optimal_time::freq::Freq;
 use optimal_time::lapic::{self as lt, Mode};
 use optimal_time::select::{self, Clock, Events};
+use optimal_time::watchdog as wd;
 
 use crate::arch::apic::Lapic;
 use crate::arch::cpu;
 use crate::clock;
 use crate::sync::{IrqSpinLock, Once};
+use crate::time::watchdog::Poll;
 use crate::time::{self, Counter, Time};
 
 /// The LAPIC timer's measurement at boot stops once its bound is this
@@ -98,6 +112,8 @@ struct Armed {
     housekeeping: Option<u64>,
     /// When the refinement next needs to run (crate::time::refine).
     refine: Option<u64>,
+    /// When the watchdog next checks the clock (crate::time::watchdog).
+    watchdog: Option<u64>,
     /// What the hardware is armed for (clock ns).
     hw: Option<u64>,
     periodic: bool,
@@ -108,6 +124,7 @@ static ARMED: IrqSpinLock<Armed> = IrqSpinLock::new(Armed {
     deadline: None,
     housekeeping: None,
     refine: None,
+    watchdog: None,
     hw: None,
     periodic: false,
     rates: Rates {
@@ -129,6 +146,8 @@ static CHUNK_CAP: AtomicU64 = AtomicU64::new(u64::MAX);
 
 static FIRES: AtomicU64 = AtomicU64::new(0);
 static EARLY: AtomicU64 = AtomicU64::new(0);
+/// One-shot armings that covered only a piece of their wait.
+static PIECES: AtomicU64 = AtomicU64::new(0);
 static PERIODIC_TICKS: AtomicU64 = AtomicU64::new(0);
 
 fn encode(e: Option<Events>) -> u8 {
@@ -222,8 +241,9 @@ pub fn init(t: &'static Time) -> &'static Timer {
             "the local APIC is not in use, so there are no timer events",
         ));
         timer.warnings = warnings;
-        // Records why the refinement cannot run.
+        // Records why the refinement and the watchdog cannot run.
         let _ = time::refine::start(t, clock::now_ns(), false);
+        let _ = time::watchdog::start(clock::now_ns(), false);
         return STATE.set(timer);
     };
     let l = c.lapic;
@@ -280,6 +300,11 @@ pub fn init(t: &'static Time) -> &'static Timer {
     // The 10 s refinement starts now, driven from interrupt() (or says
     // why not).
     a.refine = time::refine::start(t, clock::now_ns(), timer.events.is_some());
+    // The watchdog starts once the refinement is done, at once if it
+    // never runs.
+    if a.refine.is_none() {
+        a.watchdog = time::watchdog::start(clock::now_ns(), timer.events.is_some());
+    }
     if timer.events.is_some() {
         if let Some(hk) = clock::housekeeping_ns() {
             a.housekeeping = Some(clock::now_ns().saturating_add(hk));
@@ -314,7 +339,7 @@ fn program(a: &mut Armed) {
     if a.periodic {
         return;
     }
-    let due = [a.deadline, a.housekeeping, a.refine]
+    let due = [a.deadline, a.housekeeping, a.refine, a.watchdog]
         .into_iter()
         .flatten()
         .min();
@@ -352,6 +377,7 @@ fn program(a: &mut Armed) {
             a.hw = Some(if ns == wait {
                 due
             } else {
+                PIECES.fetch_add(1, Ordering::Relaxed);
                 now.saturating_add(ns - CONVERSION_PAD_NS.min(ns))
             });
             l.write(regs::TIMER_DIVIDE, arm.dcr());
@@ -359,6 +385,49 @@ fn program(a: &mut Armed) {
         }
         None => a.hw = None,
     }
+}
+
+/// The TSC is unstable (crate::time::watchdog): move the clock to its
+/// fallback, starting at `floor_ns` or later, events to LAPIC one-shot,
+/// and the LAPIC timer's rate across with `bound_ppb` added. Everything
+/// that can fail is the switch itself, done first: when it fails nothing
+/// else changes. With the timer's lock held.
+fn fall_back(a: &mut Armed, now: u64, floor_ns: u64, bound_ppb: u64) {
+    let lapic = a.rates.lapic.map(|r| wd::carry(r, bound_ppb));
+    let to = clock::switch(floor_ns);
+    if to.is_some() {
+        a.rates.lapic = lapic;
+        if let Some(l) = lapic {
+            a.rates.longest_ns = lt::longest_ns(l.freq, l.ppb);
+        }
+        // TSC-deadline events are timed by the TSC, which is no longer
+        // trusted. Without a LAPIC rate they stay: every event is still
+        // checked against the clock, so none is early, only late by
+        // whatever the TSC does.
+        if events_now() == Some(Events::TscDeadline)
+            && lapic.is_some()
+            && let Some(l) = STATE.get().and_then(|t| t.lapic_regs)
+        {
+            EVENTS.store(encode(Some(Events::LapicOneShot)), Ordering::SeqCst);
+            set_mode(l, Some(Events::LapicOneShot));
+            a.rates.tsc = None;
+        }
+        if let Some(hk) = clock::housekeeping_ns() {
+            a.housekeeping = Some(clock::now_ns().saturating_add(hk));
+        }
+    }
+    let kind = clock::kind();
+    time::watchdog::fired(now, kind.zip(to), events_now());
+}
+
+/// How events are programmed now: the boot choice ([`Timer::events`]),
+/// unless the watchdog moved them off TSC-deadline mode.
+#[cfg_attr(
+    not(feature = "ktest"),
+    expect(dead_code, reason = "tests read it; the scorecard will")
+)]
+pub fn events() -> Option<Events> {
+    events_now()
 }
 
 /// The LAPIC timer interrupt (crate::irq::dispatch, vector 0xF0).
@@ -371,7 +440,8 @@ pub fn interrupt() {
         PERIODIC_TICKS.fetch_add(1, Ordering::Relaxed);
         return;
     }
-    if a.hw.is_some_and(|hw| now < hw) {
+    let early = a.hw.is_some_and(|hw| now < hw);
+    if early {
         EARLY.fetch_add(1, Ordering::Relaxed);
     }
     a.hw = None;
@@ -381,6 +451,28 @@ pub fn interrupt() {
     if a.refine.is_some_and(|r| r <= now) {
         // May give the clock a new frequency, and these rates with it.
         a.refine = time::refine::poll(now, &mut a.rates);
+        if a.refine.is_none() {
+            a.watchdog = time::watchdog::start(now, events_now().is_some());
+        }
+    }
+    // An event early by the clock means the clock fell behind the
+    // timer's own count (the LAPIC's crystal, or in TSC-deadline mode the
+    // TSC itself where the clock's reading of it went wrong): check at
+    // once, rather than when the clock reaches the next check, which a
+    // clock that went back would put off.
+    if a.watchdog.is_some_and(|w| w <= now || early) {
+        a.watchdog = match time::watchdog::poll(now) {
+            Poll::Next(t) => Some(t),
+            Poll::Stop => None,
+            Poll::Fall {
+                floor_ns,
+                bound_ppb,
+                ..
+            } => {
+                fall_back(&mut a, now, floor_ns, bound_ppb);
+                None
+            }
+        };
     }
     let fire = a.deadline.is_some_and(|d| d <= now);
     if fire {
@@ -437,6 +529,15 @@ pub fn cancel() {
 )]
 pub fn fires() -> (u64, u64) {
     (FIRES.load(Ordering::SeqCst), EARLY.load(Ordering::SeqCst))
+}
+
+/// One-shot armings so far that covered only a piece of their wait.
+#[cfg_attr(
+    not(feature = "ktest"),
+    expect(dead_code, reason = "tests read it; the scorecard will")
+)]
+pub fn pieces() -> u64 {
+    PIECES.load(Ordering::SeqCst)
 }
 
 /// Run the LAPIC timer periodically, every `period_ns` or a little more
