@@ -12,8 +12,12 @@
 #   and a later piece start at the same address, which is an overlap; plan
 #   refuses that on its first pass whichever piece comes first, and the
 #   other callers only see maps plan accepted.
+# - `replace <= with <` in zones::first_list_next, for the same reason:
+#   it only changes which of two ranges starting at the same address is
+#   taken first, and either way check_sorted refuses the overlap.
 exclude_re = [
     "proofs::",
     "replace \\| with \\^ in (Flags::bits|AddressSpace::map|AddressSpace::protect|AddressSpace::for_each_leaf::walk)",
     "replace < with <= in merged",
+    "replace <= with < in first_list_next",
 ]
