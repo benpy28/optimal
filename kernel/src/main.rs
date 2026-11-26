@@ -104,6 +104,12 @@ extern "C" fn kmain_on_own_tables() -> ! {
     time::report(t);
     clock::init(t);
     timer::report(timer::init(t));
+    // With a faked CPUID claim the clock runs wrong until the refinement
+    // replaces it, so the tests start after it (crate::time::fake).
+    #[cfg(feature = "ktest")]
+    if time::fake::current().claim_ppm.is_some() && !time::refine::wait(time::refine::WAIT_NS) {
+        panic!("the refinement did not finish");
+    }
     paint_screen(info);
 
     let cmdline = info.cmdline();
@@ -115,7 +121,30 @@ extern "C" fn kmain_on_own_tables() -> ! {
     ktest::run_all();
 
     crate::println!("{BOOT_OK}");
-    arch::cpu::halt_forever();
+    idle();
+}
+
+/// Nothing to run yet: wait for interrupts (the timer's events, which
+/// finish the clock's 10 s refinement), and report the refinement once it
+/// is done. With no interrupt controller in use, just halt.
+fn idle() -> ! {
+    if irq::controllers().is_none() {
+        arch::cpu::halt_forever();
+    }
+    loop {
+        // Checked with interrupts off, then enabled and halted in one
+        // step, so a refinement that finishes in between still wakes us.
+        arch::cpu::interrupts_disable();
+        if time::refine::finished() {
+            arch::cpu::interrupts_enable();
+            time::refine::report();
+            break;
+        }
+        arch::cpu::enable_and_halt();
+    }
+    loop {
+        arch::cpu::enable_and_halt();
+    }
 }
 
 fn on(b: bool) -> &'static str {

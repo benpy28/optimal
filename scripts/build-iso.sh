@@ -48,6 +48,10 @@ make_iso "$BUILD/optimal-kernel-ktest" "$BUILD/optimal-ktest.iso"
 # The test suite after the kernel itself dirties the 8259s, I/O APICs and
 # local APIC the way sloppy firmware leaves them (kernel/src/irq/dirt.rs).
 make_iso "$BUILD/optimal-kernel-ktest" "$BUILD/optimal-ktest-irqdirt.iso" "irqdirt=pic,ioapic,lapic"
+# The TSC taken as invariant (so it is the clock under TCG), and with a
+# CPUID claim 2000 ppm off (kernel/src/time/fake.rs).
+make_iso "$BUILD/optimal-kernel-ktest" "$BUILD/optimal-ktest-tsc-invariant.iso" "tscfake=invariant"
+make_iso "$BUILD/optimal-kernel-ktest" "$BUILD/optimal-ktest-tsc-claim.iso" "tscfake=invariant,claim+2000"
 for name in "${!CRASHTESTS[@]}"; do
     make_iso "$BUILD/optimal-kernel" "$BUILD/crash-$name.iso" "crashtest=$name"
 done

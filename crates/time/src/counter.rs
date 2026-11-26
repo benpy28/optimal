@@ -42,6 +42,26 @@ impl Extend {
         self.total
     }
 
+    /// Takes a new raw reading that is known, some other way, to be
+    /// `ticks` after the last one (optimal_time::refine::unwrap works it
+    /// out across any number of wraps). Returns the new total, or `None`,
+    /// changing nothing, when `ticks` does not match the raw difference
+    /// modulo 2^bits or the total would pass u64::MAX.
+    pub fn advance(&mut self, raw: u64, ticks: u64) -> Option<u64> {
+        let raw = raw & mask(self.bits);
+        if ticks & mask(self.bits) != delta(self.last, raw, self.bits) {
+            return None;
+        }
+        self.total = self.total.checked_add(ticks)?;
+        self.last = raw;
+        Some(self.total)
+    }
+
+    /// The raw reading last taken.
+    pub const fn last(&self) -> u64 {
+        self.last
+    }
+
     /// Ticks since the first reading, as of the last update.
     pub const fn total(&self) -> u64 {
         self.total

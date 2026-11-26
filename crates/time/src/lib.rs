@@ -26,6 +26,7 @@ pub mod hpet;
 pub mod lapic;
 pub mod pit;
 pub mod pm;
+pub mod refine;
 pub mod select;
 pub mod timeline;
 

@@ -132,10 +132,21 @@ ktest!(pm_timer_runs_at_its_specified_rate, {
     assert!(e.ppb <= super::WARN_PPB, "bound {} ppb", e.ppb);
 });
 
-/// The TSC's boot frequency as an estimate (Time::tsc_estimate).
+/// The TSC's boot frequency as an estimate (Time::tsc_estimate). With a
+/// faked CPUID claim (super::fake), which is wrong on purpose, the value
+/// the refinement replaced it with before the tests started.
 fn boot_tsc(t: &Time) -> Estimate {
-    t.tsc_estimate()
-        .expect("the TSC's frequency is known on QEMU")
+    let boot = t
+        .tsc_estimate()
+        .expect("the TSC's frequency is known on QEMU");
+    if super::fake::current().claim_ppm.is_none() {
+        return boot;
+    }
+    Estimate {
+        freq: crate::clock::freq().expect("the TSC is the clock"),
+        ppb: super::refine::tsc_bound_ppb(),
+        window: 0,
+    }
 }
 
 ktest!(every_reference_agrees_about_the_tsc, {

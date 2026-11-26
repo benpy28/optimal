@@ -40,11 +40,12 @@ for fw in "${firmwares[@]}"; do
         # clean too.
         if grep -qE "OPTIMAL: ktest [0-9]+ passed, 0 failed" "$log" && ! grep -qE "KTEST FAIL|KERNEL PANIC|EXCEPTION" "$log" &&
             grep -qE "^interrupts: on; 0 warnings$" "$log" && grep -qE "^time: reference hpet .*; 0 warnings$" "$log" &&
-            grep -qE "^timer: lapic [0-9.]+ MHz .*; events (tsc-deadline|lapic one-shot); .*; 0 warnings$" "$log"; then
+            grep -qE "^timer: lapic [0-9.]+ MHz .*; events (tsc-deadline|lapic one-shot); .*; 0 warnings$" "$log" &&
+            grep -qE "^refine: .*; 0 warnings$" "$log"; then
             ok=yes
         fi
         check "$name" "$log" "$ok"
-        grep -E "^timer?:" "$log" 2>/dev/null | sed 's/^/    /'
+        grep -E "^(timer?|refine):" "$log" 2>/dev/null | sed 's/^/    /'
         grep "KTEST PASS" "$log" 2>/dev/null | sed 's/^/    /'
 
         # Crash tests: the report must name the right fault and the kernel must halt.

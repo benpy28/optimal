@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 391389aca9e01603b5ae7e7f6de7f6877e6c8c93f0641e7ff35f018e555681f2 # shrinks to ticks = 566511734404, tsc = Freq { num: 500000, den: 993 }, reference = Freq { num: 8197880299, den: 1 }

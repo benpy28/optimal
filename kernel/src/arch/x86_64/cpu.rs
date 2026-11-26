@@ -165,6 +165,15 @@ pub fn halt_forever() -> ! {
     }
 }
 
+/// Enable interrupts and halt until one arrives, as one step: `sti` only
+/// takes effect after the next instruction, so an interrupt that became
+/// pending while they were off wakes the `hlt` instead of being missed.
+/// Returns with interrupts on.
+pub fn enable_and_halt() {
+    // SAFETY: as in interrupts_enable; halting at ring 0 is always valid.
+    unsafe { asm!("sti; hlt", options(nomem, nostack)) };
+}
+
 const RFLAGS_IF: u64 = 1 << 9;
 
 /// Disable interrupts on this CPU. Returns whether they were enabled.

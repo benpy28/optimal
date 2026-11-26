@@ -76,7 +76,8 @@ ktest!(lapic_rate_agrees_with_the_reference, {
     // so nothing else arms it meanwhile.
     let t = get().unwrap();
     let tm = time::get().unwrap();
-    let boot = t.lapic.unwrap();
+    // The rate in use: boot's, carried across any refinement.
+    let boot = super::rates().lapic.unwrap();
     let r = tm.reference_counter().unwrap();
     let l = t.lapic_regs.unwrap();
     let pit_b = matches!(r, Counter::Pit).then(pit_start);
@@ -94,7 +95,7 @@ ktest!(lapic_rate_agrees_with_the_reference, {
     // Boot's bound is against the clock; the clock is the TSC (within its
     // own bound of the reference) or the reference itself.
     let clock_ppb = match clock::kind().unwrap() {
-        Clock::Tsc | Clock::TscNotInvariant => tm.tsc_estimate().unwrap().ppb,
+        Clock::Tsc | Clock::TscNotInvariant => time::refine::tsc_bound_ppb(),
         _ => 0,
     };
     let allowed = lt::compose_ppb(boot.ppb, clock_ppb).saturating_add(SLACK_PPB);
@@ -146,13 +147,12 @@ fn wait_for_hook(limit_ns: u64) -> bool {
 /// earlier than asked, on the clock and on the reference, and that the
 /// hardware never fired before what it was armed for.
 fn never_early(what: &str) {
-    let tm = time::get().unwrap();
     let r = reference();
     let rf = r.freq().unwrap();
     let bits = r.bits();
     // How far the reference may run slow against the clock.
     let clock_ppb = match clock::kind().unwrap() {
-        Clock::Tsc | Clock::TscNotInvariant => tm.tsc_estimate().unwrap().ppb,
+        Clock::Tsc | Clock::TscNotInvariant => time::refine::tsc_bound_ppb(),
         _ => 0,
     } + SLACK_PPB;
     let pit_b = matches!(r, Counter::Pit).then(pit_start);
@@ -214,7 +214,7 @@ ktest!(every_event_mode_never_fires_early, {
     let t = get().unwrap();
     let was = t.events.expect("timer events on QEMU");
     let mut modes = 0;
-    if t.tsc.is_some() {
+    if super::rates().tsc.is_some() {
         force_events(Events::TscDeadline).unwrap();
         never_early("tsc-deadline");
         modes += 1;

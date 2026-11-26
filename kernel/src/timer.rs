@@ -57,7 +57,9 @@ const LAPIC_WINDOW_NS: u64 = 50_000_000;
 const CONVERSION_PAD_NS: u64 = 2;
 
 pub struct Timer {
-    /// The LAPIC timer's undivided count rate against the clock.
+    /// The LAPIC timer's undivided count rate against the clock, as
+    /// measured at boot. (After the refinement changes the clock's
+    /// frequency the rate in use is [`rates`]'s.)
     pub lapic: Option<Estimate>,
     /// What it was measured against.
     pub against: Option<&'static str>,
@@ -66,31 +68,53 @@ pub struct Timer {
     pub deadline_mode: bool,
     /// CPUID 06h EAX bit 2.
     pub arat: bool,
-    /// The longest one-shot arming (optimal_time::lapic::longest_ns).
+    /// The longest one-shot arming (optimal_time::lapic::longest_ns), at
+    /// boot.
     pub longest_ns: u64,
-    /// The TSC's frequency, in TSC-deadline mode (the clock's).
-    tsc: Option<Freq>,
     lapic_regs: Option<Lapic>,
     pub warnings: Vec<String>,
 }
 
 static STATE: Once<Timer> = Once::new();
 
+/// The rates arming works from. They change when the refinement gives
+/// the clock a new frequency (crate::time::refine), always under the
+/// [`ARMED`] lock together with the clock, so an arming never mixes a
+/// clock reading with a rate from before or after.
+#[derive(Clone, Copy, Debug)]
+pub struct Rates {
+    /// The LAPIC timer's undivided count rate against the clock.
+    pub lapic: Option<Estimate>,
+    /// optimal_time::lapic::longest_ns for it.
+    pub longest_ns: u64,
+    /// The TSC's frequency, in TSC-deadline mode (the clock's).
+    pub tsc: Option<Freq>,
+}
+
 struct Armed {
     /// When the expiry hook is due (clock ns).
     deadline: Option<u64>,
     /// When the next housekeeping read is due (narrow clocks).
     housekeeping: Option<u64>,
+    /// When the refinement next needs to run (crate::time::refine).
+    refine: Option<u64>,
     /// What the hardware is armed for (clock ns).
     hw: Option<u64>,
     periodic: bool,
+    rates: Rates,
 }
 
 static ARMED: IrqSpinLock<Armed> = IrqSpinLock::new(Armed {
     deadline: None,
     housekeeping: None,
+    refine: None,
     hw: None,
     periodic: false,
+    rates: Rates {
+        lapic: None,
+        longest_ns: 0,
+        tsc: None,
+    },
 });
 
 /// The expiry hook, a `fn(u64)` as usize; 0 for none.
@@ -189,15 +213,17 @@ pub fn init(t: &'static Time) -> &'static Timer {
         deadline_mode: t.tsc_features.deadline,
         arat: leaf6.is_some_and(cpuid::arat),
         longest_ns: 0,
-        tsc: None,
         lapic_regs: None,
         warnings: Vec::new(),
     };
+    let mut tsc = None;
     let Some(c) = crate::irq::controllers() else {
         warnings.push(String::from(
             "the local APIC is not in use, so there are no timer events",
         ));
         timer.warnings = warnings;
+        // Records why the refinement cannot run.
+        let _ = time::refine::start(t, clock::now_ns(), false);
         return STATE.set(timer);
     };
     let l = c.lapic;
@@ -217,7 +243,7 @@ pub fn init(t: &'static Time) -> &'static Timer {
         timer.lapic.is_some(),
     );
     if timer.events == Some(Events::TscDeadline) {
-        timer.tsc = match clock::counter() {
+        tsc = match clock::counter() {
             Some(Counter::TscAt(f)) => Some(f),
             _ => unreachable!("TSC-deadline events need the TSC as the clock"),
         };
@@ -245,22 +271,40 @@ pub fn init(t: &'static Time) -> &'static Timer {
     let timer = STATE.set(timer);
     EVENTS.store(encode(timer.events), Ordering::SeqCst);
     set_mode(l, timer.events);
-    if let Some(hk) = clock::housekeeping_ns()
-        && timer.events.is_some()
-    {
-        let mut a = ARMED.lock();
-        a.housekeeping = Some(clock::now_ns().saturating_add(hk));
+    let mut a = ARMED.lock();
+    a.rates = Rates {
+        lapic: timer.lapic,
+        longest_ns: timer.longest_ns,
+        tsc,
+    };
+    // The 10 s refinement starts now, driven from interrupt() (or says
+    // why not).
+    a.refine = time::refine::start(t, clock::now_ns(), timer.events.is_some());
+    if timer.events.is_some() {
+        if let Some(hk) = clock::housekeeping_ns() {
+            a.housekeeping = Some(clock::now_ns().saturating_add(hk));
+        }
         program(&mut a);
     }
+    drop(a);
     timer
 }
 
 #[cfg_attr(
     not(feature = "ktest"),
-    expect(dead_code, reason = "tests read it; the refinement (1c3b2) will")
+    expect(dead_code, reason = "tests read it; the scorecard will")
 )]
 pub fn get() -> Option<&'static Timer> {
     STATE.get()
+}
+
+/// The rates arming uses now.
+#[cfg_attr(
+    not(feature = "ktest"),
+    expect(dead_code, reason = "tests read it; the scorecard will")
+)]
+pub fn rates() -> Rates {
+    ARMED.lock().rates
 }
 
 /// Arm the hardware for the earliest thing due, or disarm it.
@@ -270,10 +314,10 @@ fn program(a: &mut Armed) {
     if a.periodic {
         return;
     }
-    let due = match (a.deadline, a.housekeeping) {
-        (Some(x), Some(y)) => Some(x.min(y)),
-        (x, y) => x.or(y),
-    };
+    let due = [a.deadline, a.housekeeping, a.refine]
+        .into_iter()
+        .flatten()
+        .min();
     let Some(due) = due else {
         a.hw = None;
         match events_now() {
@@ -287,7 +331,10 @@ fn program(a: &mut Armed) {
     let wait = due.saturating_sub(now).saturating_add(CONVERSION_PAD_NS);
     match events_now() {
         Some(Events::TscDeadline) => {
-            let f = t.tsc.expect("TSC-deadline mode has the TSC's frequency");
+            let f = a
+                .rates
+                .tsc
+                .expect("TSC-deadline mode has the TSC's frequency");
             // The clock is the TSC itself, so the conversion is exact at
             // the clock's own rate: no error bound to allow for.
             let d = lt::tsc_deadline(cpu::rdtsc_ordered(), f, 0, wait);
@@ -296,9 +343,9 @@ fn program(a: &mut Armed) {
             unsafe { cpu::write_msr(lt::TSC_DEADLINE_MSR, d) };
         }
         Some(Events::LapicOneShot) => {
-            let e = t.lapic.expect("one-shot mode has the LAPIC's rate");
+            let e = a.rates.lapic.expect("one-shot mode has the LAPIC's rate");
             let ns = wait
-                .min(t.longest_ns)
+                .min(a.rates.longest_ns)
                 .min(CHUNK_CAP.load(Ordering::Relaxed));
             let arm = lt::arm(e.freq, e.ppb, ns).expect("longest_ns always arms");
             // Covers the whole wait, or this is one of several armings.
@@ -330,6 +377,10 @@ pub fn interrupt() {
     a.hw = None;
     if a.housekeeping.is_some_and(|h| h <= now) {
         a.housekeeping = clock::housekeeping_ns().map(|hk| now.saturating_add(hk));
+    }
+    if a.refine.is_some_and(|r| r <= now) {
+        // May give the clock a new frequency, and these rates with it.
+        a.refine = time::refine::poll(now, &mut a.rates);
     }
     let fire = a.deadline.is_some_and(|d| d <= now);
     if fire {
@@ -399,12 +450,12 @@ pub fn fires() -> (u64, u64) {
 pub fn start_periodic(period_ns: u64) -> Result<lt::Arm, &'static str> {
     let t = STATE.get().ok_or("no timer")?;
     let l = t.lapic_regs.ok_or("no local APIC")?;
-    let e = t.lapic.ok_or("the LAPIC timer's rate is unknown")?;
+    let mut a = ARMED.lock();
+    let e = a.rates.lapic.ok_or("the LAPIC timer's rate is unknown")?;
     if clock::housekeeping_ns().is_some_and(|hk| period_ns > hk) {
         return Err("the period is longer than the clock's housekeeping gap");
     }
     let arm = lt::arm(e.freq, e.ppb, period_ns).ok_or("the period is too long")?;
-    let mut a = ARMED.lock();
     a.periodic = true;
     a.hw = None;
     set_mode(l, None);
@@ -443,6 +494,14 @@ pub fn periodic_ticks() -> u64 {
     PERIODIC_TICKS.load(Ordering::SeqCst)
 }
 
+/// Tests: run `f` with the timer's lock held (interrupts off), so no
+/// timer event, refinement poll or arming happens meanwhile.
+#[cfg(feature = "ktest")]
+pub fn hold<R>(f: impl FnOnce() -> R) -> R {
+    let _a = ARMED.lock();
+    f()
+}
+
 /// Tests: program events another way (one-shot on a machine with
 /// TSC-deadline mode, say). Returns the previous way. Refused (None) when
 /// the new way lacks what it needs.
@@ -450,12 +509,12 @@ pub fn periodic_ticks() -> u64 {
 pub fn force_events(e: Events) -> Option<Events> {
     let t = STATE.get()?;
     let l = t.lapic_regs?;
+    let mut a = ARMED.lock();
     match e {
-        Events::TscDeadline if t.tsc.is_none() => return None,
-        Events::LapicOneShot if t.lapic.is_none() => return None,
+        Events::TscDeadline if a.rates.tsc.is_none() => return None,
+        Events::LapicOneShot if a.rates.lapic.is_none() => return None,
         _ => {}
     }
-    let mut a = ARMED.lock();
     let was = events_now();
     EVENTS.store(encode(Some(e)), Ordering::SeqCst);
     set_mode(l, Some(e));
