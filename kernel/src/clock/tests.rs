@@ -108,6 +108,11 @@ ktest!(a_narrow_clock_stays_extended_across_wraps, {
         crate::println!("ktest: the clock is 64-bit; nothing to check");
         return;
     };
+    if crate::timer::get().is_none_or(|t| t.events.is_none()) {
+        // Nothing can keep it extended, which boot warned about.
+        crate::println!("ktest: no timer events to keep the clock extended");
+        return;
+    }
     let t = time::get().unwrap();
     let tsc = t.tsc_estimate().expect("a TSC frequency on QEMU");
     let wrap = hk * 4;

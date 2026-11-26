@@ -18,11 +18,28 @@ use crate::clock;
 use crate::ktest;
 use crate::time::{self, Counter, pit_start, pit_stop};
 
+/// With interrupts off (no usable local APIC) there are no timer events,
+/// and boot said so; every test here then has nothing to check.
+fn no_lapic() -> bool {
+    if crate::irq::controllers().is_some() {
+        return false;
+    }
+    let t = get().expect("timer::init ran");
+    assert_eq!(t.events, None);
+    assert_eq!(events_now(), None);
+    assert!(t.lapic.is_none());
+    crate::println!("ktest: no local APIC in use; no timer events to check");
+    true
+}
+
 /// Rates measured two ways agree within both bounds plus this, and the
 /// reference may disagree with the clock by this much: 20 ppm.
 const SLACK_PPB: u64 = 20_000;
 
 ktest!(boot_chose_events_by_the_rules, {
+    if no_lapic() {
+        return;
+    }
     let t = get().expect("timer::init ran");
     let tm = time::get().unwrap();
     assert!(
@@ -51,6 +68,9 @@ ktest!(boot_chose_events_by_the_rules, {
 });
 
 ktest!(lapic_rate_agrees_with_the_reference, {
+    if no_lapic() {
+        return;
+    }
     // Measured again for up to 500 ms against the calibration reference
     // (the boot measurement was against the clock), with the timer held
     // so nothing else arms it meanwhile.
@@ -188,6 +208,9 @@ fn never_early(what: &str) {
 }
 
 ktest!(every_event_mode_never_fires_early, {
+    if no_lapic() {
+        return;
+    }
     let t = get().unwrap();
     let was = t.events.expect("timer events on QEMU");
     let mut modes = 0;
@@ -216,6 +239,9 @@ ktest!(every_event_mode_never_fires_early, {
 });
 
 ktest!(cancel_and_past_deadlines, {
+    if no_lapic() {
+        return;
+    }
     set_hook(Some(hook));
     HITS.store(0, Ordering::SeqCst);
     HIT_NS.store(0, Ordering::SeqCst);
@@ -243,6 +269,9 @@ ktest!(cancel_and_past_deadlines, {
 });
 
 ktest!(periodic_never_runs_fast, {
+    if no_lapic() {
+        return;
+    }
     // 1 ms ticks for about 100 ms of the reference, bracketed: the ticks
     // seen between the two reference reads can be at most one more than
     // whole periods in the longer interval. A loaded host can drop ticks,

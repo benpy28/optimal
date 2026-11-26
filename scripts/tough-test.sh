@@ -467,7 +467,7 @@ scenario "apic-xapic-tcg-qemu64" "boot:^apic: xAPIC \(CPU has no x2APIC\), id 0,
 # remapping but without extended interrupt mode).
 scenario "apic-dmar-x2apic-opt-out" "boot:^acpi: .* tables \[.*DMAR.*\]; .*; 0 warnings$ && ^apic: xAPIC \(firmware opted out of x2APIC \(DMAR\)\), " "$ISO" bios q35 512M 2 30 kvm -- -acpitable "file=$AQ/dmar-x2apic-opt-out.bin"
 # A CPU with no local APIC at all: everything masked, interrupts stay off.
-scenario "apic-none-tcg" "boot:^apic: firmware left: local APIC disabled; PIC masks 0xff/0xff; I/O APIC pins unmasked 0/24$ && ^interrupts: off \(the CPU has no local APIC \(IA32_APIC_BASE 0x100\)\); 0 warnings$" "$ISO" bios q35 512M 1 40 tcg -- -cpu qemu64,-apic
+scenario "apic-none-tcg" "boot:^apic: firmware left: local APIC disabled; PIC masks 0xff/0xff; I/O APIC pins unmasked 0/24$ && ^interrupts: off \(the CPU has no local APIC \(IA32_APIC_BASE 0x100\)\); 0 warnings$ && ^timer: lapic unknown; events none; .*; 1 warnings$ && ^timer: warning: the local APIC is not in use, so there are no timer events$" "$ISO" bios q35 512M 1 40 tcg -- -cpu qemu64,-apic
 # Local APIC states from the firmware-quirk injector (applied after
 # ExitBootServices; Limine leaves the local APIC as it finds it).
 if has_uefi && [ -f "$QUIRK_EFI" ]; then
@@ -483,7 +483,7 @@ if has_uefi && [ -f "$QUIRK_EFI" ]; then
     # current CPUs; QEMU's emulated APIC only re-enables on reset, as on
     # some older ones, and then interrupts must stay off cleanly.
     scenario "apic-quirk-off" "boot:$(quirk_lines apic-off) && ^apic: firmware left: local APIC disabled; && ^apic: x2APIC \(CPU supports it\), && ^apic: warning: firmware left the local APIC disabled; switched it back on$ && ^interrupts: on; 1 warnings$" "$QDIR/apic-off.img" uefi q35 512M 2 30 kvm
-    scenario "apic-quirk-off-tcg" "boot:$(quirk_lines apic-off) && ^apic: firmware left: local APIC disabled; && ^interrupts: off \(the local APIC is disabled and would not switch back on \(IA32_APIC_BASE 0xfee00100\)\); 0 warnings$" "$QDIR/apic-off.img" uefi q35 512M 2 40 tcg -- -cpu qemu64
+    scenario "apic-quirk-off-tcg" "boot:$(quirk_lines apic-off) && ^apic: firmware left: local APIC disabled; && ^interrupts: off \(the local APIC is disabled and would not switch back on \(IA32_APIC_BASE 0xfee00100\)\); 0 warnings$ && ^timer: lapic unknown; events none; .*; 1 warnings$ && ^timer: warning: the local APIC is not in use, so there are no timer events$" "$QDIR/apic-off.img" uefi q35 512M 2 40 tcg -- -cpu qemu64
 fi
 
 # ---------------------------------------------------------------------------
