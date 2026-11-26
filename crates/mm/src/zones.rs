@@ -168,12 +168,26 @@ pub fn plan(
 ) -> Result<usize, PlanError> {
     check_sorted(usable)?;
     check_sorted(later)?;
+    // No range of one list may overlap a range of the other. Checked on
+    // the ranges as given, not trimmed to pages, which would hide an
+    // overlap of under a page: each list is sorted, so walking both in
+    // start order finds any.
+    let (mut a, mut b) = (
+        usable.iter().filter(|r| !r.is_empty()).peekable(),
+        later.iter().filter(|r| !r.is_empty()).peekable(),
+    );
     let mut prev_end = 0;
-    for p in merged(usable, later, 0) {
-        if p.start < prev_end {
+    loop {
+        let next = match (a.peek(), b.peek()) {
+            (Some(x), Some(y)) if y.start < x.start => b.next(),
+            (Some(_), _) => a.next(),
+            (None, _) => b.next(),
+        };
+        let Some(r) = next else { break };
+        if r.start < prev_end {
             return Err(PlanError::Unsorted);
         }
-        prev_end = p.end;
+        prev_end = r.end;
     }
     // Group pieces into zones.
     let mut n = 0;
@@ -455,6 +469,27 @@ mod tests {
         let mut out = [Zone::EMPTY; 4];
         assert_eq!(
             plan(&[r(8 * MIB, 16 * MIB)], &sub_page, 0, &mut out),
+            Err(PlanError::Unsorted)
+        );
+        // And across the two lists: a usable range ending one byte into a
+        // later range (found by CI's random maps). Trimmed to pages they
+        // only touch, but the map itself overlaps.
+        assert_eq!(
+            plan(
+                &[r(MIB + 0x123, 2 * MIB + 1)],
+                &[r(2 * MIB, 2 * MIB + 0x1000)],
+                0,
+                &mut out
+            ),
+            Err(PlanError::Unsorted)
+        );
+        assert_eq!(
+            plan(
+                &[r(2 * MIB + 0xFFF, 4 * MIB)],
+                &[r(MIB, 2 * MIB + 0x1000)],
+                0,
+                &mut out
+            ),
             Err(PlanError::Unsorted)
         );
         // Empty entries (firmware does list them) are skipped, wherever
