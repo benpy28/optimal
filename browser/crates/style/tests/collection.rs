@@ -18,14 +18,15 @@ fn set(css: &str) -> StyleSet<'_> {
 /// Whether `svg|a` (with the prefix declared by `before` and the rule
 /// after) matched an SVG `a`: whether the @namespace counted.
 fn namespace_counts(before: &str) -> bool {
-    let css =
-        format!("{before} @namespace svg url(http://www.w3.org/2000/svg); svg|a {{ color: x }}");
+    let css = format!(
+        "{before} @namespace svg url(http://www.w3.org/2000/svg); svg|a {{ font-family: x }}"
+    );
     let s = set(&css);
     let mut t = Tree::new(true, "html");
     t.add(0, SVG, "a", &[]);
     let c = s.prepare();
     c.with_session(false, |ss| {
-        ss.cascade(&t.el(1), None).winner("color").is_some()
+        ss.cascade(&t.el(1), None).winner("font-family").is_some()
     })
 }
 
@@ -88,25 +89,25 @@ fn namespace_syntax() {
             false,
         ),
     ] {
-        let css = format!("{rule} svg|a {{ color: x }}");
+        let css = format!("{rule} svg|a {{ font-family: x }}");
         let s = set(&css);
         let mut t = Tree::new(true, "html");
         t.add(0, SVG, "a", &[]);
         let c = s.prepare();
         let got = c.with_session(false, |ss| {
-            ss.cascade(&t.el(1), None).winner("color").is_some()
+            ss.cascade(&t.el(1), None).winner("font-family").is_some()
         });
         assert_eq!(got, counts, "{rule}");
     }
     // A default namespace applies to type selectors.
-    let s = set("@namespace url(http://www.w3.org/2000/svg); a { color: x }");
+    let s = set("@namespace url(http://www.w3.org/2000/svg); a { font-family: x }");
     let mut t = Tree::new(true, "html");
     t.add(0, SVG, "a", &[]);
     t.add(0, HTML, "a", &[]);
     let c = s.prepare();
     c.with_session(false, |ss| {
-        assert!(ss.cascade(&t.el(1), None).winner("color").is_some());
-        assert!(ss.cascade(&t.el(2), None).winner("color").is_none());
+        assert!(ss.cascade(&t.el(1), None).winner("font-family").is_some());
+        assert!(ss.cascade(&t.el(2), None).winner("font-family").is_none());
     });
 }
 
@@ -156,7 +157,7 @@ fn import_layer_syntax() {
 
 #[test]
 fn refusal_counts() {
-    assert_eq!(set("p { & { color: x } }").refused_too_deep(), 0);
+    assert_eq!(set("p { & { font-family: x } }").refused_too_deep(), 0);
     let deep = format!(
         "p {{ {}{} }}",
         "& { ".repeat(MAX_RULE_NESTING as usize + 1),
@@ -170,17 +171,17 @@ fn refusal_counts() {
 fn element_attached_declarations_come_after_every_sheet() {
     // Their order of appearance is after all sheets' declarations, in
     // their own order (6.1).
-    let s = set("p { color: a; width: b } p { color: c }");
+    let s = set("p { font-family: a; counter-reset: b } p { font-family: c }");
     let t = {
         let mut t = Tree::new(true, "html");
         t.add(0, HTML, "p", &[]);
         t
     };
-    let style = StyleAttribute::parse(Wtf8::from_str("color: d; color: e"));
+    let style = StyleAttribute::parse(Wtf8::from_str("font-family: d; font-family: e"));
     let c = s.prepare();
     c.with_session(false, |ss| {
         let out = ss.cascade(&t.el(1), Some(&style));
-        let color = out.get("color").unwrap();
+        let color = out.get("font-family").unwrap();
         let orders: Vec<u32> = color.iter().map(|e| e.priority.order).collect();
         assert_eq!(orders, vec![4, 3, 2, 0]);
         assert_eq!(color[0].source, Source::Attribute(1));
@@ -239,17 +240,26 @@ fn nesting_selector_detection_per_item() {
         let c = s.prepare();
         c.with_session(false, |ss| {
             (0..t.nodes.len())
-                .filter(|&i| ss.cascade(&t.el(i), None).winner("color").is_some())
+                .filter(|&i| ss.cascade(&t.el(i), None).winner("font-family").is_some())
                 .collect()
         })
     };
     // ":is(.c)" is relative even though the next item has &.
-    assert_eq!(colored(".p { :is(.c), &.q { color: x } }"), vec![inside]);
+    assert_eq!(
+        colored(".p { :is(.c), &.q { font-family: x } }"),
+        vec![inside]
+    );
     // & inside a function: ".x :is(&)" stands as written.
-    assert_eq!(colored(".p { .x :is(&) { color: x } }"), vec![p_in_x]);
-    assert_eq!(colored(".p { .x :is(.y, :not(&)) { color: x } }"), vec![]);
+    assert_eq!(colored(".p { .x :is(&) { font-family: x } }"), vec![p_in_x]);
+    assert_eq!(
+        colored(".p { .x :is(.y, :not(&)) { font-family: x } }"),
+        vec![]
+    );
     // & in a string is not the nesting selector.
-    assert_eq!(colored(".p { [title=\"&\"] { color: x } }"), vec![titled]);
+    assert_eq!(
+        colored(".p { [title=\"&\"] { font-family: x } }"),
+        vec![titled]
+    );
     let _ = (outside, titled_outside);
 }
 
@@ -307,8 +317,8 @@ fn nesting_depth_counts_every_functional_level() {
         }),
     ];
     for (name, shape) in shapes {
-        let ok = format!("p {{ {} {{ color: x }} }}", shape(m - 1));
-        let deep = format!("p {{ {} {{ color: x }} }}", shape(m));
+        let ok = format!("p {{ {} {{ font-family: x }} }}", shape(m - 1));
+        let deep = format!("p {{ {} {{ font-family: x }} }}", shape(m));
         let s = set(&ok);
         assert_eq!(
             (s.rules().len(), s.refused_too_deep()),

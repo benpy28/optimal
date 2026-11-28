@@ -24,8 +24,9 @@
 //!   cascaded value is the first declaration in the sorted list that no
 //!   description covers; inheritance by looking up the parent's result.
 //!
-//! It shares the CSS parser and the selector parser and matcher with the
-//! production code: those have their own suites and models. It shares the
+//! It shares the CSS parser, the selector parser and matcher, and the
+//! value grammar matcher with the production code: those have their own
+//! suites and models. It shares the
 //! property table's data (names, inherited flags, shorthand lists), which
 //! `tests/property_table.rs` checks against the specs.
 
@@ -168,6 +169,13 @@ pub fn classify(
     // `all` takes only the keywords; nothing else takes an empty value;
     // the keywords can't be combined with other values.
     if name == "all" || values.is_empty() || values.iter().any(|v| wide(v).is_some()) {
+        return None;
+    }
+    // The value grammar: shared with the production code, like the
+    // selector matcher (`tests/value_grammars.rs` and `tests/wpt_values.rs`
+    // check it on its own).
+    let target = optimal_style::property::target(name).expect("a known property");
+    if !optimal_style::values::value_matches_items(target, values.iter().copied()) {
         return None;
     }
     Some((sets, None))

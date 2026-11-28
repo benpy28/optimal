@@ -204,37 +204,49 @@ fn origins_and_importance() {
     // 6.1 Origin and Importance.
     let t = one("p", &[]);
     let ua = (
-        "p { color: ua; } p { width: ua !important; }",
+        "p { font-family: ua; } p { counter-reset: ua !important; }",
         Origin::UserAgent,
     );
     let user = (
-        "p { color: user; } p { margin: user !important; width: user; }",
+        "p { font-family: user; } p { counter-increment: user !important; counter-reset: user; }",
         Origin::User,
     );
     let auth = (
-        "p { color: author; margin: author !important; width: author !important; } p { padding: author }",
+        "p { font-family: author; counter-increment: author !important; counter-reset: author !important; } p { counter-set: author }",
         Origin::Author,
     );
     // The author sheet is first; the order of sheets doesn't matter
     // across origins.
     let sheets = [auth, user, ua];
     // Normal: author over user over user agent.
-    assert_eq!(ident(&sheets, &t, "color", 1).as_deref(), Some("author"));
+    assert_eq!(
+        ident(&sheets, &t, "font-family", 1).as_deref(),
+        Some("author")
+    );
     // Important: user over author.
-    assert_eq!(ident(&sheets, &t, "margin-top", 1).as_deref(), Some("user"));
+    assert_eq!(
+        ident(&sheets, &t, "counter-increment", 1).as_deref(),
+        Some("user")
+    );
     // Important user agent over everything.
-    assert_eq!(ident(&sheets, &t, "width", 1).as_deref(), Some("ua"));
+    assert_eq!(
+        ident(&sheets, &t, "counter-reset", 1).as_deref(),
+        Some("ua")
+    );
     // Unopposed: the only one.
     assert_eq!(
-        ident(&sheets, &t, "padding-left", 1).as_deref(),
+        ident(&sheets, &t, "counter-set", 1).as_deref(),
         Some("author")
     );
     // Normal user over normal user agent.
     let sheets = [
-        ("p { color: ua; }", Origin::UserAgent),
-        ("p { color: user; }", Origin::User),
+        ("p { font-family: ua; }", Origin::UserAgent),
+        ("p { font-family: user; }", Origin::User),
     ];
-    assert_eq!(ident(&sheets, &t, "color", 1).as_deref(), Some("user"));
+    assert_eq!(
+        ident(&sheets, &t, "font-family", 1).as_deref(),
+        Some("user")
+    );
 }
 
 #[test]
@@ -246,22 +258,31 @@ fn element_attached_declarations() {
         "p",
         &[
             ("id", "x"),
-            ("style", "color: attr; margin: attr; width: attr !important"),
+            (
+                "style",
+                "font-family: attr; counter-increment: attr; counter-reset: attr !important",
+            ),
         ],
     );
-    let css = "#x#x { color: rule; }
-        p { margin: rule !important; }
-        @layer a { p { width: rule !important; } }";
+    let css = "#x#x { font-family: rule; }
+        p { counter-increment: rule !important; }
+        @layer a { p { counter-reset: rule !important; } }";
     let s = author(css);
-    assert_eq!(ident(&s, &t, "color", 1).as_deref(), Some("attr"));
-    assert_eq!(ident(&s, &t, "margin-top", 1).as_deref(), Some("rule"));
-    assert_eq!(ident(&s, &t, "width", 1).as_deref(), Some("attr"));
+    assert_eq!(ident(&s, &t, "font-family", 1).as_deref(), Some("attr"));
+    assert_eq!(
+        ident(&s, &t, "counter-increment", 1).as_deref(),
+        Some("rule")
+    );
+    assert_eq!(ident(&s, &t, "counter-reset", 1).as_deref(), Some("attr"));
     // User important still beats author important attributes.
-    let sheets = [("p { width: user !important }", Origin::User)];
-    assert_eq!(ident(&sheets, &t, "width", 1).as_deref(), Some("user"));
+    let sheets = [("p { counter-reset: user !important }", Origin::User)];
+    assert_eq!(
+        ident(&sheets, &t, "counter-reset", 1).as_deref(),
+        Some("user")
+    );
     // Later declarations in the attribute win.
-    let t = one("p", &[("style", "color: a; color: b")]);
-    assert_eq!(ident(&[], &t, "color", 1).as_deref(), Some("b"));
+    let t = one("p", &[("style", "font-family: a; font-family: b")]);
+    assert_eq!(ident(&[], &t, "font-family", 1).as_deref(), Some("b"));
 }
 
 #[test]
@@ -283,10 +304,13 @@ fn order_of_appearance_across_sheets() {
     // 6.1 Order of Appearance: sheets in order; the last wins.
     let t = one("p", &[]);
     let sheets = [
-        ("p { color: first }", Origin::Author),
-        ("p { color: second }", Origin::Author),
+        ("p { font-family: first }", Origin::Author),
+        ("p { font-family: second }", Origin::Author),
     ];
-    assert_eq!(ident(&sheets, &t, "color", 1).as_deref(), Some("second"));
+    assert_eq!(
+        ident(&sheets, &t, "font-family", 1).as_deref(),
+        Some("second")
+    );
 }
 
 #[test]
@@ -324,26 +348,32 @@ fn relative_nested_selectors() {
     let foo = t.add(0, HTML, "div", &[("class", "foo parent")]);
     let bar = t.add(foo, HTML, "p", &[("class", "bar")]);
     let deep = t.add(bar, HTML, "p", &[("class", "bar")]);
-    let css = ".foo { > .bar { color: child; } }";
+    let css = ".foo { > .bar { font-family: child; } }";
     let s = author(css);
-    assert_eq!(ident(&s, &t, "color", bar).as_deref(), Some("child"));
-    assert_eq!(ident(&s, &t, "color", deep), None);
-    let css = ".bar { .parent & { color: inside; } }";
+    assert_eq!(ident(&s, &t, "font-family", bar).as_deref(), Some("child"));
+    assert_eq!(ident(&s, &t, "font-family", deep), None);
+    let css = ".bar { .parent & { font-family: inside; } }";
     let s = author(css);
-    assert_eq!(ident(&s, &t, "color", bar).as_deref(), Some("inside"));
-    assert_eq!(ident(&s, &t, "color", deep).as_deref(), Some("inside"));
-    let css = ".foo { .bar { color: desc; } }";
+    assert_eq!(ident(&s, &t, "font-family", bar).as_deref(), Some("inside"));
+    assert_eq!(
+        ident(&s, &t, "font-family", deep).as_deref(),
+        Some("inside")
+    );
+    let css = ".foo { .bar { font-family: desc; } }";
     let s = author(css);
-    assert_eq!(ident(&s, &t, "color", deep).as_deref(), Some("desc"));
-    assert_eq!(ident(&s, &t, "color", foo), None);
+    assert_eq!(ident(&s, &t, "font-family", deep).as_deref(), Some("desc"));
+    assert_eq!(ident(&s, &t, "font-family", foo), None);
     // Same specificity with and without the written &: the later wins.
-    let css = ".foo { & > .bar { color: a; } } .foo { > .bar { color: b; } }";
-    assert_eq!(ident(&author(css), &t, "color", bar).as_deref(), Some("b"));
+    let css = ".foo { & > .bar { font-family: a; } } .foo { > .bar { font-family: b; } }";
+    assert_eq!(
+        ident(&author(css), &t, "font-family", bar).as_deref(),
+        Some("b")
+    );
     // A nested rule with an invalid selector is dropped, but the parent
     // stays (css-nesting-1 3.1).
-    let css = ".foo { color: kept; !!x { color: dropped; } }";
+    let css = ".foo { font-family: kept; !!x { font-family: dropped; } }";
     let s = author(css);
-    assert_eq!(ident(&s, &t, "color", foo).as_deref(), Some("kept"));
+    assert_eq!(ident(&s, &t, "font-family", foo).as_deref(), Some("kept"));
 }
 
 #[test]
@@ -352,10 +382,10 @@ fn ampersand_at_top_level_is_scope() {
     // is :root.
     let mut t = Tree::new(true, "html");
     t.add(0, HTML, "p", &[]);
-    let css = "& { color: root; }";
+    let css = "& { font-family: root; }";
     let s = author(css);
-    assert_eq!(ident(&s, &t, "color", 0).as_deref(), Some("root"));
-    assert_eq!(ident(&s, &t, "color", 1), None);
+    assert_eq!(ident(&s, &t, "font-family", 0).as_deref(), Some("root"));
+    assert_eq!(ident(&s, &t, "font-family", 1), None);
 }
 
 #[test]
@@ -364,29 +394,32 @@ fn nested_group_rules() {
     // nested declarations rule, in that layer: here layer "a", which loses
     // to the unlayered "green" though it comes later.
     let t = one("p", &[]);
-    let css = "p { color: green; @layer a { color: red; } }";
+    let css = "p { font-family: green; @layer a { font-family: red; } }";
     assert_eq!(
-        ident(&author(css), &t, "color", 1).as_deref(),
+        ident(&author(css), &t, "font-family", 1).as_deref(),
         Some("green")
     );
     // Style rules nested in it take & from the style rule.
-    let css = "@layer a { p { @layer b { & { color: deep; } } } }";
-    assert_eq!(ident(&author(css), &t, "color", 1).as_deref(), Some("deep"));
+    let css = "@layer a { p { @layer b { & { font-family: deep; } } } }";
+    assert_eq!(
+        ident(&author(css), &t, "font-family", 1).as_deref(),
+        Some("deep")
+    );
     // An at-rule that is not allowed in a style rule is ignored; the
     // declarations around it stay in the rule.
-    let css = "p { color: before; @font-face { color: x; } width: after; }";
+    let css = "p { font-family: before; @font-face { font-family: x; } counter-reset: after; }";
     let s = author(css);
-    assert_eq!(ident(&s, &t, "color", 1).as_deref(), Some("before"));
-    assert_eq!(ident(&s, &t, "width", 1).as_deref(), Some("after"));
+    assert_eq!(ident(&s, &t, "font-family", 1).as_deref(), Some("before"));
+    assert_eq!(ident(&s, &t, "counter-reset", 1).as_deref(), Some("after"));
 }
 
 #[test]
 fn declarations_outside_style_rules_are_dropped() {
     let t = one("p", &[]);
-    let css = "@layer a { color: red; p { width: ok; } }";
+    let css = "@layer a { font-family: red; p { counter-reset: ok; } }";
     let s = author(css);
-    assert_eq!(ident(&s, &t, "color", 1), None);
-    assert_eq!(ident(&s, &t, "width", 1).as_deref(), Some("ok"));
+    assert_eq!(ident(&s, &t, "font-family", 1), None);
+    assert_eq!(ident(&s, &t, "counter-reset", 1).as_deref(), Some("ok"));
 }
 
 #[test]
@@ -396,35 +429,38 @@ fn namespaces() {
     let mut t = Tree::new(true, "html");
     t.add(0, HTML, "a", &[]);
     t.add(0, SVG, "a", &[]);
-    let css = "@namespace svg url(http://www.w3.org/2000/svg); svg|a { color: svg; }";
+    let css = "@namespace svg url(http://www.w3.org/2000/svg); svg|a { font-family: svg; }";
     let s = author(css);
-    assert_eq!(ident(&s, &t, "color", 1), None);
-    assert_eq!(ident(&s, &t, "color", 2).as_deref(), Some("svg"));
-    let css = "@namespace \"http://www.w3.org/1999/xhtml\"; a { color: html; }";
+    assert_eq!(ident(&s, &t, "font-family", 1), None);
+    assert_eq!(ident(&s, &t, "font-family", 2).as_deref(), Some("svg"));
+    let css = "@namespace \"http://www.w3.org/1999/xhtml\"; a { font-family: html; }";
     let s = author(css);
-    assert_eq!(ident(&s, &t, "color", 1).as_deref(), Some("html"));
-    assert_eq!(ident(&s, &t, "color", 2), None);
+    assert_eq!(ident(&s, &t, "font-family", 1).as_deref(), Some("html"));
+    assert_eq!(ident(&s, &t, "font-family", 2), None);
     // After a style rule, @namespace is ignored, so svg|a has an
     // undeclared prefix and its rule is invalid.
-    let css = "p {} @namespace svg url(http://www.w3.org/2000/svg); svg|a { color: svg; }";
-    assert_eq!(ident(&author(css), &t, "color", 2), None);
+    let css = "p {} @namespace svg url(http://www.w3.org/2000/svg); svg|a { font-family: svg; }";
+    assert_eq!(ident(&author(css), &t, "font-family", 2), None);
     // After @import and @layer statements it is fine; an invalid rule
     // before it doesn't count.
-    let css = "@layer x; @import url(a.css); !!bad {} @charset \"x\"; @namespace svg url(http://www.w3.org/2000/svg); svg|a { color: svg; }";
-    assert_eq!(ident(&author(css), &t, "color", 2).as_deref(), Some("svg"));
+    let css = "@layer x; @import url(a.css); !!bad {} @charset \"x\"; @namespace svg url(http://www.w3.org/2000/svg); svg|a { font-family: svg; }";
+    assert_eq!(
+        ident(&author(css), &t, "font-family", 2).as_deref(),
+        Some("svg")
+    );
     // A @layer statement after @import ends the place for @namespace
     // (css-cascade-5 6.4.4.2 note).
-    let css = "@import url(a.css); @layer x; @namespace svg url(http://www.w3.org/2000/svg); svg|a { color: svg; }";
-    assert_eq!(ident(&author(css), &t, "color", 2), None);
+    let css = "@import url(a.css); @layer x; @namespace svg url(http://www.w3.org/2000/svg); svg|a { font-family: svg; }";
+    assert_eq!(ident(&author(css), &t, "font-family", 2), None);
     // Prefixes are per sheet.
     let sheets = [
         (
             "@namespace svg url(http://www.w3.org/2000/svg);",
             Origin::Author,
         ),
-        ("svg|a { color: svg; }", Origin::Author),
+        ("svg|a { font-family: svg; }", Origin::Author),
     ];
-    assert_eq!(ident(&sheets, &t, "color", 2), None);
+    assert_eq!(ident(&sheets, &t, "font-family", 2), None);
 }
 
 #[test]
@@ -433,19 +469,27 @@ fn import_layers_are_declared_and_placement_is_checked() {
     // the sheet isn't loaded. b is declared by the import, so a comes later
     // and wins.
     let t = one("p", &[]);
-    let css =
-        "@import url(x.css) layer(b); @layer a { p { color: a; } } @layer b { p { color: b; } }";
-    assert_eq!(ident(&author(css), &t, "color", 1).as_deref(), Some("a"));
+    let css = "@import url(x.css) layer(b); @layer a { p { font-family: a; } } @layer b { p { font-family: b; } }";
+    assert_eq!(
+        ident(&author(css), &t, "font-family", 1).as_deref(),
+        Some("a")
+    );
     // After "@layer b;" a second @import is invalid (6.4.4.2 note), so its
     // layer a is declared by the block after c: order b, c, a, and a wins.
     // (Had the import counted, a would come before c, and c would win.)
     let css = "@import \"x.css\"; @layer b; @import \"y.css\" layer(a);
-        @layer c { p { color: c; } } @layer a { p { color: a; } }";
-    assert_eq!(ident(&author(css), &t, "color", 1).as_deref(), Some("a"));
+        @layer c { p { font-family: c; } } @layer a { p { font-family: a; } }";
+    assert_eq!(
+        ident(&author(css), &t, "font-family", 1).as_deref(),
+        Some("a")
+    );
     // With import conditions the layer isn't declared yet (the conditions
     // aren't evaluated): a is declared by its block, after c.
-    let css = "@import url(x.css) layer(a) print; @layer c { p { color: c; } } @layer a { p { color: a; } }";
-    assert_eq!(ident(&author(css), &t, "color", 1).as_deref(), Some("a"));
+    let css = "@import url(x.css) layer(a) print; @layer c { p { font-family: c; } } @layer a { p { font-family: a; } }";
+    assert_eq!(
+        ident(&author(css), &t, "font-family", 1).as_deref(),
+        Some("a")
+    );
 }
 
 #[test]
@@ -453,9 +497,9 @@ fn property_names() {
     // Property names are ASCII case-insensitive; custom property names are
     // case-sensitive.
     let t = one("p", &[]);
-    let css = "p { COLOR: upper; color: lower; --X: big; --x: small; }";
+    let css = "p { COLOR: upper; font-family: lower; --X: big; --x: small; }";
     let s = author(css);
-    assert_eq!(ident(&s, &t, "color", 1).as_deref(), Some("lower"));
+    assert_eq!(ident(&s, &t, "font-family", 1).as_deref(), Some("lower"));
     assert_eq!(ident(&s, &t, "--X", 1).as_deref(), Some("big"));
     assert_eq!(ident(&s, &t, "--x", 1).as_deref(), Some("small"));
 }
@@ -463,10 +507,10 @@ fn property_names() {
 #[test]
 fn pseudo_element_selectors_never_match_elements() {
     let t = one("p", &[]);
-    let css = "p::before { color: red; } p, p::after { width: ok; }";
+    let css = "p::before { font-family: red; } p, p::after { counter-reset: ok; }";
     let s = author(css);
-    assert_eq!(ident(&s, &t, "color", 1), None);
-    assert_eq!(ident(&s, &t, "width", 1).as_deref(), Some("ok"));
+    assert_eq!(ident(&s, &t, "font-family", 1), None);
+    assert_eq!(ident(&s, &t, "counter-reset", 1).as_deref(), Some("ok"));
 }
 
 #[test]
@@ -484,7 +528,11 @@ fn deep_nesting_is_refused_not_overflowed() {
     // contents; the rules above stay. The top rule has depth 0 and each
     // "&" level adds one, so depths 0 to MAX_RULE_NESTING stay.
     let n = MAX_RULE_NESTING as usize + 50;
-    let css = format!("p {{ {}{}", "color: c; & { ".repeat(n), "} ".repeat(n + 1));
+    let css = format!(
+        "p {{ {}{}",
+        "font-family: c; & { ".repeat(n),
+        "} ".repeat(n + 1)
+    );
     let mut set = StyleSet::new();
     set.add_sheet(Wtf8::from_str(&css), Origin::Author);
     assert_eq!(set.rules().len(), MAX_RULE_NESTING as usize + 1);
@@ -493,12 +541,14 @@ fn deep_nesting_is_refused_not_overflowed() {
     let t = one("p", &[]);
     let c = set.prepare();
     let count = c.with_session(false, |s| {
-        s.cascade(&t.el(1), None).get("color").map(|e| e.len())
+        s.cascade(&t.el(1), None)
+            .get("font-family")
+            .map(|e| e.len())
     });
     assert_eq!(count, Some(MAX_RULE_NESTING as usize + 1));
     // Each functional pseudo-class level counts too.
     let css = format!(
-        "p {{ {}&{} {{ color: x }} }}",
+        "p {{ {}&{} {{ font-family: x }} }}",
         ":is(".repeat(MAX_RULE_NESTING as usize),
         ")".repeat(MAX_RULE_NESTING as usize)
     );
@@ -507,7 +557,7 @@ fn deep_nesting_is_refused_not_overflowed() {
     assert_eq!(set.refused_too_deep(), 1);
     // Layers nest as deep as the input does.
     let css = format!(
-        "{}p {{ color: deep }}{}",
+        "{}p {{ font-family: deep }}{}",
         "@layer {".repeat(100_000),
         "}".repeat(100_000)
     );

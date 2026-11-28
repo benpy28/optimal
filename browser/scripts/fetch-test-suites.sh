@@ -54,9 +54,11 @@ fetch_sparse() { # name url commit path... (directories or files)
 fetch_sparse wpt https://github.com/web-platform-tests/wpt.git 6852422b49e7dc8037d7f130ee07cf991fb73f05 html/syntax/parsing/resources
 
 # web-platform-tests again, at the same commit: the CSS syntax tests
-# (css/css-syntax), whose An+B cases the css crate runs, and the selector
-# parsing tests (css/selectors/parsing).
-fetch_sparse wpt-css https://github.com/web-platform-tests/wpt.git 6852422b49e7dc8037d7f130ee07cf991fb73f05 css/css-syntax css/selectors/parsing css/css-cascade css/css-nesting
+# (css/css-syntax), whose An+B cases the css crate runs, the selector
+# parsing tests (css/selectors/parsing), the cascade and nesting tests, and
+# the property value parsing tests (css/css-values and each module's
+# parsing directory), which the style crate's value grammars run.
+fetch_sparse wpt-css https://github.com/web-platform-tests/wpt.git 6852422b49e7dc8037d7f130ee07cf991fb73f05 css/css-syntax css/selectors/parsing css/css-cascade css/css-nesting css/css-values css/css-align/parsing css/css-backgrounds/parsing css/css-box/parsing css/css-break/parsing css/css-color/parsing css/css-content/parsing css/css-display/parsing css/css-flexbox/parsing css/css-fonts/parsing css/css-images/parsing css/css-inline/parsing css/css-lists/parsing css/css-overflow/parsing css/css-position/parsing css/css-sizing/parsing css/css-tables/parsing css/css-text/parsing css/css-transforms/parsing css/css-ui/parsing css/css-writing-modes/parsing css/css-counter-styles/parsing
 
 # web-platform-tests again, at the same commit: the Selectors API tests
 # (dom/nodes), whose selectors.js cases and fixture the selectors crate's
@@ -72,9 +74,10 @@ fetch css-tokenizer-tests https://github.com/romainmenke/css-tokenizer-tests.git
 fetch css-parsing-tests https://github.com/SimonSapin/css-parsing-tests.git 203ce36bffd617db7f118c551e32794561fb273d
 
 # csswg-drafts again, at the same commit: the specs whose property definition
-# tables the style crate's property table copies. The table is checked against
-# them (crates/style/tests/property_table.rs), so they are fetched every time.
-fetch_sparse csswg-propdefs https://github.com/w3c/csswg-drafts.git 7027ab6fdf3c98d9c44666820041cb075b0e28dd css-align-3 css-backgrounds-3 css-box-4 css-break-3 css-color-4 css-content-3 css-display-4 css-flexbox-1 css-fonts-4 css-inline-3 css-lists-3 css-overflow-3 css-position-3 css-sizing-3 css-tables-3 css-text-4 css-transforms-1 css-ui-4 css-writing-modes-4 css2 css-cascade-5
+# tables and value grammars the style crate copies. The tables are checked
+# against them (crates/style/tests/property_table.rs, value_grammars.rs), so
+# they are fetched every time.
+fetch_sparse csswg-propdefs https://github.com/w3c/csswg-drafts.git 7027ab6fdf3c98d9c44666820041cb075b0e28dd css-align-3 css-backgrounds-3 css-box-4 css-break-3 css-color-4 css-content-3 css-display-4 css-flexbox-1 css-fonts-4 css-inline-3 css-lists-3 css-overflow-3 css-position-3 css-sizing-3 css-tables-3 css-text-4 css-transforms-1 css-ui-4 css-writing-modes-4 css2 css-cascade-5 css-values-4 css-images-3 css-images-4 css-counter-styles-3
 
 # The specs the CSS crate is written from, at the commit it follows. Not test
 # data, so only fetched on request: ./scripts/fetch-test-suites.sh --specs
@@ -84,4 +87,6 @@ if [ "${1:-}" = "--specs" ]; then
   # HTML defines) and DOM (scope-match a selectors string).
   fetch_sparse whatwg-html https://github.com/whatwg/html.git 30f7046075a1c19999caef3a52388f64d96acad7 source
   fetch_sparse whatwg-dom https://github.com/whatwg/dom.git ddfb52fde44069e2f77b839bdf114eeefc87e3f7 dom.bs
+  # CSS Typed OM (the numeric type algebra math functions are typed with).
+  fetch_sparse css-houdini-drafts https://github.com/w3c/css-houdini-drafts.git 470869d921e3bfb40e710d5ee6106016346d431b css-typed-om/Overview.bs
 fi

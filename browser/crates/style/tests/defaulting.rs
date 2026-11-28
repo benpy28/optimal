@@ -268,9 +268,10 @@ fn invalid_declarations_are_dropped() {
         // Unknown names, and empty values.
         ("p { display: flex; nope: inherit }", "flex"),
         ("p { display: flex; display: }", "flex"),
-        // `default` is reserved, not a keyword: no grammar check yet, so
-        // it is kept as a value.
-        ("p { display: default }", "default"),
+        // `default` is reserved, not a keyword, and not in the grammar.
+        ("p { display: flex; display: default }", "flex"),
+        // Not in the grammar (css-display-4: one inside value).
+        ("p { display: flex; display: grid flex }", "flex"),
         // A substitution function makes any value valid at parse time,
         // and it isn't a keyword then.
         ("p { display: var(--a) initial }", "var(--a) initial"),
@@ -281,8 +282,9 @@ fn invalid_declarations_are_dropped() {
         ),
         // Function names are ASCII case-insensitive.
         ("p { display: VAR(--a) initial }", "VAR(--a) initial"),
-        // A keyword inside a function is not at the top level.
-        ("p { display: f(initial) }", "f(initial)"),
+        // A keyword inside a function is not at the top level, so the
+        // value is checked against the grammar, which has no f().
+        ("p { display: flex; display: f(initial) }", "flex"),
     ] {
         assert_eq!(
             on(&author(css), &t, P, "display").as_deref(),

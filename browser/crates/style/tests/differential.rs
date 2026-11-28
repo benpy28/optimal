@@ -136,6 +136,15 @@ const VALUES: &[&str] = &[
     "f(var(--y))",
     "--f(1)",
     "default",
+    // Valid by the value grammars of some of NAMES, so plain values reach
+    // the cascade too.
+    "auto",
+    "block",
+    "rtl",
+    "condensed",
+    "nowrap",
+    "1px 2px",
+    "1px solid red",
 ];
 const LAYERS: &[&str] = &[
     "a", "b", "a.b", "b.a", "c", "A", "a.b.c", "initial", "a .b", "B.c",

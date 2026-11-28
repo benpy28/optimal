@@ -29,6 +29,7 @@ pub mod collect;
 pub mod defaulting;
 pub mod layer;
 pub mod property;
+pub mod values;
 
 pub use cascade::{ATTACHED_BLOCK, Cascade, Cascaded, Entry, Level, Priority, Session, Source};
 pub use collect::{
