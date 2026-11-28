@@ -463,7 +463,7 @@ pub fn init(t: &'static Time) -> &'static Timer {
     if timer.events.is_none() && !skip.hpet && t.hpet.is_some() {
         // The PIT is tried after the HPET, so legacy replacement takes ISA
         // IRQ 0 from nothing.
-        match hpet::setup(skip.hpet_routes(true)) {
+        match hpet::setup(skip.hpet_routes(true), None) {
             Ok((ev, rate)) => {
                 timer.hpet = Some((ev.n, ev.named(), rate));
                 sources.hpet = true;
@@ -474,7 +474,7 @@ pub fn init(t: &'static Time) -> &'static Timer {
         timer.events = select::events(sources);
     }
     if timer.events.is_none() && !skip.pit {
-        match pit::setup() {
+        match pit::setup(None) {
             Ok(rate) => {
                 timer.pit = Some(rate);
                 sources.pit = true;
@@ -933,31 +933,47 @@ pub fn hold<R>(f: impl FnOnce() -> R) -> R {
 pub fn force_events(e: Events) -> Result<Option<Events>, String> {
     let t = STATE.get().ok_or("no timer")?;
     let l = t.lapic_regs.ok_or("no local APIC")?;
+    // An HPET comparator held on a route hpet::ONLY no longer allows is
+    // given back (the routes share vector 0xED) and set up again by
+    // another route with the rate already measured: the rate is the
+    // counter's against the clock, whatever the route, and measuring it
+    // again would lose what the refinement and the watchdog did to it.
     {
         let mut a = ARMED.lock();
         let only = hpet::ONLY.load(Ordering::SeqCst);
-        let drop_hpet = a.hpet.as_ref().is_some_and(|ev| {
-            let r = ev.route();
-            (e == Events::PitOneShot && r == optimal_time::hpet::Route::Legacy)
-                || (e == Events::HpetOneShot && only != 0 && only & hpet::only_bit(r) == 0)
-        });
-        if drop_hpet {
-            give_back_hpet(&mut a, l);
+        if e == Events::PitOneShot
+            && a.hpet
+                .as_ref()
+                .is_some_and(|ev| ev.route() == optimal_time::hpet::Route::Legacy)
+        {
+            give_back_hpet(&mut a, l, true);
+        }
+        if e == Events::HpetOneShot
+            && only != 0
+            && a.hpet
+                .as_ref()
+                .is_some_and(|ev| only & hpet::only_bit(ev.route()) == 0)
+        {
+            give_back_hpet(&mut a, l, true);
         }
         if e == Events::HpetOneShot && a.hpet.is_none() && a.pit {
-            give_back_pit(&mut a, l);
+            give_back_pit(&mut a, l, true);
         }
     }
     // Set up outside the lock: measuring takes up to 50 ms, and the
     // HPET's probe needs interrupts.
     let new_hpet = match e {
         Events::HpetOneShot if ARMED.lock().hpet.is_none() => {
-            Some(hpet::setup(t.skip.hpet_routes(true))?)
+            let known = ARMED.lock().rates.hpet;
+            Some(hpet::setup(t.skip.hpet_routes(true), known)?)
         }
         _ => None,
     };
     let new_pit = match e {
-        Events::PitOneShot if !ARMED.lock().pit => Some(pit::setup()?),
+        Events::PitOneShot if !ARMED.lock().pit => {
+            let known = ARMED.lock().rates.pit;
+            Some(pit::setup(known)?)
+        }
         _ => None,
     };
     let mut a = ARMED.lock();
@@ -1008,21 +1024,29 @@ fn stop_if_current(a: &mut Armed, l: Lapic, e: Events) {
     }
 }
 
+/// Tests: give the HPET comparator back; with `keep_rate`, its rate stays
+/// for the next setup.
 #[cfg(feature = "ktest")]
-fn give_back_hpet(a: &mut Armed, l: Lapic) {
+fn give_back_hpet(a: &mut Armed, l: Lapic, keep_rate: bool) {
     stop_if_current(a, l, Events::HpetOneShot);
     if let Some(ev) = a.hpet.take() {
         ev.release();
+    }
+    if !keep_rate {
         a.rates.hpet = None;
     }
 }
 
+/// Tests: give PIT channel 0 and ISA IRQ 0 back; with `keep_rate`, the
+/// PIT's rate stays for the next setup.
 #[cfg(feature = "ktest")]
-fn give_back_pit(a: &mut Armed, l: Lapic) {
+fn give_back_pit(a: &mut Armed, l: Lapic, keep_rate: bool) {
     stop_if_current(a, l, Events::PitOneShot);
     if a.pit {
         pit::release();
         a.pit = false;
+    }
+    if !keep_rate {
         a.rates.pit = None;
     }
 }
@@ -1037,10 +1061,10 @@ pub fn release_unused() {
     let mut a = ARMED.lock();
     let now = events_now();
     if now != Some(Events::HpetOneShot) {
-        give_back_hpet(&mut a, l);
+        give_back_hpet(&mut a, l, false);
     }
     if now != Some(Events::PitOneShot) {
-        give_back_pit(&mut a, l);
+        give_back_pit(&mut a, l, false);
     }
 }
 

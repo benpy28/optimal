@@ -18,8 +18,8 @@ use crate::irq;
 use crate::time::{self, Counter};
 
 /// Set channel 0 up for events on ISA IRQ 0, with the PIT's rate against
-/// the clock. Or say why not.
-pub fn setup() -> Result<Estimate, String> {
+/// the clock, measured unless `known` gives it. Or say why not.
+pub fn setup(known: Option<Estimate>) -> Result<Estimate, String> {
     let c = irq::controllers().ok_or("interrupts are off")?;
     let r = c.plan.isa_route(0).ok_or("ISA IRQ 0 is not routed")?;
     if r.entry.level {
@@ -28,15 +28,20 @@ pub fn setup() -> Result<Estimate, String> {
     let against = clock::counter().ok_or("no clock to measure the PIT against")?;
     // OUT held low: nothing reaches IRQ 0 until an arming.
     time::pit0_disarm();
-    let port_b = time::pit_start();
-    let rate = time::measure_to(
-        against,
-        Counter::Pit,
-        super::LAPIC_GOAL_PPB,
-        super::LAPIC_WINDOW_NS,
-    );
-    time::pit_stop(port_b);
-    let rate = rate.map_err(|e| format!("could not measure the PIT: {e}"))?;
+    let rate = match known {
+        Some(r) => r,
+        None => {
+            let port_b = time::pit_start();
+            let rate = time::measure_to(
+                against,
+                Counter::Pit,
+                super::LAPIC_GOAL_PPB,
+                super::LAPIC_WINDOW_NS,
+            );
+            time::pit_stop(port_b);
+            rate.map_err(|e| format!("could not measure the PIT: {e}"))?
+        }
+    };
     // Refused while the HPET's legacy replacement holds ISA IRQ 0
     // (crate::timer::hpet).
     if !irq::try_set_handler(r.entry.vector, interrupt) {

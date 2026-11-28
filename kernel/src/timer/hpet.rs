@@ -355,8 +355,10 @@ fn refusal(
 }
 
 /// Take a comparator for events by the first route in `allowed` that
-/// works, and measure the HPET's rate against the clock. Or say why not.
-pub fn setup(allowed: Allowed) -> Result<(Ev, Estimate), String> {
+/// works, and measure the HPET's rate against the clock, unless `known`
+/// gives it (the rate is the counter's against the clock, whichever
+/// comparator and route it drives). Or say why not.
+pub fn setup(allowed: Allowed, known: Option<Estimate>) -> Result<(Ev, Estimate), String> {
     let c = irq::controllers().ok_or("interrupts are off")?;
     let t = time::get().ok_or("no time setup")?;
     let h = t.hpet.as_ref().ok_or("no HPET")?;
@@ -400,7 +402,7 @@ pub fn setup(allowed: Allowed) -> Result<(Ev, Estimate), String> {
         .map(|n| h.read(regs::timer_config(n)))
         .collect();
     // The rate is measured once, for the first route that is set up.
-    let mut rate: Option<Estimate> = None;
+    let mut rate: Option<Estimate> = known;
     let mut tried = Vec::new();
     loop {
         let Some((n, route)) = regs::pick(
