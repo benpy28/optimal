@@ -1400,17 +1400,36 @@ const PART_GUID: lp::Uuid = lp::Uuid {
 };
 
 /// With OB_EXPECT_VOLUME=gpt (the kernel is booted from build-images.sh's
-/// disk), the executable file's volume must be that disk's partition 1.
+/// disk, on any controller), the executable file's volume must be that
+/// disk's partition 1; with OB_EXPECT_VOLUME=optical (its CD), a CD.
 /// This is the end-to-end check of the device-path reading in core::devpath
 /// and of the GPT header read that finds the disk GUID.
 fn boot_volume(t: &mut T, c: &Ctx, f: &lp::File) {
-    if option_env!("OB_EXPECT_VOLUME") != Some("gpt") {
+    let want = option_env!("OB_EXPECT_VOLUME");
+    if !matches!(want, Some("gpt") | Some("optical")) {
         return;
     }
     if !c.ours {
         t.skip(
             "ob-boot-volume",
             "the reference boots its own image, with other GUIDs",
+        );
+        return;
+    }
+    if want == Some("optical") {
+        // A CD (El Torito): media type 1, no partition or GPT details.
+        check!(
+            t,
+            "ob-boot-volume",
+            f.media_type == 1
+                && f.partition_index == 0
+                && f.gpt_disk_uuid == lp::Uuid::default()
+                && f.gpt_part_uuid == lp::Uuid::default(),
+            "media {} partition {} disk {:x?} part {:x?}",
+            f.media_type,
+            f.partition_index,
+            f.gpt_disk_uuid,
+            f.gpt_part_uuid
         );
         return;
     }
