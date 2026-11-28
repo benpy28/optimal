@@ -12,7 +12,15 @@
 #   mode (bits 17 and 18); dcr and dcr_log2 OR bits 0 and 1 with bit 2 or
 #   3. Pinned bit for bit by lapic::lvt_hand_worked and
 #   dcr_matches_the_sdm_table, and the round-trip properties.
+# - `replace | with ^` in level_one_shot: ^ binds tighter than | in Rust,
+#   so each mutant XORs two neighbouring terms, and every pair is disjoint:
+#   T_ROUTE (bits 9 to 13) and T_32BIT_MODE (bit 8); the configuration with
+#   the route field cleared and the new route; the route and T_LEVEL (bit
+#   1); T_LEVEL and T_INT_ENABLE (bit 2) or 0. On disjoint bits OR and XOR
+#   give the same value, so these mutants are equivalent. Pinned bit for
+#   bit by hpet::level_one_shot_hand_worked and level_one_shot_bits.
 exclude_re = [
     "replace \\| with \\^ in (halted|quiet)",
     "replace \\| with \\^ in (lvt|dcr|dcr_log2)",
+    "replace \\| with \\^ in level_one_shot",
 ]

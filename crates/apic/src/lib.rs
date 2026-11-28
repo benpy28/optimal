@@ -18,6 +18,7 @@
 extern crate alloc;
 
 pub mod base;
+pub mod eoi;
 pub mod ioapic;
 pub mod lapic;
 pub mod pic;
