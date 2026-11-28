@@ -33,6 +33,8 @@ mod superblock;
 #[cfg(test)]
 mod tests;
 mod tree;
+#[cfg(test)]
+mod write_fail_tests;
 
 #[cfg(feature = "std")]
 pub use crypto::OsEntropy;

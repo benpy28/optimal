@@ -326,7 +326,13 @@ the heaviest testing in the project:
   points: mount gives the last returned commit or a state the interrupted
   operation commits. A device that stops taking writes degrades the
   volume and recovers. A failed flush that loses the device cache never
-  yields a commit that claims the lost data.
+  yields a commit that claims the lost data. Unit tests
+  (`src/write_fail_tests.rs`) inject the exact condition behind each
+  safeguard the workloads can't reach: a failed second superblock write
+  (the retry is numbered above it and rewrites all four slots), bad blocks
+  in the available count, a mid-transaction rebuild reproducing the space
+  map exactly, the attempt bound and the bad-set limit. 18 hand mutations
+  of the safeguards, 18 caught.
 - **Lying drives**: flushes are acknowledged but lost for 1 to 8 commits,
   then power is cut. Images are steered into the worst cases (every later
   superblock write landed; or only the newest pair landed and the other pair

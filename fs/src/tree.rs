@@ -265,6 +265,12 @@ impl NodeCache {
             _ => None,
         }
     }
+    /// Birth generations of every cached node (tests).
+    #[cfg(test)]
+    pub(crate) fn births(&self) -> Vec<u64> {
+        self.map.values().map(|(p, _)| p.birth).collect()
+    }
+
     /// Drops the entry for logical address `a`, if any.
     pub fn forget(&mut self, a: u64) {
         self.map.remove(&a);

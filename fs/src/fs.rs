@@ -398,6 +398,8 @@ pub struct Filesystem<D: BlockDevice> {
     /// Early data flushes (dirty data over the limit) that failed since
     /// the last successful commit.
     early_flush_failures: u32,
+    /// Attempts the last `commit` call made (tests).
+    pub(crate) last_commit_attempts: u32,
 }
 
 /// Most attempts one [`Filesystem::commit`] call makes (the storage
@@ -577,6 +579,7 @@ impl<D: BlockDevice> Filesystem<D> {
             degraded: false,
             sb_started: false,
             early_flush_failures: 0,
+            last_commit_attempts: 0,
         };
         let now = fs.clock.now_ns();
         let root = Attr {
@@ -748,6 +751,7 @@ impl<D: BlockDevice> Filesystem<D> {
                 degraded: false,
                 sb_started: false,
                 early_flush_failures: 0,
+                last_commit_attempts: 0,
             };
             let check = if clean {
                 Ok(())
@@ -884,6 +888,12 @@ impl<D: BlockDevice> Filesystem<D> {
 
     pub fn device(&self) -> &D {
         &self.store.io.dev
+    }
+
+    /// Writes the dirty file data now (tests).
+    #[doc(hidden)]
+    pub fn flush_data_for_tests(&mut self) -> Result<()> {
+        self.flush_data()
     }
 
     /// Makes the allocator continue its search at block `b` (tests use it
@@ -2234,7 +2244,12 @@ impl<D: BlockDevice> Filesystem<D> {
     /// snapshot counters and the dirty data are the transaction's and stay.
     /// `sb_started`: the failed commit may have reached a superblock, so
     /// later commits are numbered above it and rewrite every slot.
-    fn rebuild(&mut self, attempted: u64, sb_started: bool, relocs: Vec<u64>) -> Result<()> {
+    pub(crate) fn rebuild(
+        &mut self,
+        attempted: u64,
+        sb_started: bool,
+        relocs: Vec<u64>,
+    ) -> Result<()> {
         self.note_failed_writes();
         let b = &self.body;
         let mut space = self.store.space.reopen(
@@ -2363,6 +2378,7 @@ impl<D: BlockDevice> Filesystem<D> {
         }
         let relocs = self.store.space.relocations.clone();
         for attempt in 1.. {
+            self.last_commit_attempts = attempt;
             let attempted = self.txn_generation();
             self.sb_started = false;
             let e = match self.commit_inner() {
