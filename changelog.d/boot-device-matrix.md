@@ -1,0 +1,1 @@
+- Optimal Boot: device matrix. New conformance cases boot the same kernel and signed config from a CD (El Torito), a USB stick (xHCI mass storage), an NVMe drive and a virtio-blk disk, under ours and under Limine. Each checks the boot volume reported to the kernel: a CD must be reported as optical media, and every disk as partition 1 of the test GPT disk with its GUIDs.
