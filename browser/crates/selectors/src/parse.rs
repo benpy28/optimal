@@ -385,8 +385,7 @@ impl<'p, 'a> Parser<'p, 'a> {
         if let Some(t) = self.type_selector(s, pos)? {
             compound.push(t);
         }
-        loop {
-            let Some(v) = s.get(*pos) else { break };
+        while let Some(v) = s.get(*pos) {
             let simple = match v.kind() {
                 Kind::Token(Token::Hash(name, HashKind::Id)) => {
                     *pos += 1;
