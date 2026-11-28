@@ -21,7 +21,10 @@
 //! shape, to regenerate it.
 
 use optimal_css::parse_component_values;
-use optimal_style::property::{classify, target};
+use optimal_css::{ComponentValue, Kind, Token};
+use optimal_style::property::{Target, classify, target};
+use optimal_style::values::parse::{Tree, TreeKind};
+use optimal_style::values::{parse_value, value_matches};
 use optimal_wtf8::Wtf8;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -324,4 +327,71 @@ fn wpt_value_parsing() {
         stale.len(),
         stale.join("\n")
     );
+}
+
+/// The leaves of a parse tree (component values), in order.
+fn leaves<'t, 'a>(t: &Tree<'t, 'a>, out: &mut Vec<ComponentValue<'t, 'a>>) {
+    match &t.kind {
+        TreeKind::Value(v) | TreeKind::Nested(v, _) => out.push(*v),
+        TreeKind::Comma => {}
+        TreeKind::Inner(t) | TreeKind::Alternative(_, t) => leaves(t, out),
+        TreeKind::List(items) => items.iter().for_each(|(_, t)| leaves(t, out)),
+    }
+}
+
+/// Every value the engine accepts has a parse tree, whose leaves are the
+/// value's component values in order, each once, all but commas (a comma
+/// token goes with a grammar comma or a `#` separator).
+#[test]
+fn wpt_valid_values_parse() {
+    let (cases, _) = all_cases();
+    let mut parsed_count = 0;
+    for c in &cases {
+        let name = c.property.to_ascii_lowercase();
+        let Some(t) = target(&name) else { continue };
+        if matches!(t, Target::All | Target::Custom) {
+            continue;
+        }
+        let (parsed, range) = parse_component_values(Wtf8::from_str(&c.value));
+        if !value_matches(t, parsed.values(range.clone())) {
+            continue;
+        }
+        let tree = parse_value(t, parsed.values(range.clone()))
+            .unwrap_or_else(|| panic!("{}: {} matches but has no parse", c.property, c.value));
+        let mut got = Vec::new();
+        leaves(&tree, &mut got);
+        let items: Vec<ComponentValue<'_, '_>> = parsed
+            .values(range)
+            .filter(|v| !matches!(v.kind(), Kind::Token(Token::Whitespace)))
+            .collect();
+        let mut at = 0;
+        for v in &got {
+            while at < items.len() && items[at].index() != v.index() {
+                assert!(
+                    matches!(items[at].kind(), Kind::Token(Token::Comma)),
+                    "{}: {}: a non-comma value is no leaf",
+                    c.property,
+                    c.value
+                );
+                at += 1;
+            }
+            assert!(
+                at < items.len(),
+                "{}: {}: leaves out of order",
+                c.property,
+                c.value
+            );
+            at += 1;
+        }
+        assert!(
+            items[at..]
+                .iter()
+                .all(|v| matches!(v.kind(), Kind::Token(Token::Comma))),
+            "{}: {}: trailing values are no leaves",
+            c.property,
+            c.value
+        );
+        parsed_count += 1;
+    }
+    assert!(parsed_count > 1_500, "{parsed_count} parsed");
 }

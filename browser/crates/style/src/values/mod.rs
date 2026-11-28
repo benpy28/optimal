@@ -13,7 +13,8 @@
 //!   describes.
 //!
 //! [`compile`] builds every grammar once, on first use. [`value_matches`]
-//! is what [`crate::property::classify`] asks.
+//! is what [`crate::property::classify`] asks; [`parse_value`] says how a
+//! value matched ([`parse`]).
 //!
 //! Design choices (chosen, why, rejected):
 //!
@@ -42,6 +43,7 @@
 
 pub mod matcher;
 pub mod math;
+pub mod parse;
 pub mod syntax;
 pub mod table;
 pub mod types;
@@ -439,4 +441,20 @@ pub fn value_matches_items<'t, 'a: 't>(
         Target::Custom => return true,
     };
     matcher::matches_items(g, top, values, 0)
+}
+
+/// How `values` matched the grammar of the property `target` names (see
+/// [`parse`]), or `None` if it doesn't match, or for custom properties and
+/// `all`, which have no grammar here.
+pub fn parse_value<'t, 'a: 't>(
+    target: Target,
+    values: impl IntoIterator<Item = ComponentValue<'t, 'a>>,
+) -> Option<parse::Tree<'t, 'a>> {
+    let g = compiled();
+    let top = match target {
+        Target::Longhand(l) => g.longhands[l as usize],
+        Target::Shorthand(s) => g.shorthands[s as usize],
+        Target::All | Target::Custom => return None,
+    };
+    parse::parse(g, top, values, 0)
 }

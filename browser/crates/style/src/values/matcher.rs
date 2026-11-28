@@ -33,21 +33,21 @@ use std::collections::{HashMap, HashSet};
 use super::syntax::{Node, NodeId};
 use super::{Compiled, MAX_NESTING, types};
 
-const NOTHING: u32 = 0;
-const EMITTED: u32 = 1;
-const PENDING: u32 = 2;
+pub(super) const NOTHING: u32 = 0;
+pub(super) const EMITTED: u32 = 1;
+pub(super) const PENDING: u32 = 2;
 /// A `#` separator comma was just consumed: a grammar comma right after
 /// it is adjacent to it, so omitted.
 const AFTER_SEPARATOR: u32 = 3;
-const COMMA_MASK: u32 = 3;
-const BANG: u32 = 4;
+pub(super) const COMMA_MASK: u32 = 3;
+pub(super) const BANG: u32 = 4;
 const SHIFT: u32 = 3;
 
-fn pos(s: u32) -> usize {
+pub(super) fn pos(s: u32) -> usize {
     (s >> SHIFT) as usize
 }
 
-fn state(pos: usize, comma: u32, bang: u32) -> u32 {
+pub(super) fn state(pos: usize, comma: u32, bang: u32) -> u32 {
     ((pos as u32) << SHIFT) | comma | bang
 }
 
@@ -56,10 +56,10 @@ fn normalize(v: &mut Vec<u32>) {
     v.dedup();
 }
 
-struct Run<'g, 't, 'a> {
-    g: &'g Compiled,
-    items: Vec<ComponentValue<'t, 'a>>,
-    depth: u32,
+pub(super) struct Run<'g, 't, 'a> {
+    pub(super) g: &'g Compiled,
+    pub(super) items: Vec<ComponentValue<'t, 'a>>,
+    pub(super) depth: u32,
     memo: HashMap<(usize, NodeId), bool>,
 }
 
@@ -139,7 +139,7 @@ impl<'t, 'a> Run<'_, 't, 'a> {
     /// The comma between repetitions of `#`: a comma token. A grammar
     /// comma right before or right after it is adjacent to it, so the same
     /// comma (2.1).
-    fn separator(&self, states: &[u32]) -> Vec<u32> {
+    pub(super) fn separator(&self, states: &[u32]) -> Vec<u32> {
         let mut out: Vec<u32> = states
             .iter()
             .filter(|&&s| self.is_comma(pos(s)))
@@ -149,7 +149,7 @@ impl<'t, 'a> Run<'_, 't, 'a> {
         out
     }
 
-    fn run(&mut self, node: NodeId, states: &[u32]) -> Vec<u32> {
+    pub(super) fn run(&mut self, node: NodeId, states: &[u32]) -> Vec<u32> {
         if states.is_empty() {
             return Vec::new();
         }
@@ -246,7 +246,7 @@ impl<'t, 'a> Run<'_, 't, 'a> {
         }
     }
 
-    fn once(&mut self, child: NodeId, sep: bool, states: &[u32]) -> Vec<u32> {
+    pub(super) fn once(&mut self, child: NodeId, sep: bool, states: &[u32]) -> Vec<u32> {
         if sep {
             let s = self.separator(states);
             self.run(child, &s)
@@ -320,17 +320,28 @@ pub fn matches_items<'t, 'a: 't>(
     values: impl IntoIterator<Item = ComponentValue<'t, 'a>>,
     depth: u32,
 ) -> bool {
-    let items: Vec<ComponentValue<'t, 'a>> = values
-        .into_iter()
-        .filter(|v| !matches!(v.kind(), Kind::Token(Token::Whitespace)))
-        .collect();
-    let n = items.len();
-    let mut run = Run {
-        g,
-        items,
-        depth,
-        memo: HashMap::new(),
-    };
+    let mut run = Run::new(g, values, depth);
+    let n = run.items.len();
     let end = run.run(top, &[state(0, NOTHING, 0)]);
     end.iter().any(|&s| pos(s) == n)
+}
+
+impl<'g, 't, 'a> Run<'g, 't, 'a> {
+    /// A run over one list, white space dropped.
+    pub(super) fn new(
+        g: &'g Compiled,
+        values: impl IntoIterator<Item = ComponentValue<'t, 'a>>,
+        depth: u32,
+    ) -> Self {
+        let items = values
+            .into_iter()
+            .filter(|v| !matches!(v.kind(), Kind::Token(Token::Whitespace)))
+            .collect();
+        Run {
+            g,
+            items,
+            depth,
+            memo: HashMap::new(),
+        }
+    }
 }

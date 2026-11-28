@@ -234,12 +234,13 @@ type ValueCase = fn(usize) -> String;
 /// the value: long lists, long runs of one component, long sums inside
 /// calc(), many functions, nesting up to the cap and past it.
 #[test]
-fn hostile_values_match_in_linear_time() {
+fn hostile_values_match_and_parse_in_linear_time() {
     if std::env::var_os("CSS_SCALING").is_none() {
         return;
     }
     use optimal_css::parse_component_values;
-    use optimal_style::property::{LONGHANDS, SHORTHANDS, classify};
+    use optimal_style::property::{LONGHANDS, SHORTHANDS, classify, target};
+    use optimal_style::values::parse_value;
     let cases: &[(&str, ValueCase)] = &[
         ("idents", |n| "a ".repeat(n)),
         ("lengths", |n| "1px ".repeat(n)),
@@ -290,6 +291,9 @@ fn hostile_values_match_in_linear_time() {
                 let start = Instant::now();
                 for name in &names {
                     std::hint::black_box(classify(name, parsed.values(range.clone())));
+                    // And the parse tree, for values that match.
+                    let t = target(name).expect("a property");
+                    std::hint::black_box(parse_value(t, parsed.values(range.clone())));
                 }
                 start.elapsed()
             })
