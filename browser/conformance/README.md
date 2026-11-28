@@ -152,9 +152,16 @@ matching (every candidate tried, `:has()` searching the whole tree), run
 against random trees (any namespace, text, comments, a fragment) and random
 selectors for every element, with no scoping root, an element, the
 document and a fragment as the scoping root, with and without quirks mode
-and a nesting parent; `query_all` must equal filtering the subtree. The
+and a nesting parent; `query_all` must equal filtering the subtree, and
+matching every element through one `MatchSession` in reverse and in
+rotated order (caches filled from elsewhere first) must agree too. The
 scaling test also times matching: linear on wide trees for 12 hostile
-selectors, and at worst quadratic (pinned) for deep ancestor chains and long
-sibling runs, which each element may walk in full. `:lang()` checks that
+selectors, and linear on one run of up to 320,000 siblings and one chain of
+up to 320,000 ancestors for 14 selectors that make each element look at all
+of its earlier siblings or ancestors unless earlier answers are reused
+(`~`, `:nth-*()` with and without `of S`, `:*-of-type`, descendant chains),
+in tree order and in reverse. Without the caches the first of them does not
+finish in 5 minutes. `:has()` over a deep chain is still pinned at
+quadratic: it has no cache yet. `:lang()` checks that
 tags and ranges are well-formed (RFC 5646) but not yet that they are valid
 or canonical, which needs the IANA subtag registry.

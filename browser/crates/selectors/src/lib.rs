@@ -13,7 +13,8 @@
 //!   [`Specificity`].
 //!
 //! - [`matches`] and [`query_all`] match a list against an element or a
-//!   subtree, through the [`Element`] trait (see [`matching`]).
+//!   subtree, through the [`Element`] trait (see [`matching`]); a
+//!   [`MatchSession`] matches many elements sharing its caches.
 #![forbid(unsafe_code)]
 
 pub mod ast;
@@ -25,7 +26,7 @@ mod specificity;
 
 pub use ast::*;
 pub use lang::{lang_matches, well_formed as language_tag_well_formed};
-pub use matching::{Direction, Element, MatchContext, Scope, matches, query_all};
+pub use matching::{Direction, Element, MatchContext, MatchSession, Scope, matches, query_all};
 pub use parse::{
     MAX_NESTING, Namespaces, SelectorError, parse_relative_selector, parse_relative_selector_list,
     parse_selector, parse_selector_list,

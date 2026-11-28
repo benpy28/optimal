@@ -207,6 +207,15 @@ impl PartialEq for El<'_> {
     }
 }
 
+impl Eq for El<'_> {}
+
+impl std::hash::Hash for El<'_> {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        std::ptr::hash(self.t, h);
+        self.i.hash(h);
+    }
+}
+
 impl<'t> El<'t> {
     pub fn new(t: &'t Tree, i: usize) -> Self {
         assert!(t.is_element(i));

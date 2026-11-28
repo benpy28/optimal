@@ -17,6 +17,23 @@
 //! can't be found among an element's ancestors, it can't be found among the
 //! ancestors of that element's descendants either.
 //!
+//! Within one call to [`matches`] or [`query_all`], or one
+//! [`MatchSession`], results that don't
+//! depend on the subject are cached, so that matching every element of a
+//! tree costs about its size, not the size times the depth or the length
+//! of the sibling runs:
+//! - the outcome of searching an element's ancestors (descendant
+//!   combinator) or earlier siblings (subsequent-sibling combinator) for
+//!   the rest of a selector, for each part of each selector;
+//! - each element's index among its siblings, overall and among those of
+//!   its type, and the length of both runs (`:nth-*()`, `:*-of-type`);
+//! - for each `of S` argument, each sibling's index among the siblings
+//!   that match `S`.
+//!
+//! Matching `:has()` is not cached yet: an element whose subtree is
+//! searched for each of its ancestors costs the depth of the tree each
+//! time.
+//!
 //! Not matched yet, because the DOM has no shadow trees: `:host`,
 //! `:host()`, `:host-context()`, `:has-slotted`, `::slotted()` and
 //! `::part()` never match. A selector whose subject is a pseudo-element
@@ -25,15 +42,20 @@
 
 use crate::ast::*;
 use crate::lang::lang_matches;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::hash::Hash;
 
 /// An element of the tree being matched: a cheap handle (an index, or a
-/// reference), compared with `==` for identity.
+/// reference), compared with `==` and hashed for identity. The tree must
+/// not change during a call to [`matches`] or [`query_all`], or a
+/// [`MatchSession`].
 ///
 /// Names and values are bytes (UTF-8, or WTF-8 for a DOM that can hold lone
 /// surrogates): every comparison Selectors makes is on code points, and
 /// these encodings keep code point boundaries, so comparing bytes gives the
 /// same answers.
-pub trait Element: Clone + PartialEq {
+pub trait Element: Clone + Eq + Hash {
     /// The parent, if it is an element.
     fn parent_element(&self) -> Option<Self>;
     /// Whether the parent is a document (for `:root`).
@@ -149,13 +171,10 @@ impl<E> Default for MatchContext<'_, E> {
 }
 
 /// "Match a selector against an element" (17.2): whether any selector in
-/// `list` matches `element`.
+/// `list` matches `element`. To match many elements, a [`MatchSession`]
+/// shares the work between them.
 pub fn matches<E: Element>(list: &SelectorList, element: &E, cx: &MatchContext<'_, E>) -> bool {
-    Matcher {
-        cx,
-        nesting: cx.nesting,
-    }
-    .list(list, &Node::El(element.clone()))
+    MatchSession::new(cx).matches(list, element)
 }
 
 /// "Match a selector against a tree" (17.4) for a scoped selector, as the
@@ -163,24 +182,51 @@ pub fn matches<E: Element>(list: &SelectorList, element: &E, cx: &MatchContext<'
 /// scoping root and match `list`, in tree order. The scope must be an element
 /// or a virtual root.
 pub fn query_all<E: Element>(list: &SelectorList, cx: &MatchContext<'_, E>) -> Vec<E> {
-    let mut out = Vec::new();
-    let m = Matcher {
-        cx,
-        nesting: cx.nesting,
-    };
+    let session = MatchSession::new(cx);
     let (first, stop) = match &cx.scope {
         Scope::Element(e) => (e.first_element_child(), Some(e.clone())),
         Scope::Root { first_child } => (first_child.clone(), None),
         Scope::None => panic!("query_all needs a scoping root"),
     };
+    let mut out = Vec::new();
     let mut next = first;
     while let Some(e) = next {
-        if m.list(list, &Node::El(e.clone())) {
+        if session.matches(list, &e) {
             out.push(e.clone());
         }
         next = following_in_subtree(&e, stop.as_ref());
     }
     out
+}
+
+/// Matching many elements in one context, with the caches described in
+/// the module documentation shared between them, so that matching a whole
+/// tree costs about its size. The selector lists are borrowed for the
+/// session's life (the caches know them by address), and the tree must not
+/// change during it.
+pub struct MatchSession<'s, E> {
+    cx: &'s MatchContext<'s, E>,
+    caches: Caches<E>,
+}
+
+impl<'s, E: Element> MatchSession<'s, E> {
+    /// A session with empty caches.
+    pub fn new(cx: &'s MatchContext<'s, E>) -> Self {
+        MatchSession {
+            cx,
+            caches: Caches::default(),
+        }
+    }
+
+    /// Whether any selector in `list` matches `element`, as [`matches`].
+    pub fn matches(&self, list: &'s SelectorList, element: &E) -> bool {
+        Matcher {
+            cx: self.cx,
+            nesting: self.cx.nesting,
+            caches: &self.caches,
+        }
+        .list(list, &Node::El(element.clone()))
+    }
 }
 
 /// The element after `e` in tree order, staying inside `root`'s subtree
@@ -235,6 +281,64 @@ struct Matcher<'c, E> {
     /// The rules `&` stands for at this point (a suffix of cx.nesting is
     /// dropped as `&` is followed outwards).
     nesting: &'c [&'c SelectorList],
+    caches: &'c Caches<E>,
+}
+
+/// Where a selector sits during one call: its address (the selectors are
+/// borrowed for the whole call, so no two share one) and how many nesting
+/// rules `&` can still stand for, which is all its matching depends on
+/// besides the element.
+type SelKey = (usize, usize);
+
+/// An element's 1-based index among the siblings that match an `of S`
+/// argument, and how many match; `None` if it doesn't match.
+type OfIndex = Option<(u32, u32)>;
+
+/// An element's place among its siblings: 1-based indices from the start,
+/// and the run lengths, overall and among the siblings of its type.
+#[derive(Clone, Copy, Debug)]
+struct Position {
+    index: u32,
+    count: u32,
+    type_index: u32,
+    type_count: u32,
+}
+
+/// The caches of one call (see the module documentation). Each holds
+/// results that depend only on the tree and the selector, never on the
+/// subject being matched.
+struct Caches<E> {
+    /// (selector, unit i, element) -> the result of the search that starts
+    /// at the element where unit i matched and looks through its ancestors
+    /// or earlier siblings (the combinator left of unit i) for the rest.
+    search: RefCell<HashMap<(SelKey, usize, E), Res>>,
+    position: RefCell<HashMap<E, Position>>,
+    /// (`of S` list, element) -> its index from the start and the count
+    /// among the siblings matching `S`, or `None` if it doesn't match.
+    of: RefCell<HashMap<(SelKey, E), OfIndex>>,
+}
+
+impl<E> Default for Caches<E> {
+    fn default() -> Self {
+        Caches {
+            search: RefCell::default(),
+            position: RefCell::default(),
+            of: RefCell::default(),
+        }
+    }
+}
+
+/// The elements in `e`'s run of siblings, in tree order.
+fn sibling_run<E: Element>(e: &E) -> Vec<E> {
+    let mut first = e.clone();
+    while let Some(p) = first.prev_sibling_element() {
+        first = p;
+    }
+    let mut run = vec![first];
+    while let Some(n) = run.last().and_then(E::next_sibling_element) {
+        run.push(n);
+    }
+    run
 }
 
 /// Selectors white space (selectors-4 section 3, "Characters and case
@@ -399,47 +503,96 @@ impl<'c, E: Element> Matcher<'c, E> {
             Some(false) => return Res::Local,
             None => {}
         }
+        // Searches that walk (descendant and subsequent-sibling
+        // combinators) are cached by the element they start from, outside
+        // :has(), where the leftmost unit also depends on the anchor.
+        let key = (std::ptr::from_ref(sel) as usize, self.nesting.len());
+        let cached = |i: usize| {
+            anchor.is_none()
+                && matches!(
+                    comb(i),
+                    Combinator::Descendant | Combinator::SubsequentSibling
+                )
+        };
+        let lookup = |i: usize, n: &Node<E>| match n {
+            Node::El(e) if cached(i) => self
+                .caches
+                .search
+                .borrow()
+                .get(&(key, i, e.clone()))
+                .copied(),
+            _ => None,
+        };
+        if let Some(r) = lookup(top, node) {
+            return r;
+        }
         // stack[k] = (index of a unit that matched, the element it is now
-        // searching from for the unit to its left).
-        let mut stack: Vec<(usize, Node<E>)> = vec![(top, node.clone())];
+        // searching from for the unit to its left, the elements it has
+        // searched from, all of which share its result).
+        let mut stack: Vec<(usize, Node<E>, Vec<E>)> = vec![(top, node.clone(), Vec::new())];
         // The result handed back to the frame on top of the stack.
         let mut back: Option<Res> = None;
-        while let Some((i, cur)) = stack.last_mut() {
-            let c = comb(*i);
+        while let Some((i, cur, from)) = stack.last_mut() {
+            let i = *i;
+            let c = comb(i);
             if let Some(r) = back.take() {
                 let out = match (r, c) {
                     (Res::Matched | Res::Global, _) | (_, Combinator::NextSibling) => Some(r),
                     (_, Combinator::Child) => Some(Res::RestartDescendant),
                     (Res::RestartDescendant, Combinator::SubsequentSibling) => Some(r),
-                    _ => None,
+                    // The search goes on from `cur`, as a search started
+                    // there would.
+                    _ => lookup(i, cur),
                 };
                 if let Some(out) = out {
+                    self.finish(key, i, from, cached(i), out);
                     stack.pop();
                     back = Some(out);
                     continue;
                 }
+            }
+            if cached(i)
+                && let Node::El(e) = &*cur
+            {
+                from.push(e.clone());
             }
             let next = match c {
                 Combinator::Descendant | Combinator::Child => self.parent(cur),
                 Combinator::NextSibling | Combinator::SubsequentSibling => Self::prev_sibling(cur),
             };
             let Some(next) = next else {
-                back = Some(match c {
+                let out = match c {
                     Combinator::Descendant | Combinator::Child => Res::Global,
                     _ => Res::RestartDescendant,
-                });
+                };
+                self.finish(key, i, from, cached(i), out);
+                back = Some(out);
                 stack.pop();
                 continue;
             };
             *cur = next.clone();
-            let j = *i - 1;
+            let j = i - 1;
             match at(j, &next) {
                 Some(true) => back = Some(Res::Matched),
                 Some(false) => back = Some(Res::Local),
-                None => stack.push((j, next)),
+                None => match lookup(j, &next) {
+                    Some(r) => back = Some(r),
+                    None => stack.push((j, next, Vec::new())),
+                },
             }
         }
         back.expect("the stack empties only with a result")
+    }
+
+    /// Record a finished search's result for every element it searched
+    /// from.
+    fn finish(&self, key: SelKey, i: usize, from: &mut Vec<E>, cached: bool, r: Res) {
+        if cached {
+            let mut search = self.caches.search.borrow_mut();
+            for e in from.drain(..) {
+                search.insert((key, i, e), r);
+            }
+        }
     }
 
     /// A `<complex-selector-unit>`: the compound selector, and no
@@ -472,6 +625,7 @@ impl<'c, E: Element> Matcher<'c, E> {
                 Matcher {
                     cx: self.cx,
                     nesting: outer,
+                    caches: self.caches,
                 }
                 .list(last, &Node::Root)
             }
@@ -516,6 +670,7 @@ impl<'c, E: Element> Matcher<'c, E> {
                 Some((last, outer)) => Matcher {
                     cx: self.cx,
                     nesting: outer,
+                    caches: self.caches,
                 }
                 .list(last, &Node::El(e.clone())),
             },
@@ -613,29 +768,28 @@ impl<'c, E: Element> Matcher<'c, E> {
                 K::OnlyChild => {
                     e.prev_sibling_element().is_none() && e.next_sibling_element().is_none()
                 }
-                K::FirstOfType => Self::count_of_type(e, E::prev_sibling_element) == 0,
-                K::LastOfType => Self::count_of_type(e, E::next_sibling_element) == 0,
-                K::OnlyOfType => {
-                    Self::count_of_type(e, E::prev_sibling_element) == 0
-                        && Self::count_of_type(e, E::next_sibling_element) == 0
+                K::FirstOfType => self.position(e).type_index == 1,
+                K::LastOfType => {
+                    let p = self.position(e);
+                    p.type_index == p.type_count
                 }
+                K::OnlyOfType => self.position(e).type_count == 1,
                 K::Host | K::HasSlotted => false,
                 _ => e.state(*k),
             },
             PseudoClass::Is(f) | PseudoClass::Where(f) => self.forgiving(f, &Node::El(e.clone())),
             PseudoClass::Not(list) => !self.list(list, &Node::El(e.clone())),
             PseudoClass::Has(rel) => self.has(rel, &Node::El(e.clone())),
-            PseudoClass::NthChild(anb, of) => {
-                self.nth(*anb, of.as_ref(), e, E::prev_sibling_element)
-            }
-            PseudoClass::NthLastChild(anb, of) => {
-                self.nth(*anb, of.as_ref(), e, E::next_sibling_element)
-            }
-            PseudoClass::NthOfType(anb) => {
-                anb.matches(Self::count_of_type(e, E::prev_sibling_element).saturating_add(1))
-            }
+            PseudoClass::NthChild(anb, of) => self
+                .nth(of.as_ref(), e)
+                .is_some_and(|(index, _)| anb.matches(index)),
+            PseudoClass::NthLastChild(anb, of) => self
+                .nth(of.as_ref(), e)
+                .is_some_and(|(index, count)| anb.matches(count - index + 1)),
+            PseudoClass::NthOfType(anb) => anb.matches(self.position(e).type_index),
             PseudoClass::NthLastOfType(anb) => {
-                anb.matches(Self::count_of_type(e, E::next_sibling_element).saturating_add(1))
+                let p = self.position(e);
+                anb.matches(p.type_count - p.type_index + 1)
             }
             PseudoClass::Lang(ranges) => {
                 e.with_language(|tag| ranges.iter().any(|r| lang_matches(tag, r.as_bytes())))
@@ -656,41 +810,64 @@ impl<'c, E: Element> Matcher<'c, E> {
         }
     }
 
-    /// How many siblings in direction `step` have `e`'s type.
-    fn count_of_type(e: &E, step: fn(&E) -> Option<E>) -> u32 {
-        let mut n = 0u32;
-        let mut cur = step(e);
-        while let Some(s) = cur {
-            if s.local_name() == e.local_name() && s.namespace() == e.namespace() {
-                n = n.saturating_add(1);
-            }
-            cur = step(&s);
+    /// `e`'s place among its siblings. The first query in a run of
+    /// siblings fills in the whole run.
+    fn position(&self, e: &E) -> Position {
+        if let Some(p) = self.caches.position.borrow().get(e) {
+            return *p;
         }
-        n
+        let run = sibling_run(e);
+        let count = u32::try_from(run.len()).unwrap_or(u32::MAX);
+        let mut types: HashMap<(&[u8], &[u8]), u32> = HashMap::new();
+        let mut type_index = Vec::with_capacity(run.len());
+        for s in &run {
+            let n = types.entry((s.namespace(), s.local_name())).or_insert(0);
+            *n = n.saturating_add(1);
+            type_index.push(*n);
+        }
+        let mut position = self.caches.position.borrow_mut();
+        for (k, (s, &t)) in run.iter().zip(&type_index).enumerate() {
+            let p = Position {
+                index: u32::try_from(k + 1).unwrap_or(u32::MAX),
+                count,
+                type_index: t,
+                type_count: types[&(s.namespace(), s.local_name())],
+            };
+            position.insert(s.clone(), p);
+        }
+        position[e]
     }
 
-    /// `:nth-child()` and `:nth-last-child()` (13.3.1, 13.3.2): the index
-    /// counts the siblings in direction `step` that match `of`, and with
-    /// `of` the element must match it too.
-    fn nth(
-        &self,
-        anb: optimal_css::AnB,
-        of: Option<&SelectorList>,
-        e: &E,
-        step: fn(&E) -> Option<E>,
-    ) -> bool {
-        if of.is_some_and(|of| !self.list(of, &Node::El(e.clone()))) {
-            return false;
+    /// For `:nth-child()` and `:nth-last-child()` (13.3.1, 13.3.2): `e`'s
+    /// 1-based index from the start among its siblings that match `of`
+    /// (all of them without `of`), and how many those are; `None` if `e`
+    /// doesn't match `of`.
+    fn nth(&self, of: Option<&SelectorList>, e: &E) -> OfIndex {
+        let Some(of) = of else {
+            let p = self.position(e);
+            return Some((p.index, p.count));
+        };
+        let key = (std::ptr::from_ref(of) as usize, self.nesting.len());
+        if let Some(r) = self.caches.of.borrow().get(&(key, e.clone())) {
+            return *r;
         }
-        let mut n = 1u32;
-        let mut cur = step(e);
-        while let Some(s) = cur {
-            if of.is_none_or(|of| self.list(of, &Node::El(s.clone()))) {
-                n = n.saturating_add(1);
-            }
-            cur = step(&s);
+        let run = sibling_run(e);
+        // Matching may fill other caches, so no borrow is held across it.
+        let hits: Vec<bool> = run
+            .iter()
+            .map(|s| self.list(of, &Node::El(s.clone())))
+            .collect();
+        let count = u32::try_from(hits.iter().filter(|&&h| h).count()).unwrap_or(u32::MAX);
+        let mut cache = self.caches.of.borrow_mut();
+        let mut index = 0u32;
+        for (s, h) in run.into_iter().zip(hits) {
+            let r = h.then(|| {
+                index = index.saturating_add(1);
+                (index, count)
+            });
+            cache.insert((key, s), r);
         }
-        anb.matches(n)
+        cache[&(key, e.clone())]
     }
 
     /// `:has()` (4.5): whether any relative selector, anchored at `anchor`,

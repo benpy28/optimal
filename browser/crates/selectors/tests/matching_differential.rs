@@ -1,14 +1,17 @@
 //! Matching checked against the literal model (`tests/common/match_reference.rs`)
 //! on random small trees and random selectors, for every element, with each
 //! kind of scoping root, in and out of quirks mode and nesting; and
-//! `query_all` against filtering the subtree with `matches`.
+//! `query_all` against filtering the subtree with `matches`. Each element
+//! is matched alone (empty caches), in a shared `MatchSession` in reverse
+//! tree order and in a rotated order (caches filled from elsewhere first),
+//! and through `query_all` (caches filled in tree order).
 
 mod common;
 
 use common::match_reference::{Model, RefScope};
 use common::tree::{El, HTML, Kind, Tree};
 use optimal_selectors::{
-    MatchContext, Namespaces, Scope, SelectorList, matches, parse_selector, query_all,
+    MatchContext, MatchSession, Namespaces, Scope, SelectorList, matches, parse_selector, query_all,
 };
 use proptest::prelude::*;
 
@@ -219,6 +222,7 @@ fn check(
     scope: RefScope,
     quirks: bool,
     nesting: &[&SelectorList],
+    rotate: usize,
 ) -> Result<(), TestCaseError> {
     let cx_scope = match scope {
         RefScope::None => Scope::None,
@@ -238,10 +242,36 @@ fn check(
         quirks,
         nesting: nesting.iter().map(|l| (*l).clone()).collect(),
     };
-    for n in elements(t) {
+    let els = elements(t);
+    let want: Vec<bool> = els.iter().map(|&n| model.list(list, n)).collect();
+    for (&n, &theirs) in els.iter().zip(&want) {
         let ours = matches(list, &El::new(t, n), &cx);
-        let theirs = model.list(list, n);
         prop_assert_eq!(ours, theirs, "element {} of {:?}", n, t);
+    }
+    let mut order: Vec<usize> = (0..els.len()).rev().collect();
+    let session = MatchSession::new(&cx);
+    for &k in &order {
+        let ours = session.matches(list, &El::new(t, els[k]));
+        prop_assert_eq!(
+            ours,
+            want[k],
+            "element {} of {:?}, reverse order",
+            els[k],
+            t
+        );
+    }
+    order.reverse();
+    order.rotate_left(rotate % els.len());
+    let session = MatchSession::new(&cx);
+    for &k in &order {
+        let ours = session.matches(list, &El::new(t, els[k]));
+        prop_assert_eq!(
+            ours,
+            want[k],
+            "element {} of {:?}, rotated order",
+            els[k],
+            t
+        );
     }
     // query_all is matches() over the scope's subtree, in tree order.
     let root = match scope {
@@ -270,12 +300,12 @@ proptest! {
         let (t, fragment) = build(&s);
         let els = elements(&t);
         let some = els[pick % els.len()];
-        check(&t, &list, RefScope::None, quirks, &[])?;
-        check(&t, &list, RefScope::Element(some), quirks, &[])?;
-        check(&t, &list, RefScope::Root(0), quirks, &[])?;
-        check(&t, &list, RefScope::Root(fragment), quirks, &[])?;
+        check(&t, &list, RefScope::None, quirks, &[], pick)?;
+        check(&t, &list, RefScope::Element(some), quirks, &[], pick)?;
+        check(&t, &list, RefScope::Root(0), quirks, &[], pick)?;
+        check(&t, &list, RefScope::Root(fragment), quirks, &[], pick)?;
         if let Ok(p) = parse_selector(&parent, &ns) {
-            check(&t, &list, RefScope::Element(some), quirks, &[&p])?;
+            check(&t, &list, RefScope::Element(some), quirks, &[&p], pick)?;
         }
     }
 }

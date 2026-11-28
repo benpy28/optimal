@@ -566,3 +566,46 @@ fn deepest_accepted_nesting_matches_on_a_small_stack() {
         .join()
         .unwrap();
 }
+
+/// Searches inside :has() depend on the anchor, so a shared session must
+/// not reuse one anchor's answer for another. Siblings d1, p, d2, q under
+/// the root: `:has(~ p ~ q)` asks for a p after the anchor and a q after
+/// that p (4.5, relative selectors anchored at the element). For d1, p and
+/// then q follow: match. For d2, only q follows: no p after d2, no match.
+/// Matching d1 first (tree order) searches q's earlier siblings for a p
+/// that follows d1 and finds one; d2 must not take that answer.
+#[test]
+fn has_searches_depend_on_the_anchor() {
+    use optimal_selectors::MatchSession;
+    let mut t = Tree::new(true);
+    let r = t.element(HTML, "html", &[("id", "r")]);
+    t.append(0, r);
+    for (name, id) in [("div", "d1"), ("p", "p"), ("div", "d2"), ("q", "q")] {
+        let e = t.element(HTML, name, &[("id", id)]);
+        t.append(r, e);
+    }
+    let list = sel("div:has(~ p ~ q)");
+    let cx = MatchContext {
+        scope: Scope::Root {
+            first_child: Some(El::new(&t, r)),
+        },
+        ..MatchContext::new()
+    };
+    let got: Vec<_> = query_all(&list, &cx)
+        .into_iter()
+        .map(|e| t.attr(e.i, "", "id").unwrap())
+        .collect();
+    assert_eq!(got, ["d1"]);
+    let session = MatchSession::new(&cx);
+    let d = |id: &str| {
+        let i = t
+            .subtree(0)
+            .into_iter()
+            .find(|&n| t.attr(n, "", "id") == Some(id))
+            .unwrap();
+        El::new(&t, i)
+    };
+    assert!(session.matches(&list, &d("d1")));
+    assert!(!session.matches(&list, &d("d2")));
+    assert_eq!(ids_plain(&t, "div:has(~ p ~ q)"), ["d1"]);
+}
