@@ -17,6 +17,7 @@ fn fmt(blocks: u64) -> Filesystem<MemDevice> {
         kdf: KdfParams::INSECURE_FAST_FOR_TESTS,
         quarantine_min_ns: 0,
         meta_chunk_blocks: 0,
+        intent_log_blocks: None,
     };
     Filesystem::format(
         MemDevice::new(blocks),

@@ -46,8 +46,9 @@ pub use device::FileDevice;
 pub use device::{BLOCK_SIZE, BlockDevice, IoError, MemDevice};
 pub use error::{Error, Result};
 pub use fs::{
-    Attr, Clock, DirEntry, FileKind, Filesystem, FormatOptions, MIN_BLOCKS, MountOptions, ROOT_INO,
-    SetAttr, StatFs, ZeroClock, auto_chunk_blocks,
+    Attr, Clock, DirEntry, FileKind, Filesystem, FormatOptions, LOG_MAX_BLOCKS, LOG_MIN_BLOCKS,
+    LogStats, MIN_BLOCKS, MountOptions, ROOT_INO, SetAttr, StatFs, ZeroClock, auto_chunk_blocks,
+    auto_log_blocks,
 };
 pub use io::IoStats;
 pub use recover::RecoveryStats;

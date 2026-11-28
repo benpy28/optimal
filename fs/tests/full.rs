@@ -9,6 +9,7 @@ fn format(blocks: u64, enc: bool) -> Filesystem<CrashDevice> {
         kdf: KdfParams::INSECURE_FAST_FOR_TESTS,
         quarantine_min_ns: 0,
         meta_chunk_blocks: 0,
+        intent_log_blocks: None,
     };
     Filesystem::format(
         CrashDevice::new(blocks, 1),
@@ -164,6 +165,7 @@ fn format_refuses_volumes_below_the_minimum() {
         kdf: KdfParams::INSECURE_FAST_FOR_TESTS,
         quarantine_min_ns: 0,
         meta_chunk_blocks: 0,
+        intent_log_blocks: None,
     };
     let r = Filesystem::format(
         CrashDevice::new(MIN_BLOCKS - 1, 1),

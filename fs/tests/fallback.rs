@@ -22,6 +22,7 @@ fn previous_commit_survives_remount_and_reuse() {
         kdf: KdfParams::INSECURE_FAST_FOR_TESTS,
         quarantine_min_ns: 0,
         meta_chunk_blocks: 0,
+        intent_log_blocks: None,
     };
     let mut fs = Filesystem::format(
         CrashDevice::new(blocks, 1),
@@ -94,6 +95,7 @@ fn first_commit_after_fallback_outranks_the_skipped_commit() {
             kdf: KdfParams::INSECURE_FAST_FOR_TESTS,
             quarantine_min_ns: 0,
             meta_chunk_blocks: 0,
+            intent_log_blocks: None,
         };
         let mut fs = Filesystem::format(
             CrashDevice::new(blocks, 1),

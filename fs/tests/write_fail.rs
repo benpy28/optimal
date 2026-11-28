@@ -240,7 +240,7 @@ fn power_cut_while_a_failed_commit_is_retried() {
                     short(&rf.ops[i])
                 );
                 let mut mh = mount(img);
-                mh.model = cands[hit.unwrap()].clone();
+                mh.set_model(cands[hit.unwrap()].clone());
                 let g = mh.fs().generation();
                 let m = mh.model.clone();
                 mh.committed.insert(g, m);
@@ -295,9 +295,9 @@ fn dead_device_degrades_then_recovers() {
         fs.write(b, 0, &big).unwrap();
         assert!(!fs.degraded(), "enc {enc}: one failed early flush degrades");
         // Two more failed early flushes (three in all) degrade the volume.
-        fs.write(b, big.len() as u64, &big[..1 << 20]).unwrap();
+        fs.write(b, big.len() as u64, &big[..1 << 19]).unwrap();
         assert!(!fs.degraded());
-        fs.write(b, big.len() as u64 + (1 << 20), &big[..1 << 20])
+        fs.write(b, big.len() as u64 + (1 << 19), &big[..1 << 19])
             .unwrap();
         assert!(fs.degraded(), "enc {enc}: three failed early flushes");
         assert_eq!(fs.write(b, 0, b"x"), Err(Error::DeviceFailing));
@@ -311,8 +311,8 @@ fn dead_device_degrades_then_recovers() {
         assert_eq!(fs.write(a, 0, b"x"), Err(Error::DeviceFailing));
         // Reads see the transaction, which is still in memory.
         let mut want = big.clone();
-        want.extend_from_slice(&big[..1 << 20]);
-        want.extend_from_slice(&big[..1 << 20]);
+        want.extend_from_slice(&big[..1 << 19]);
+        want.extend_from_slice(&big[..1 << 19]);
         let mut buf = vec![0u8; want.len()];
         assert_eq!(fs.read(b, 0, &mut buf).unwrap(), want.len());
         assert!(buf == want, "enc {enc}: uncommitted data");

@@ -401,6 +401,7 @@ fn small_fs(chunk: u32) -> crate::fs::Filesystem<MemDevice> {
         kdf: crate::KdfParams::INSECURE_FAST_FOR_TESTS,
         quarantine_min_ns: 0,
         meta_chunk_blocks: chunk,
+        intent_log_blocks: None,
     };
     let mut rng = Rng::new(21);
     crate::fs::Filesystem::format(

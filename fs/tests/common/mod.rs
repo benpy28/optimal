@@ -377,6 +377,8 @@ pub enum Op {
     Rollback(u64),
     /// Unmount without committing, then mount again.
     Remount,
+    /// `fsync` of an inode (intent log, or a full commit).
+    Fsync(u64),
 }
 
 pub fn content(seed: u64, len: u64) -> Vec<u8> {
@@ -612,6 +614,7 @@ pub fn fmt_opts(enc: bool) -> FormatOptions {
         kdf: KdfParams::INSECURE_FAST_FOR_TESTS,
         quarantine_min_ns: 0,
         meta_chunk_blocks: 0,
+        intent_log_blocks: None,
     }
 }
 
@@ -640,6 +643,19 @@ pub struct Harness {
     /// `apply` returns checksum failures ([`Error::Corrupt`]) like I/O
     /// errors instead of failing the comparison (injected damage).
     pub pass_faults: bool,
+    /// What intent-log replay would rebuild if the log held every record
+    /// so far: the last commit, every namespace operation since, and each
+    /// file's data as of its last logged state (writes alone change
+    /// nothing here).
+    pub shadow: Model,
+    /// The state a power cut now must recover: the last commit, or
+    /// `shadow` as of the last intent-log batch written.
+    pub durable: Model,
+    /// Files renamed or linked since the last batch (their state rides
+    /// along with the next one).
+    pub force: BTreeSet<u64>,
+    /// The last op succeeded on the filesystem and changed the model.
+    last_ok: bool,
 }
 
 /// Metadata chunk size for a run: `OFS_CHUNK` if set, otherwise spread
@@ -673,7 +689,7 @@ impl Harness {
         committed.insert(fs.generation(), model.clone());
         Ok(Harness {
             fs: Some(fs),
-            model,
+            model: model.clone(),
             committed,
             enc,
             seed,
@@ -681,6 +697,10 @@ impl Harness {
             ops_done: 0,
             cache_nodes: 512,
             pass_faults: false,
+            shadow: model.clone(),
+            durable: model,
+            force: BTreeSet::new(),
+            last_ok: false,
         })
     }
 
@@ -710,7 +730,6 @@ impl Harness {
         committed.insert(fs.generation(), model.clone());
         Harness {
             fs: Some(fs),
-            model,
             committed,
             enc,
             seed,
@@ -718,7 +737,21 @@ impl Harness {
             ops_done: 0,
             cache_nodes: 512,
             pass_faults: false,
+            shadow: model.clone(),
+            durable: model.clone(),
+            force: BTreeSet::new(),
+            last_ok: false,
+            model,
         }
+    }
+
+    /// Replaces the model (and the intent-log states derived from it)
+    /// with `m`, the state the volume is known to hold now.
+    pub fn set_model(&mut self, m: Model) {
+        self.shadow = m.clone();
+        self.durable = m.clone();
+        self.force.clear();
+        self.model = m;
     }
 
     pub fn fs(&mut self) -> &mut Filesystem<CrashDevice> {
@@ -756,6 +789,90 @@ impl Harness {
     /// Applies `op`. Panics on any mismatch between the filesystem and the model.
     /// Returns Err only for I/O errors (power cut or injected faults).
     pub fn apply(&mut self, op: &Op) -> Result<()> {
+        let before = self.fs().generation();
+        let batches = self.fs().intent_log_stats().batches;
+        let pre = self.model.live.clone();
+        self.last_ok = false;
+        self.apply_inner(op)?;
+        let fs = self.fs.as_ref().unwrap();
+        let (after, wrote) = (fs.generation(), fs.intent_log_stats().batches > batches);
+        if std::env::var("OFS_DEBUG").is_ok() {
+            eprintln!(
+                "track {} last_ok {} gen {before}->{after} wrote {wrote}",
+                short(op),
+                self.last_ok
+            );
+        }
+        match op {
+            Op::Write(..) | Op::Commit | Op::Snapshot | Op::SnapDelete(_) | Op::Rollback(_) => {}
+            Op::Remount => return Ok(()),
+            Op::Fsync(ino) => {
+                if wrote {
+                    let mut set = core::mem::take(&mut self.force);
+                    set.insert(*ino);
+                    for f in set {
+                        if let Some(n) = self.model.live.nodes.get(&f)
+                            && n.kind == FileKind::File
+                        {
+                            let data = n.data.clone();
+                            self.shadow.live.nodes.get_mut(&f).unwrap().data = data;
+                        }
+                    }
+                    self.durable = self.shadow.clone();
+                }
+            }
+            _ if self.last_ok => {
+                // The same namespace operation on the shadow (it has the
+                // same namespace, so it succeeds there too).
+                let mut sh = self.shadow.live.clone();
+                let r = match op {
+                    Op::Create(d, n, p) => sh.create(*d, n, FileKind::File, *p).map(|_| ()),
+                    Op::Mkdir(d, n, p) => sh.create(*d, n, FileKind::Dir, *p).map(|_| ()),
+                    Op::Symlink(d, n, t) => sh.symlink(*d, n, t).map(|_| ()),
+                    Op::Link(i, d, n) => {
+                        self.force.insert(*i);
+                        sh.link(*i, *d, n)
+                    }
+                    Op::Unlink(d, n) => sh.unlink(*d, n),
+                    Op::Rmdir(d, n) => sh.rmdir(*d, n),
+                    Op::Rename(a, b, c, d) => {
+                        if let Ok(i) = self.model.live.lookup(*c, d)
+                            && self.model.live.nodes[&i].kind == FileKind::File
+                        {
+                            self.force.insert(i);
+                        }
+                        sh.rename(*a, b, *c, d)
+                    }
+                    Op::Truncate(i, sz) => sh.truncate(*i, *sz),
+                    Op::SetAttr(i, a) => sh.setattr(*i, a),
+                    _ => Ok(()),
+                };
+                assert!(
+                    r.is_ok(),
+                    "seed {:#x}: shadow refused {op:?}: {r:?}",
+                    self.seed
+                );
+                self.shadow.live = sh;
+                assert_eq!(
+                    self.shadow.live.nodes.keys().collect::<Vec<_>>(),
+                    self.model.live.nodes.keys().collect::<Vec<_>>(),
+                    "shadow namespace diverged"
+                );
+            }
+            _ => {
+                let _ = pre;
+            }
+        }
+        if after != before {
+            // A commit (maybe inside the op): the log starts again.
+            self.durable = self.committed.values().next_back().unwrap().clone();
+            self.shadow = self.model.clone();
+            self.force.clear();
+        }
+        Ok(())
+    }
+
+    fn apply_inner(&mut self, op: &Op) -> Result<()> {
         self.ops_done += 1;
         if std::env::var("OFS_DEBUG").is_ok() {
             eprintln!("start op #{} {}", self.ops_done, short(op));
@@ -795,6 +912,7 @@ impl Harness {
                     cmp!(fr, mr);
                     if mr.is_ok() {
                         self.model.live = m;
+                        self.last_ok = true;
                     }
                 }
             }
@@ -806,6 +924,7 @@ impl Harness {
                     cmp!(fr, mr);
                     if mr.is_ok() {
                         self.model.live = m;
+                        self.last_ok = true;
                     }
                 }
             }
@@ -817,6 +936,7 @@ impl Harness {
                     cmp!(fr, mr);
                     if mr.is_ok() {
                         self.model.live = m;
+                        self.last_ok = true;
                     }
                 }
             }
@@ -828,6 +948,7 @@ impl Harness {
                     cmp!(fr, mr);
                     if mr.is_ok() {
                         self.model.live = m;
+                        self.last_ok = true;
                     }
                 }
             }
@@ -837,6 +958,7 @@ impl Harness {
                 cmp!(self.fs().unlink(d, &n), mr);
                 if mr.is_ok() {
                     self.model.live = m;
+                    self.last_ok = true;
                 }
             }
             Op::Rmdir(d, n) => {
@@ -845,6 +967,7 @@ impl Harness {
                 cmp!(self.fs().rmdir(d, &n), mr);
                 if mr.is_ok() {
                     self.model.live = m;
+                    self.last_ok = true;
                 }
             }
             Op::Rename(a, b, c, d) => {
@@ -853,6 +976,7 @@ impl Harness {
                 cmp!(self.fs().rename(a, &b, c, &d), mr);
                 if mr.is_ok() {
                     self.model.live = m;
+                    self.last_ok = true;
                 }
             }
             Op::Write(i, off, len, seed) => {
@@ -866,6 +990,7 @@ impl Harness {
                     cmp!(fr, mr);
                     if mr.is_ok() {
                         self.model.live = m;
+                        self.last_ok = true;
                     }
                 }
             }
@@ -875,6 +1000,7 @@ impl Harness {
                 cmp!(self.fs().truncate(i, s), mr);
                 if mr.is_ok() {
                     self.model.live = m;
+                    self.last_ok = true;
                 }
             }
             Op::SetAttr(i, s) => {
@@ -884,7 +1010,20 @@ impl Harness {
                 cmp!(fr, mr);
                 if mr.is_ok() {
                     self.model.live = m;
+                    self.last_ok = true;
                 }
+            }
+            Op::Fsync(ino) => {
+                let mr = if self.model.live.nodes.contains_key(&ino) {
+                    Ok(())
+                } else {
+                    Err(Error::NotFound)
+                };
+                let r = self.fs().fsync(ino);
+                cmp!(r, mr);
+                let st = self.model.clone();
+                self.record(before_gen, &[st]);
+                return Ok(());
             }
             Op::Commit => {
                 let r = self.fs().commit();
@@ -988,8 +1127,16 @@ impl Harness {
                         self.committed.keys().next_back()
                     );
                 }
+                let g = fs.generation();
                 self.fs = Some(fs);
-                self.model = self.last_committed();
+                // Replay rebuilds the last durable state (and commits it
+                // when it replayed anything).
+                self.model = self.durable.clone();
+                self.shadow = self.durable.clone();
+                self.force.clear();
+                if g > *self.committed.keys().next_back().unwrap() {
+                    self.committed.insert(g, self.durable.clone());
+                }
                 return Ok(());
             }
         }

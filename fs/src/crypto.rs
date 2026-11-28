@@ -58,6 +58,8 @@ pub enum BlockKind {
     ChunkLeaf = 8,
     /// Chunk-table interior table.
     ChunkTable = 9,
+    /// Intent-log ring block (sealed on its own: nonce and MAC inside it).
+    Log = 10,
 }
 
 /// Argon2id parameters for turning a passphrase into a key-encryption key.

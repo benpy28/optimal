@@ -16,6 +16,9 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec;
 use alloc::vec::Vec;
 
+mod ilog;
+pub use ilog::{LOG_MAX_BLOCKS, LOG_MIN_BLOCKS, LogStats, auto_log_blocks};
+
 pub const ROOT_INO: u64 = 1;
 pub const NAME_MAX: usize = 255;
 /// Longest symlink target stored (kept inside one tree item).
@@ -279,6 +282,10 @@ pub struct FormatOptions {
     /// size it to the device ([`auto_chunk_blocks`]). Fixed for the life
     /// of the volume.
     pub meta_chunk_blocks: u32,
+    /// Blocks set aside for the fsync intent log: `None` sizes it to the
+    /// device ([`auto_log_blocks`]), `Some(0)` makes none (every `fsync` then
+    /// commits), otherwise [`LOG_MIN_BLOCKS`] to [`LOG_MAX_BLOCKS`].
+    pub intent_log_blocks: Option<u64>,
 }
 
 impl Default for FormatOptions {
@@ -288,6 +295,7 @@ impl Default for FormatOptions {
             kdf: KdfParams::DEFAULT,
             quarantine_min_ns: DEFAULT_QUARANTINE_NS,
             meta_chunk_blocks: 0,
+            intent_log_blocks: None,
         }
     }
 }
@@ -415,6 +423,13 @@ pub struct Filesystem<D: BlockDevice> {
     /// Superblock slots (bit per slot) a write failed on during this
     /// mount; commits write around them (see [`superblock::plan_waves`]).
     pub(crate) dead_slots: u8,
+    /// The fsync intent log ([`ilog`]).
+    ilog: ilog::LogState,
+    /// Clock readings the operation in progress took (for its log record).
+    op_times: Vec<i64>,
+    /// During replay: the readings the replayed operation took.
+    replay_times: Option<VecDeque<i64>>,
+    replay_last: i64,
 }
 
 /// What [`Filesystem::op`] restores when an operation fails part way,
@@ -534,7 +549,28 @@ impl<D: BlockDevice> Filesystem<D> {
                 ));
             }
         };
+        let log_blocks = match opts.intent_log_blocks {
+            None => auto_log_blocks(total),
+            Some(0) => 0,
+            Some(n) if (LOG_MIN_BLOCKS..=LOG_MAX_BLOCKS).contains(&n) && n <= total / 16 => n,
+            Some(_) => {
+                return Err(Error::Invalid(
+                    "intent log size must be 0 or 16 to 16384 blocks, at most 1/16 of the volume",
+                ));
+            }
+        };
+        // The ring sits right after the front superblock slots.
+        let ring = (
+            if log_blocks > 0 {
+                crate::space::SB_RESERVED_FRONT
+            } else {
+                0
+            },
+            log_blocks,
+        );
         let mut header = Header {
+            log_start: ring.0,
+            log_blocks: ring.1,
             uuid,
             total_blocks: total,
             suite: SUITE_PLAIN,
@@ -574,8 +610,12 @@ impl<D: BlockDevice> Filesystem<D> {
         let sealer = Sealer::new(uuid, master.as_ref(), rng);
         let mut space = Space::format(total, header.chunk_shift)?;
         space.quarantine_min_ns = opts.quarantine_min_ns;
+        let mut io = Io::new(dev, sealer);
+        if ring.1 > 0 {
+            space.claim(&mut io, ring.0, ring.1)?;
+        }
         let store = Store {
-            io: Io::new(dev, sealer),
+            io,
             space,
             cache: NodeCache::new(8192),
             latest_snap_gen: 0,
@@ -604,7 +644,7 @@ impl<D: BlockDevice> Filesystem<D> {
             replay_value: 0,
             flags: 0,
             window_gen: 0,
-            log_root: BlockPtr::NULL,
+            log_start: None,
             history: Vec::new(),
         };
         let mut fs = Filesystem {
@@ -643,6 +683,10 @@ impl<D: BlockDevice> Filesystem<D> {
             ops_undone: 0,
             unlogged_rebuilds: 0,
             dead_slots: 0,
+            ilog: ilog::LogState::new(ring.0, ring.1),
+            op_times: Vec::new(),
+            replay_times: None,
+            replay_last: 0,
         };
         let now = fs.clock.now_ns();
         let root = Attr {
@@ -674,11 +718,36 @@ impl<D: BlockDevice> Filesystem<D> {
     /// to skip newer commits, new commits are numbered above all of them
     /// and the first one overwrites every superblock slot.
     pub fn mount(
+        dev: D,
+        opts: &MountOptions,
+        rng: &mut dyn Entropy,
+        clock: Box<dyn Clock>,
+    ) -> Result<Self> {
+        match Self::mount_replaying(dev, opts, rng, clock, None)? {
+            Ok(fs) => Ok(fs),
+            // A batch of the intent log failed to apply: mount again with
+            // only the batches before it (the state after each batch is
+            // one the volume really had).
+            Err((dev, clock, batches)) => {
+                match Self::mount_replaying(dev, opts, rng, clock, Some(batches))? {
+                    Ok(fs) => Ok(fs),
+                    Err(_) => Err(Error::Corrupt("intent log replay failed twice", batches)),
+                }
+            }
+        }
+    }
+
+    /// [`mount`](Self::mount), replaying at most `limit` intent-log
+    /// batches. `Ok(Err(..))`: a batch failed; the device, the clock and
+    /// how many batches applied come back for a second mount.
+    #[allow(clippy::type_complexity)]
+    fn mount_replaying(
         mut dev: D,
         opts: &MountOptions,
         rng: &mut dyn Entropy,
         mut clock: Box<dyn Clock>,
-    ) -> Result<Self> {
+        limit: Option<u64>,
+    ) -> Result<core::result::Result<Self, (D, Box<dyn Clock>, u64)>> {
         let cands = superblock::candidates(&mut dev)?;
         if cands.is_empty() {
             return Err(Error::NoFilesystem);
@@ -765,6 +834,15 @@ impl<D: BlockDevice> Filesystem<D> {
             };
             io.repair_enabled = !opts.read_only;
             let mut body = body;
+            let bad_log = match body.log_start {
+                None => false,
+                Some(s) => from_history || s >= header.log_blocks,
+            };
+            if bad_log {
+                last_err = Error::Corrupt("intent log start", body.generation);
+                dev = Some(io.dev);
+                continue;
+            }
             let (mut space, fs_tree, meta) = match Self::open_commit(&mut io, &header, &mut body) {
                 Ok(x) => x,
                 Err(e) => {
@@ -777,6 +855,7 @@ impl<D: BlockDevice> Filesystem<D> {
             let generation = body.generation;
             let mut header = header;
             header.generation = generation;
+            let log_ring = (header.log_start, header.log_blocks);
             let mut fs = Filesystem {
                 store: Store {
                     io,
@@ -823,6 +902,10 @@ impl<D: BlockDevice> Filesystem<D> {
                 ops_undone: 0,
                 unlogged_rebuilds: 0,
                 dead_slots: 0,
+                ilog: ilog::LogState::new(log_ring.0, log_ring.1),
+                op_times: Vec::new(),
+                replay_times: None,
+                replay_last: 0,
             };
             let check = if clean {
                 Ok(())
@@ -861,7 +944,26 @@ impl<D: BlockDevice> Filesystem<D> {
                             fs.txn_dirty = true;
                         }
                     }
-                    return Ok(fs);
+                    fs.attach_chain(from_history);
+                    // A clean unmount's commit has an empty chain.
+                    if !clean && !from_history {
+                        if let Err(stop) = fs.replay_log(limit) {
+                            let clock = fs.clock_take();
+                            return Ok(Err((fs.into_device(), clock, stop.batches)));
+                        }
+                        if fs.ilog.stats.replayed_batches > 0 && !fs.read_only {
+                            // Make the replayed state a commit, so the chain
+                            // can be dropped. If that fails the volume is
+                            // degraded as after any failed commit, and the
+                            // chain stays until a commit lands.
+                            if let Err(e) = fs.commit()
+                                && fs.poisoned
+                            {
+                                return Err(e);
+                            }
+                        }
+                    }
+                    return Ok(Ok(fs));
                 }
                 Err(e) => {
                     last_err = e;
@@ -1132,7 +1234,7 @@ impl<D: BlockDevice> Filesystem<D> {
         if self.poisoned {
             return Err(Error::Poisoned);
         }
-        if self.read_only {
+        if self.read_only && self.replay_times.is_none() {
             return Err(Error::ReadOnly);
         }
         if self.degraded {
@@ -1315,6 +1417,11 @@ impl<D: BlockDevice> Filesystem<D> {
     /// has changed nothing yet) is refused with [`Error::DeviceFailing`]
     /// rather than an I/O error that would stop the volume.
     fn commit_for_space(&mut self) -> Result<()> {
+        // Replay never commits part way: the chain must stay whole until
+        // the commit after it.
+        if self.replay_times.is_some() {
+            return Err(Error::NoSpace);
+        }
         match self.commit_forced() {
             Err(Error::Io(_) | Error::Corrupt(..)) if !self.poisoned && self.degraded => {
                 Err(Error::DeviceFailing)
@@ -1432,7 +1539,7 @@ impl<D: BlockDevice> Filesystem<D> {
     }
 
     fn new_inode(&mut self, kind: FileKind, perm: u32, parent: u64) -> Attr {
-        let now = self.clock.now_ns();
+        let now = self.op_now();
         let ino = self.next_ino;
         self.next_ino += 1;
         Attr {
@@ -1461,7 +1568,7 @@ impl<D: BlockDevice> Filesystem<D> {
         let a = self.new_inode(kind, perm, dir);
         self.put_inode(&a)?;
         self.add_entry(dir, name, a.ino, kind)?;
-        let now = self.clock.now_ns();
+        let now = self.op_now();
         d.size += 1;
         if kind == FileKind::Dir {
             d.nlink += 1;
@@ -1519,7 +1626,7 @@ impl<D: BlockDevice> Filesystem<D> {
         let mut d = self.check_new_name(dir, name)?;
         self.ensure_space(0, 8, false)?;
         self.add_entry(dir, name, ino, a.kind)?;
-        let now = self.clock.now_ns();
+        let now = self.op_now();
         a.nlink += 1;
         a.ctime_ns = now;
         self.put_inode(&a)?;
@@ -1540,7 +1647,7 @@ impl<D: BlockDevice> Filesystem<D> {
         }
         self.ensure_space(0, 8, true)?;
         self.remove_entry(dir, name)?;
-        let now = self.clock.now_ns();
+        let now = self.op_now();
         let mut d = self.get_inode(dir)?;
         d.size -= 1;
         d.mtime_ns = now;
@@ -1567,7 +1674,7 @@ impl<D: BlockDevice> Filesystem<D> {
         }
         self.ensure_space(0, 8, true)?;
         self.remove_entry(dir, name)?;
-        let now = self.clock.now_ns();
+        let now = self.op_now();
         let mut d = self.get_inode(dir)?;
         d.size -= 1;
         d.nlink -= 1;
@@ -1644,7 +1751,7 @@ impl<D: BlockDevice> Filesystem<D> {
             return Err(Error::TooManyLinks);
         }
         self.ensure_space(0, 16, true)?;
-        let now = self.clock.now_ns();
+        let now = self.op_now();
         // Drop the replaced target.
         if let Some(t) = target {
             let mut ta = self.get_inode(t)?;
@@ -1734,7 +1841,9 @@ impl<D: BlockDevice> Filesystem<D> {
     }
 
     pub fn setattr(&mut self, ino: u64, s: &SetAttr) -> Result<Attr> {
-        self.op(|fs| fs.setattr_inner(ino, s))
+        let a = self.op(|fs| fs.setattr_inner(ino, s))?;
+        self.log_setattr(ino, s);
+        Ok(a)
     }
 
     fn setattr_inner(&mut self, ino: u64, s: &SetAttr) -> Result<Attr> {
@@ -1743,7 +1852,7 @@ impl<D: BlockDevice> Filesystem<D> {
         if s.perm.is_some_and(|p| p > 0o7777) {
             return Err(Error::Invalid("permission bits"));
         }
-        let now = self.clock.now_ns();
+        let now = self.op_now();
         if let Some(size) = s.size {
             if a.kind != FileKind::File {
                 return Err(if a.kind == FileKind::Dir {
@@ -1752,7 +1861,7 @@ impl<D: BlockDevice> Filesystem<D> {
                     Error::Invalid("truncate of a non-file")
                 });
             }
-            self.truncate(ino, size)?;
+            self.truncate_inner(ino, size)?;
             a = self.get_inode(ino)?;
         }
         if let Some(p) = s.perm {
@@ -1778,31 +1887,45 @@ impl<D: BlockDevice> Filesystem<D> {
 
     // Public mutating operations: see `op`.
     pub fn create(&mut self, dir: u64, name: &[u8], perm: u32) -> Result<u64> {
-        self.op(|fs| fs.create_inner(dir, name, perm))
+        let ino = self.op(|fs| fs.create_inner(dir, name, perm))?;
+        self.log_create(FileKind::File, dir, name, perm, ino);
+        Ok(ino)
     }
 
     pub fn mkdir(&mut self, dir: u64, name: &[u8], perm: u32) -> Result<u64> {
-        self.op(|fs| fs.mkdir_inner(dir, name, perm))
+        let ino = self.op(|fs| fs.mkdir_inner(dir, name, perm))?;
+        self.log_create(FileKind::Dir, dir, name, perm, ino);
+        Ok(ino)
     }
 
     pub fn symlink(&mut self, dir: u64, name: &[u8], target: &[u8]) -> Result<u64> {
-        self.op(|fs| fs.symlink_inner(dir, name, target))
+        let ino = self.op(|fs| fs.symlink_inner(dir, name, target))?;
+        self.log_symlink(dir, name, target, ino);
+        Ok(ino)
     }
 
     pub fn link(&mut self, ino: u64, dir: u64, name: &[u8]) -> Result<()> {
-        self.op(|fs| fs.link_inner(ino, dir, name))
+        self.op(|fs| fs.link_inner(ino, dir, name))?;
+        self.log_link(ino, dir, name);
+        Ok(())
     }
 
     pub fn unlink(&mut self, dir: u64, name: &[u8]) -> Result<()> {
-        self.op(|fs| fs.unlink_inner(dir, name))
+        self.op(|fs| fs.unlink_inner(dir, name))?;
+        self.log_remove(false, dir, name);
+        Ok(())
     }
 
     pub fn rmdir(&mut self, dir: u64, name: &[u8]) -> Result<()> {
-        self.op(|fs| fs.rmdir_inner(dir, name))
+        self.op(|fs| fs.rmdir_inner(dir, name))?;
+        self.log_remove(true, dir, name);
+        Ok(())
     }
 
     pub fn rename(&mut self, sdir: u64, sname: &[u8], ddir: u64, dname: &[u8]) -> Result<()> {
-        self.op(|fs| fs.rename_inner(sdir, sname, ddir, dname))
+        self.op(|fs| fs.rename_inner(sdir, sname, ddir, dname))?;
+        self.log_rename(sdir, sname, ddir, dname);
+        Ok(())
     }
 
     pub fn write(&mut self, ino: u64, off: u64, data: &[u8]) -> Result<usize> {
@@ -1816,7 +1939,9 @@ impl<D: BlockDevice> Filesystem<D> {
     }
 
     pub fn truncate(&mut self, ino: u64, size: u64) -> Result<()> {
-        self.op(|fs| fs.truncate_inner(ino, size))
+        self.op(|fs| fs.truncate_inner(ino, size))?;
+        self.log_truncate(ino, size);
+        Ok(())
     }
 
     /// Runs `f` against snapshot `id`, read-only. Uncommitted live changes
@@ -1881,7 +2006,14 @@ impl<D: BlockDevice> Filesystem<D> {
             return f(self);
         }
         self.op_cp = Some(self.checkpoint(whole));
+        self.op_times.clear();
+        let gen0 = self.body.generation;
         let r = f(self);
+        // An operation a commit split, or one that changes whole trees,
+        // has no log record: fsync commits until the next commit.
+        if whole || self.body.generation != gen0 {
+            self.ilog.disable();
+        }
         let cp = self.op_cp.take().expect("operation checkpoint");
         let undo = self.store.undo.take();
         match r {
@@ -2006,11 +2138,13 @@ impl<D: BlockDevice> Filesystem<D> {
         for c in changes.drain(..) {
             match c {
                 DataChange::DropFile(ino) => {
+                    self.ilog.note_dropped(ino, 0);
                     if let Some(m) = self.dirty_data.remove(&ino) {
                         self.dirty_blocks -= m.len();
                     }
                 }
                 DataChange::DropFrom(ino, keep) => {
+                    self.ilog.note_dropped(ino, keep);
                     if let Some(m) = self.dirty_data.get_mut(&ino) {
                         let dropped = m.split_off(&keep);
                         self.dirty_blocks -= dropped.len();
@@ -2187,6 +2321,7 @@ impl<D: BlockDevice> Filesystem<D> {
     /// The dirty copy of block `idx` of file `ino`, made from `old` (or
     /// zeros) if it is not dirty yet.
     fn dirty_block(&mut self, ino: u64, idx: u64, old: Option<Block>) -> &mut Block {
+        self.ilog.note_dirty(ino, idx);
         let m = self.dirty_data.entry(ino).or_default();
         let mut added = false;
         let b = m.entry(idx).or_insert_with(|| {
@@ -2238,7 +2373,7 @@ impl<D: BlockDevice> Filesystem<D> {
                 old[slot] = self.old_block_unless_dirty(ino, idx)?;
             }
         }
-        let now = self.clock.now_ns();
+        let now = self.op_now();
         if end > a.size {
             a.size = end;
         }
@@ -2307,7 +2442,7 @@ impl<D: BlockDevice> Filesystem<D> {
                 });
             }
         }
-        let now = self.clock.now_ns();
+        let now = self.op_now();
         a.size = size;
         a.mtime_ns = now;
         a.ctime_ns = now;
@@ -2535,6 +2670,7 @@ impl<D: BlockDevice> Filesystem<D> {
     }
 
     fn put_dirty(&mut self, ino: u64, idx: u64, b: Block) {
+        self.ilog.note_dirty(ino, idx);
         if self
             .dirty_data
             .entry(ino)
@@ -2795,6 +2931,9 @@ impl<D: BlockDevice> Filesystem<D> {
                 }
                 Err(e) => e,
             };
+            // Its superblock may have landed with a new chain start: log
+            // nothing more until a commit is known to have landed.
+            self.ilog.disable();
             // The on-disk state is still the previous commit (or the failed
             // one, if its superblock landed).
             self.store.io.discard_batch();
@@ -2904,7 +3043,7 @@ impl<D: BlockDevice> Filesystem<D> {
                 .unwrap_or(generation)
                 .min(generation.saturating_sub(crate::space::QUARANTINE_COMMITS - 1))
                 .max(1),
-            log_root: BlockPtr::NULL,
+            log_start: self.ilog.next_start(),
             // Generation 0 is format's starting state, never a commit.
             history: core::iter::once(self.body.core())
                 .filter(|c| c.generation > 0)
@@ -2936,6 +3075,7 @@ impl<D: BlockDevice> Filesystem<D> {
         self.rewrite_all_slots = false;
         self.replay_bump = false;
         self.header.generation = generation;
+        self.ilog.committed(generation, body.log_start);
         self.body = body;
         self.store.space.committed(generation, now);
         self.txn_dirty = false;

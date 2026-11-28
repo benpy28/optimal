@@ -18,6 +18,7 @@ fn opts() -> FormatOptions {
         kdf: crate::KdfParams::INSECURE_FAST_FOR_TESTS,
         quarantine_min_ns: 0,
         meta_chunk_blocks: 0,
+        intent_log_blocks: None,
     }
 }
 
