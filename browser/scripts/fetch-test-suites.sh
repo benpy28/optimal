@@ -49,6 +49,10 @@ fetch_sparse() { # name url commit path
 # web-platform-tests: the tree construction tests (html/syntax/parsing).
 fetch_sparse wpt https://github.com/web-platform-tests/wpt.git 6852422b49e7dc8037d7f130ee07cf991fb73f05 html/syntax/parsing/resources
 
+# web-platform-tests again, at the same commit: the CSS syntax tests
+# (css/css-syntax), whose An+B cases the css crate runs.
+fetch_sparse wpt-css https://github.com/web-platform-tests/wpt.git 6852422b49e7dc8037d7f130ee07cf991fb73f05 css/css-syntax
+
 # romainmenke/css-tokenizer-tests (MIT): the CSS tokenizer suite.
 fetch css-tokenizer-tests https://github.com/romainmenke/css-tokenizer-tests.git 0db1d128d02f0e3e38c9271f377eb8d70f280813
 

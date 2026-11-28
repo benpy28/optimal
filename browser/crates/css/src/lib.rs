@@ -14,12 +14,17 @@
 //! Both run the same scanner, which applies the input preprocessing of
 //! section 3.3 as it reads, so token offsets are offsets into the text as
 //! given (before CR LF and form feeds are turned into LF).
+//!
+//! [`parse_anb`] and [`parse_anb_prefix`] recognize the An+B microsyntax
+//! (section 6) in component values, and [`AnB`] serializes it (9.2).
 #![forbid(unsafe_code)]
 
+mod anb;
 mod parser;
 mod stream;
 mod tokenizer;
 
+pub use anb::{AnB, parse_anb, parse_anb_prefix};
 pub use parser::{
     AcceptAll, BlockItem, BlockKind, ComponentValue, Declaration, Kind, ParseError, Parsed,
     ParserErrorKind, Rule, RuleId, SyntaxError, TokenList, Validity, Values,

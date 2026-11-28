@@ -93,3 +93,18 @@ model of section 5 (`crates/css/tests/common/parse_reference.rs`) on
 random token streams for all seven entry points. A hostile-input test
 times 15 input shapes (deep nesting, unclosed blocks, long speculative
 declarations) at three sizes and fails on worse than linear growth.
+
+## CSS An+B
+
+| Suite | Pinned commit | Passed | Notes |
+|---|---|---|---|
+| SimonSapin/css-parsing-tests `An+B.json` | 203ce36 | 128 / 128 | A and B, or no match |
+| web-platform-tests `css/css-syntax/anb-parsing.html` | 6852422 | 67 / 67 | each `testANB` call read from the file: parsed and serialized |
+| web-platform-tests `css/css-syntax/anb-serialization.html` | 6852422 | 20 / 20 | as above |
+
+No errata. A and B are clamped to `i32` (css-values-4 5.1 lets a UA clamp
+integers to the range it supports), with the negation in clauses such as
+`-n- <integer>` done before clamping. Random token streams are checked
+against a literal model that writes out each clause of the grammar in 6.2
+as a sequence of token matchers, for whole values and for the longest
+matching prefix.
