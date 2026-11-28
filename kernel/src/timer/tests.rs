@@ -353,7 +353,9 @@ ktest!(pit_reaches_long_deadlines_in_pieces, {
     if no_lapic() {
         return;
     }
-    let was = get().unwrap().events.unwrap();
+    // What is in use, which the watchdog may have moved off the boot
+    // choice.
+    let was = super::events().unwrap();
     if let Err(why) = force_events(Events::PitOneShot) {
         crate::println!("ktest: no PIT events here ({why})");
         return;
@@ -395,8 +397,9 @@ ktest!(fallbacks_given_back, {
     }
     let t = get().unwrap();
     let a = ARMED.lock();
-    assert_eq!(a.hpet.is_some(), t.events == Some(Events::HpetOneShot));
-    assert_eq!(a.pit, t.events == Some(Events::PitOneShot));
+    let now = events_now();
+    assert_eq!(a.hpet.is_some(), now == Some(Events::HpetOneShot));
+    assert_eq!(a.pit, now == Some(Events::PitOneShot));
     assert_eq!(a.rates.hpet.is_some(), a.hpet.is_some());
     assert_eq!(a.rates.pit.is_some(), a.pit);
     drop(a);
