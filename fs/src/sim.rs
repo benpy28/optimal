@@ -78,6 +78,21 @@ pub struct Faults {
     pub read_error_one_in: u64,
     pub write_error_one_in: u64,
     pub flush_error_one_in: u64,
+    /// The write with this index (counting every write since the device
+    /// was made, from 0) fails. With `fail_write_persists` the blocks it
+    /// covered go bad for good (they join `bad_blocks`); otherwise only
+    /// that one attempt fails.
+    pub fail_write_at: Option<u64>,
+    pub fail_write_persists: bool,
+    /// Blocks that fail every write that covers them.
+    pub bad_blocks: alloc::collections::BTreeSet<u64>,
+    /// Every write fails (a device that stopped accepting writes).
+    pub all_writes_fail: bool,
+    /// The flush with this index (from 0) fails.
+    pub fail_flush_at: Option<u64>,
+    /// A failed flush also loses every write it had not yet made durable
+    /// (as a kernel may drop the pages of a failed writeback).
+    pub failed_flush_loses_cache: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +113,8 @@ pub struct CrashDevice {
     /// A lying drive: flushes report success but make nothing durable, so
     /// writes from many "flushed" commits pile up in the volatile cache.
     pub lying_flush: bool,
+    /// When set, every write request's (first block, blocks) is appended.
+    pub trace: Option<Vec<(u64, u64)>>,
     rng: Rng,
 }
 
@@ -114,6 +131,7 @@ impl CrashDevice {
             powered: true,
             faults: Faults::default(),
             lying_flush: false,
+            trace: None,
             rng: Rng::new(seed),
         }
     }
@@ -267,7 +285,27 @@ impl BlockDevice for CrashDevice {
     fn write(&mut self, block: u64, buf: &[u8]) -> Result<(), IoError> {
         self.step(true)?;
         let n = check_range(self.blocks, block, buf.len())?;
+        let index = self.writes;
         self.writes += 1;
+        if let Some(t) = &mut self.trace {
+            t.push((block, n));
+        }
+        if self.faults.fail_write_at == Some(index) {
+            if self.faults.fail_write_persists {
+                self.faults.bad_blocks.extend(block..block + n);
+            }
+            return Err(IoError::Failed);
+        }
+        if self.faults.all_writes_fail
+            || self
+                .faults
+                .bad_blocks
+                .range(block..block + n)
+                .next()
+                .is_some()
+        {
+            return Err(IoError::Failed);
+        }
         if self.faults.write_error_one_in > 0 && self.rng.chance(1, self.faults.write_error_one_in)
         {
             // A failed write may still have partially reached the media.
@@ -292,9 +330,15 @@ impl BlockDevice for CrashDevice {
     }
     fn flush(&mut self) -> Result<(), IoError> {
         self.step(true)?;
+        let index = self.flushes;
         self.flushes += 1;
-        if self.faults.flush_error_one_in > 0 && self.rng.chance(1, self.faults.flush_error_one_in)
+        if self.faults.fail_flush_at == Some(index)
+            || (self.faults.flush_error_one_in > 0
+                && self.rng.chance(1, self.faults.flush_error_one_in))
         {
+            if self.faults.failed_flush_loses_cache {
+                self.volatile.clear();
+            }
             return Err(IoError::Failed);
         }
         if self.lying_flush {

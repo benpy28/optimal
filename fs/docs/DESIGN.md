@@ -234,19 +234,80 @@ The storage design's error policy is in the block layer: retryable device
 errors are retried 3 times (the last after a controller reset), a device
 goes read-only after 16 failed writes in 10 minutes or when it says so, and
 writeback errors are reported once per open file through errseq. No file
-system stops all writes on a single error. In this crate:
+system stops all writes on a single error. By the time a write error
+reaches this crate the block layer has already retried it in place, so the
+file system only ever retries at a new block. In this crate:
 
 - Reads never poison anything. A read that fails returns the error and the
   volume carries on.
-- A failed write *inside a mutating operation or a commit* means the
-  in-memory state no longer matches any commit, so today the volume
-  refuses further changes until remount, and the disk still holds the last
-  good commit. This is open against the storage design: the fix (next on
-  the list) is to rebuild the failed commit from the dirty in-memory state
-  with fresh allocations, so a permanently bad block is reallocated, not
-  retried forever, and nothing dirty is lost.
-- The VFS (the file system track, after 4a) owns errseq, page retention while a device is gone,
-  and the read-only switch.
+- **A commit whose writes fail keeps its transaction.** The blocks of every
+  failed request join a per-mount bad set, widened to their aligned group
+  of 64 blocks (256 KiB; failing blocks come in regions, such as a worn
+  flash erase block), and are never allocated again on this mount. The
+  in-memory state is then rebuilt on top of the last commit
+  (`Filesystem::rebuild`): the space map is opened again from the last
+  commit and the transaction's own space-map changes (`Store::log`: every
+  free made through the trees or the file data path, and every file-data
+  allocation) are replayed onto it; tree nodes the failed commit wrote
+  become dirty again (`Tree::unwrite`); file blocks that were not written
+  go back to dirty memory (decrypted from the write queue); chunks with a
+  copy on a bad block are queued to move. If the failed commit had started
+  writing superblocks, later commits are numbered above it and rewrite all
+  four slots, as after a fallback mount. Then the commit runs again, with
+  new homes for everything.
+- **A failed flush** leaves the durability of everything written since the
+  last good flush unknown. The rebuild reads back each file block of the
+  transaction written since then, checks it against its MAC and makes it
+  dirty again, so the retry writes it to a new home and flushes it. A block
+  that no longer reads back intact is lost, and the volume stops (see
+  below) rather than commit a transaction that points at lost data.
+- **Bounded**: at most 3 attempts per `commit` call (the storage design's
+  "at most 3 writeback cycles"), and at most 1/64 of the volume (at least
+  256 blocks) in the bad set. Past either, `commit` returns the I/O error
+  and the volume is **degraded**: new changes are refused with
+  `Error::DeviceFailing`, reads (including of the uncommitted changes)
+  work, and a later `commit` call tries again (3 more attempts, keeping
+  the bad blocks found so far). Success clears the state.
+- **A device failing as a whole** (unplugged, dead, refusing writes) is
+  told apart from bad blocks: when not one request of a batch of several
+  could be written, nothing is marked bad, so a device that comes back is
+  not left with most of its space condemned.
+- **An early data flush** (dirty data past the limit, inside `write`) that
+  fails is not the write's failure: the data is in the transaction, so
+  `write` succeeds, the data stays in memory, the space map is rebuilt and
+  the commit retries (durability is promised by `commit`, as writeback
+  errors surface at fsync). Three failed early flushes before a commit
+  succeeds degrade the volume, so memory can't grow without bound.
+- A commit refused for space inside the commit (space accounting makes this
+  a bug, but it is handled) is rebuilt the same way and returns `NoSpace`;
+  the volume stays writable.
+- **Still stops the volume** (`Error::Poisoned`, remount to continue, the
+  disk holds the last good commit): an error that leaves a tree half
+  changed, that is a read or corruption error in the middle of a mutating
+  operation, or in a commit's own tree changes (the snapshot deadlist
+  append, the punch before writing file data); and a rebuild that can't
+  read the last commit back. Rolling back a half-applied operation with the
+  same log is on the "Not done yet" list.
+- Superblock slots are fixed blocks: a slot that fails every write makes
+  every commit to its pair fail, and the volume degrades. Writing around a
+  dead slot is on the "Not done yet" list.
+- The VFS (the file system track, after 4a) owns errseq, page retention
+  while a device is gone, and the read-only switch.
+
+What it costs on the success path: one log entry (at most 40 bytes) per
+space-map change made through the trees or the data path (freed tree nodes
+and extents, data runs), one reference-count increment per tree node a
+commit writes, and a range set of blocks written since the last flush.
+Measured on a 781 MiB in-memory device, release build, best of 5, plain
+suite: 2000 creates with a 64 KiB write each and a commit every 100
+(0.219 s before, 0.216 to 0.223 s after), 256 MiB written in 1 MiB writes
+then one commit (0.456 to 0.493 s before, 0.444 to 0.461 s after), and
+20000 random 4 KiB overwrites of a 64 MiB file with a commit every 1000
+(0.316 to 0.331 s before, 0.326 to 0.328 s after): no difference beyond
+run-to-run noise. Blocks freed in the same transaction that allocated them
+(file data flushed early, then overwritten or a failed write's new home)
+are reusable at once rather than quarantined, since no commit references
+them.
 
 ## Testing
 
@@ -257,6 +318,15 @@ the heaviest testing in the project:
   rename, links, snapshots, rollback, remount, ...) run against the real
   filesystem and a simple in-memory reference model. Every result is
   compared, full state is compared regularly, and fsck runs throughout.
+- **Write failures** (`tests/write_fail.rs`): every write of a random
+  workload (with snapshots and remounts) failing for good, its blocks gone
+  bad, and every flush failing once: every operation still succeeds and
+  matches the model, fsck is clean, a remount shows the committed state. A
+  failed write followed by a power cut at each of the next 24 write
+  points: mount gives the last returned commit or a state the interrupted
+  operation commits. A device that stops taking writes degrades the
+  volume and recovers. A failed flush that loses the device cache never
+  yields a commit that claims the lost data.
 - **Lying drives**: flushes are acknowledged but lost for 1 to 8 commits,
   then power is cut. Images are steered into the worst cases (every later
   superblock write landed; or only the newest pair landed and the other pair
@@ -305,6 +375,20 @@ the heaviest testing in the project:
   space appears. Rejected: shorter quarantine (it is the fallback depth),
   and letting a commit fail for space and roll back (ZFS-style reserved
   space is simpler and never loses the transaction).
+- A failed commit is rebuilt from a log of the transaction's space-map
+  changes replayed onto the last committed map, with the trees kept and
+  their written nodes turned dirty again. Rejected: cloning the in-memory
+  state before each commit (a copy of every cached table per commit); an
+  undo log inside the space map (every internal copy-on-write step would
+  need an inverse); replaying whole operations (inode numbers, times and
+  hashes would have to be replayed exactly).
+- Failed writes move to new blocks and condemn their 256 KiB group for the
+  mount, and are not retried in place: the block layer already retried, and
+  writing again to a region that just failed is what repair avoids too. A
+  batch where no request worked is a failing device, not bad blocks.
+  Rejected: probing each block of a failed request on its own (an in-place
+  retry, and slow convergence on regions); persisting the bad set (needs a
+  format change; it waits for the rescue tooling).
 - Checksum in the parent pointer, not in the block: catches lost and
   misdirected writes, which an in-block checksum can't.
 - XChaCha20-Poly1305 first: fast everywhere in software and its large nonce
@@ -368,7 +452,7 @@ the file system track is done.
 | Hibernation region, stage 1 to 2 migration | | open, kernel integration |
 | Optional features: vault region (F3), travel class key (F5), remove a file from every snapshot (F12) | | open |
 | Per-file fsync intent log, benchmarked under background writeback; it also carries namespace operations (directory fsync, link, rename, O_TMPFILE plus linkat), syncfs latency has a published bound, and a dpkg-style create, fsync, rename, directory-fsync loop joins the tests | FORMAT body (root reserved) | open (next but one) |
-| Error policy: failed write retried at a new block, at most 3 writeback cycles | Errors | partly: commit rebuild after a write failure is next |
+| Error policy: failed write retried at a new block, at most 3 writeback cycles | Errors | done for commits and data flushes; half-applied operations still stop the volume (Not done yet) |
 | Metadata stored twice: 64-byte pointers with logical addresses, paired chunks, copy-on-write chunk table in every root set, MAC binds the logical address | Duplicated metadata; FORMAT "Duplicated metadata" | done |
 | The two copies differ; no (copy 1 key, nonce) pair repeats | Duplicated metadata; FORMAT "The second copy" | done (copy 1 checked through the parent's MAC rather than a trailer tag, as agreed in design review) |
 | Online scrub | Duplicated metadata (`scrub_metadata`) | done for metadata on an idle volume; online (concurrent) scrub open |
@@ -379,8 +463,11 @@ the file system track is done.
 
 ## Not done yet (tracked, in order)
 
-1. Rebuilding a commit after a write failure (reallocate, keep dirty state).
-2. The per-file fsync intent log, with an fsync-under-writeback benchmark.
+1. Rolling back a half-applied operation (a read or corruption error in the
+   middle of one) with the transaction log instead of stopping the volume,
+   and writing around a superblock slot that fails every write.
+2. The per-file fsync intent log (its records can build on the
+   transaction log of `Store::log`), with an fsync-under-writeback benchmark.
 3. Benchmarks against ext4 (fio-style workloads on the same device),
    including a scrub that reads copy 1 first.
 4. Kani proofs for the space map, chunk table and tree invariants.

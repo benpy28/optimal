@@ -265,6 +265,10 @@ impl NodeCache {
             _ => None,
         }
     }
+    /// Drops the entry for logical address `a`, if any.
+    pub fn forget(&mut self, a: u64) {
+        self.map.remove(&a);
+    }
     fn put(&mut self, p: BlockPtr, n: Arc<Node>) {
         if self.map.insert(p.addr, (p, n)).is_none() {
             self.order.push_back(p.addr);
@@ -293,6 +297,32 @@ pub struct Store<D> {
     /// Blocks the live tree dropped that a snapshot still holds:
     /// `(addr, len, birth)`, appended to the live deadlist at commit.
     pub dead_pending: Vec<(u64, u64, u64)>,
+    /// Every space-map change the open transaction made through the trees
+    /// and the file data path, in order, so a failed commit can rebuild
+    /// it on top of the last committed map (see [`SpaceOp`]).
+    pub log: Vec<SpaceOp>,
+    /// Nodes the commit in progress has written, by logical address, so a
+    /// failed commit can turn them back into dirty nodes
+    /// ([`Tree::unwrite`]).
+    pub written: BTreeMap<u64, Arc<Node>>,
+}
+
+/// One space-map change of the open transaction, recorded by [`Store`].
+/// Changes the space map makes to itself (copy-on-write of its own
+/// tables, chunk moves, the commit's own blocks) are not recorded: a
+/// rebuild redoes them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpaceOp {
+    /// `[addr, addr+len)` freed (physical, or logical metadata blocks).
+    Free(u64, u64),
+    /// Physical run `[addr, addr+len)` allocated for file `ino`'s blocks
+    /// from `idx` on.
+    Data {
+        addr: u64,
+        len: u64,
+        ino: u64,
+        idx: u64,
+    },
 }
 
 impl<D: BlockDevice> Store<D> {
@@ -312,8 +342,15 @@ impl<D: BlockDevice> Store<D> {
             self.dead_pending.push((addr, len, birth));
             Ok(())
         } else {
-            self.space.free(&mut self.io, addr, len)
+            self.free(addr, len)
         }
+    }
+
+    /// Frees `[addr, addr+len)` in the space map, recording it in the log.
+    pub fn free(&mut self, addr: u64, len: u64) -> Result<()> {
+        self.space.free(&mut self.io, addr, len)?;
+        self.log.push(SpaceOp::Free(addr, len));
+        Ok(())
     }
 }
 
@@ -485,6 +522,22 @@ impl Tree {
             break;
         }
         Ok(true)
+    }
+
+    /// Undoes a [`write`](Self::write) for `generation` that did not
+    /// become durable: every node it wrote (birth `generation`, kept in
+    /// `written`) becomes a dirty node again, so the tree is exactly as it
+    /// was before the write and the next commit writes it afresh. Also
+    /// right after a write that stopped part way.
+    pub fn unwrite(
+        &mut self,
+        written: &mut BTreeMap<u64, Arc<Node>>,
+        generation: u64,
+    ) -> Result<()> {
+        match &mut self.root {
+            None => Ok(()),
+            Some(root) => unwrite_rec(root, written, generation),
+        }
     }
 
     /// Writes every dirty node and returns the new root pointer.
@@ -699,8 +752,34 @@ fn write_rec<D: BlockDevice>(
         b,
         node.level as u64,
     )?;
-    let node = core::mem::take(&mut **node);
-    s.cache.put(p, Arc::new(node));
+    let node = Arc::new(core::mem::take(&mut **node));
+    s.written.insert(p.addr, node.clone());
+    s.cache.put(p, node);
     *c = Child::Clean(p);
+    Ok(())
+}
+
+/// See [`Tree::unwrite`].
+fn unwrite_rec(
+    c: &mut Child,
+    written: &mut BTreeMap<u64, Arc<Node>>,
+    generation: u64,
+) -> Result<()> {
+    if let Child::Clean(p) = c {
+        if p.birth != generation {
+            return Ok(());
+        }
+        let n = written
+            .remove(&p.addr)
+            .ok_or(Error::Corrupt("failed commit's node not recorded", p.addr))?;
+        *c = Child::Dirty(Box::new(
+            Arc::try_unwrap(n).unwrap_or_else(|n| (*n).clone()),
+        ));
+    }
+    if let Child::Dirty(n) = c {
+        for (_, k) in n.kids.iter_mut() {
+            unwrite_rec(k, written, generation)?;
+        }
+    }
     Ok(())
 }
