@@ -67,6 +67,11 @@ pub const WANT_5LVL: bool = env_u64(option_env!("OB_PAGING"), 4) == 5;
 pub const ENTRY_REQ: bool = env_u64(option_env!("OB_ENTRY_REQ"), 0) == 1;
 pub const STACK_SIZE: u64 = 256 * 1024;
 pub const ENTROPY_COUNT: u64 = 16;
+/// OB_X2APIC=1 sets the MP request's "enable x2APIC if possible" flag.
+pub const WANT_X2APIC: bool = env_u64(option_env!("OB_X2APIC"), 0) == 1;
+/// OB_MP=0 leaves the MP request out (cases that test the loader's
+/// handling of firmware APIC state without the MP request's mode change).
+pub const WANT_MP: bool = env_u64(option_env!("OB_MP"), 1) == 1;
 
 #[used]
 #[unsafe(link_section = ".requests_start_marker")]
@@ -119,6 +124,13 @@ req!(PERF, 6, Feature::BootloaderPerformance, 0, [0; 4]);
 req!(TSC, 6, Feature::TscFrequency, 0, [0; 4]);
 req!(ENTROPY, 7, Feature::Entropy, 0, [ENTROPY_COUNT, 0, 0, 0]);
 req!(DTB, 6, Feature::Dtb, 0, [0; 4]);
+#[used]
+#[unsafe(link_section = ".requests")]
+pub static MP: Raw<7> = if WANT_MP {
+    request::<7>(Feature::Mp, 0, [if WANT_X2APIC { 1 } else { 0 }, 0, 0, 0])
+} else {
+    Raw(UnsafeCell::new([0; 7]))
+};
 
 /// The Entry Point request holds a pointer to alt_start, so in a PIE build
 /// it needs a relocation, which also tests that the loader relocates before

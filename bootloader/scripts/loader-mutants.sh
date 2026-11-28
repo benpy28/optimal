@@ -9,6 +9,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 P=loader/src/platform.rs
 B=loader/src/boot.rs
+M=loader/src/mp.rs
 # name # file # perl substitution # case that must fail
 MUTANTS=(
   "no-pic-mask#$B#s/^\s*platform::mask_pics\(&plat\);\n//m#quirk"
@@ -26,11 +27,12 @@ MUTANTS=(
   "amdvi-left-on#$P#s/mmio_write64\(base \+ 0x18, ctrl & !1\);/mmio_write64(base + 0x18, ctrl);/#quirk-iommu-amd"
   "apic-trust-cpuid#$P#s/!hw::features\(\)\.apic && p\.madt\.is_none\(\)/!hw::features().apic/#quirk-apic-off"
   "no-apic-enable#$P#s/apic_base \|= 1 << 11;\n/\n/#quirk-apic-off"
+  "mp-x2apic-kept#$M#s/\} else if !x2 && on \{/} else if false {/#quirk-x2apic-mp"
 )
 want=("$@")
 backup=$(mktemp -d)
-cp "$P" "$B" "$backup/"
-restore() { cp "$backup/platform.rs" "$P"; cp "$backup/boot.rs" "$B"; }
+cp "$P" "$B" "$M" "$backup/"
+restore() { cp "$backup/platform.rs" "$P"; cp "$backup/boot.rs" "$B"; cp "$backup/mp.rs" "$M"; }
 trap 'restore; rm -rf "$backup"' EXIT
 killed=0; survived=(); stale=()
 for m in "${MUTANTS[@]}"; do

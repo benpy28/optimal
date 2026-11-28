@@ -11,6 +11,7 @@ pub mod elf;
 pub mod fuzzkit;
 pub mod kaslr;
 pub mod memmap;
+pub mod mp;
 pub mod paging;
 pub mod protocol;
 pub mod rng;

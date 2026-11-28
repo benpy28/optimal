@@ -19,6 +19,7 @@ use core::arch::global_asm;
 
 /// Data the trampoline reads; lives at the start of a page below 4 GiB.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct Block {
     pub cr3: u64,            // 0x00
     pub cr4: u64,            // 0x08
@@ -34,7 +35,8 @@ pub struct Block {
     pub stack_top: u64,      // 0x70
     pub entry: u64,          // 0x78
     pub code_delta: u64,     // 0x80: handoff alias minus identity address of the code page
-    pub _pad: [u64; 15],
+    pub arg: u64, // 0x88: RDI at `entry` (0 for the kernel; an AP's info for the parking loop)
+    pub _pad: [u64; 14],
     pub gdt: [u64; 9], // 0x100
 }
 
@@ -62,23 +64,30 @@ unsafe extern "C" {
     static ob_tramp_start: u8;
     static ob_tramp_end: u8;
     static ob_tramp_stub64: u8;
+    static ob_tramp_park: u8;
 }
 
-/// The trampoline's machine code, and the offset of its 64-bit re-entry.
-pub fn trampoline() -> (&'static [u8], usize) {
+/// The trampoline's machine code, the offset of its 64-bit re-entry, and
+/// the offset of the AP parking loop.
+pub fn trampoline() -> (&'static [u8], usize, usize) {
     // SAFETY: the symbols delimit the global_asm block below.
     unsafe {
         let s = &ob_tramp_start as *const u8;
         let e = &ob_tramp_end as *const u8;
         let k = &ob_tramp_stub64 as *const u8;
+        let p = &ob_tramp_park as *const u8;
         (
             core::slice::from_raw_parts(s, e.offset_from(s) as usize),
             k.offset_from(s) as usize,
+            p.offset_from(s) as usize,
         )
     }
 }
 
 // Entered (System V ABI) with rdi = identity address of Block (below 4 GiB), interrupts off.
+// The BSP enters it once, last; each AP (mp.rs) enters it with a Block of
+// its own whose low_entry is 0 (so it leaves the identity mapping alone),
+// whose entry is the parking loop and whose arg is its limine_mp_info.
 // The rest of the Block's page is the trampoline's own stack, so the 32-bit
 // part never depends on where the firmware's stack was.
 global_asm!(
@@ -87,6 +96,7 @@ global_asm!(
     .global ob_tramp_start
     .global ob_tramp_end
     .global ob_tramp_stub64
+    .global ob_tramp_park
     .code64
 ob_tramp_start:
     cli
@@ -135,7 +145,10 @@ ob_tramp_stub64:
 3:
     add rsp, [rdi + 0x60]
     mov rax, [rdi + 0x68]
+    test rax, rax
+    jz 5f
     mov qword ptr [rax], 0
+5:
     mov rax, cr3
     mov cr3, rax
     lgdt [rdi + 0x38]
@@ -172,7 +185,6 @@ ob_tramp_stub64:
     xor ecx, ecx
     xor edx, edx
     xor esi, esi
-    xor edi, edi
     xor ebp, ebp
     xor r8d, r8d
     xor r9d, r9d
@@ -182,10 +194,31 @@ ob_tramp_stub64:
     xor r13d, r13d
     xor r14d, r14d
     xor r15d, r15d
+    mov rdi, [rdi + 0x88]
     // Last, because every xor above sets flags: RFLAGS = 0x2 exactly.
     push 2
     popfq
     ret
+// An AP's entry: rdi = its limine_mp_info (HHDM), rsp = stack top - 8 with
+// the 0 return address at [rsp]. `reserved` gets the stack pointer, which
+// also tells the BSP this AP is parked; then wait for goto_address (x86
+// loads have acquire semantics). CR3 is reloaded before the jump, to drop
+// TLB entries for the identity pages the BSP has removed since.
+ob_tramp_park:
+    mov [rdi + 8], rsp
+6:
+    mov rax, [rdi + 16]
+    test rax, rax
+    jnz 7f
+    pause
+    jmp 6b
+7:
+    mov rcx, cr3
+    mov cr3, rcx
+    xor ecx, ecx
+    push 2
+    popfq
+    jmp rax
 ob_tramp_end:
     .text
 "#

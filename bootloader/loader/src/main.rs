@@ -20,6 +20,7 @@ mod handoff;
 mod hw;
 mod memory;
 mod menu;
+mod mp;
 mod platform;
 mod tpm;
 
