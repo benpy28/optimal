@@ -1,0 +1,19 @@
+[package]
+name = "optimal-selectors"
+version = "0.1.0"
+description = "Selectors Level 4 parsing, serialization and specificity for the Optimal browser engine"
+edition.workspace = true
+publish = false
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+optimal-css = { path = "../css" }
+optimal-wtf8 = { path = "../wtf8" }
+
+[dev-dependencies]
+proptest = "1"
+serde_json = "1"

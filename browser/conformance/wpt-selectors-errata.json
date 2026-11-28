@@ -1,0 +1,27 @@
+{
+  "parse-part.html#16": {
+    "input": ":lang(en)::part(foo)",
+    "expected": ":lang(\"en\")::part(foo)",
+    "reason": "cssom-1 5.2 (Serializing Selectors), serialize a simple selector, :lang(): the arguments are serialized as a comma-separated list of each argument's serialization as a string. So :lang(en) serializes as :lang(\"en\"). The test expects the identifier kept, which browsers do but the text does not say."
+  },
+  "parse-part.html#18": {
+    "input": "::part(foo):lang(en)",
+    "expected": "::part(foo):lang(\"en\")",
+    "reason": "cssom-1 5.2: :lang() arguments serialize as strings (see parse-part.html#16)."
+  },
+  "parse-part.html#31": {
+    "input": "::part(foo):has(li)",
+    "expected": "::part(foo):has(li)",
+    "reason": "css-pseudo-4 section 5 (element-backed pseudo-elements, of which ::part() is one): all pseudo-classes are syntactically allowed after an element-backed pseudo-element, just as if it were a type selector; :has() is listed among those that never match, not among invalid ones. So the selector is valid and matches nothing."
+  },
+  "parse-slotted.html#14": {
+    "input": "::slotted(foo):hover",
+    "expected": "::slotted(foo):hover",
+    "reason": "selectors-4 3.6.3: any pseudo-element may be followed by any combination of the logical combination and user action pseudo-classes. ::slotted() is a pseudo-element and :hover a user action pseudo-class, so this is valid. css-shadow-1 says nothing that overrides it."
+  },
+  "parse-slotted.html#15": {
+    "input": "::slotted(foo):focus",
+    "expected": "::slotted(foo):focus",
+    "reason": "selectors-4 3.6.3: :focus is a user action pseudo-class, allowed after any pseudo-element (see parse-slotted.html#14)."
+  }
+}

@@ -147,6 +147,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "optimal-selectors"
+version = "0.1.0"
+dependencies = [
+ "optimal-css",
+ "optimal-wtf8",
+ "proptest",
+ "serde_json",
+]
+
+[[package]]
 name = "optimal-wtf8"
 version = "0.1.0"
 dependencies = [
