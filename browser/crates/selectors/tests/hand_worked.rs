@@ -418,6 +418,13 @@ fn pseudo_elements_and_what_may_follow_them() {
         "::part(a):first-child:state(x)"
     );
     assert_eq!(err("::part(a).b"), SelectorError::NotAllowedHere);
+    // An argument that isn't a logical combination's starts afresh, even
+    // after a pseudo-element.
+    assert_eq!(ser("::part(a):host(.b)"), "::part(a):host(.b)");
+    assert_eq!(
+        ser("::part(a):nth-child(2 of .b c)"),
+        "::part(a):nth-child(2 of .b c)"
+    );
     assert_eq!(
         ser("::file-selector-button:disabled"),
         "::file-selector-button:disabled"

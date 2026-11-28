@@ -674,10 +674,8 @@ impl<'p, 'a> Parser<'p, 'a> {
             if !ctx.any_value_checked && !is_any_value(args) {
                 return Err(SelectorError::Syntax);
             }
-            let logical = Ctx {
-                any_value_checked: true,
-                ..logical
-            };
+            let mut logical = logical;
+            logical.any_value_checked = true;
             let f = self.forgiving(s, logical)?;
             return Ok(if is("is") {
                 PseudoClass::Is(f)
