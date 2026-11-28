@@ -29,9 +29,12 @@ use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use optimal_acpi::dmar::Dmar;
 use optimal_acpi::madt::Madt;
 use optimal_apic::base::{self, Mode, Reason};
+use optimal_apic::eoi::{self, Outcome};
 use optimal_apic::lapic::{self, Delivery, Lvt};
 use optimal_apic::plan::{Inputs, IoApicStatus, NotRouted, Plan, Warning};
 use optimal_apic::{ioapic, pic, vectors};
+
+pub mod level;
 use optimal_mm::PAGE_SIZE;
 
 use crate::arch::apic::{self, IoApicRegs, Lapic};
@@ -63,12 +66,13 @@ pub struct Controllers {
     pub version: lapic::Version,
     pub plan: Plan,
     /// Register blocks, by MADT index (None where not mapped).
-    #[cfg_attr(
-        not(feature = "ktest"),
-        expect(dead_code, reason = "read by isa_mask/isa_unmask, first used in 1c3")
-    )]
     pub ioapics: Vec<Option<IoApicRegs>>,
     pub ioapic_versions: Vec<Option<ioapic::Version>>,
+    /// How EOIs reach the I/O APICs (optimal_apic::eoi::choose).
+    pub eoi: eoi::Mode,
+    /// By MADT index: a used I/O APIC whose EOI register the kernel can
+    /// use, to clear a stuck Remote IRR (in either mode).
+    pub eoi_register: Vec<bool>,
     pub pic: bool,
     pub warnings: Vec<String>,
 }
@@ -182,6 +186,10 @@ pub fn dispatch(frame: &mut InterruptFrame) {
             }
             eoi_if_in_service(lapic, v);
         }
+        _ if level::is_line(v) => {
+            let c = controllers().expect("a level line exists only while interrupts are on");
+            level::interrupt(c, c.lapic, frame);
+        }
         _ => {
             let h = HANDLERS[usize::from(v)].load(Ordering::SeqCst);
             if h != 0 {
@@ -215,7 +223,10 @@ fn eoi_if_in_service(lapic: Option<Lapic>, vector: u8) {
 // ---------------------------------------------------------------------------
 // ISA lines.
 
-/// Unmask ISA IRQ `irq` on its routed pin. Err if the plan did not route it.
+/// Unmask ISA IRQ `irq` on its routed pin. Err if the plan did not route
+/// it. A level-triggered ISA IRQ must be claimed as a level line instead
+/// (level::claim_isa), which masks it from interrupt to done and ends it at
+/// the I/O APIC; unmasking one here panics.
 #[cfg_attr(
     not(feature = "ktest"),
     expect(dead_code, reason = "first user outside tests is the timer (1c3)")
@@ -248,6 +259,10 @@ fn set_isa_mask(irq: u8, masked: bool) -> Result<(), NotRouted> {
         .get(usize::from(irq))
         .copied()
         .unwrap_or(Err(NotRouted::Cascade))?;
+    assert!(
+        masked || !r.entry.level,
+        "ISA IRQ {irq} is level-triggered: claim it with level::claim_isa"
+    );
     let regs = c.ioapics[r.ioapic].expect("a used I/O APIC is mapped");
     let entry = ioapic::Redirection { masked, ..r.entry };
     let _g = IOAPIC_LOCK.lock();
@@ -534,6 +549,35 @@ fn setup(info: &BootInfo) -> Report {
             "firmware left {stale} interrupts in service; retired"
         ));
     }
+    // EOI mode: directed only if every used I/O APIC can take it.
+    let used: Vec<eoi::IoApic> = plan
+        .ioapics
+        .iter()
+        .enumerate()
+        .filter(|(_, io)| io.status == IoApicStatus::Used)
+        .filter_map(|(i, io)| {
+            versions[i].map(|version| eoi::IoApic {
+                index: i,
+                version,
+                address: u64::from(io.address),
+            })
+        })
+        .collect();
+    let eoi_register: Vec<bool> = (0..ioapics.len())
+        .map(|i| used.iter().any(|u| u.index == i && u.has_eoi()))
+        .collect();
+    let mut eoi_mode = eoi::choose(version, &used);
+    if eoi_mode == eoi::Mode::Directed {
+        let svr = lapic::svr(vectors::SPURIOUS, true) | lapic::SVR_SUPPRESS_EOI_BROADCAST;
+        lapic.write(lapic::SVR, svr);
+        if lapic.read(lapic::SVR) & lapic::SVR_SUPPRESS_EOI_BROADCAST == 0 {
+            eoi_mode = eoi::Mode::Broadcast(eoi::Why::SuppressDidNotStick);
+            warnings.push(String::from(
+                "the local APIC says it can suppress EOI broadcasts, but SVR bit 12 did not stay set; broadcasting",
+            ));
+            lapic.write(lapic::SVR, lapic::svr(vectors::SPURIOUS, true));
+        }
+    }
 
     // 4. PICs.
     let has_pic = apic::pic_probe();
@@ -581,9 +625,19 @@ fn setup(info: &BootInfo) -> Report {
                 regs.write(reg, v);
             }
             let (lo, hi) = regs.entry(pin as u8);
-            if ioapic::Redirection::decode(lo, hi).entry != *e {
+            let back = ioapic::Redirection::decode(lo, hi);
+            if back.entry != *e {
                 warnings.push(format!(
                     "I/O APIC {i} pin {pin} reads back {lo:#x}/{hi:#x} after programming"
+                ));
+            }
+            if back.remote_irr {
+                // Firmware left an interrupt on this pin unfinished; the
+                // pin is masked, so clearing it delivers nothing.
+                warnings.push(sweep_message(
+                    i,
+                    pin as u8,
+                    level::settle(regs, pin as u8, *e, eoi_register[i]),
                 ));
             }
         }
@@ -616,10 +670,70 @@ fn setup(info: &BootInfo) -> Report {
             plan,
             ioapics,
             ioapic_versions: versions,
+            eoi: eoi_mode,
+            eoi_register,
             pic: has_pic,
             warnings,
         })),
     }
+}
+
+/// The warning for a pin setup found with Remote IRR set.
+pub fn sweep_message(ioapic: usize, pin: u8, out: Outcome) -> String {
+    match out {
+        Outcome::Clear => {
+            format!("I/O APIC {ioapic} pin {pin}: Remote IRR was set, then clear by itself")
+        }
+        Outcome::Cleared(m) => format!(
+            "I/O APIC {ioapic} pin {pin}: firmware left Remote IRR set; cleared by {}",
+            level::method_name(m)
+        ),
+        Outcome::Stuck => {
+            format!("I/O APIC {ioapic} pin {pin}: Remote IRR stays set; pin left masked")
+        }
+    }
+}
+
+fn eoi_line(c: &Controllers) -> String {
+    let mut line = match c.eoi {
+        eoi::Mode::Directed => String::from(
+            "eoi: directed (the local APIC suppresses broadcasts and every I/O APIC has an EOI register)",
+        ),
+        eoi::Mode::Broadcast(why) => format!(
+            "eoi: broadcast ({})",
+            match why {
+                eoi::Why::LapicCannotSuppress =>
+                    String::from("the local APIC cannot suppress broadcasts"),
+                eoi::Why::NoIoApic => String::from("no I/O APIC in use"),
+                eoi::Why::NoEoiRegister { index, version } =>
+                    format!("I/O APIC {index} is version {version:#x}, with no EOI register"),
+                eoi::Why::EoiNotInPage { index } =>
+                    format!("I/O APIC {index}'s EOI register is outside its page"),
+                eoi::Why::SuppressDidNotStick => String::from("suppression did not stay set"),
+            }
+        ),
+    };
+    line.push_str("; a stuck Remote IRR is cleared by");
+    let mut any = false;
+    for (i, io) in c.plan.ioapics.iter().enumerate() {
+        if io.status == IoApicStatus::Used {
+            let _ = write!(
+                line,
+                "{} I/O APIC {i}: {}",
+                if any { "," } else { "" },
+                if c.eoi_register[i] {
+                    "the EOI register"
+                } else {
+                    "the trigger toggle"
+                }
+            );
+            any = true;
+        }
+    }
+    if !any {
+        line.push_str(" nothing (no I/O APIC)");
+    }
+    line
 }
 
 fn mask_pin(regs: IoApicRegs, pin: u8) {
@@ -845,6 +959,7 @@ pub fn report(r: &Report) {
     } else {
         crate::println!("pic: none found");
     }
+    crate::println!("{}", eoi_line(c));
     for w in warnings {
         crate::println!("apic: warning: {w}");
     }

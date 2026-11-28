@@ -405,6 +405,38 @@ mod tests {
     }
 
     #[test]
+    fn room_left_counts_what_earlier_zones_carved() {
+        // Zone 0 is two pieces: A = 1..5 MiB (4 MiB) and B = the last
+        // 3.5 MiB below 1 GiB. It spans 0x40000 frames, so its metadata is
+        // 3 MiB, carved from A (the most room): A has 1 MiB left. Zone 1 is
+        // two single pages at 4 GiB and 5 GiB - 4 KiB, also 0x40000 frames
+        // and 3 MiB of metadata, with no room of its own. Of the pieces
+        // elsewhere, A has 1 MiB left (too little) and B 3.5 MiB, so it
+        // goes at the start of B. Counting A's room as its length plus what
+        // was carved (7 MiB) would put it past A's end.
+        let b = GIB - 7 * MIB / 2;
+        let map = [
+            r(MIB, 5 * MIB),
+            r(b, GIB),
+            r(4 * GIB, 4 * GIB + 4096),
+            r(5 * GIB - 4096, 5 * GIB),
+        ];
+        let z = plan_vec(&map, MIB).unwrap();
+        assert_eq!(z.len(), 2);
+        assert_eq!(z[0].meta, r(MIB, 4 * MIB));
+        assert_eq!(z[1].meta, r(b, b + 3 * MIB));
+        assert_eq!(
+            free_vec(&map, MIB, &z),
+            [
+                r(4 * MIB, 5 * MIB),
+                r(b + 3 * MIB, GIB),
+                r(4 * GIB, 4 * GIB + 4096),
+                r(5 * GIB - 4096, 5 * GIB)
+            ]
+        );
+    }
+
+    #[test]
     fn later_memory_is_covered_but_never_used_for_metadata() {
         // Usable 1..64 MiB now; bootloader memory 64..128 MiB and 4 GiB +
         // 64 MiB later. Worked by hand:

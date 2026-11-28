@@ -391,8 +391,10 @@ These parsers read untrusted bytes:
 - the firmware memory map
 - device paths, in the loader and the quirk injector
 
-All of them live in `core/`, except device-path walking, which moves there
-next.
+All of them live in `core/`. Device paths came last: the loader and the
+quirk injector now measure a firmware path node header by node header with
+`devpath::measure` (bounded at 4 KiB) and hand the measured bytes to
+`core/src/devpath.rs`.
 
 Coverage-guided fuzzers (libFuzzer, AFL) need a nightly toolchain or
 sanitizer runtimes, which the stable-only rule rules out for CI gating. So
@@ -403,13 +405,56 @@ the gate is seeded structured mutation on stable:
 - Each parser is checked against a property: it never panics, and every
   accepted input satisfies the parser's invariants (a re-check or
   re-serialisation round trip).
-- Each PR runs 10^5 cases per parser. The nightly soak runs 10^8, and
-  prints the seed on failure.
+- Each PR runs 10^5 cases per parser. The nightly soak runs 10^8 with a new
+  base seed each night, and prints the seed on failure. Signature cases sign
+  and verify (about 100 times the cost of a case of the other parsers), so
+  they run a tenth of that: 10^4 per PR, 10^7 nightly.
+- The runs use the `fuzz` build profile: release speed with overflow checks
+  and debug assertions on, so arithmetic that would wrap silently in the
+  shipped loader panics and is caught.
 - A crash found anywhere becomes a fixed regression case.
 
 **Today:** config, ELF, request scanning, memory maps and page tables have
-seeded random tests. The signature, ACPI, TCG log and device-path parsers do
-not yet, and are next.
+seeded random tests. The signature, ACPI, TCG log and device-path parsers
+have the generator, mutator and property above (`core/src/fuzzkit.rs`). For
+ACPI, TCG logs and device paths the generator also gives the answer a
+correct parser must report, and the valid-input test checks it exactly.
+Measured locally with the `fuzz` profile, 10^6 cases take 1 to 15 seconds
+per parser test, one thread each. At that rate the slowest test needs about
+25 minutes for 10^8 cases; the tests run in parallel, and the nightly job
+has a 300-minute limit.
+
+What this work found, each now a fixed regression test:
+
+- ACPI: a table placed at the top of the 64-bit address space with a length
+  running past 2^64 made `addr + offset` wrap. A debug build panicked; the
+  release loader would have read low memory as if it were the table (for
+  example as DMAR remapping units). Every range is now checked to fit before
+  it is read.
+- ACPI: a FACS was accepted on its length field alone, so a stray FADT
+  pointer made random memory a range the kernel must keep mapped. The
+  `FACS` signature is now required.
+- TCG log: the header was not checked against the PC Client Platform
+  Firmware Profile. A first event other than PCR 0 / EV_NO_ACTION, a
+  duplicate algorithm, a digest size of 0, a size that contradicts the TCG
+  Algorithm Registry for a known algorithm (SHA-256 declared as 20 bytes),
+  or vendor info running past the event is now refused, since every later
+  event is sized from this header. Event offsets near `usize::MAX` no longer
+  wrap.
+- Device paths (found while moving the walker into `core/`, then pinned by
+  a test): the quirk injector copied every instance of a multi-instance
+  path before appending the next loader's file node, giving a path that
+  names the wrong file. Both users now stop at the first End node, End
+  Instance included, and the whole-disk prefix is the path before the first
+  media node.
+
+## Boot media (done)
+
+Conformance cases `cd`, `usb`, `nvme` and `virtio` boot from each kind of
+medium QEMU's q35 offers besides SATA (`small` and the rest use SATA), under
+ours and under Limine. `ob-boot-volume` checks what the kernel is told about
+the volume. These are QEMU's emulated controllers; real hardware is not
+covered yet.
 
 ## Not yet: MP, BIOS
 

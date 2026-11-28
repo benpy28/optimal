@@ -199,3 +199,133 @@ proptest! {
         }
     }
 }
+
+/// QEMU's q35 comparators: route capability 0x00FF0104 (inputs 2, 8 and
+/// 16 to 23), 64-bit and periodic capable (bits 4 and 5: 0x30). Level
+/// one-shot on input 16 with the interrupt on: 0x30 | 16 << 9 (0x2000) |
+/// level 0x2 | enable 0x4 = 0x2036, capability kept.
+#[test]
+fn level_one_shot_hand_worked() {
+    let q35 = (0x00FF_0104u64 << 32) | T_PERIODIC_CAPABLE | T_64BIT_CAPABLE;
+    assert_eq!(route_cap(q35), 0x00FF_0104);
+    assert_eq!(
+        level_one_shot(q35, 16, true),
+        Some((0x00FF_0104 << 32) | 0x2036)
+    );
+    assert_eq!(
+        level_one_shot(q35, 16, false),
+        Some((0x00FF_0104 << 32) | 0x2032)
+    );
+    // Input 2 is 2 << 9 = 0x400.
+    assert_eq!(
+        level_one_shot(q35, 2, true),
+        Some((0x00FF_0104 << 32) | 0x436)
+    );
+    // Not in the capability, or past input 31.
+    assert_eq!(level_one_shot(q35, 3, true), None);
+    assert_eq!(level_one_shot(q35, 24, true), None);
+    assert_eq!(level_one_shot(u64::MAX, 32, true), None);
+    // Firmware left it periodic, by FSB, 32-bit forced, on input 8 with
+    // VAL_SET: all of that goes, the new route replaces the old.
+    let dirty =
+        q35 | T_PERIODIC | T_FSB_ENABLE | T_32BIT_MODE | T_VAL_SET | (8 << 9) | T_INT_ENABLE;
+    assert_eq!(
+        level_one_shot(dirty, 17, false),
+        Some((0x00FF_0104 << 32) | 0x30 | 17 << 9 | 0x2)
+    );
+    assert_eq!((T_ROUTE_SHIFT, T_ROUTE), (9, 0x3E00));
+}
+
+#[test]
+fn deadline_hand_worked() {
+    let wide = T_64BIT_CAPABLE;
+    assert_eq!(deadline(1000, 100_000, wide), 101_000);
+    assert_eq!(deadline(u64::MAX - 9, 20, wide), 10);
+    // A 32-bit comparator: 0x1_FFFF_FFF0 + 0x20 = 0x2_0000_0010, low half 0x10.
+    assert_eq!(deadline(0x1_FFFF_FFF0, 0x20, 0), 0x10);
+    assert_eq!(deadline(5, 7, 0), 12);
+}
+
+#[test]
+fn passed_hand_worked() {
+    let wide = T_64BIT_CAPABLE;
+    assert!(passed(100, 100, wide));
+    assert!(passed(101, 100, wide));
+    assert!(!passed(99, 100, wide));
+    // Across the 64-bit wrap: the deadline 10 is 20 ticks after
+    // 2^64 - 10, and passed once the counter reaches it.
+    assert!(!passed(u64::MAX - 9, 10, wide));
+    assert!(passed(10, u64::MAX - 9, wide));
+    // A 32-bit comparator: only the low halves count, so 0x1_0000_0005
+    // has passed 0x3 and not 0x7.
+    assert!(passed(0x1_0000_0005, 0x3, 0));
+    assert!(!passed(0x1_0000_0005, 0x7, 0));
+    assert!(passed(0x5, 0xFFFF_FFF0, 0));
+    assert!(!passed(0xFFFF_FFF0, 0x5, 0));
+    // In 64-bit mode the high half counts.
+    assert!(!passed(0x1_0000_0005, 0x2_0000_0003, wide));
+}
+
+#[test]
+fn pick_level_hand_worked() {
+    let q35 = 0x00FF_0104u64 << 32;
+    let pc = 0x0000_0004u64 << 32;
+    // On q35 with inputs 2 and 8 taken by ISA IRQs: comparator 2, input 16.
+    let free = |g: u32| g != 2 && g != 8;
+    assert_eq!(pick_level(&[q35, q35, q35], free), Some((2, 16)));
+    // On pc only input 2 exists, and it is taken.
+    assert_eq!(pick_level(&[pc, pc, pc], free), None);
+    // A later comparator that reaches nothing free is passed over.
+    assert_eq!(pick_level(&[q35, q35, pc], free), Some((1, 16)));
+    assert_eq!(pick_level(&[], free), None);
+    assert_eq!(pick_level(&[pc], |_| true), Some((0, 2)));
+}
+
+proptest! {
+    #![proptest_config(config(5000))]
+
+    /// level_one_shot changes only the bits it owns, and only when the
+    /// route is allowed.
+    #[test]
+    fn level_one_shot_bits(raw: u64, gsi in 0u32..40, enabled: bool) {
+        let got = level_one_shot(raw, gsi, enabled);
+        if gsi < 32 && (raw >> 32) & (1 << gsi) != 0 {
+            let owned = T_ROUTE | T_32BIT_MODE | T_LEVEL | T_INT_ENABLE | T_PERIODIC | T_FSB_ENABLE | T_VAL_SET;
+            let v = got.unwrap();
+            prop_assert_eq!(v & !owned, raw & !owned);
+            prop_assert_eq!((v & T_ROUTE) >> 9, u64::from(gsi));
+            prop_assert_eq!(v & (T_32BIT_MODE | T_PERIODIC | T_FSB_ENABLE | T_VAL_SET), 0);
+            prop_assert_eq!(v & T_LEVEL, T_LEVEL);
+            prop_assert_eq!(v & T_INT_ENABLE != 0, enabled);
+        } else {
+            prop_assert_eq!(got, None);
+        }
+    }
+
+    /// A deadline `ticks` ahead (under half the width) has not passed
+    /// before then and has from then on.
+    #[test]
+    fn deadline_then_passed(now: u64, ticks in 1u64..(1 << 31), wide: bool, late in 0u64..(1 << 30)) {
+        let c = if wide { T_64BIT_CAPABLE } else { 0 };
+        let d = deadline(now, ticks, c);
+        prop_assert!(!passed(now, d, c));
+        prop_assert!(!passed(now.wrapping_add(ticks - 1), d, c));
+        prop_assert!(passed(now.wrapping_add(ticks), d, c));
+        prop_assert!(passed(now.wrapping_add(ticks + late), d, c));
+    }
+
+    /// pick_level against a brute-force search.
+    #[test]
+    fn pick_level_matches_search(caps in proptest::collection::vec(any::<u32>(), 0..6), taken: u32) {
+        let configs: Vec<u64> = caps.iter().map(|&c| u64::from(c) << 32).collect();
+        let free = |g: u32| taken & (1 << g) == 0;
+        let mut want = None;
+        for n in (0..caps.len()).rev() {
+            if let Some(g) = (0..32).find(|&g| caps[n] & (1 << g) != 0 && free(g)) {
+                want = Some((n as u8, g));
+                break;
+            }
+        }
+        prop_assert_eq!(pick_level(&configs, free), want);
+    }
+}

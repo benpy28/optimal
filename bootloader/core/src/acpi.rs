@@ -35,7 +35,17 @@ pub struct Range {
     pub len: u64,
 }
 
+/// True if `[addr, addr + len)` fits in the 64-bit address space. Every
+/// range is checked before it is read, so no `addr + offset` below can wrap
+/// (a wrapped address would read low memory as if it were the table).
+fn fits(addr: u64, len: u64) -> bool {
+    addr.checked_add(len).is_some()
+}
+
 fn checksum_ok(mem: &impl PhysRead, addr: u64, len: u32) -> bool {
+    if !fits(addr, len as u64) {
+        return false;
+    }
     let mut sum = 0u8;
     let mut buf = [0u8; 256];
     let mut off = 0u64;
@@ -65,7 +75,7 @@ pub struct Acpi<'m, M: PhysRead> {
 impl<'m, M: PhysRead> Acpi<'m, M> {
     pub fn new(mem: &'m M, rsdp: u64) -> Option<Self> {
         let mut sig = [0u8; 8];
-        if !mem.read(rsdp, &mut sig) || &sig != b"RSD PTR " {
+        if !fits(rsdp, 36) || !mem.read(rsdp, &mut sig) || &sig != b"RSD PTR " {
             return None;
         }
         if !checksum_ok(mem, rsdp, 20) {
@@ -111,11 +121,11 @@ impl<'m, M: PhysRead> Acpi<'m, M> {
 
     fn header_len(&self, addr: u64, want: &[u8; 4]) -> Option<u32> {
         let mut sig = [0u8; 4];
-        if !self.mem.read(addr, &mut sig) || &sig != want {
+        if !fits(addr, 8) || !self.mem.read(addr, &mut sig) || &sig != want {
             return None;
         }
         let len = self.mem.u32(addr + 4)?;
-        (36..=MAX_TABLE_LEN).contains(&len).then_some(len)
+        ((36..=MAX_TABLE_LEN).contains(&len) && fits(addr, len as u64)).then_some(len)
     }
 
     /// Calls `f(signature, address, length)` for each table in the root table.
@@ -135,13 +145,13 @@ impl<'m, M: PhysRead> Acpi<'m, M> {
                 continue;
             };
             let mut sig = [0u8; 4];
-            if !self.mem.read(addr, &mut sig) {
+            if !fits(addr, 8) || !self.mem.read(addr, &mut sig) {
                 continue;
             }
             let Some(tlen) = self
                 .mem
                 .u32(addr + 4)
-                .filter(|l| (36..=MAX_TABLE_LEN).contains(l))
+                .filter(|&l| (36..=MAX_TABLE_LEN).contains(&l) && fits(addr, l as u64))
             else {
                 continue;
             };
@@ -206,11 +216,17 @@ impl<'m, M: PhysRead> Acpi<'m, M> {
             };
             for p in [field32(36), field64(132)].into_iter().flatten() {
                 // FACS: signature "FACS", length at +4 (no checksum header).
+                // The signature is checked, so a stray pointer never makes
+                // random memory look like a table that must stay mapped.
+                let mut sig = [0u8; 4];
                 if p != 0
+                    && fits(p, 8)
+                    && self.mem.read(p, &mut sig)
+                    && &sig == b"FACS"
                     && let Some(l) = self
                         .mem
                         .u32(p + 4)
-                        .filter(|l| (64..=MAX_TABLE_LEN).contains(l))
+                        .filter(|&l| (64..=MAX_TABLE_LEN).contains(&l) && fits(p, l as u64))
                 {
                     f(Range {
                         start: p,
@@ -263,7 +279,7 @@ pub struct Madt {
 
 impl Madt {
     pub fn parse(mem: &impl PhysRead, addr: u64, len: u32) -> Option<Madt> {
-        if len < 44 {
+        if len < 44 || !fits(addr, len as u64) {
             return None;
         }
         let mut m = Madt {
@@ -337,6 +353,9 @@ impl Madt {
 }
 
 fn walk_madt(mem: &impl PhysRead, addr: u64, len: u32, mut f: impl FnMut(u8, u64, u8)) {
+    if !fits(addr, len as u64) {
+        return;
+    }
     let mut off = 44u64;
     while off + 2 <= len as u64 {
         let (Some(typ), Some(elen)) = (mem.u8(addr + off), mem.u8(addr + off + 1)) else {
@@ -353,6 +372,9 @@ fn walk_madt(mem: &impl PhysRead, addr: u64, len: u32, mut f: impl FnMut(u8, u64
 /// Register base addresses of every remapping unit in a DMAR (Intel VT-d).
 pub fn dmar_units(mem: &impl PhysRead, addr: u64, len: u32, out: &mut [u64; MAX_IOMMUS]) -> usize {
     let mut n = 0;
+    if !fits(addr, len as u64) {
+        return 0;
+    }
     let mut off = 48u64;
     while off + 4 <= len as u64 {
         let (Some(typ), Some(slen)) = (mem.u16(addr + off), mem.u16(addr + off + 2)) else {
@@ -379,6 +401,9 @@ pub fn dmar_units(mem: &impl PhysRead, addr: u64, len: u32, out: &mut [u64; MAX_
 /// can be described by several IVHD types, so addresses are de-duplicated.
 pub fn ivrs_units(mem: &impl PhysRead, addr: u64, len: u32, out: &mut [u64; MAX_IOMMUS]) -> usize {
     let mut n = 0;
+    if !fits(addr, len as u64) {
+        return 0;
+    }
     let mut off = 48u64;
     while off + 4 <= len as u64 {
         let (Some(typ), Some(blen)) = (mem.u8(addr + off), mem.u16(addr + off + 2)) else {
@@ -413,8 +438,11 @@ pub mod sim {
 
     impl PhysRead for Mem {
         fn read(&self, phys: u64, buf: &mut [u8]) -> bool {
+            let Some(end) = phys.checked_add(buf.len() as u64) else {
+                return false;
+            };
             for (base, bytes) in &self.0 {
-                if phys >= *base && phys + buf.len() as u64 <= base + bytes.len() as u64 {
+                if phys >= *base && end <= base + bytes.len() as u64 {
                     let o = (phys - base) as usize;
                     buf.copy_from_slice(&bytes[o..o + buf.len()]);
                     return true;
@@ -459,6 +487,10 @@ pub mod sim {
         r
     }
 }
+
+#[cfg(test)]
+#[path = "acpi_fuzz.rs"]
+mod fuzz;
 
 #[cfg(test)]
 mod tests {
@@ -542,6 +574,47 @@ mod tests {
         let mut units = [0u64; MAX_IOMMUS];
         let n = dmar_units(&mem, da, dl, &mut units);
         assert_eq!(&units[..n], &[0xfed9_0000, 0xfed9_1000]);
+    }
+
+    /// Found by the fuzzer: a table at the very top of the address space
+    /// whose length runs past 2^64. `addr + offset` used to wrap (a panic in
+    /// debug builds; in the release loader, low memory read as if it were
+    /// the table). Now any range that does not fit is refused before reading.
+    #[test]
+    fn tables_that_wrap_the_address_space_are_refused() {
+        let top = u64::MAX - 63; // 64 readable bytes: [top, 2^64)
+        let mut t = table(b"DMAR", &[0u8; 12]);
+        t.resize(64, 0);
+        let mem = Mem(vec![(top, t)]);
+        let mut u = [0u64; MAX_IOMMUS];
+        // len 100 claims 36 bytes beyond the end of the address space.
+        assert_eq!(dmar_units(&mem, top, 100, &mut u), 0);
+        assert_eq!(ivrs_units(&mem, top, 100, &mut u), 0);
+        assert!(Madt::parse(&mem, top, 100).is_none());
+        // An RSDP whose 36 bytes would wrap is not read at all.
+        assert!(Acpi::new(&mem, u64::MAX - 10).is_none());
+        // An XSDT entry pointing 2 bytes below 2^64 is skipped, not wrapped.
+        let mut mem = system();
+        let xsdt = &mut mem.0[1].1;
+        xsdt[36..44].copy_from_slice(&(u64::MAX - 1).to_le_bytes());
+        fix(xsdt, 9);
+        let acpi = Acpi::new(&mem, 0xe0000).unwrap();
+        assert_eq!(acpi.find(b"APIC"), None);
+        assert!(acpi.find(b"FACP").is_some());
+    }
+
+    /// Found by the fuzzer: a FACS pointer was followed on its length field
+    /// alone, so a stray pointer made random memory a range to keep mapped.
+    #[test]
+    fn facs_needs_its_signature() {
+        let mut mem = system();
+        let facs = mem.0.iter_mut().find(|r| r.0 == 0x6000).unwrap();
+        facs.1[0..4].copy_from_slice(b"XXXX");
+        let acpi = Acpi::new(&mem, 0xe0000).unwrap();
+        let mut ranges = Vec::new();
+        acpi.for_each_range(|r| ranges.push(r.start));
+        assert!(!ranges.contains(&0x6000), "{ranges:x?}");
+        assert!(ranges.contains(&0x7000));
     }
 
     #[test]
