@@ -31,6 +31,9 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
+      - name: Hold the host clock steady (no NTP slewing under the guests' clocks)
+        run: ./scripts/steady-host-clock.sh
+
       - name: Install QEMU, xorriso and UEFI firmware
         run: |
           sudo apt-get update
@@ -70,11 +73,26 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
+      - name: Hold the host clock steady (no NTP slewing under the guests' clocks)
+        run: ./scripts/steady-host-clock.sh
+
       - name: Install QEMU, firmware, signing and stress tools
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends qemu-system-x86 xorriso ovmf \
-            stress-ng sbsigntool mtools python3-virt-firmware
+            stress-ng sbsigntool mtools python3-virt-firmware dosfstools fdisk
+
+      - name: Install Rust (version pinned in kernel/rust-toolchain.toml)
+        working-directory: kernel
+        run: rustup show active-toolchain || rustup toolchain install
+
+      # The broken-ACPI scenarios need it, as in kernel.yml's tough-conditions
+      # job; without it the soak counted them as one failure every night.
+      - name: Build the firmware-quirk injector (breaks ACPI tables in RAM)
+        working-directory: bootloader
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          cargo build --release -p optimal-boot-quirk --target x86_64-unknown-uefi
 
       - name: Build kernel, ISOs and Secure Boot images, fetch extra firmware
         env:

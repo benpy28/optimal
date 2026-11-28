@@ -534,6 +534,37 @@ scenario "apic-xapic-tcg-qemu64" "boot:^apic: xAPIC \(CPU has no x2APIC\), id 0,
 scenario "apic-dmar-x2apic-opt-out" "boot:^acpi: .* tables \[.*DMAR.*\]; .*; 0 warnings$ && ^apic: xAPIC \(firmware opted out of x2APIC \(DMAR\)\), " "$ISO" bios q35 512M 2 30 kvm -- -acpitable "file=$AQ/dmar-x2apic-opt-out.bin"
 # A CPU with no local APIC at all: everything masked, interrupts stay off.
 scenario "apic-none-tcg" "boot:^apic: firmware left: local APIC disabled; PIC masks 0xff/0xff; I/O APIC pins unmasked 0/24$ && ^interrupts: off \(the CPU has no local APIC \(IA32_APIC_BASE 0x100\)\); 0 warnings$ && ^timer: lapic unknown; events none; .*; 1 warnings$ && ^timer: warning: the local APIC is not in use, so there are no timer events$" "$ISO" bios q35 512M 1 40 tcg -- -cpu qemu64,-apic
+# Level-triggered lines and stuck Remote IRRs (1c3c). The test suite
+# drives an HPET comparator as a level device on a free I/O APIC input
+# (kernel/src/irq/level/tests.rs), makes its Remote IRR stick by moving
+# the entry's vector while the interrupt is in service, and checks the
+# kernel clears it. Which method clears it depends on the I/O APIC:
+# QEMU's own is version 0x20, with an EOI register...
+EOI_BC='^eoi: broadcast \(the local APIC cannot suppress broadcasts\); a stuck Remote IRR is cleared by I/O APIC 0: '
+LEVEL16='^level: hpet comparator 2 on GSI 16 \(I/O APIC 0 pin 16\): 26 interrupts, '
+scenario "irq-level-eoi-register-tcg" "boot:${EOI_BC}the EOI register$ && ${LEVEL16}broadcast EOI$" "$ISO" bios q35 512M 2 40 tcg -- -cpu max
+# ...made version 0x11 (the 82093AA's) it has none, so the trigger toggle
+# (mask, edge, level) must do it...
+scenario "irq-level-old-ioapic-tcg" "boot:${EOI_BC}the trigger toggle$ && ${LEVEL16}broadcast EOI$" "$ISO" bios q35 512M 2 40 tcg -- -cpu max -global ioapic.version=0x11
+if [ "$KVM" = yes ]; then
+    # ...and KVM's in-kernel I/O APIC is version 0x11 too.
+    scenario "irq-level-kvm-in-kernel-ioapic" "boot:^eoi: broadcast \(.*\); a stuck Remote IRR is cleared by I/O APIC 0: the trigger toggle$ && ${LEVEL16}broadcast EOI$" "$ISO" bios q35 512M 2 30 kvm
+    # With the I/O APIC in QEMU (split irqchip), KVM's x2APIC offers EOI
+    # broadcast suppression (version register bit 24), so the kernel goes
+    # directed: SVR bit 12 set, the vector written to the I/O APIC's EOI
+    # register. KVM releases before the 2025 suppress-EOI-broadcast work still
+    # broadcast as well, so this proves the directed path is set up and works
+    # alongside a broadcast, not that the broadcast is suppressed.
+    scenario "irq-level-kvm-split-directed" "boot:^apic: x2APIC .* && ^eoi: directed \(the local APIC suppresses broadcasts and every I/O APIC has an EOI register\); a stuck Remote IRR is cleared by I/O APIC 0: the EOI register$ && ${LEVEL16}directed EOI$" "$ISO" bios q35,kernel-irqchip=split 512M 2 30 kvm
+else
+    echo "SKIP: irq-level-kvm-* (no KVM on this host)"
+    skipped=$((skipped + 1))
+fi
+# QEMU's pc machine lets the HPET reach only GSI 2, which ISA IRQ 0 owns:
+# the device search must say there is nothing free (and the claim of GSI 2
+# is refused in the suite). Given GSIs 16 to 23 as well, it runs there.
+scenario "irq-level-pc-no-free-input" "boot:^ktest: HPET route capability 0x00000004; 0 free inputs$" "$ISO" bios pc 256M 1 40 tcg -- -cpu max
+scenario "irq-level-pc-hpet-intcap" "boot:^ktest: HPET route capability 0x00ff0004; 8 free inputs$ && ${LEVEL16}broadcast EOI$" "$ISO" bios pc 256M 1 30 kvm -- -global hpet.hpet-intcap=0xff0004
 # Local APIC states from the firmware-quirk injector (applied after
 # ExitBootServices; Limine leaves the local APIC as it finds it).
 if has_uefi && [ -f "$QUIRK_EFI" ]; then
