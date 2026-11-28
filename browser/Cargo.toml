@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/wtf8", "crates/dom", "crates/html", "crates/css", "crates/selectors"]
+members = ["crates/wtf8", "crates/dom", "crates/html", "crates/css", "crates/selectors", "crates/style"]
 
 [workspace.package]
 edition = "2024"

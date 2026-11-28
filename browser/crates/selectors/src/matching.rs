@@ -227,6 +227,27 @@ impl<'s, E: Element> MatchSession<'s, E> {
         }
         .list(list, &Node::El(element.clone()))
     }
+
+    /// Whether any selector in `list` matches `element`, with `nesting` as
+    /// the rules `&` stands for (outermost first) instead of the context's.
+    /// This lets one session match the rules of a whole style sheet, each
+    /// nested at its own place. The caches know a list by its address and
+    /// the length of its nesting, so each list must be matched with the
+    /// same nesting every time in a session (as each rule of a style sheet
+    /// is); the lists in `nesting` must outlive the session too.
+    pub fn matches_nested(
+        &self,
+        list: &'s SelectorList,
+        nesting: &[&'s SelectorList],
+        element: &E,
+    ) -> bool {
+        Matcher {
+            cx: self.cx,
+            nesting,
+            caches: &self.caches,
+        }
+        .list(list, &Node::El(element.clone()))
+    }
 }
 
 /// The element after `e` in tree order, staying inside `root`'s subtree

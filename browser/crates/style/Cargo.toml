@@ -1,0 +1,19 @@
+[package]
+name = "optimal-style"
+version = "0.1.0"
+description = "CSS Cascading and Inheritance Level 5 for the Optimal browser engine: style sheet collection, cascade layers and the cascade"
+edition.workspace = true
+publish = false
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+optimal-css = { path = "../css" }
+optimal-selectors = { path = "../selectors" }
+optimal-wtf8 = { path = "../wtf8" }
+
+[dev-dependencies]
+proptest = "1"

@@ -74,7 +74,7 @@ fetch css-parsing-tests https://github.com/SimonSapin/css-parsing-tests.git 203c
 # The specs the CSS crate is written from, at the commit it follows. Not test
 # data, so only fetched on request: ./scripts/fetch-test-suites.sh --specs
 if [ "${1:-}" = "--specs" ]; then
-  fetch_sparse csswg-drafts https://github.com/w3c/csswg-drafts.git 7027ab6fdf3c98d9c44666820041cb075b0e28dd css-syntax-3 selectors-4 cssom-1 css-pseudo-4 css-shadow-1 css-nesting-1 css-namespaces-3 css-text-3
+  fetch_sparse csswg-drafts https://github.com/w3c/csswg-drafts.git 7027ab6fdf3c98d9c44666820041cb075b0e28dd css-syntax-3 selectors-4 cssom-1 css-pseudo-4 css-shadow-1 css-nesting-1 css-namespaces-3 css-text-3 css-cascade-5 css-values-4
   # WHATWG HTML (the selector case-sensitivity rules, and the pseudo-classes
   # HTML defines) and DOM (scope-match a selectors string).
   fetch_sparse whatwg-html https://github.com/whatwg/html.git 30f7046075a1c19999caef3a52388f64d96acad7 source
