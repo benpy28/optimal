@@ -157,7 +157,11 @@ fn lie_and_check(
             rh.apply(&op).unwrap();
         }
         rh.apply(&Op::Commit).unwrap();
-        assert!(rh.fs().generation() > skipped);
+        assert!(
+            rh.fs().generation() > skipped,
+            "seed {seed:#x} lies {lies} image {img_no}: generation {} after commit, mounted {g}, skipped {skipped}",
+            rh.fs().generation()
+        );
         let m = rh.model.clone();
         rh.verify(&m);
         rh.fsck();
