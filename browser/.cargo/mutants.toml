@@ -63,4 +63,14 @@ exclude_re = [
     # which this iteration has already taken and no later one reads, so
     # they are dropped: same results, only wasted work. Equivalent.
     "style/src/values/matcher\\.rs:214:38: replace << with >> in Run<'_, 't, 'a>::run",
+    # style parse trees, nested contents: a function's contents are parsed
+    # at its depth plus one. A smaller depth only loosens the nesting
+    # limit, which the outer match already passed, so the contents give
+    # the same tree. Equivalent. Line-pinned.
+    "style/src/values/parse\\.rs:261:52: replace \\+ with \\* in Parser<'_, 't, 'a>::extract",
+    # style parse trees, the && / || walk: child i is only added when its
+    # bit is clear in `mask` (checked just before), so `^` sets it as `|`
+    # does. Equivalent. Line-pinned.
+    "style/src/values/parse\\.rs:350:80: replace \\| with \\^ in Parser<'_, 't, 'a>::extract",
+    "style/src/values/parse\\.rs:371:75: replace \\| with \\^ in Parser<'_, 't, 'a>::extract",
 ]

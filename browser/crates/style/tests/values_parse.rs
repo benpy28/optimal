@@ -104,6 +104,10 @@ fn keywords_before_custom_ident() {
     check(&g, "x ease-in", "[0=x 1=0:ease-in]");
     let g = build(&[], "[ ease-in | ease-out ] || <custom-ident>");
     check(&g, "ease-in ease-out", "[0=0:ease-in 1=ease-out]");
+    // A <custom-ident> inside a multiplier counts too.
+    let g = build(&[], "<custom-ident>? || [ a | b ]");
+    check(&g, "a", "[1=0:a]");
+    check(&g, "x a", "[0=[0=x] 1=0:a]");
     // Also between alternatives.
     let g = build(&[("name", "<custom-ident>")], "<name> | auto");
     check(&g, "auto", "1:auto");
@@ -166,6 +170,10 @@ fn functions_blocks_and_required() {
     );
     check(&g, "f() a", "[0=f([0=[] 1=[]]) 1=[] 2=[0=[0=a] 1=[]]]");
     assert_eq!(tree(&g, "f()"), None, "the ! group needs something");
+    // A ! group in a juxtaposition ends where the rest still matches.
+    let g = build(&[], "[ a b? ]! b");
+    check(&g, "a b", "[0=[0=a 1=[]] 1=b]");
+    check(&g, "a b b", "[0=[0=a 1=[0=b]] 1=b]");
 }
 
 #[test]

@@ -36,7 +36,7 @@
 //! matching), and recording parse pointers in the matcher itself (it
 //! would make every match pay for trees only valid values need).
 
-use optimal_css::{BlockKind, ComponentValue, Kind, Values};
+use optimal_css::{BlockKind, ComponentValue, Kind};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use super::matcher::{BANG, COMMA_MASK, EMITTED, NOTHING, PENDING, Run, pos, state};
@@ -101,15 +101,6 @@ pub fn parse<'t, 'a: 't>(
         return None;
     }
     Some(p.extract(top, start, &ends).0)
-}
-
-/// [`parse`] for a whole value of the property whose grammar is `top`.
-pub fn parse_list<'t, 'a: 't>(
-    g: &Compiled,
-    top: NodeId,
-    values: Values<'t, 'a>,
-) -> Option<Tree<'t, 'a>> {
-    parse(g, top, values, 0)
 }
 
 struct Parser<'g, 't, 'a> {
@@ -285,12 +276,18 @@ impl<'t, 'a> Parser<'_, 't, 'a> {
                 (tree(TreeKind::Inner(Box::new(t))), end)
             }
             Node::Required(c) => {
+                // The inner end states that are acceptable ends once the
+                // `!` flag is dropped. They all have the flag: a state's
+                // flag says whether a component value other than a comma
+                // was taken since the `!` began, which only depends on
+                // the component values between the two positions, and the
+                // matcher only let these ends through with the flag.
                 let c = *c;
                 let inner: Vec<u32> = self
                     .out(c, s & !BANG)
                     .iter()
                     .copied()
-                    .filter(|&x| x & BANG != 0 && ends.binary_search(&(x & !BANG)).is_ok())
+                    .filter(|&x| ends.binary_search(&(x & !BANG)).is_ok())
                     .collect();
                 let (t, end) = self.extract(c, s & !BANG, &furthest(&inner));
                 (tree(TreeKind::Inner(Box::new(t))), end & !BANG)
