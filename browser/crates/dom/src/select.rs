@@ -181,6 +181,8 @@ pub struct Stats {
     /// Nodes visited looking for options and selectedcontent elements in
     /// inserted or removed subtrees.
     pub visited: u64,
+    /// Runs of "update a select's descendant selectedcontent elements".
+    pub content_updates: u64,
 }
 
 /// The fold of every upward walk the model makes, for a child of a node.
@@ -226,13 +228,12 @@ enum Change {
     /// list of options changed.
     Leaf(NodeId, bool),
     /// Part of the operation with this number.
-    Batch(u64),
+    Batch,
 }
 
 /// The context of the operation whose steps are running.
 #[derive(Clone, Copy, Debug)]
 struct Op {
-    id: u64,
     /// The only option in the subtree inserted or removed, if there is
     /// exactly one: then it is the only change to any list of options.
     single: Option<NodeId>,
@@ -420,20 +421,10 @@ impl Document {
     fn ctx_of(&mut self, n: NodeId) -> Ctx {
         match self.parent(n) {
             Some(p) => self.ctx(p),
-            None => Ctx {
-                connected: n == Document::ROOT,
-                ..Ctx::DETACHED
-            },
+            // Only the root has no parent and is connected, and nothing
+            // asks for the root's own context.
+            None => Ctx::DETACHED,
         }
-    }
-
-    /// Is the node connected (is its root the document)?
-    pub fn is_connected(&self, n: NodeId) -> bool {
-        let mut x = n;
-        while let Some(p) = self.parent(x) {
-            x = p;
-        }
-        x == Document::ROOT
     }
 
     /// Is the option disabled (HTML 4.10.10)?
@@ -538,10 +529,7 @@ impl Document {
             v
         };
         let (ca, cb) = (chain(a), chain(b));
-        let mut i = 0;
-        while i < ca.len() && i < cb.len() && ca[i] == cb[i] {
-            i += 1;
-        }
+        let i = ca.iter().zip(&cb).take_while(|(x, y)| x == y).count();
         if i == ca.len() {
             return true; // a is an ancestor of b
         }
@@ -557,19 +545,15 @@ impl Document {
     fn sibling_precedes(&self, x: NodeId, y: NodeId) -> bool {
         let (mut back, mut fwd) = (self.prev_sibling(x), self.next_sibling(x));
         loop {
-            match (back, fwd) {
-                (None, None) => unreachable!("siblings share a parent"),
-                _ => {
-                    if fwd == Some(y) {
-                        return true;
-                    }
-                    if back == Some(y) {
-                        return false;
-                    }
-                    back = back.and_then(|n| self.prev_sibling(n));
-                    fwd = fwd.and_then(|n| self.next_sibling(n));
-                }
+            if fwd == Some(y) {
+                return true;
             }
+            if back == Some(y) {
+                return false;
+            }
+            assert!(back.is_some() || fwd.is_some(), "siblings share a parent");
+            back = back.and_then(|n| self.prev_sibling(n));
+            fwd = fwd.and_then(|n| self.next_sibling(n));
         }
     }
 
@@ -627,10 +611,7 @@ impl Document {
             (Some(&o), None) => Some(o),
             _ => None,
         };
-        Op {
-            id: self.model.op,
-            single,
-        }
+        Op { single }
     }
 
     /// After `n` was linked under `parent`: the insertion steps for `n`'s
@@ -655,10 +636,8 @@ impl Document {
             .iter()
             .filter(|&&d| is_html(self, d, local::SELECTEDCONTENT))
             .count();
-        if contents > 0 && !self.model.reference {
-            for s in self.select_chain(parent) {
-                self.select_state(s).descendant_contents += contents;
-            }
+        for s in self.select_chain(parent) {
+            self.select_state(s).descendant_contents += contents;
         }
         for d in relevant {
             self.insertion_steps(d, op);
@@ -677,10 +656,8 @@ impl Document {
             .iter()
             .filter(|&&d| is_html(self, d, local::SELECTEDCONTENT))
             .count();
-        if contents > 0 && !self.model.reference {
-            for s in self.select_chain(parent) {
-                self.select_state(s).descendant_contents -= contents;
-            }
+        for s in self.select_chain(parent) {
+            self.select_state(s).descendant_contents -= contents;
         }
         for d in relevant {
             self.removing_steps(d, op);
@@ -769,9 +746,9 @@ impl Document {
             return;
         };
         let (select, selected) = (st.cached_select, st.selectedness);
+        // Not reachable during an update, which never pops an element.
         if let Some(s) = select
             && selected
-            && !self.select_ref(s).updating
         {
             self.update_contents(s);
         }
@@ -780,7 +757,8 @@ impl Document {
     /// Run every queued microtask.
     pub fn perform_microtask_checkpoint(&mut self) {
         while let Some(s) = self.model.microtasks.pop_front() {
-            if self.select_ref(s).pending && !self.select_ref(s).updating {
+            // Not reachable during an update, which never runs microtasks.
+            if self.select_ref(s).pending {
                 self.update_contents(s);
             }
         }
@@ -807,7 +785,7 @@ impl Document {
             let change = if op.single == Some(o) {
                 Change::Leaf(o, joined)
             } else {
-                Change::Batch(op.id)
+                Change::Batch
             };
             let changed = self.run_selectedness(s, change);
             if self.selectedness(o) || changed {
@@ -826,20 +804,16 @@ impl Document {
         let st = self.select_ref(s);
         if !self.model.reference && st.settled {
             match change {
-                Change::Batch(op) if st.settled_op == op => return false,
+                Change::Batch if st.settled_op == self.model.op => return false,
                 Change::Leaf(o, joined) => return self.run_leaf(s, o, joined),
                 _ => {}
             }
         }
-        let op = match change {
-            Change::Batch(op) => op,
-            _ => self.model.op,
-        };
-        self.run_full(s, op)
+        self.run_full(s)
     }
 
     /// The algorithm as the standard words it.
-    fn run_full(&mut self, s: NodeId, op: u64) -> bool {
+    fn run_full(&mut self, s: NodeId) -> bool {
         self.model.stats.full_runs += 1;
         let mut has_changed = false;
         let mut first_enabled = None;
@@ -878,6 +852,7 @@ impl Document {
             has_changed = true;
             selected = Some(f);
         }
+        let op = self.model.op;
         let st = self.select_state(s);
         st.settled = true;
         st.selected = selected;
@@ -907,8 +882,7 @@ impl Document {
             }
             self.select_state(s).selected = None;
             if self.display_size(s) == 1 {
-                let op = self.model.op;
-                return self.run_full(s, op);
+                return self.run_full(s);
             }
             return false;
         }
@@ -983,6 +957,7 @@ impl Document {
 
     /// "Update a select's descendant selectedcontent elements".
     fn update_contents(&mut self, s: NodeId) {
+        self.model.stats.content_updates += 1;
         self.select_state(s).pending = false;
         if self.has_multiple(s) {
             return;
@@ -1352,9 +1327,6 @@ impl Document {
                     );
                 }
                 Behaviour::Select(st) => {
-                    if self.model.reference {
-                        continue;
-                    }
                     let desc = self.descendants(n);
                     let count = desc
                         .iter()
@@ -1372,7 +1344,7 @@ impl Document {
                     enabled.sort();
                     reg.sort();
                     assert_eq!(reg, enabled, "registry of enabled selectedcontent");
-                    if st.settled {
+                    if st.settled && !self.model.reference {
                         assert!(!self.has_multiple(n), "settled with multiple");
                         let list = self.list_of_options(n);
                         let selected: Vec<NodeId> = list

@@ -482,7 +482,11 @@ fn appending_options_runs_the_algorithm_once() {
     let (mut d, s) = doc_with_select(&[]);
     let before = d.behaviour_stats().full_runs;
     for i in 0..1000 {
-        let o = el(&mut d, "option", if i % 3 == 0 { &["selected"] } else { &[] });
+        let o = el(
+            &mut d,
+            "option",
+            if i % 3 == 0 { &["selected"] } else { &[] },
+        );
         d.append(s, o);
     }
     assert_eq!(d.behaviour_stats().full_runs - before, 1);
@@ -498,7 +502,11 @@ fn appending_options_runs_the_algorithm_once() {
         let o = el(&mut r, "option", &[]);
         r.append(rs, o);
     }
-    assert_eq!(r.behaviour_stats().full_runs, 10, "the literal model runs every time");
+    assert_eq!(
+        r.behaviour_stats().full_runs,
+        10,
+        "the literal model runs every time"
+    );
 }
 
 /// A subtree with one option moves like a single option: no full run.
@@ -543,7 +551,11 @@ fn ancestor_contexts_are_memoised() {
         d.append(p, o);
     }
     let steps = d.behaviour_stats().ctx_steps - before;
-    assert!(steps < 2 * 2000 + 100, "{steps} context steps");
+    // The first option walks the 2000 divs once.
+    assert!(
+        (2000..2 * 2000 + 100).contains(&steps),
+        "{steps} context steps"
+    );
 }
 
 /// Moving a subtree that never held an option or selectedcontent visits
@@ -568,6 +580,500 @@ fn moves_visit_flagged_nodes_only() {
     d.remove(big);
     // root and option, each in the removal walk
     assert_eq!(d.behaviour_stats().visited - before, 2);
+}
+
+// ---- The ancestor walks, literally ----------------------------------------
+//
+// The normal and the literal document share the fold behind every upward
+// walk (`Document::ctx_step`), so comparing them cannot catch a mistake in
+// it. These are the standard's algorithms word for word, independent of
+// that fold.
+
+fn has_attr(d: &Document, n: NodeId, name: LocalName) -> bool {
+    d.element(n).is_some_and(|e| e.attribute(name).is_some())
+}
+
+fn ancestors(d: &Document, n: NodeId) -> Vec<NodeId> {
+    let mut out = Vec::new();
+    let mut a = d.parent(n);
+    while let Some(x) = a {
+        out.push(x);
+        a = d.parent(x);
+    }
+    out
+}
+
+/// "Get the nearest ancestor select" (4.10.10).
+fn literal_nearest_select(d: &Document, o: NodeId) -> Option<NodeId> {
+    let mut ancestor_optgroup = None;
+    for a in ancestors(d, o) {
+        if is_html(d, a, local::DATALIST)
+            || is_html(d, a, local::HR)
+            || is_html(d, a, local::OPTION)
+        {
+            return None;
+        }
+        if is_html(d, a, local::OPTGROUP) {
+            if ancestor_optgroup.is_some() {
+                return None;
+            }
+            ancestor_optgroup = Some(a);
+        }
+        if is_html(d, a, local::SELECT) {
+            return Some(a);
+        }
+    }
+    None
+}
+
+/// An option is disabled (4.10.10).
+fn literal_option_disabled(d: &Document, o: NodeId) -> bool {
+    if has_attr(d, o, local::DISABLED) {
+        return true;
+    }
+    for a in ancestors(d, o) {
+        if [local::SELECT, local::HR, local::DATALIST, local::OPTION]
+            .iter()
+            .any(|&n| is_html(d, a, n))
+        {
+            return false;
+        }
+        if is_html(d, a, local::OPTGROUP) {
+            return has_attr(d, a, local::DISABLED);
+        }
+    }
+    false
+}
+
+/// "Recalculate a selectedcontent element's disabledness": the cached
+/// select and the disabled flag.
+fn literal_recalc(d: &Document, c: NodeId) -> (Option<NodeId>, bool) {
+    let mut nearest = None;
+    let mut disabled = false;
+    for a in ancestors(d, c) {
+        if is_html(d, a, local::SELECT) {
+            if nearest.is_none() {
+                nearest = Some(a);
+                continue;
+            }
+            disabled = true;
+            break;
+        }
+        if is_html(d, a, local::OPTION) || is_html(d, a, local::SELECTEDCONTENT) {
+            disabled = true;
+            break;
+        }
+    }
+    (nearest, disabled)
+}
+
+/// Every cached ancestor result in `d` against the literal walks.
+fn check_literal(d: &mut Document) {
+    for i in 0..d.node_count() {
+        let n = NodeId(i as u32);
+        let connected = n == Document::ROOT || ancestors(d, n).last() == Some(&Document::ROOT);
+        if n != Document::ROOT {
+            assert_eq!(d.is_connected_mut(n), connected, "connected {i}");
+        }
+        let mut selects: Vec<NodeId> = std::iter::once(n)
+            .chain(ancestors(d, n))
+            .filter(|&a| is_html(d, a, local::SELECT))
+            .collect();
+        assert_eq!(d.select_chain(n), selects, "selects at or above {i}");
+        selects.clear();
+        match d.behaviour(n).clone() {
+            Behaviour::Option(st) => {
+                assert_eq!(
+                    st.cached_select,
+                    literal_nearest_select(d, n),
+                    "select of {i}"
+                );
+                let disabled = literal_option_disabled(d, n);
+                assert_eq!(d.option_disabled(n), disabled, "option {i} disabled");
+                assert_eq!(d.option_disabled_mut(n), disabled, "option {i} disabled");
+            }
+            Behaviour::SelectedContent(st) => {
+                assert_eq!(
+                    (st.cached_select, st.disabled),
+                    literal_recalc(d, n),
+                    "selectedcontent {i}"
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+const CHAIN: &[(&str, &[&str])] = &[
+    ("select", &[]),
+    ("option", &[]),
+    ("optgroup", &[]),
+    ("optgroup", &["disabled"]),
+    ("datalist", &[]),
+    ("hr", &[]),
+    ("selectedcontent", &[]),
+    ("div", &[]),
+];
+
+const LEAVES: &[(&str, &[&str])] = &[
+    ("option", &[]),
+    ("option", &["disabled"]),
+    ("selectedcontent", &[]),
+    ("select", &[]),
+];
+
+/// Every chain of up to three of the elements that matter, ending in an
+/// option, a selectedcontent or a select; connected or not; built top down
+/// (each element appended to the last) and bottom up (the finished chain
+/// inserted at once); in both documents.
+#[test]
+fn ancestor_walks_match_the_standard_on_every_short_chain() {
+    let n = CHAIN.len();
+    let mut chains: Vec<Vec<usize>> = vec![vec![]];
+    for len in 1..=3 {
+        for mut k in 0..n.pow(len) {
+            let mut c = Vec::new();
+            for _ in 0..len {
+                c.push(k % n);
+                k /= n;
+            }
+            chains.push(c);
+        }
+    }
+    for chain in &chains {
+        for leaf in LEAVES {
+            for connected in [true, false] {
+                for top_down in [true, false] {
+                    for reference in [false, true] {
+                        let mut d = if reference {
+                            Document::new_reference()
+                        } else {
+                            Document::new()
+                        };
+                        let html = el(&mut d, "html", &[]);
+                        if connected {
+                            d.append(Document::ROOT, html);
+                        }
+                        let mut kinds: Vec<(&str, &[&str])> =
+                            chain.iter().map(|&k| CHAIN[k]).collect();
+                        kinds.push(*leaf);
+                        let nodes: Vec<NodeId> =
+                            kinds.iter().map(|(name, a)| el(&mut d, name, a)).collect();
+                        if top_down {
+                            let mut p = html;
+                            for &x in &nodes {
+                                d.append(p, x);
+                                p = x;
+                            }
+                        } else {
+                            for w in nodes.windows(2).rev() {
+                                d.append(w[0], w[1]);
+                            }
+                            d.append(html, nodes[0]);
+                        }
+                        check_literal(&mut d);
+                        d.check_invariants();
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---- Steps with no visible difference between the two documents --------
+
+/// Option A is created selected and inserted with its text. The algorithm
+/// changes nothing, but A is selected, so "update an option's nearest
+/// ancestor select" returns the select and the selectedcontent shows A.
+#[test]
+fn inserting_a_selected_option_updates_selectedcontent() {
+    let (mut d, s) = doc_with_select(&[]);
+    let sc = el(&mut d, "selectedcontent", &[]);
+    d.append(s, sc);
+    let a = el(&mut d, "option", &["selected"]);
+    let t = text(&mut d, "A");
+    d.append(a, t);
+    d.append(s, a);
+    assert_eq!(text_of(&d, sc), "A");
+    d.check_invariants();
+}
+
+/// Display size 2: adding selected to A selects it and the algorithm has
+/// nothing left to change, so only hasChanged makes the update happen.
+#[test]
+fn selected_attribute_with_display_size_two_updates_selectedcontent() {
+    let (mut d, s) = doc_with_select(&["size=2"]);
+    let sc = el(&mut d, "selectedcontent", &[]);
+    d.append(s, sc);
+    let a = el(&mut d, "option", &[]);
+    let t = text(&mut d, "A");
+    d.append(a, t);
+    d.append(s, a);
+    d.perform_microtask_checkpoint();
+    assert_eq!(text_of(&d, sc), "");
+    d.set_attribute(a, local::SELECTED, Wtf8Buf::new());
+    assert_eq!(text_of(&d, sc), "A");
+    d.check_invariants();
+}
+
+/// A disabled attribute is not a selected attribute: adding it to B
+/// leaves B unselected and A selected.
+#[test]
+fn disabled_attribute_does_not_select() {
+    let (mut d, s) = doc_with_select(&[]);
+    let a = el(&mut d, "option", &[]);
+    let b = el(&mut d, "option", &[]);
+    d.append(s, a);
+    d.append(s, b);
+    d.set_attribute(b, local::DISABLED, Wtf8Buf::new());
+    assert_eq!(selected(&d, &[a, b]), [true, false]);
+    d.check_invariants();
+}
+
+/// Attribute change steps that return early run nothing: another
+/// attribute on an option, a select or an optgroup; a value change of
+/// multiple. Removing selected from an option the algorithm already
+/// deselected runs the algorithm but updates nothing.
+#[test]
+fn attribute_changes_that_change_nothing_run_nothing() {
+    let (mut d, s) = doc_with_select(&[]);
+    let sc = el(&mut d, "selectedcontent", &[]);
+    d.append(s, sc);
+    let g = el(&mut d, "optgroup", &[]);
+    d.append(s, g);
+    // B then A, both with selected: the algorithm keeps the last, A.
+    let b = el(&mut d, "option", &["selected"]);
+    d.append(g, b);
+    let a = el(&mut d, "option", &["selected"]);
+    d.append(s, a);
+    d.perform_microtask_checkpoint();
+    assert_eq!(selected(&d, &[b, a]), [false, true]);
+    let label = d.names.intern_str("label");
+    let name = d.names.intern_str("name");
+    let quiet = |d: &mut Document, f: &dyn Fn(&mut Document)| {
+        let before = d.behaviour_stats();
+        f(d);
+        let after = d.behaviour_stats();
+        let what = d.behaviour_dump();
+        assert_eq!(after.full_runs, before.full_runs, "{what}");
+        assert_eq!(after.content_updates, before.content_updates, "{what}");
+        assert!(d.select_ref(s).settled);
+        d.check_invariants();
+    };
+    quiet(&mut d, &|d| d.set_attribute(a, label, Wtf8Buf::from("x")));
+    quiet(&mut d, &|d| {
+        d.set_attribute(a, local::SELECTED, Wtf8Buf::from("x"))
+    });
+    quiet(&mut d, &|d| d.set_attribute(s, name, Wtf8Buf::from("x")));
+    quiet(&mut d, &|d| d.remove_attribute(s, name));
+    quiet(&mut d, &|d| d.set_attribute(g, label, Wtf8Buf::from("x")));
+    // The steps go on to reset the select's selectedness (one run of the
+    // algorithm), which changes nothing, and hasChanged is false: no
+    // update.
+    let before = d.behaviour_stats();
+    d.remove_attribute(b, local::SELECTED);
+    assert_eq!(d.behaviour_stats().full_runs, before.full_runs + 1);
+    assert_eq!(d.behaviour_stats().content_updates, before.content_updates);
+    assert_eq!(selected(&d, &[b, a]), [false, true]);
+    // The optgroup's context memo survives an unrelated change.
+    assert!(d.model.memo.contains_key(&g));
+    let m = el(&mut d, "select", &["multiple"]);
+    d.append(s, m);
+    let before = d.behaviour_stats();
+    d.set_attribute(m, local::MULTIPLE, Wtf8Buf::from("x"));
+    assert_eq!(d.behaviour_stats().content_updates, before.content_updates);
+}
+
+/// Setting an attribute replaces the one with that name and no namespace,
+/// and leaves the others.
+#[test]
+fn set_attribute_replaces_only_its_own_attribute() {
+    let mut d = Document::new();
+    let o = el(&mut d, "option", &["label=L", "selected=1"]);
+    let xlink = d.names.intern_str("selected");
+    d.element_mut(o).unwrap().attributes.insert(
+        0,
+        Attribute {
+            namespace: Namespace::XLink,
+            prefix: None,
+            local: xlink,
+            value: Wtf8Buf::from("ns"),
+        },
+    );
+    d.set_attribute(o, local::SELECTED, Wtf8Buf::from("2"));
+    let attrs: Vec<String> = d
+        .element(o)
+        .unwrap()
+        .attributes
+        .iter()
+        .map(|a| format!("{:?} {}", a.namespace, a.value))
+        .collect();
+    assert_eq!(attrs, ["XLink ns", "None L", "None 2"]);
+}
+
+/// Queueing twice queues once; a select with no selectedcontent queues
+/// nothing.
+#[test]
+fn queue_update_queues_once_and_only_with_selectedcontent() {
+    let (mut d, s) = doc_with_select(&[]);
+    let a = el(&mut d, "option", &[]);
+    d.append(s, a);
+    assert!(!d.has_microtasks());
+    let sc = el(&mut d, "selectedcontent", &[]);
+    d.append(s, sc);
+    d.perform_microtask_checkpoint();
+    d.queue_update(s);
+    d.queue_update(s);
+    assert_eq!(d.model.microtasks.len(), 1);
+    let before = d.behaviour_stats().content_updates;
+    d.perform_microtask_checkpoint();
+    assert_eq!(d.behaviour_stats().content_updates, before + 1);
+    // Nothing pending: a stale queue entry does nothing.
+    d.model.microtasks.push_back(s);
+    d.perform_microtask_checkpoint();
+    assert_eq!(d.behaviour_stats().content_updates, before + 1);
+}
+
+/// The option children parsed steps clone the option as it is now.
+#[test]
+fn children_parsed_clones_the_finished_option() {
+    let (mut d, s) = doc_with_select(&[]);
+    let sc = el(&mut d, "selectedcontent", &[]);
+    d.append(s, sc);
+    let a = el(&mut d, "option", &[]);
+    d.append(s, a);
+    d.perform_microtask_checkpoint();
+    let t = text(&mut d, "A");
+    d.append(a, t);
+    assert_eq!(text_of(&d, sc), "");
+    d.children_parsed(a);
+    assert_eq!(text_of(&d, sc), "A");
+    // Not an option, or not selected: nothing.
+    let b = el(&mut d, "option", &[]);
+    let t = text(&mut d, "B");
+    d.append(b, t);
+    d.append(s, b);
+    d.children_parsed(b);
+    d.children_parsed(s);
+    assert_eq!(text_of(&d, sc), "A");
+}
+
+/// On a settled select the first selected option is the recorded one; the
+/// literal document always walks the list. (Shown by corrupting the
+/// record.)
+#[test]
+fn first_selected_uses_the_record_only_when_fast() {
+    for reference in [false, true] {
+        let mut d = if reference {
+            Document::new_reference()
+        } else {
+            Document::new()
+        };
+        let s = el(&mut d, "select", &[]);
+        d.append(Document::ROOT, s);
+        let a = el(&mut d, "option", &[]);
+        let b = el(&mut d, "option", &[]);
+        d.append(s, a);
+        d.append(s, b);
+        assert!(d.select_ref(s).settled);
+        d.select_state(s).selected = Some(b);
+        assert_eq!(d.first_selected(s), Some(if reference { a } else { b }));
+    }
+}
+
+/// Memos made by the insertion steps stay after the post-connection steps.
+#[test]
+fn post_connection_keeps_memos() {
+    let (mut d, s) = doc_with_select(&[]);
+    let div = el(&mut d, "div", &[]);
+    let o = el(&mut d, "option", &[]);
+    d.append(div, o);
+    d.append(s, div);
+    assert!(d.model.memo.contains_key(&div));
+}
+
+/// Tree order between nodes where one contains the other, siblings either
+/// way round, and cousins.
+#[test]
+fn tree_order() {
+    let (mut d, s) = doc_with_select(&[]);
+    let kids: Vec<NodeId> = (0..4)
+        .map(|_| {
+            let x = el(&mut d, "div", &[]);
+            d.append(s, x);
+            x
+        })
+        .collect();
+    let inner = el(&mut d, "div", &[]);
+    d.append(kids[1], inner);
+    assert!(d.precedes(s, inner));
+    assert!(!d.precedes(inner, s));
+    assert!(d.precedes(kids[1], inner));
+    assert!(d.precedes(inner, kids[2]));
+    assert!(!d.precedes(kids[3], inner));
+    for i in 0..4 {
+        for j in 0..4 {
+            if i != j {
+                assert_eq!(d.precedes(kids[i], kids[j]), i < j, "{i} {j}");
+            }
+        }
+    }
+}
+
+/// The dump names each stateful element's state.
+#[test]
+fn behaviour_dump_lists_state() {
+    let (mut d, s) = doc_with_select(&[]);
+    let sc = el(&mut d, "selectedcontent", &[]);
+    d.append(s, sc);
+    let o = el(&mut d, "option", &[]);
+    d.append(s, o);
+    let dump = d.behaviour_dump();
+    let (s, sc, o) = (s.index(), sc.index(), o.index());
+    assert!(
+        dump.contains(&format!("{s} select pending=false")),
+        "{dump}"
+    );
+    assert!(
+        dump.contains(&format!(
+            "{sc} selectedcontent disabled=false select=Some(NodeId({s}))"
+        )),
+        "{dump}"
+    );
+    assert!(
+        dump.contains(&format!(
+            "{o} option selected=true dirty=false select=Some(NodeId({s}))"
+        )),
+        "{dump}"
+    );
+    // Each insertion queued a microtask; the post-connection steps did the
+    // updates, so both entries will find nothing pending.
+    assert!(
+        dump.ends_with(&format!("microtasks [NodeId({s}), NodeId({s})]\n")),
+        "{dump}"
+    );
+}
+
+/// The invariant check finds broken state.
+#[test]
+#[should_panic(expected = "flags upward closed")]
+fn invariants_catch_unflagged_parents() {
+    let (mut d, s) = doc_with_select(&[]);
+    let o = el(&mut d, "option", &[]);
+    d.append(s, o);
+    d.model.flagged[s.index()] = false;
+    d.model.memo.remove(&s);
+    d.check_invariants();
+}
+
+#[test]
+#[should_panic(expected = "option's cached select")]
+fn invariants_catch_a_wrong_cached_select() {
+    let (mut d, s) = doc_with_select(&[]);
+    let o = el(&mut d, "option", &[]);
+    d.append(s, o);
+    d.option_state(o).cached_select = None;
+    d.check_invariants();
 }
 
 // ---- Random operations, fast against literal ---------------------------
@@ -739,8 +1245,10 @@ proptest! {
         }
         for (i, op) in ops.iter().enumerate() {
             apply(&mut docs, op);
-            docs[0].check_invariants();
-            docs[1].check_invariants();
+            for d in docs.iter_mut() {
+                d.check_invariants();
+                check_literal(d);
+            }
             prop_assert_eq!(shape(&docs[0]), shape(&docs[1]), "tree after op {} {:?}", i, op);
             prop_assert_eq!(
                 docs[0].behaviour_dump(),
