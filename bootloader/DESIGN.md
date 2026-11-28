@@ -118,16 +118,15 @@ these requests:
 - Stack size, HHDM, paging mode (4 or 5 levels), entry point and memory map.
 - Framebuffer, modules, RSDP, SMBIOS, EFI system table, EFI memory map, TPM
   event log, date at boot, bootloader performance, TSC frequency, entropy,
-  and keep IOMMU.
-
-The MP request is planned.
+  keep IOMMU, and MP (see "Multiprocessor start" below).
 
 **Memory protection beyond the spec:**
 
 - No page is ever both writable and executable.
 - The HHDM is non-executable.
 - The only executable page outside the kernel is one read-only handoff page
-  at `kernel_virt_base - 4 KiB`, which the trampoline leaves through.
+  at `kernel_virt_base - 4 KiB`, which the trampoline leaves through and
+  where the parked APs wait.
 
 **KASLR:**
 
@@ -456,9 +455,56 @@ ours and under Limine. `ob-boot-volume` checks what the kernel is told about
 the volume. These are QEMU's emulated controllers; real hardware is not
 covered yet.
 
-## Not yet: MP, BIOS
+## Multiprocessor start (done)
 
-- The MP request (starting the APs with the same LAPIC, x2APIC and PAT
-  state as the BSP) is next after the device matrix.
-- A BIOS stage comes after that. Until it lands, BIOS machines boot with
-  Limine, which is boot tier B4 in boot.md.
+With the MP request present, the loader starts every enabled processor in
+the MADT and parks it for the kernel, as the Limine protocol describes.
+
+- **Which processors:** enabled MADT entries (types 0 and 9) in table order,
+  each APIC id once. Online-capable ones are left for the OS. In xAPIC mode
+  ids above 254 are left out, because an xAPIC IPI cannot name them. The BSP
+  is always reported; if the MADT does not list it, it comes first with UID
+  `u32::MAX`. The logic is `core::mp::select`, unit tested and fuzzed
+  against a model.
+- **x2APIC:** on when the kernel asks and the CPU has it. If the firmware
+  left it on and the kernel did not ask, it is turned off. If that is
+  impossible (the platform locked it, or an APIC id needs it), the boot is
+  refused before leaving the firmware, as the spec requires. Without the MP
+  request the APIC mode is left as the firmware set it.
+- **Start-up:** one AP at a time after ExitBootServices: INIT, 10 ms,
+  start-up IPI, 200 us, a second start-up IPI if it has not run yet (Intel
+  SDM Vol. 3A 8.4.4.1). That is about 10 ms per AP, so a 64-CPU machine
+  spends about 0.65 s here. The start page is a loader-code page below
+  1 MiB. Its real-mode code goes to long mode on the firmware's page tables
+  (a below-4 GiB copy of the top level if needed). Then Rust code on the AP
+  sets the APIC mode, copies the BSP's MTRRs (SDM 11.11.7.2 and 11.11.8),
+  and from base revision 5 sets up the local APIC exactly as on the BSP.
+  Finally it runs the handoff trampoline with a Block of its own: the final
+  page tables, CR0, CR4, EFER, PAT, its own GDT (a loaded TSS descriptor is
+  marked busy, so it cannot be shared), and the IDTR, LDTR and TR state.
+- **Parking:** the AP ends in a loop in the handoff page. It stores its
+  stack pointer in `reserved` (this tells the BSP it is parked) and waits
+  for `goto_address`. It reloads CR3 before jumping, to drop TLB entries for
+  the identity pages the BSP has removed since. Each AP gets a stack of the
+  requested size in bootloader-reclaimable memory, with a 0 return address,
+  like the BSP. The BSP removes the identity mappings only after every AP
+  has parked.
+- **Failures:** an AP that does not park within 5 s is sent INIT again,
+  which stops it, and is left out of the response. The loader prints how
+  many were left out. If there is no memory below 1 MiB, only the BSP is
+  reported, with a printed warning.
+- **Tests:** the conformance kernel releases each AP in turn and checks
+  its RDI, stack, segments, CR0, CR3, CR4, EFER, PAT, RFLAGS, GDT, IDTR,
+  LDTR and TR (base revision 5 and later), APIC mode and id, LAPIC state,
+  MTRRs and `extra_argument`. It also checks the response against its own
+  reading of the MADT. Cases: `smp` (8 CPUs, base revision 5), `smp-r3`
+  (4 CPUs, base revision 3), and `smp-x2apic` (8 CPUs asking for x2APIC;
+  needs KVM). Every other case has one CPU and checks a BSP-only response.
+  All run under ours and under Limine.
+- **Not covered yet:** more than 255 CPUs (x2APIC-only ids), firmware with
+  x2APIC locked, and real hardware.
+
+## Not yet: BIOS
+
+- A BIOS stage is next. Until it lands, BIOS machines boot with Limine,
+  which is boot tier B4 in boot.md.

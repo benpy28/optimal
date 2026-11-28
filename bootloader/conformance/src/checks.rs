@@ -516,6 +516,7 @@ pub fn run() {
     tpm_log(&mut t, &c);
     strict_state(&mut t, &c, es, &tables);
     platform(&mut t, &c);
+    mp(&mut t, &c, es);
     address_space(&mut t, &c);
 
     if t.fail == 0 {
@@ -2213,4 +2214,570 @@ fn platform(t: &mut T, c: &Ctx) {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------- MP
+
+/// What an application processor saw when it was released: written by
+/// `ob_ap_entry` and `ap_main`, one AP at a time (the BSP releases the next
+/// only after this one reports in).
+#[repr(C)]
+struct ApRec {
+    rdi: u64,        // 0
+    rsp: u64,        // 8
+    ret: u64,        // 16: the word at [rsp]
+    rflags: u64,     // 24
+    sregs: [u64; 6], // 32: cs ds es ss fs gs
+    cr0: u64,
+    cr3: u64,
+    cr4: u64,
+    efer: u64,
+    pat: u64,
+    fs_base: u64,
+    gs_base: u64,
+    gdtr: (u16, u64),
+    idtr: (u16, u64),
+    tr: u16,
+    ldtr: u16,
+    apic_base: u64,
+    apic_id: u32,
+    svr: u32,
+    tpr: u32,
+    lvt: [u32; 7],
+    mtrr: Mtrrs,
+    extra: u64,
+}
+
+const AP_REC_ZERO: ApRec = ApRec {
+    rdi: 0,
+    rsp: 0,
+    ret: 0,
+    rflags: 0,
+    sregs: [0; 6],
+    cr0: 0,
+    cr3: 0,
+    cr4: 0,
+    efer: 0,
+    pat: 0,
+    fs_base: 0,
+    gs_base: 0,
+    gdtr: (0, 0),
+    idtr: (0, 0),
+    tr: 0,
+    ldtr: 0,
+    apic_base: 0,
+    apic_id: 0,
+    svr: 0,
+    tpr: 0,
+    lvt: [0; 7],
+    mtrr: MTRRS_ZERO,
+    extra: 0,
+};
+
+#[unsafe(no_mangle)]
+static mut AP_REC: ApRec = AP_REC_ZERO;
+/// The info pointer of the AP that finished `ap_main`.
+static AP_DONE: AtomicU64 = AtomicU64::new(0);
+/// The local APIC's registers for xAPIC-mode APs, mapped by the BSP.
+static LAPIC_VIRT: AtomicU64 = AtomicU64::new(0);
+
+global_asm!(
+    ".global ob_ap_entry",
+    "ob_ap_entry:",
+    "    push rax",
+    "    pushfq",
+    "    pop rax",
+    "    mov [rip + AP_REC + 24], rax",
+    "    pop rax",
+    "    mov [rip + AP_REC + 0], rdi",
+    "    mov [rip + AP_REC + 8], rsp",
+    "    mov rax, [rsp]",
+    "    mov [rip + AP_REC + 16], rax",
+    "    xor eax, eax",
+    "    mov ax, cs",
+    "    mov [rip + AP_REC + 32], rax",
+    "    mov ax, ds",
+    "    mov [rip + AP_REC + 40], rax",
+    "    mov ax, es",
+    "    mov [rip + AP_REC + 48], rax",
+    "    mov ax, ss",
+    "    mov [rip + AP_REC + 56], rax",
+    "    mov ax, fs",
+    "    mov [rip + AP_REC + 64], rax",
+    "    mov ax, gs",
+    "    mov [rip + AP_REC + 72], rax",
+    "    and rsp, -16",
+    "    call ap_main",
+    "2:  cli",
+    "    hlt",
+    "    jmp 2b",
+);
+
+unsafe extern "C" {
+    fn ob_ap_entry();
+}
+
+const FIXED_MTRRS: [u32; 11] = [
+    0x250, 0x258, 0x259, 0x268, 0x269, 0x26a, 0x26b, 0x26c, 0x26d, 0x26e, 0x26f,
+];
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Mtrrs {
+    def: u64,
+    var: [u64; 32],
+    fixed: [u64; 11],
+}
+const MTRRS_ZERO: Mtrrs = Mtrrs {
+    def: 0,
+    var: [0; 32],
+    fixed: [0; 11],
+};
+
+fn has_mtrr() -> bool {
+    cpuid(1, 0)[3] & (1 << 12) != 0
+}
+
+fn read_mtrrs() -> Mtrrs {
+    let mut m = MTRRS_ZERO;
+    if !has_mtrr() {
+        return m;
+    }
+    let cap = rdmsr(0xfe);
+    m.def = rdmsr(0x2ff);
+    let vcnt = (cap & 0xff).min(16) as u32;
+    for i in 0..2 * vcnt {
+        m.var[i as usize] = rdmsr(0x200 + i);
+    }
+    if cap & (1 << 8) != 0 {
+        for (k, &msr) in FIXED_MTRRS.iter().enumerate() {
+            m.fixed[k] = rdmsr(msr);
+        }
+    }
+    m
+}
+
+/// Local APIC register `off`, in whichever mode the APIC is in.
+fn lapic_rd(x2: bool, virt: u64, off: u32) -> u32 {
+    if x2 {
+        rdmsr(0x800 + (off >> 4)) as u32
+    } else if virt != 0 {
+        // SAFETY: the BSP mapped the APIC page uncached at `virt`.
+        unsafe { core::ptr::read_volatile((virt + off as u64) as *const u32) }
+    } else {
+        0
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ap_main(info: u64) -> ! {
+    // SAFETY: only this AP runs here; the BSP waits for AP_DONE before reading.
+    #[allow(clippy::deref_addrof)]
+    let r = unsafe { &mut *(&raw mut AP_REC) };
+    let tb = entry_tables();
+    let mut gdtr = [0u8; 10];
+    // SAFETY: sgdt stores 10 bytes.
+    unsafe { asm!("sgdt [{}]", in(reg) gdtr.as_mut_ptr()) };
+    r.gdtr = (
+        u16::from_le_bytes([gdtr[0], gdtr[1]]),
+        u64::from_le_bytes(gdtr[2..].try_into().unwrap()),
+    );
+    r.idtr = tb.idtr;
+    r.tr = tb.tr;
+    r.ldtr = tb.ldtr;
+    r.cr0 = cr0();
+    r.cr3 = cr3();
+    r.cr4 = cr4();
+    r.efer = rdmsr(0xc000_0080);
+    r.pat = rdmsr(0x277);
+    r.fs_base = rdmsr(0xc000_0100);
+    r.gs_base = rdmsr(0xc000_0101);
+    r.apic_base = rdmsr(0x1b);
+    let x2 = r.apic_base & (1 << 10) != 0;
+    let virt = LAPIC_VIRT.load(SeqCst);
+    if r.apic_base & (1 << 11) != 0 {
+        let id = lapic_rd(x2, virt, 0x20);
+        r.apic_id = if x2 { id } else { id >> 24 };
+        r.svr = lapic_rd(x2, virt, 0xf0);
+        r.tpr = lapic_rd(x2, virt, 0x80);
+        let max_lvt = lapic_rd(x2, virt, 0x30) >> 16 & 0xff;
+        for (k, (off, _)) in LAPIC_LVTS.iter().enumerate() {
+            let present = match off {
+                0x330 => max_lvt >= 5,
+                0x340 => max_lvt >= 4,
+                0x2f0 => max_lvt >= 6,
+                _ => true,
+            };
+            // An absent LVT reads as masked.
+            r.lvt[k] = if present {
+                lapic_rd(x2, virt, *off)
+            } else {
+                1 << 16
+            };
+        }
+    }
+    r.mtrr = read_mtrrs();
+    // SAFETY: the loader proved nothing yet; the BSP checks `info` was
+    // mapped before releasing us, and extra_argument is its word 3.
+    r.extra = unsafe { core::ptr::read_volatile((info + 24) as *const u64) };
+    AP_DONE.store(info, SeqCst);
+    crate::halt()
+}
+
+/// One aggregated check: the first AP that fails it is reported.
+struct Agg {
+    name: &'static str,
+    bad: Option<(u32, [u64; 3])>,
+}
+impl Agg {
+    fn new(name: &'static str) -> Agg {
+        Agg { name, bad: None }
+    }
+    fn test(&mut self, lapic: u32, ok: bool, v: [u64; 3]) {
+        if !ok && self.bad.is_none() {
+            self.bad = Some((lapic, v));
+        }
+    }
+    fn report(&self, t: &mut T, what: &str) {
+        check!(
+            t,
+            self.name,
+            self.bad.is_none(),
+            "AP with APIC id {:?}: {what} {:#x?}",
+            self.bad.map(|b| b.0),
+            self.bad.map(|b| b.1)
+        );
+    }
+}
+
+/// GDT contents as the spec promises them; None if fine, else (index, value).
+fn gdt_mismatch(c: &Ctx, base: u64, limit: u16) -> Option<(usize, u64)> {
+    if (limit as u64) < 7 * 8 - 1 || !c.mapped(base, 7 * 8, false) {
+        return Some((usize::MAX, base));
+    }
+    for (i, w) in GDT_WANT.iter().enumerate() {
+        // As in `gdt`: accessed bit ignored, and for other loaders only the
+        // parts of the 64-bit descriptors that long mode uses.
+        let mask = match i {
+            5 if !c.ours => 0x0060_ff00_0000_0000,
+            6 if !c.ours => 0x0000_ff00_0000_0000,
+            _ => u64::MAX,
+        };
+        let got = rd64(base + 8 * i as u64) & !(1 << 40) & mask;
+        if got != *w & mask {
+            return Some((i, got));
+        }
+    }
+    None
+}
+
+/// A loaded TR whose descriptor has base 0 and limit 0.
+fn null_tss(c: &Ctx, gbase: u64, tr: u16) -> bool {
+    let sel = (tr & !7) as u64;
+    sel != 0 && c.mapped(gbase + sel, 16, false) && {
+        let (lo, hi) = (rd64(gbase + sel), rd64(gbase + sel + 8));
+        let base = (lo >> 16 & 0xff_ffff) | (lo >> 56) << 24 | (hi & 0xffff_ffff) << 32;
+        let limit = (lo & 0xffff) | (lo >> 48 & 0xf) << 16;
+        base == 0 && limit == 0
+    }
+}
+
+/// The processors the MADT says are enabled: (APIC id, ACPI UID), read
+/// here independently of the loader's parser.
+fn madt_cpus(ph: &Phys, madt: u64, len: u32, out: &mut [(u32, u32); 512]) -> usize {
+    let mut n = 0;
+    let mut off = 44u64;
+    while off + 2 <= len as u64 {
+        let (Some(typ), Some(el)) = (ph.u8(madt + off), ph.u8(madt + off + 1)) else {
+            break;
+        };
+        if el < 2 || off + el as u64 > len as u64 {
+            break;
+        }
+        let at = madt + off;
+        let ent = match typ {
+            0 if el >= 8 => {
+                let flags = ph.u32(at + 4).unwrap_or(0);
+                let id = ph.u8(at + 3).unwrap_or(0xff) as u32;
+                (flags & 1 != 0 && id != 0xff).then(|| (id, ph.u8(at + 2).unwrap_or(0) as u32))
+            }
+            9 if el >= 16 => {
+                let flags = ph.u32(at + 8).unwrap_or(0);
+                (flags & 1 != 0).then(|| {
+                    (
+                        ph.u32(at + 4).unwrap_or(u32::MAX),
+                        ph.u32(at + 12).unwrap_or(0),
+                    )
+                })
+            }
+            _ => None,
+        };
+        if let Some(e) = ent
+            && n < out.len()
+            && !out[..n].iter().any(|x| x.0 == e.0)
+        {
+            out[n] = e;
+            n += 1;
+        }
+        off += el as u64;
+    }
+    n
+}
+
+/// The MP response, then every AP released one at a time and its state
+/// compared with what the spec promises (the BSP's, plus RDI and a stack).
+fn mp(t: &mut T, c: &Ctx, es: &crate::EntryState) {
+    let Some(r) = c.need(t, "mp", &req::MP, 4) else {
+        return;
+    };
+    let w1 = rd64(r + 8);
+    let (flags, bsp_id) = (w1 as u32, (w1 >> 32) as u32);
+    let (n, cpus) = (rd64(r + 16), rd64(r + 24));
+    let br = lp::MEMMAP_BOOTLOADER_RECLAIMABLE;
+    if n == 0 || n > 512 || !c.virt_in(cpus, n * 8, br) {
+        t.fail(
+            "mp",
+            format_args!("{n} CPUs at {cpus:#x}: none, too many, or not bootloader-reclaimable"),
+        );
+        return;
+    }
+    let info = |i: u64| rd64(cpus + 8 * i);
+    if let Some(i) = (0..n).find(|&i| !c.virt_in(info(i), 32, br)) {
+        t.fail(
+            "mp",
+            format_args!(
+                "CPU {i}'s info at {:#x} is not bootloader-reclaimable",
+                info(i)
+            ),
+        );
+        return;
+    }
+    let lapic_of = |i: u64| (rd64(info(i)) >> 32) as u32;
+    let uid_of = |i: u64| rd64(info(i)) as u32;
+
+    // Which mode the BSP's APIC is in, and its id.
+    let ab = rdmsr(0x1b);
+    let x2 = ab & (1 << 10) != 0;
+    let ph = Phys(c);
+    let virt = if x2 {
+        0
+    } else {
+        ph.virt(ab & 0x000f_ffff_ffff_f000).unwrap_or(0)
+    };
+    LAPIC_VIRT.store(virt, SeqCst);
+    let my_id = {
+        let v = lapic_rd(x2, virt, 0x20);
+        if x2 { v } else { v >> 24 }
+    };
+
+    // The MADT's enabled processors (xAPIC mode can only address ids up to 254).
+    let mut want = [(0u32, 0u32); 512];
+    let mut nwant = 0;
+    let rsdp = req::response(&req::RSDP);
+    if rsdp != 0 && c.mapped(rsdp, 16, false) {
+        let raw = rd64(rsdp + 8);
+        let p = if c.rev >= 4 {
+            raw.wrapping_sub(c.hhdm)
+        } else {
+            raw
+        };
+        if let Some(a) = acpi::Acpi::new(&ph, p)
+            && let Some((m, l)) = a.find(b"APIC")
+        {
+            nwant = madt_cpus(&ph, m, l, &mut want);
+        }
+    }
+    let mut k = 0;
+    for i in 0..nwant {
+        if x2 || want[i].0 <= 0xfe {
+            want[k] = want[i];
+            k += 1;
+        }
+    }
+    let want = &want[..k];
+    let dup = (0..n).any(|i| (0..i).any(|j| lapic_of(i) == lapic_of(j)));
+    let same_set = want.len() as u64 == n
+        && (0..n).all(|i| {
+            want.iter()
+                .any(|&(id, uid)| id == lapic_of(i) && uid == uid_of(i))
+        });
+    check!(
+        t,
+        "mp-response",
+        bsp_id == my_id && !dup && same_set && (0..n).any(|i| lapic_of(i) == my_id),
+        "BSP id {bsp_id} (ours {my_id}), {n} CPUs, MADT has {} usable, duplicates {dup}, same set {same_set}",
+        want.len()
+    );
+    let x2_cpu = cpuid(1, 0)[2] & (1 << 21) != 0;
+    let flag = flags & 1 != 0;
+    check!(
+        t,
+        "mp-x2apic",
+        flag == x2 && flag == (req::WANT_X2APIC && x2_cpu),
+        "flag {flag}, BSP in x2APIC mode {x2}, asked {}, CPU has x2APIC {x2_cpu}",
+        req::WANT_X2APIC
+    );
+    let goto_null = (0..n).all(|i| rd64(info(i) + 16) == 0);
+    check!(
+        t,
+        "mp-goto-null",
+        goto_null,
+        "a goto_address is set before the kernel set it"
+    );
+    println!("info mp: {n} CPUs, BSP APIC id {my_id}, x2APIC {x2}");
+
+    let (b_cr0, b_cr3, b_cr4) = (cr0(), cr3(), cr4());
+    let (b_efer, b_pat) = (rdmsr(0xc000_0080), rdmsr(0x277));
+    let b_mtrr = read_mtrrs();
+    let hz = pit_tsc_hz().max(1_000_000);
+    let mut entry = Agg::new("mp-ap-entry");
+    let mut stack = Agg::new("mp-ap-stack");
+    let mut seg = Agg::new("mp-ap-segments");
+    let mut regs = Agg::new("mp-ap-control-registers");
+    let mut flagsr = Agg::new("mp-ap-rflags");
+    let mut gdt = Agg::new("mp-ap-gdt");
+    let mut strict = Agg::new("mp-ap-rev5-tables");
+    let mut apic = Agg::new("mp-ap-lapic");
+    let mut lvt = Agg::new("mp-ap-rev5-lapic");
+    let mut mtrr = Agg::new("mp-ap-mtrr");
+    let mut extra = Agg::new("mp-extra-argument");
+    let mut tops = [0u64; 512];
+    tops[0] = es.gprs[7] + 8;
+    let mut ntops = 1;
+    let mut lost = None;
+    for i in 0..n {
+        let id = lapic_of(i);
+        if id == my_id {
+            continue;
+        }
+        let p = info(i);
+        let magic = 0x0b07_0000_0000_0000 | i;
+        AP_DONE.store(0, SeqCst);
+        // SAFETY: proven mapped above; extra_argument, then goto_address
+        // with a release store, as the spec asks.
+        unsafe {
+            core::ptr::write_volatile((p + 24) as *mut u64, magic);
+            (*((p + 16) as *const AtomicU64)).store(ob_ap_entry as *const () as u64, SeqCst);
+        }
+        let t0 = rdtsc();
+        while AP_DONE.load(SeqCst) != p {
+            if rdtsc() - t0 > 5 * hz {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        if AP_DONE.load(SeqCst) != p {
+            lost = Some(id);
+            break;
+        }
+        // SAFETY: the AP has finished writing and halted.
+        #[allow(clippy::deref_addrof)]
+        let a = unsafe { &*(&raw const AP_REC) };
+        entry.test(id, a.rdi == p && a.ret == 0, [a.rdi, p, a.ret]);
+        let top = a.rsp + 8;
+        let bottom = top.wrapping_sub(req::STACK_SIZE);
+        let mut ok = top >> 63 == 1;
+        let mut q = bottom;
+        while ok && q < top {
+            ok = c
+                .tr(q)
+                .is_some_and(|x| x.write && (!c.nx || !x.exec || !c.ours))
+                && c.phys(q).and_then(|ph| c.type_of(ph, 1)) == Some(br);
+            q += PAGE;
+        }
+        let apart = tops[..ntops]
+            .iter()
+            .all(|&o| o.abs_diff(top) >= req::STACK_SIZE);
+        if ntops < tops.len() {
+            tops[ntops] = top;
+            ntops += 1;
+        }
+        stack.test(id, ok && apart, [top, ok as u64, apart as u64]);
+        let s = a.sregs;
+        seg.test(
+            id,
+            s[0] == 0x28 && s[1..].iter().all(|&v| v == 0x30) && a.fs_base == 0 && a.gs_base == 0,
+            [s[0], s[1], a.fs_base | a.gs_base],
+        );
+        regs.test(
+            id,
+            a.cr0 == b_cr0
+                && a.cr3 == b_cr3
+                && a.cr4 == b_cr4
+                && a.efer == b_efer
+                && a.pat == b_pat,
+            [a.cr0, a.cr4, a.efer],
+        );
+        let rf_ok = if c.rev >= 5 {
+            a.rflags == 2
+        } else {
+            a.rflags & (1 << 9 | 1 << 10 | 1 << 17) == 0
+        };
+        flagsr.test(id, rf_ok, [a.rflags, 0, 0]);
+        let gp = c.phys(a.gdtr.1).unwrap_or(0);
+        let gmem = matches!(
+            c.type_of(gp, 56),
+            Some(lp::MEMMAP_BOOTLOADER_RECLAIMABLE) | Some(lp::MEMMAP_EXECUTABLE_AND_MODULES)
+        );
+        let gm = gdt_mismatch(c, a.gdtr.1, a.gdtr.0);
+        gdt.test(
+            id,
+            gm.is_none() && gmem,
+            [
+                a.gdtr.1,
+                gm.map_or(0, |g| g.0 as u64),
+                gm.map_or(0, |g| g.1),
+            ],
+        );
+        if c.rev >= 5 {
+            strict.test(
+                id,
+                a.idtr == (0, 0) && a.ldtr == 0 && null_tss(c, a.gdtr.1, a.tr),
+                [a.idtr.1, a.ldtr as u64, a.tr as u64],
+            );
+        }
+        let ax2 = a.apic_base & (1 << 10) != 0;
+        apic.test(
+            id,
+            a.apic_base & (1 << 11) != 0 && ax2 == flag && a.apic_id == id,
+            [a.apic_base, a.apic_id as u64, id as u64],
+        );
+        if c.rev >= 5 {
+            let masked = a
+                .lvt
+                .iter()
+                .all(|&v| !matches!(v >> 8 & 7, 0 | 1 | 4 | 7) || v & (1 << 16) != 0);
+            lvt.test(
+                id,
+                a.svr & 0x3ff == 0x1ff && a.tpr == 0 && masked,
+                [a.svr as u64, a.tpr as u64, masked as u64],
+            );
+        }
+        mtrr.test(id, a.mtrr == b_mtrr, [a.mtrr.def, b_mtrr.def, 0]);
+        extra.test(id, a.extra == magic, [a.extra, magic, 0]);
+    }
+    check!(
+        t,
+        "mp-ap-started",
+        lost.is_none(),
+        "the AP with APIC id {lost:?} did not reach its goto_address within 5 s"
+    );
+    if lost.is_some() || n == 1 {
+        if n == 1 {
+            t.skip("mp-ap", "a single CPU: no APs to release");
+        }
+        return;
+    }
+    entry.report(t, "RDI, expected, [rsp]");
+    stack.report(t, "stack top, all usable, apart from the others");
+    seg.report(t, "CS, DS, FS|GS base");
+    regs.report(t, "CR0, CR4, EFER (or CR3/PAT) differ from the BSP's");
+    flagsr.report(t, "RFLAGS");
+    gdt.report(t, "GDT base, descriptor, value");
+    if c.rev >= 5 {
+        strict.report(t, "IDTR base, LDTR, TR");
+        lvt.report(t, "SVR, TPR, all LVTs masked");
+    }
+    apic.report(t, "APIC base, id, expected id");
+    mtrr.report(t, "MTRR default type, the BSP's");
+    extra.report(t, "extra_argument seen, written");
 }

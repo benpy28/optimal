@@ -344,6 +344,37 @@ impl Madt {
         uid
     }
 
+    /// Every processor entry (types 0 and 9), in table order. A type-0
+    /// entry with APIC id 0xFF is not a processor and is skipped.
+    pub fn processors(&self, mem: &impl PhysRead, mut f: impl FnMut(crate::mp::MadtCpu)) {
+        self.walk(mem, |typ, at, elen| match typ {
+            0 if elen >= 8 => {
+                if let (Some(uid), Some(id), Some(flags)) =
+                    (mem.u8(at + 2), mem.u8(at + 3), mem.u32(at + 4))
+                    && id != 0xff
+                {
+                    f(crate::mp::MadtCpu {
+                        apic_id: id as u32,
+                        uid: uid as u32,
+                        enabled: flags & 1 != 0,
+                    });
+                }
+            }
+            9 if elen >= 16 => {
+                if let (Some(id), Some(flags), Some(uid)) =
+                    (mem.u32(at + 4), mem.u32(at + 8), mem.u32(at + 12))
+                {
+                    f(crate::mp::MadtCpu {
+                        apic_id: id,
+                        uid,
+                        enabled: flags & 1 != 0,
+                    });
+                }
+            }
+            _ => {}
+        });
+    }
+
     pub fn ioapics(&self) -> &[u64] {
         &self.ioapics[..self.ioapic_count]
     }
@@ -576,6 +607,48 @@ mod tests {
         assert_eq!(&units[..n], &[0xfed9_0000, 0xfed9_1000]);
     }
 
+    #[test]
+    fn madt_processors_in_table_order() {
+        let mut body = vec![0u8; 8]; // local APIC address, flags
+        body.extend_from_slice(&[0, 8, 5, 0, 1, 0, 0, 0]); // uid 5 id 0 enabled
+        body.extend_from_slice(&[0, 8, 6, 0xff, 1, 0, 0, 0]); // id 0xff: not a CPU
+        body.extend_from_slice(&[0, 8, 7, 2, 0, 0, 0, 0]); // id 2 disabled
+        body.extend_from_slice(&[1, 12, 0, 0, 0, 0, 0xc0, 0xfe, 0, 0, 0, 0]); // I/O APIC
+        let mut x2 = vec![9, 16, 0, 0];
+        x2.extend_from_slice(&0x1234u32.to_le_bytes());
+        x2.extend_from_slice(&2u32.to_le_bytes()); // online-capable only
+        x2.extend_from_slice(&77u32.to_le_bytes());
+        body.extend_from_slice(&x2);
+        body.extend_from_slice(&[0, 6, 1, 1, 1, 0]); // too short: skipped
+        let madt = table(b"APIC", &body);
+        let len = madt.len() as u32;
+        let mem = Mem(vec![(0x2000, madt)]);
+        let m = Madt::parse(&mem, 0x2000, len).unwrap();
+        let mut got = Vec::new();
+        m.processors(&mem, |c| got.push(c));
+        use crate::mp::MadtCpu as C;
+        assert_eq!(
+            got,
+            [
+                C {
+                    apic_id: 0,
+                    uid: 5,
+                    enabled: true
+                },
+                C {
+                    apic_id: 2,
+                    uid: 7,
+                    enabled: false
+                },
+                C {
+                    apic_id: 0x1234,
+                    uid: 77,
+                    enabled: false
+                },
+            ]
+        );
+    }
+
     /// Found by the fuzzer: a table at the very top of the address space
     /// whose length runs past 2^64. `addr + offset` used to wrap (a panic in
     /// debug builds; in the release loader, low memory read as if it were
@@ -637,6 +710,7 @@ mod tests {
                     && let Some(m) = Madt::parse(&mem, a, l)
                 {
                     let _ = m.uid_for_apic(&mem, 0);
+                    m.processors(&mem, |_| {});
                 }
                 if let Some((a, l)) = acpi.find(b"DMAR") {
                     let mut u = [0; MAX_IOMMUS];

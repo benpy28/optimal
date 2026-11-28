@@ -21,6 +21,8 @@ struct Want {
     nmis: Vec<LapicNmi>,
     /// (APIC id, UID of the first entry with that id).
     apic_uids: Vec<(u32, u32)>,
+    /// Every processor entry, in order (type 0 with id 0xFF is not one).
+    procs: Vec<crate::mp::MadtCpu>,
     dmar: Vec<u64>,
     ivrs: Vec<u64>,
 }
@@ -64,6 +66,13 @@ fn madt(rng: &mut Rng, w: &mut Want) -> Vec<u8> {
             0 => {
                 let (uid, id) = (rng.next() as u8, rng.next() as u8);
                 body.extend_from_slice(&[0, 8, uid, id, 1, 0, 0, 0]);
+                if id != 0xff {
+                    w.procs.push(crate::mp::MadtCpu {
+                        apic_id: id as u32,
+                        uid: uid as u32,
+                        enabled: true,
+                    });
+                }
                 if !w.apic_uids.iter().any(|&(a, _)| a == id as u32) {
                     w.apic_uids.push((id as u32, uid as u32));
                 }
@@ -102,6 +111,11 @@ fn madt(rng: &mut Rng, w: &mut Want) -> Vec<u8> {
                 body.extend_from_slice(&id.to_le_bytes());
                 body.extend_from_slice(&1u32.to_le_bytes());
                 body.extend_from_slice(&uid.to_le_bytes());
+                w.procs.push(crate::mp::MadtCpu {
+                    apic_id: id,
+                    uid,
+                    enabled: true,
+                });
                 if !w.apic_uids.iter().any(|&(a, _)| a == id) {
                     w.apic_uids.push((id, uid));
                 }
@@ -315,6 +329,9 @@ fn generated_systems_read_exactly() {
             for &(id, uid) in &w.apic_uids {
                 assert_eq!(m.uid_for_apic(&mem, id), Some(uid), "apic {id}");
             }
+            let mut procs = Vec::new();
+            m.processors(&mem, |c| procs.push(c));
+            assert_eq!(procs, w.procs);
         }
         let mut u = [0u64; MAX_IOMMUS];
         match acpi.find(b"DMAR") {
@@ -387,6 +404,9 @@ fn mutated_systems_never_panic() {
                 for id in [0, 1, 0xff, u32::MAX] {
                     let _ = m.uid_for_apic(&mem, id);
                 }
+                let mut k = 0usize;
+                m.processors(&mem, |_| k += 1);
+                assert!(k <= l as usize / 8);
             }
             let mut u = [0u64; MAX_IOMMUS];
             let n = dmar_units(&mem, a, l, &mut u);

@@ -6,7 +6,7 @@
 # under Limine is a bug in the check (or a Limine bug, to be confirmed
 # against the spec), and one that fails only under ours is a bug in ours.
 #
-# Cases: r3 r4 r5 r6 pie entry la57 tpm iommu-intel iommu-amd smp big small tiny
+# Cases: r3 r4 r5 r6 pie entry la57 tpm iommu-intel iommu-amd smp smp-r3 smp-x2apic big small tiny
 #        cd usb nvme virtio (device matrix: the boot medium on each controller)
 #        headless old-cpu
 #        quirk-r3 quirk quirk-x2apic quirk-apic-off quirk-iommu-intel
@@ -27,7 +27,7 @@ export OB_EXPECT_CMDLINE="conformance case=$case_name" OB_EXPECT_MODULES=1 OB_EX
 # How the boot medium is attached: sata (q35's AHCI, the default), cd, usb,
 # nvme or virtio. The device matrix cases below set it.
 MEDIUM=sata
-export OB_REVISION=3 OB_PIE=0 OB_PAGING=4 OB_ENTRY_REQ=0
+export OB_REVISION=3 OB_PIE=0 OB_PAGING=4 OB_ENTRY_REQ=0 OB_X2APIC=0
 QEMU=(-machine q35 -m 512M)
 TPM=0
 QUIRKS=""
@@ -43,6 +43,12 @@ case "$case_name" in
     iommu-intel) OB_REVISION=5; QEMU=(-machine q35,kernel-irqchip=split -m 512M -device intel-iommu,intremap=on) ;;
     iommu-amd) OB_REVISION=5; QEMU+=(-device amd-iommu) ;;
     smp) OB_REVISION=5; QEMU=(-machine q35 -m 2G -smp 8) ;;
+    smp-r3) QEMU=(-machine q35 -m 1G -smp 4) ;;
+    # The MP request asking for x2APIC. QEMU 8.2's emulator has no x2APIC.
+    smp-x2apic) OB_REVISION=6; OB_X2APIC=1; QEMU=(-machine q35 -m 2G -smp 8 -cpu max,+x2apic)
+        if [ ! -w /dev/kvm ] || [ "${QEMU_ACCEL:-auto}" = tcg ]; then
+            echo "smp-x2apic needs KVM (QEMU 8.2 cannot emulate x2APIC)"; exit 1
+        fi ;;
     big) OB_REVISION=4; QEMU=(-machine q35 -m 6G) ;;
     small) QEMU=(-machine q35 -m 160M) ;;
     # 128 MiB: the old ~38 MiB single-block page-table reservation failed

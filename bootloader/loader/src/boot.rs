@@ -7,7 +7,7 @@ use crate::handoff::{self, Block};
 use crate::memory::{self, Arena, PAGE, Pages};
 use crate::platform::{self, Identity};
 use crate::tpm::{self, Tpm};
-use crate::{NAME, TRUSTED_KEYS, VERSION, fatal, gop, hw, menu, println};
+use crate::{NAME, TRUSTED_KEYS, VERSION, fatal, gop, hw, menu, mp, println};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec;
@@ -495,6 +495,27 @@ pub fn run(image: efi::Handle) -> Result<Infallible, efi::Status> {
     } else {
         None
     };
+    // MP: the APIC mode and the processors are decided now, so a kernel
+    // that cannot be booted is refused while the firmware can still report it.
+    let mut mp_plan = if wants(Feature::Mp) {
+        let asked_x2 = field(Feature::Mp, 0).unwrap_or(0) & 1 != 0;
+        match mp::prepare(&plat, asked_x2, stack_size, rev) {
+            Ok(p) => {
+                println!(
+                    "MP: {} processor(s), x2APIC {}",
+                    p.cpus.len(),
+                    if p.x2 { "on" } else { "off" }
+                );
+                if let Some(why) = p.no_start {
+                    println!("MP: WARNING: only the boot processor is reported: {why}");
+                }
+                Some(p)
+            }
+            Err(e) => fail!("{e}"),
+        }
+    } else {
+        None
+    };
     let date = {
         let mut t: efi::Time = unsafe { core::mem::zeroed() };
         if (runtime_services().get_time)(&mut t, ptr::null_mut()) == efi::SUCCESS {
@@ -641,7 +662,7 @@ pub fn run(image: efi::Handle) -> Result<Infallible, efi::Status> {
     };
     // The handoff page's alias: just below the kernel's lowest page (see handoff.rs).
     let code_alias = layout.base.wrapping_add(slide) - PAGE;
-    let (tramp, stub64_off) = handoff::trampoline();
+    let (tramp, stub64_off, park_off) = handoff::trampoline();
     assert!(tramp.len() < PAGE as usize);
 
     let mut map_size = 0usize;
@@ -716,7 +737,8 @@ pub fn run(image: efi::Handle) -> Result<Infallible, efi::Status> {
             .iter()
             .map(|m| 256 + m.path.len() as u64 + m.string.len() as u64)
             .sum::<u64>()
-        + entry.cmdline.len() as u64;
+        + entry.cmdline.len() as u64
+        + mp_plan.as_ref().map_or(0, |p| p.arena_bytes());
     let arena = Pages::new(arena_bytes, efi::LOADER_DATA, None);
     let mut mapbuf = Pages::new((desc_cap * dsize) as u64, efi::LOADER_DATA, None);
     let (Some(arena), Some(mapbuf_ref)) = (arena, mapbuf.as_mut()) else {
@@ -894,6 +916,16 @@ pub fn run(image: efi::Handle) -> Result<Infallible, efi::Status> {
     platform::mask_pics(&plat);
     platform::mask_ioapics(&plat, rev);
     let keep_iommu = wants(Feature::KeepIommu);
+    // The BSP's APIC mode first: platform::init_lapic programs it in that
+    // mode, and the APs are started in it.
+    if let Some(p) = &mp_plan
+        && !mp::set_mode(p.x2)
+    {
+        println!(
+            "OPTIMAL-BOOT: FATAL: after leaving the firmware: the local APIC refused the mode change"
+        );
+        (runtime_services().reset_system)(efi::RESET_COLD, efi::LOAD_ERROR, 0, ptr::null());
+    }
     if rev >= 5 {
         platform::init_lapic(&plat);
         if !keep_iommu {
@@ -1156,13 +1188,7 @@ pub fn run(image: efi::Handle) -> Result<Infallible, efi::Status> {
         respond(Feature::BootloaderPerformance, p);
     }
 
-    // The base revision tag: supported, and loaded with exactly this revision.
-    if let Some(t) = reqs.base_revision_tag {
-        img[t + 8..t + 16].copy_from_slice(&rev.to_le_bytes());
-        img[t + 16..t + 24].copy_from_slice(&0u64.to_le_bytes());
-    }
-
-    // ---- Jump ----
+    // ---- The handoff Block and trampoline (the APs use them too) ----
     // SAFETY: block_page is ours, below 4 GiB, identity mapped.
     let block = unsafe { &mut *(block_page as *mut Block) };
     block.cr3 = built.root;
@@ -1190,6 +1216,59 @@ pub fn run(image: efi::Handle) -> Result<Infallible, efi::Status> {
         core::arch::asm!("mov cr0, {}", in(reg) cr0 & !(1 << 16));
         ptr::copy_nonoverlapping(tramp.as_ptr(), code_page as *mut u8, tramp.len());
         core::arch::asm!("mov cr0, {}", in(reg) cr0);
+    }
+
+    // ---- MP: start and park the APs, then report the ones that parked ----
+    if let Some(plan) = mp_plan.as_mut() {
+        let n = plan.cpus.len();
+        for i in 0..n {
+            plan.infos[i] = arena.alloc(32, 8).unwrap();
+            plan.gdts[i] = arena.alloc(8 * handoff::GDT.len() as u64, 8).unwrap();
+            let c = plan.cpus[i];
+            // processor_id, lapic_id; reserved, goto_address and
+            // extra_argument stay 0 (the arena is zeroed).
+            // SAFETY: infos[i] has 32 zeroed bytes in the arena.
+            unsafe { ptr::write(plan.infos[i] as *mut [u32; 2], [c.uid, c.apic_id]) };
+        }
+        let parking = mp::Parking {
+            block: block_page,
+            tramp: code_page,
+            park: code_alias + park_off as u64,
+            hhdm,
+        };
+        mp::start_all(plan, &parking);
+        let mut up = 0;
+        for i in 0..n {
+            if plan.ok[i] {
+                plan.up[up] = hh(plan.infos[i]);
+                up += 1;
+            }
+        }
+        if up < n {
+            println!(
+                "OPTIMAL-BOOT: MP: {} of {} application processors did not start; they are not reported",
+                n - up,
+                n - 1
+            );
+        }
+        let array = put_words(&mut arena, &plan.up[..up]);
+        let flags = plan.x2 as u64;
+        let p = put_words(
+            &mut arena,
+            &[0, flags | (plan.bsp as u64) << 32, up as u64, hh(array)],
+        );
+        respond(Feature::Mp, p);
+    }
+
+    // The base revision tag: supported, and loaded with exactly this revision.
+    if let Some(t) = reqs.base_revision_tag {
+        img[t + 8..t + 16].copy_from_slice(&rev.to_le_bytes());
+        img[t + 16..t + 24].copy_from_slice(&0u64.to_le_bytes());
+    }
+
+    // ---- Jump ----
+    // SAFETY: the trampoline is in place (copied above) and identity mapped.
+    unsafe {
         let enter: extern "sysv64" fn(u64) -> ! = core::mem::transmute(code_page as usize);
         enter(block_page)
     }
