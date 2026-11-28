@@ -263,6 +263,8 @@ fn tree_shrinks_after_mass_delete() {
         cache: NodeCache::new(64),
         latest_snap_gen: 0,
         dead_pending: vec![],
+        log: Vec::new(),
+        written: Default::default(),
     };
     let mut t = Tree::new(TreeId::Meta, BlockPtr::NULL).unwrap();
     for i in 0..20_000u64 {

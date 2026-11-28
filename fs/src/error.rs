@@ -34,6 +34,11 @@ pub enum Error {
     /// until it is remounted; the on-disk state is still the last good commit.
     Poisoned,
     ReadOnly,
+    /// Commits kept failing to write (see [`Filesystem::commit`](crate::Filesystem::commit)).
+    /// The open transaction is kept in memory and reads still work; new
+    /// changes are refused until a commit succeeds. The on-disk state is
+    /// the last good commit.
+    DeviceFailing,
 }
 
 pub type Result<T> = core::result::Result<T, Error>;
@@ -64,8 +69,15 @@ impl fmt::Display for Error {
             Error::Invalid(w) => write!(f, "invalid argument: {w}"),
             Error::FileTooBig => write!(f, "file too big"),
             Error::TooManyLinks => write!(f, "too many links"),
-            Error::Poisoned => write!(f, "filesystem stopped after a failed commit; remount"),
+            Error::Poisoned => write!(
+                f,
+                "filesystem stopped after an error it cannot undo; remount"
+            ),
             Error::ReadOnly => write!(f, "read-only"),
+            Error::DeviceFailing => write!(
+                f,
+                "the device keeps failing writes; changes are held in memory until a commit succeeds"
+            ),
         }
     }
 }
