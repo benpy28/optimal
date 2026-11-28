@@ -419,7 +419,7 @@ impl<'a, 'e> Scanner<'a, 'e> {
             len,
             raw: false,
         };
-        if b < 0x80 {
+        if b.is_ascii() {
             return Ok(Some(match b {
                 b'\r' => match s.get(i + 1) {
                     Some(b'\n') => lf(2),
@@ -444,18 +444,17 @@ impl<'a, 'e> Scanner<'a, 'e> {
         let (cp, len) = decode_at(s, i);
         Ok(Some(match char::from_u32(cp) {
             Some(c) => Cp { c, len, raw: true },
-            None => {
-                // A high surrogate at the end of a chunk may yet pair with a
-                // low one at the start of the next and become one code point.
-                if cp < 0xDC00 && i + len == s.len() && !self.eof {
-                    return Err(NeedMore);
-                }
-                Cp {
-                    c: REPLACEMENT,
-                    len,
-                    raw: false,
-                }
-            }
+            // A surrogate. A high one at the end of a chunk may yet pair with
+            // a low one at the start of the next, but no wait is needed here:
+            // U+FFFD and every supplementary code point are both ident code
+            // points (4.2), so each algorithm treats them alike and reads on
+            // past them, reaching the chunk end and waiting there. The retry
+            // then reads the joined code point.
+            None => Cp {
+                c: REPLACEMENT,
+                len,
+                raw: false,
+            },
         }))
     }
 
@@ -884,7 +883,10 @@ impl<'a, 'e> Scanner<'a, 'e> {
         loop {
             match self.bump()? {
                 None | Some(Cp { c: ')', .. }) => return Ok(()),
-                Some(Cp { c: '\\', .. }) if valid_escape(Some('\\'), self.nth(0)?) => {
+                // Only "\" + newline isn't a valid escape, and consuming it
+                // as one reads the same newline the next step would skip, so
+                // the check can be left out with the same result.
+                Some(Cp { c: '\\', .. }) => {
                     self.escaped()?;
                 }
                 Some(_) => {}

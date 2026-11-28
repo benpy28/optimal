@@ -16,7 +16,7 @@
 
 mod common;
 
-use common::{assert_covers, reference, tokenize_chunked, tokenize_whole};
+use common::{assert_covers, reference, tokenize_chunked, tokenize_pieces, tokenize_whole};
 use optimal_wtf8::{Wtf8, Wtf8Buf};
 use proptest::prelude::*;
 
@@ -28,28 +28,22 @@ const PIECES: &[&str] = &[
     "??", "é", "·", "\u{200d}", "\u{2010}", "\u{fffd}", "😀", "_",
 ];
 
-/// A random input: pieces, plus lone surrogates (only possible in WTF-8).
-fn input() -> impl Strategy<Value = Wtf8Buf> {
+/// A random input as UTF-16 code units: pieces, plus lone surrogates (only
+/// possible in WTF-8).
+fn input_units() -> impl Strategy<Value = Vec<u16>> {
     let piece = prop_oneof![
         8 => (0..PIECES.len()).prop_map(|i| PIECES[i].encode_utf16().collect::<Vec<u16>>()),
         1 => prop_oneof![Just(vec![0xD800u16]), Just(vec![0xDC00u16]), Just(vec![0xDBFFu16])],
     ];
-    prop::collection::vec(piece, 0..40).prop_map(|ps| Wtf8Buf::from_utf16(&ps.concat()))
+    prop::collection::vec(piece, 0..40).prop_map(|ps| ps.concat())
+}
+
+fn input() -> impl Strategy<Value = Wtf8Buf> {
+    input_units().prop_map(|u| Wtf8Buf::from_utf16(&u))
 }
 
 fn debug<T: std::fmt::Debug>(t: &T) -> String {
     format!("{t:?}")
-}
-
-fn cut_points(src: Wtf8<'_>, picks: &[prop::sample::Index]) -> Vec<usize> {
-    let all = common::all_boundaries(src);
-    if all.is_empty() {
-        return all;
-    }
-    let mut cuts: Vec<usize> = picks.iter().map(|p| all[p.index(all.len())]).collect();
-    cuts.sort_unstable();
-    cuts.dedup();
-    cuts
 }
 
 proptest! {
@@ -64,14 +58,25 @@ proptest! {
 
     #[test]
     fn chunking_changes_nothing(
-        src in input(),
+        units in input_units(),
         ur in any::<bool>(),
         picks in prop::collection::vec(any::<prop::sample::Index>(), 0..12),
     ) {
+        // Cuts are between UTF-16 code units, so a surrogate pair can be
+        // split into two chunks (as `document.write` can do); the stream
+        // tokenizer must join it.
+        let src = Wtf8Buf::from_utf16(&units);
         let w = src.as_wtf8();
         let whole = tokenize_whole(w, ur);
-        let cuts = cut_points(w, &picks);
-        let chunked = tokenize_chunked(w, &cuts, ur);
+        let mut cuts: Vec<usize> = picks.iter().map(|p| p.index(units.len() + 1)).collect();
+        cuts.sort_unstable();
+        cuts.dedup();
+        let chunks: Vec<Wtf8Buf> = std::iter::once(0)
+            .chain(cuts.iter().copied())
+            .zip(cuts.iter().copied().chain(std::iter::once(units.len())))
+            .map(|(a, b)| Wtf8Buf::from_utf16(&units[a..b]))
+            .collect();
+        let chunked = tokenize_pieces(&chunks, ur);
         prop_assert_eq!(debug(&chunked), debug(&whole), "input {:?} cut at {:?}", w, cuts);
     }
 }

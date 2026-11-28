@@ -367,9 +367,12 @@ fn values_borrow_unless_unescaped() {
 
 #[test]
 fn end_of_input_is_sticky() {
-    let mut t = Tokenizer::new(Wtf8::from_str("a"));
+    let mut t = Tokenizer::new(Wtf8::from_str("ab c"));
     assert!(t.next().is_some());
-    assert_eq!(t.position(), 1);
+    assert_eq!(t.position(), 2);
+    assert!(t.next().is_some());
+    assert!(t.next().is_some());
+    assert_eq!(t.position(), 4);
     assert!(t.next().is_none());
     assert!(t.next().is_none());
 }
@@ -385,7 +388,8 @@ fn drain(s: &mut StreamTokenizer) -> Vec<Token<'static>> {
 #[test]
 fn stream_joins_a_split_surrogate_pair() {
     // U+1F600 as two UTF-16 halves in two chunks: one ident code point, not
-    // two U+FFFDs. The scanner must wait at the lone high surrogate.
+    // two U+FFFDs. The ident reads on past the lone high surrogate to the
+    // chunk end and waits there; the retry reads the joined code point.
     let mut s = StreamTokenizer::new();
     s.push(Wtf8Buf::from_utf16(&[0x61, 0xD83D]).as_wtf8());
     assert_eq!(drain(&mut s), []);

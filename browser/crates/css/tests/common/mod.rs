@@ -58,6 +58,34 @@ pub fn tokenize_chunked(
     (out, t.errors().to_vec())
 }
 
+/// Feed `pieces` to a stream tokenizer one by one, asking for tokens after
+/// every piece.
+pub fn tokenize_pieces(
+    pieces: &[optimal_wtf8::Wtf8Buf],
+    unicode_ranges: bool,
+) -> (Vec<Spanned<'static>>, Vec<TokenError>) {
+    let mut t = StreamTokenizer::new();
+    let mut out = Vec::new();
+    let drain = |t: &mut StreamTokenizer, out: &mut Vec<Spanned<'static>>| loop {
+        match t.next_token(unicode_ranges) {
+            Next::Token(s) => out.push(Spanned {
+                token: s.token.into_owned(),
+                start: s.start,
+                end: s.end,
+            }),
+            Next::NeedInput => return false,
+            Next::End => return true,
+        }
+    };
+    for p in pieces {
+        t.push(p.as_wtf8());
+        assert!(!drain(&mut t, &mut out), "end of input before finish()");
+    }
+    t.finish();
+    assert!(drain(&mut t, &mut out), "no end after finish()");
+    (out, t.errors().to_vec())
+}
+
 /// Every code point boundary of `src` except 0 and the end.
 pub fn all_boundaries(src: Wtf8<'_>) -> Vec<usize> {
     let mut cuts = Vec::new();
