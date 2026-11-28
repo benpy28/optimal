@@ -1,0 +1,894 @@
+{
+  "component_value_list.json#38": {
+    "input": "u+1 U+10 U+100 U+1000 U+10000 U+100000 U+1000000",
+    "reason": "css-syntax-3 4.3.1: \"U\"/\"u\" starts a unicode-range token only when \"unicode ranges allowed\" is true, which only the unicode-range descriptor sets (4.3.14 note, 5.5.13). Parse a list of component values tokenizes normally, so \"U+1\" is an ident \"U\" and a number \"+1\", and \"?\" is a delim.",
+    "expected": [
+      [
+        "ident",
+        "u"
+      ],
+      [
+        "number",
+        "+1",
+        1.0,
+        "integer"
+      ],
+      " ",
+      [
+        "ident",
+        "U"
+      ],
+      [
+        "number",
+        "+10",
+        10.0,
+        "integer"
+      ],
+      " ",
+      [
+        "ident",
+        "U"
+      ],
+      [
+        "number",
+        "+100",
+        100.0,
+        "integer"
+      ],
+      " ",
+      [
+        "ident",
+        "U"
+      ],
+      [
+        "number",
+        "+1000",
+        1000.0,
+        "integer"
+      ],
+      " ",
+      [
+        "ident",
+        "U"
+      ],
+      [
+        "number",
+        "+10000",
+        10000.0,
+        "integer"
+      ],
+      " ",
+      [
+        "ident",
+        "U"
+      ],
+      [
+        "number",
+        "+100000",
+        100000.0,
+        "integer"
+      ],
+      " ",
+      [
+        "ident",
+        "U"
+      ],
+      [
+        "number",
+        "+1000000",
+        1000000.0,
+        "integer"
+      ]
+    ]
+  },
+  "component_value_list.json#39": {
+    "input": "u+? u+1? U+10? U+100? U+1000? U+10000? U+100000?",
+    "reason": "css-syntax-3 4.3.1: \"U\"/\"u\" starts a unicode-range token only when \"unicode ranges allowed\" is true, which only the unicode-range descriptor sets (4.3.14 note, 5.5.13). Parse a list of component values tokenizes normally, so \"U+1\" is an ident \"U\" and a number \"+1\", and \"?\" is a delim.",
+    "expected": [
+      [
+        "ident",
+        "u"
+      ],
+      "+",
+      "?",
+      " ",
+      [
+        "ident",
+        "u"
+      ],
+      [
+        "number",
+        "+1",
+        1.0,
+        "integer"
+      ],
+      "?",
+      " ",
+      [
+        "ident",
+        "U"
+      ],
+      [
+        "number",
+        "+10",
+        10.0,
+        "integer"
+      ],
+      "?",
+      " ",
+      [
+        "ident",
+        "U"
+      ],
+      [
+        "number",
+        "+100",
+        100.0,
+        "integer"
+      ],
+      "?",
+      " ",
+      [
+        "ident",
+        "U"
+      ],
+      [
+        "number",
+        "+1000",
+        1000.0,
+        "integer"
+      ],
+      "?",
+      " ",
+      [
+        "ident",
+        "U"
+      ],
+      [
+        "number",
+        "+10000",
+        10000.0,
+        "integer"
+      ],
+      "?",
+      " ",
+      [
+        "ident",
+        "U"
+      ],
+      [
+        "number",
+        "+100000",
+        100000.0,
+        "integer"
+      ],
+      "?"
+    ]
+  },
+  "component_value_list.json#40": {
+    "input": "u+?? U+1?? U+10?? U+100?? U+1000?? U+10000??",
+    "reason": "css-syntax-3 4.3.1: \"U\"/\"u\" starts a unicode-range token only when \"unicode ranges allowed\" is true, which only the unicode-range descriptor sets (4.3.14 note, 5.5.13). Parse a list of component values tokenizes normally, so \"U+1\" is an ident \"U\" and a number \"+1\", and \"?\" is a delim.",
+    "expected": [
+      [
+        "ident",
+        "u"
+      ],
+      "+",
+      "?",
+      "?",
+      " ",
+      [
+        "ident",
+        "U"
+      ],
+      [
+        "number",
+        "+1",
+        1.0,
+        "integer"
+      ],
+      "?",
+      "?",
+      " ",
+      [
+        "ident",
+        "U"
+      ],
+      [
+        "number",
+        "+10",
+        10.0,
+        "integer"
+      ],
+      "?",
+      "?",
+      " ",
+      [
+        "ident",
+        "U"
+      ],
+      [
+        "number",
+        "+100",
+        100.0,
+        "integer"
+      ],
+      "?",
+      "?",
+      " ",
+      [
+        "ident",
+        "U"
+      ],
+      [
+        "number",
+        "+1000",
+        1000.0,
+        "integer"
+      ],
+      "?",
+      "?",
+      " ",
+      [
+        "ident",
+        "U"
+      ],
+      [
+        "number",
+        "+10000",
+        10000.0,
+        "integer"
+      ],
+      "?",
+      "?"
+    ]
+  },
+  "component_value_list.json#41": {
+    "input": "u+??? U+1??? U+10??? U+100??? U+1000???",
+    "reason": "css-syntax-3 4.3.1: \"U\"/\"u\" starts a unicode-range token only when \"unicode ranges allowed\" is true, which only the unicode-range descriptor sets (4.3.14 note, 5.5.13). Parse a list of component values tokenizes normally, so \"U+1\" is an ident \"U\" and a number \"+1\", and \"?\" is a delim.",
+    "expected": [
+      [
+        "ident",
+        "u"
+      ],
+      "+",
+      "?",
+      "?",
+      "?",
+      " ",
+      [
+        "ident",
+        "U"
+      ],
+      [
+        "number",
+        "+1",
+        1.0,
+        "integer"
+      ],
+      "?",
+      "?",
+      "?",
+      " ",
+      [
+        "ident",
+        "U"
+      ],
+      [
+        "number",
+        "+10",
+        10.0,
+        "integer"
+      ],
+      "?",
+      "?",
+      "?",
+      " ",
+      [
+        "ident",
+        "U"
+      ],
+      [
+        "number",
+        "+100",
+        100.0,
+        "integer"
+      ],
+      "?",
+      "?",
+      "?",
+      " ",
+      [
+        "ident",
+        "U"
+      ],
+      [
+        "number",
+        "+1000",
+        1000.0,
+        "integer"
+      ],
+      "?",
+      "?",
+      "?"
+    ]
+  },
+  "component_value_list.json#42": {
+    "input": "u+???? U+1???? U+10???? U+100????",
+    "reason": "css-syntax-3 4.3.1: \"U\"/\"u\" starts a unicode-range token only when \"unicode ranges allowed\" is true, which only the unicode-range descriptor sets (4.3.14 note, 5.5.13). Parse a list of component values tokenizes normally, so \"U+1\" is an ident \"U\" and a number \"+1\", and \"?\" is a delim.",
+    "expected": [
+      [
+        "ident",
+        "u"
+      ],
+      "+",
+      "?",
+      "?",
+      "?",
+      "?",
+      " ",
+      [
+        "ident",
+        "U"
+      ],
+      [
+        "number",
+        "+1",
+        1.0,
+        "integer"
+      ],
+      "?",
+      "?",
+      "?",
+      "?",
+      " ",
+      [
+        "ident",
+        "U"
+      ],
+      [
+        "number",
+        "+10",
+        10.0,
+        "integer"
+      ],
+      "?",
+      "?",
+      "?",
+      "?",
+      " ",
+      [
+        "ident",
+        "U"
+      ],
+      [
+        "number",
+        "+100",
+        100.0,
+        "integer"
+      ],
+      "?",
+      "?",
+      "?",
+      "?"
+    ]
+  },
+  "component_value_list.json#43": {
+    "input": "u+????? U+1????? U+10?????",
+    "reason": "css-syntax-3 4.3.1: \"U\"/\"u\" starts a unicode-range token only when \"unicode ranges allowed\" is true, which only the unicode-range descriptor sets (4.3.14 note, 5.5.13). Parse a list of component values tokenizes normally, so \"U+1\" is an ident \"U\" and a number \"+1\", and \"?\" is a delim.",
+    "expected": [
+      [
+        "ident",
+        "u"
+      ],
+      "+",
+      "?",
+      "?",
+      "?",
+      "?",
+      "?",
+      " ",
+      [
+        "ident",
+        "U"
+      ],
+      [
+        "number",
+        "+1",
+        1.0,
+        "integer"
+      ],
+      "?",
+      "?",
+      "?",
+      "?",
+      "?",
+      " ",
+      [
+        "ident",
+        "U"
+      ],
+      [
+        "number",
+        "+10",
+        10.0,
+        "integer"
+      ],
+      "?",
+      "?",
+      "?",
+      "?",
+      "?"
+    ]
+  },
+  "component_value_list.json#44": {
+    "input": "u+?????? U+1??????",
+    "reason": "css-syntax-3 4.3.1: \"U\"/\"u\" starts a unicode-range token only when \"unicode ranges allowed\" is true, which only the unicode-range descriptor sets (4.3.14 note, 5.5.13). Parse a list of component values tokenizes normally, so \"U+1\" is an ident \"U\" and a number \"+1\", and \"?\" is a delim.",
+    "expected": [
+      [
+        "ident",
+        "u"
+      ],
+      "+",
+      "?",
+      "?",
+      "?",
+      "?",
+      "?",
+      "?",
+      " ",
+      [
+        "ident",
+        "U"
+      ],
+      [
+        "number",
+        "+1",
+        1.0,
+        "integer"
+      ],
+      "?",
+      "?",
+      "?",
+      "?",
+      "?",
+      "?"
+    ]
+  },
+  "component_value_list.json#45": {
+    "input": "u+1-2 U+100000-2 U+1000000-2 U+10-200000",
+    "reason": "css-syntax-3 4.3.1: \"U\"/\"u\" starts a unicode-range token only when \"unicode ranges allowed\" is true, which only the unicode-range descriptor sets (4.3.14 note, 5.5.13). Parse a list of component values tokenizes normally, so \"U+1\" is an ident \"U\" and a number \"+1\", and \"?\" is a delim.",
+    "expected": [
+      [
+        "ident",
+        "u"
+      ],
+      [
+        "number",
+        "+1",
+        1.0,
+        "integer"
+      ],
+      [
+        "number",
+        "-2",
+        -2.0,
+        "integer"
+      ],
+      " ",
+      [
+        "ident",
+        "U"
+      ],
+      [
+        "number",
+        "+100000",
+        100000.0,
+        "integer"
+      ],
+      [
+        "number",
+        "-2",
+        -2.0,
+        "integer"
+      ],
+      " ",
+      [
+        "ident",
+        "U"
+      ],
+      [
+        "number",
+        "+1000000",
+        1000000.0,
+        "integer"
+      ],
+      [
+        "number",
+        "-2",
+        -2.0,
+        "integer"
+      ],
+      " ",
+      [
+        "ident",
+        "U"
+      ],
+      [
+        "number",
+        "+10",
+        10.0,
+        "integer"
+      ],
+      [
+        "number",
+        "-200000",
+        -200000.0,
+        "integer"
+      ]
+    ]
+  },
+  "component_value_list.json#46": {
+    "input": "ù+12 Ü+12 u +12 U+ 12 U+12 - 20 U+1?2 U+1?-50",
+    "reason": "css-syntax-3 4.3.1: \"U\"/\"u\" starts a unicode-range token only when \"unicode ranges allowed\" is true, which only the unicode-range descriptor sets (4.3.14 note, 5.5.13). Parse a list of component values tokenizes normally, so \"U+1\" is an ident \"U\" and a number \"+1\", and \"?\" is a delim.",
+    "expected": [
+      [
+        "ident",
+        "ù"
+      ],
+      [
+        "number",
+        "+12",
+        12.0,
+        "integer"
+      ],
+      " ",
+      [
+        "ident",
+        "Ü"
+      ],
+      [
+        "number",
+        "+12",
+        12.0,
+        "integer"
+      ],
+      " ",
+      [
+        "ident",
+        "u"
+      ],
+      " ",
+      [
+        "number",
+        "+12",
+        12.0,
+        "integer"
+      ],
+      " ",
+      [
+        "ident",
+        "U"
+      ],
+      "+",
+      " ",
+      [
+        "number",
+        "12",
+        12.0,
+        "integer"
+      ],
+      " ",
+      [
+        "ident",
+        "U"
+      ],
+      [
+        "number",
+        "+12",
+        12.0,
+        "integer"
+      ],
+      " ",
+      "-",
+      " ",
+      [
+        "number",
+        "20",
+        20.0,
+        "integer"
+      ],
+      " ",
+      [
+        "ident",
+        "U"
+      ],
+      [
+        "number",
+        "+1",
+        1.0,
+        "integer"
+      ],
+      "?",
+      [
+        "number",
+        "2",
+        2.0,
+        "integer"
+      ],
+      " ",
+      [
+        "ident",
+        "U"
+      ],
+      [
+        "number",
+        "+1",
+        1.0,
+        "integer"
+      ],
+      "?",
+      [
+        "number",
+        "-50",
+        -50.0,
+        "integer"
+      ]
+    ]
+  },
+  "component_value_list.json#6": {
+    "input": "\\- red0 -red --red -\\-red\\ blue 0red -0red \u0000red _Red .red rêd r\\êd ",
+    "reason": "css-syntax-3 4.2: non-ASCII ident code points are listed ranges starting at U+00B7; U+0080 and U+0081 are not in them (the 2021 draft allowed any non-ASCII code point), so each is a delim token.",
+    "expected": [
+      [
+        "ident",
+        "-"
+      ],
+      " ",
+      [
+        "ident",
+        "red0"
+      ],
+      " ",
+      [
+        "ident",
+        "-red"
+      ],
+      " ",
+      [
+        "ident",
+        "--red"
+      ],
+      " ",
+      [
+        "ident",
+        "--red blue"
+      ],
+      " ",
+      [
+        "dimension",
+        "0",
+        0.0,
+        "integer",
+        "red"
+      ],
+      " ",
+      [
+        "dimension",
+        "-0",
+        -0.0,
+        "integer",
+        "red"
+      ],
+      " ",
+      [
+        "ident",
+        "�red"
+      ],
+      " ",
+      [
+        "ident",
+        "_Red"
+      ],
+      " ",
+      ".",
+      [
+        "ident",
+        "red"
+      ],
+      " ",
+      [
+        "ident",
+        "rêd"
+      ],
+      " ",
+      [
+        "ident",
+        "rêd"
+      ],
+      " ",
+      "",
+      "",
+      ""
+    ]
+  },
+  "declaration_list.json#6": {
+    "input": "@import 'foo.css'; a:b; @import 'bar.css'",
+    "reason": "css-syntax-3 5.3.5 (parse a list of declarations): an <at-keyword-token> starts an at-rule that is consumed and discarded, so only declarations are returned.",
+    "expected": [
+      [
+        "declaration",
+        "a",
+        [
+          [
+            "ident",
+            "b"
+          ]
+        ],
+        false
+      ]
+    ]
+  },
+  "declaration_list.json#7": {
+    "input": "@media screen { div{;}} a:b;; @media print{div{",
+    "reason": "css-syntax-3 5.3.5 (parse a list of declarations): an <at-keyword-token> starts an at-rule that is consumed and discarded, so only declarations are returned.",
+    "expected": [
+      [
+        "declaration",
+        "a",
+        [
+          [
+            "ident",
+            "b"
+          ]
+        ],
+        false
+      ]
+    ]
+  },
+  "declaration_list.json#8": {
+    "input": "@ media screen { div{;}} a:b;; @media print{div{",
+    "reason": "css-syntax-3 5.3.5 (parse a list of declarations): an <at-keyword-token> starts an at-rule that is consumed and discarded, so only declarations are returned. The leading '@' is a delim, so consume a declaration fails and consumes the remnants of a bad declaration up to the first top-level ';' (5.5.6), which swallows 'a:b'; the final @media rule is discarded.",
+    "expected": []
+  },
+  "one_declaration.json#11": {
+    "input": "\n/**/ foo: ",
+    "reason": "css-syntax-3 5.5.6 (consume a declaration): step 4 discards whitespace after the colon and step 7 removes trailing whitespace from the value, so the value has no leading or trailing whitespace tokens.",
+    "expected": [
+      "declaration",
+      "foo",
+      [],
+      false
+    ]
+  },
+  "one_declaration.json#12": {
+    "input": "foo:;",
+    "reason": "css-syntax-3 5.5.6 step 5 consumes the value with <semicolon-token> as the stop token and 5.5.7 returns at the stop token without consuming it, so the ';' is left; 5.3.7 (parse a declaration) then finds the input not empty and returns a syntax error (we report it as extra-input).",
+    "expected": [
+      "error",
+      "extra-input"
+    ]
+  },
+  "one_declaration.json#14": {
+    "input": "foo:;bar:;",
+    "reason": "css-syntax-3 5.5.6 step 5 consumes the value with <semicolon-token> as the stop token and 5.5.7 returns at the stop token without consuming it, so the ';' is left; 5.3.7 (parse a declaration) then finds the input not empty and returns a syntax error (we report it as extra-input).",
+    "expected": [
+      "error",
+      "extra-input"
+    ]
+  },
+  "one_declaration.json#15": {
+    "input": "foo: 9000  !Important",
+    "reason": "css-syntax-3 5.5.6 (consume a declaration): step 4 discards whitespace after the colon and step 7 removes trailing whitespace from the value, so the value has no leading or trailing whitespace tokens.",
+    "expected": [
+      "declaration",
+      "foo",
+      [
+        [
+          "number",
+          "9000",
+          9000.0,
+          "integer"
+        ]
+      ],
+      true
+    ]
+  },
+  "one_declaration.json#16": {
+    "input": "foo: 9000  ! /**/\t IMPORTant /**/\f",
+    "reason": "css-syntax-3 5.5.6 (consume a declaration): step 4 discards whitespace after the colon and step 7 removes trailing whitespace from the value, so the value has no leading or trailing whitespace tokens.",
+    "expected": [
+      "declaration",
+      "foo",
+      [
+        [
+          "number",
+          "9000",
+          9000.0,
+          "integer"
+        ]
+      ],
+      true
+    ]
+  },
+  "one_declaration.json#17": {
+    "input": "foo: 9000  /* Dotted capital I */!İmportant",
+    "reason": "css-syntax-3 5.5.6 (consume a declaration): step 4 discards whitespace after the colon and step 7 removes trailing whitespace from the value, so the value has no leading or trailing whitespace tokens.",
+    "expected": [
+      "declaration",
+      "foo",
+      [
+        [
+          "number",
+          "9000",
+          9000.0,
+          "integer"
+        ],
+        " ",
+        "!",
+        [
+          "ident",
+          "İmportant"
+        ]
+      ],
+      false
+    ]
+  },
+  "one_declaration.json#18": {
+    "input": "foo: 9000  !important!",
+    "reason": "css-syntax-3 5.5.6 (consume a declaration): step 4 discards whitespace after the colon and step 7 removes trailing whitespace from the value, so the value has no leading or trailing whitespace tokens.",
+    "expected": [
+      "declaration",
+      "foo",
+      [
+        [
+          "number",
+          "9000",
+          9000.0,
+          "integer"
+        ],
+        " ",
+        "!",
+        [
+          "ident",
+          "important"
+        ],
+        "!"
+      ],
+      false
+    ]
+  },
+  "one_declaration.json#19": {
+    "input": "foo: 9000  important",
+    "reason": "css-syntax-3 5.5.6 (consume a declaration): step 4 discards whitespace after the colon and step 7 removes trailing whitespace from the value, so the value has no leading or trailing whitespace tokens.",
+    "expected": [
+      "declaration",
+      "foo",
+      [
+        [
+          "number",
+          "9000",
+          9000.0,
+          "integer"
+        ],
+        " ",
+        [
+          "ident",
+          "important"
+        ]
+      ],
+      false
+    ]
+  },
+  "rule_list.json#10": {
+    "input": " /* CDO/CDC are not special */ <!-- --> {",
+    "reason": "The 2021 \"parse a list of rules\" kept CDO and CDC tokens; css-syntax-3 replaced it with 5.3.4 (parse a stylesheet's contents, oldid parse-list-of-rules), which runs 5.5.1, and 5.5.1 discards <CDO-token> and <CDC-token>.",
+    "expected": [
+      [
+        "qualified rule",
+        [],
+        []
+      ]
+    ]
+  }
+}

@@ -16,9 +16,16 @@
 //! given (before CR LF and form feeds are turned into LF).
 #![forbid(unsafe_code)]
 
+mod parser;
 mod stream;
 mod tokenizer;
 
+pub use parser::{
+    AcceptAll, BlockItem, BlockKind, ComponentValue, Declaration, Kind, ParseError, Parsed,
+    ParserErrorKind, Rule, RuleId, SyntaxError, TokenList, Validity, Values,
+    parse_comma_separated_component_values, parse_component_value, parse_component_values,
+    parse_declaration, parse_declaration_list, parse_rule, parse_stylesheet,
+};
 pub use stream::{Next, StreamTokenizer};
 pub use tokenizer::{
     ErrorKind, HashKind, Number, Sign, Spanned, Token, TokenError, Tokenizer, is_ident_code_point,

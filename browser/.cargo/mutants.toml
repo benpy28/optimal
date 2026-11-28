@@ -18,4 +18,14 @@ exclude_re = [
     # the same tokens and errors; it only costs a second scan. Equivalent.
     # Line-pinned like the one above.
     "tokenizer\\.rs:2486:24: delete ! in Tokenizer::named_character_reference",
+    # css parser, TokenList::push_run: `end` is below UNCLOSED (asserted just
+    # above), so its top bit is clear and `^` sets it exactly as `|` does.
+    # Equivalent. Line-pinned.
+    "css/src/parser\\.rs:99:39: replace \\| with \\^ in TokenList<'a>::push_run",
+    # css parser, has_curly_block_and_more: the value it checks has no
+    # whitespace at either end (5.5.6 steps 4 and 7 removed it), so any
+    # whitespace in it sits between two other values and `other` is set by
+    # them anyway; counting whitespace as "other" (the mutant) changes no
+    # result. Equivalent. Line-pinned.
+    "css/src/parser\\.rs:628:17: delete match arm Token::Whitespace in Parser<'p, 'a, V>::has_curly_block_and_more",
 ]

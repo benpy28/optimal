@@ -159,3 +159,181 @@ pub fn kind(t: &Token<'_>) -> &'static str {
         Token::Comment => "comment",
     }
 }
+
+pub mod parse_reference;
+
+use optimal_css::{BlockItem, Declaration, Kind, ParseError, Parsed, Rule, RuleId, Values};
+use parse_reference::Entry;
+use serde_json::{Value, json};
+
+/// The [`parse_reference`] validity rules, for the crate.
+pub struct ModelValidity;
+
+impl optimal_css::Validity for ModelValidity {
+    fn at_rule(&mut self, p: &Parsed<'_>, rule: &Rule, _nested: bool) -> bool {
+        let Rule::At { name, .. } = rule else {
+            unreachable!()
+        };
+        parse_reference::at_valid(p.name(*name))
+    }
+    fn qualified_rule(&mut self, p: &Parsed<'_>, rule: &Rule, _nested: bool) -> bool {
+        let Rule::Qualified { prelude, .. } = rule else {
+            unreachable!()
+        };
+        let first = p
+            .values(prelude.clone())
+            .next()
+            .and_then(|v| match v.token() {
+                Token::Ident(s) => Some(s.to_string()),
+                _ => None,
+            });
+        parse_reference::qualified_valid(first.as_deref())
+    }
+    fn declaration(&mut self, p: &Parsed<'_>, d: &Declaration, _nested: bool) -> bool {
+        parse_reference::decl_valid(p.name(d.name))
+    }
+}
+
+fn cv_json(p: &Parsed<'_>, v: optimal_css::ComponentValue<'_, '_>) -> Value {
+    match v.kind() {
+        Kind::Function(name, c) => json!(["f", name, cvs_json(p, c), v.is_closed()]),
+        Kind::Block(_, c) => json!([
+            "b",
+            format!("{:?}", v.token()),
+            cvs_json(p, c),
+            v.is_closed()
+        ]),
+        Kind::Token(t) => {
+            let s = p.tokens.get(v.index());
+            json!(["t", format!("{t:?}"), s.start, s.end])
+        }
+    }
+}
+
+fn cvs_json(p: &Parsed<'_>, vs: Values<'_, '_>) -> Value {
+    Value::Array(vs.map(|v| cv_json(p, v)).collect())
+}
+
+fn decl_json(p: &Parsed<'_>, d: &Declaration) -> Value {
+    json!([
+        "d",
+        p.name(d.name),
+        cvs_json(p, p.values(d.value.clone())),
+        d.important,
+        d.original_text.clone().map(|r| json!([r.start, r.end]))
+    ])
+}
+
+fn decls_json(p: &Parsed<'_>, ds: &[Declaration]) -> Value {
+    Value::Array(ds.iter().map(|d| decl_json(p, d)).collect())
+}
+
+/// A rule of the crate's output in the model's JSON shape.
+pub fn rule_json(p: &Parsed<'_>, id: RuleId) -> Value {
+    match &p.rules[id as usize] {
+        Rule::At {
+            name,
+            prelude,
+            block,
+        } => json!([
+            "at",
+            p.name(*name),
+            cvs_json(p, p.values(prelude.clone())),
+            block.as_ref().map(|b| Value::Array(
+                b.iter()
+                    .map(|i| match i {
+                        BlockItem::Rule(r) => rule_json(p, *r),
+                        BlockItem::Declarations(d) => json!(["decls", decls_json(p, d)]),
+                    })
+                    .collect()
+            ))
+        ]),
+        Rule::Qualified {
+            prelude,
+            declarations,
+            children,
+        } => json!([
+            "qr",
+            cvs_json(p, p.values(prelude.clone())),
+            decls_json(p, declarations),
+            Value::Array(children.iter().map(|&c| rule_json(p, c)).collect())
+        ]),
+        Rule::NestedDeclarations(d) => json!(["nd", decls_json(p, d)]),
+    }
+}
+
+fn syntax_error(e: optimal_css::SyntaxError) -> Value {
+    match e {
+        optimal_css::SyntaxError::Empty => json!(["error", "empty"]),
+        optimal_css::SyntaxError::Invalid => json!(["error", "invalid"]),
+        optimal_css::SyntaxError::ExtraInput => json!(["error", "extra-input"]),
+    }
+}
+
+fn parser_errors(p: &Parsed<'_>) -> Value {
+    Value::Array(
+        p.errors
+            .iter()
+            .filter_map(|e| match e {
+                ParseError::Parser(k, at) => Some(json!([format!("{k:?}"), at])),
+                ParseError::Token(_) => None,
+            })
+            .collect(),
+    )
+}
+
+/// Run `entry` on `src` with the crate (validity as in the model): the
+/// result and the parser errors, in the model's JSON shape.
+pub fn parse_json(src: Wtf8<'_>, entry: Entry) -> (Value, Value) {
+    let v = &mut ModelValidity;
+    match entry {
+        Entry::Stylesheet => {
+            let (p, rules) = optimal_css::parse_stylesheet(src, v);
+            (
+                Value::Array(rules.iter().map(|&r| rule_json(&p, r)).collect()),
+                parser_errors(&p),
+            )
+        }
+        Entry::DeclarationList => {
+            let (p, ds) = optimal_css::parse_declaration_list(src, v);
+            (decls_json(&p, &ds), parser_errors(&p))
+        }
+        Entry::Rule => {
+            let (p, r) = optimal_css::parse_rule(src, v);
+            (
+                r.map_or_else(syntax_error, |id| rule_json(&p, id)),
+                parser_errors(&p),
+            )
+        }
+        Entry::Declaration => {
+            let (p, r) = optimal_css::parse_declaration(src, v);
+            (
+                r.map_or_else(syntax_error, |d| decl_json(&p, &d)),
+                parser_errors(&p),
+            )
+        }
+        Entry::ComponentValue => {
+            let (p, r) = optimal_css::parse_component_value(src);
+            (
+                r.map_or_else(syntax_error, |i| cv_json(&p, p.tokens.value(i))),
+                parser_errors(&p),
+            )
+        }
+        Entry::ComponentValues => {
+            let (p, r) = optimal_css::parse_component_values(src);
+            (cvs_json(&p, p.values(r)), parser_errors(&p))
+        }
+        Entry::CommaSeparated => {
+            let (p, groups) = optimal_css::parse_comma_separated_component_values(src);
+            (
+                Value::Array(
+                    groups
+                        .into_iter()
+                        .map(|g| cvs_json(&p, p.values(g)))
+                        .collect(),
+                ),
+                parser_errors(&p),
+            )
+        }
+    }
+}
