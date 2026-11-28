@@ -521,10 +521,7 @@ impl<'p, 'a, V: Validity> Parser<'p, 'a, V> {
         self.i += 1;
         // Steps 2 to 4.
         self.discard_whitespace();
-        if !matches!(
-            self.token(self.i),
-            Some(Token::Colon)
-        ) {
+        if !matches!(self.token(self.i), Some(Token::Colon)) {
             if !speculative {
                 self.bad_declaration_remnants(nested, limit);
             }
@@ -559,7 +556,6 @@ impl<'p, 'a, V: Validity> Parser<'p, 'a, V> {
         // Step 9.
         self.v.declaration(self.p, &decl, nested).then_some(decl)
     }
-
 
     /// Step 5 of 5.5.6 for a speculative, non-custom declaration: the same
     /// list, but `None` as soon as step 8 is sure to reject it (a `{}`-block
