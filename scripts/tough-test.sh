@@ -163,7 +163,7 @@ has_uefi() { [ -n "$OVMF" ]; }
 boot_ok() {
     local log="$1" expect="$2" rest re
     grep -qE "OPTIMAL: ktest [0-9]+ passed, 0 failed" "$log" || return 1
-    ! grep -qE "KTEST FAIL|KERNEL PANIC|EXCEPTION" "$log" || return 1
+    ! grep -qE "KTEST FAIL|KERNEL PANIC|EXCEPTION|^HOST MEMORY:" "$log" || return 1
     if [ "$expect" = boot ]; then
         rest='^acpi: (XSDT|RSDT) rev .*; 0 warnings$'
     else
@@ -288,9 +288,15 @@ scenario "mem-split-1G-below-4G" boot "$ISO" bios q35,max-ram-below-4g=1G 6G 2 3
 has_uefi && scenario "mem-split-1G-below-4G-uefi" boot "$ISO" uefi q35,max-ram-below-4g=1G 6G 2 30 kvm
 # 32 GiB, more than the CI host has: reserve=off lets the host back it lazily
 # (the guest only touches what it uses), so this tests a big memory map.
+# QEMU asks for transparent huge pages, so one guest write backs 2 MiB of
+# host memory; the frame drain ktest writes at most 1 GiB + 256 MiB for that
+# reason (kernel/src/mm/tests.rs). The limit holds that, plus QEMU itself,
+# the firmware, the allocator's metadata (12 bytes per frame, 96 MiB) and
+# up to 2 MiB per page-table and heap page the kernel uses, with room to
+# spare; writing to all memory would need 32 GiB and fail it.
 big=(-object memory-backend-ram,id=big,size=32G,reserve=off)
-scenario "mem-32G-large" boot "$ISO" bios q35,memory-backend=big 32G 4 30 kvm -- "${big[@]}"
-has_uefi && scenario "mem-32G-large-uefi" boot "$ISO" uefi q35,memory-backend=big 32G 4 30 kvm -- "${big[@]}"
+QEMU_MAX_RSS_MB=3072 scenario "mem-32G-large" boot "$ISO" bios q35,memory-backend=big 32G 4 30 kvm -- "${big[@]}"
+has_uefi && QEMU_MAX_RSS_MB=3072 scenario "mem-32G-large-uefi" boot "$ISO" uefi q35,memory-backend=big 32G 4 30 kvm -- "${big[@]}"
 dimms=(-object memory-backend-ram,id=d0,size=512M -device pc-dimm,memdev=d0
     -object memory-backend-ram,id=d1,size=256M -device pc-dimm,memdev=d1)
 scenario "mem-extra-dimms" boot "$ISO" bios q35 1G,slots=4,maxmem=8G 2 30 kvm -- "${dimms[@]}"

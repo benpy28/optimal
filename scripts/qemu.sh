@@ -54,6 +54,10 @@ PY
 #   QEMU_ACCEL=(...)   replaces the accelerator, e.g. (-accel tcg) for a slow CPU
 #   QEMU_WRAP=(...)    command prefix, e.g. (taskset -c 0) to squeeze every vCPU
 #                      onto one host core
+#   QEMU_MAX_RSS_MB=N  fail the run (a "HOST MEMORY:" line in the log) if
+#                      QEMU's peak resident memory on the host went over N MiB
+#                      (for big guests backed lazily: the guest must not make
+#                      the host back memory it never needed)
 QEMU_EXTRA=()
 QEMU_WRAP=()
 QEMU_ACCEL=("${ACCEL[@]}")
@@ -119,6 +123,11 @@ run_qemu() {
         # so a failure comes with evidence (firmware, bootloader or kernel?).
         hang_report "$log.mon" "$log" >"$log.hang" 2>&1
     fi
+    # QEMU_WRAP programs exec QEMU, so $qemu is QEMU itself.
+    local peak_kb=""
+    if [ -n "${QEMU_MAX_RSS_MB:-}" ]; then
+        peak_kb=$(awk '/^VmHWM:/ {print $2}' "/proc/$qemu/status" 2>/dev/null || true)
+    fi
     kill "$qemu" 2>/dev/null
     wait "$qemu" 2>/dev/null
     # Firmware and Limine draw text with terminal escape codes, one character
@@ -127,6 +136,15 @@ run_qemu() {
     # Keep QEMU's own complaints (bad option, unsupported feature) with the log.
     if [ -s "$log.qemu" ]; then
         { echo "--- qemu stderr ---"; cat "$log.qemu"; } >>"$log"
+    fi
+    if [ -n "${QEMU_MAX_RSS_MB:-}" ]; then
+        if [ -z "$peak_kb" ]; then
+            echo "HOST MEMORY: QEMU's peak memory could not be read (QEMU had already exited)" >>"$log"
+        elif [ $((peak_kb / 1024)) -gt "$QEMU_MAX_RSS_MB" ]; then
+            echo "HOST MEMORY: QEMU peaked at $((peak_kb / 1024)) MiB, over the limit of $QEMU_MAX_RSS_MB MiB" >>"$log"
+        else
+            echo "host memory: QEMU peaked at $((peak_kb / 1024)) MiB (limit $QEMU_MAX_RSS_MB MiB)" >>"$log"
+        fi
     fi
     if [ -s "$log.hang" ]; then
         { echo "--- hang report (no finish line within ${timeout}s) ---"; cat "$log.hang"; } >>"$log"

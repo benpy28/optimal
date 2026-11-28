@@ -41,30 +41,78 @@ fn in_metadata(phys: u64) -> bool {
         .any(|z| z.meta.start <= phys && phys < z.meta.end)
 }
 
-/// Frames below this physical address are all written by the test below;
-/// above it, only every `TOUCH_STRIDE`th frame is. Writing to every frame
-/// of a 32 GiB guest makes the host back all of it, which is more memory
-/// than a CI runner has (the tough-conditions run backs that guest lazily).
-/// The bitmap still checks every single frame for duplicates, so only the
-/// "is this frame really ours to write" part is sampled above the limit.
+/// Frames below this physical address are all written by the drain test
+/// below. Above it, frames are written only in sampled 2 MiB windows (every
+/// frame of a sampled window, none outside), at most `TOUCH_WINDOWS_MAX` of
+/// them spread evenly up to the top of memory. The bitmap still checks every
+/// single frame for duplicates, so only the "is this frame really ours to
+/// write" part is sampled above the limit.
+///
+/// Why windows and not every Nth frame: the tough-conditions run gives a
+/// 32 GiB guest to a runner with less memory than that, backed lazily, and
+/// QEMU asks the host for transparent huge pages. One 4 KiB write then makes
+/// the host back the whole 2 MiB page around it, so writing every 64th frame
+/// (one per 256 KiB) backed all 32 GiB: the runner swapped until the test
+/// missed its deadline, or the host killed QEMU. Whole windows bound what the
+/// guest makes the host back to `TOUCH_ALL_BELOW` + `TOUCH_WINDOWS_MAX` x
+/// 2 MiB (1.25 GiB) on any machine size, twice the window part if the
+/// host's huge pages are not aligned with guest memory. The scenario checks
+/// QEMU's peak memory against that (QEMU_MAX_RSS_MB in tough-test.sh).
 const TOUCH_ALL_BELOW: u64 = 1 << 30;
-const TOUCH_STRIDE: u64 = 64;
+const TOUCH_WINDOW: u64 = 2 << 20;
+const TOUCH_WINDOWS_MAX: u64 = 128;
 
-fn touched(phys: u64) -> bool {
-    phys < TOUCH_ALL_BELOW || (phys / PAGE_SIZE).is_multiple_of(TOUCH_STRIDE)
+/// Every `touch_stride(top)`th window above `TOUCH_ALL_BELOW` is written, on a
+/// machine whose allocatable memory ends at `top`: the smallest stride that
+/// keeps the number of written windows at or under `TOUCH_WINDOWS_MAX`.
+fn touch_stride(top: u64) -> u64 {
+    let windows = top.saturating_sub(TOUCH_ALL_BELOW).div_ceil(TOUCH_WINDOW);
+    windows.div_ceil(TOUCH_WINDOWS_MAX).max(1)
+}
+
+fn touched(phys: u64, stride: u64) -> bool {
+    phys < TOUCH_ALL_BELOW || ((phys - TOUCH_ALL_BELOW) / TOUCH_WINDOW).is_multiple_of(stride)
 }
 
 ktest!(touch_policy_is_as_documented, {
-    // Hand-worked: everything below 1 GiB, then frame indices that are
-    // multiples of 64 (0x4000_0000 is frame 0x40000, a multiple of 64).
-    assert!(touched(LOW_MEMORY_END));
-    assert!(touched(TOUCH_ALL_BELOW - PAGE_SIZE));
-    assert!(touched(TOUCH_ALL_BELOW));
-    assert!(!touched(TOUCH_ALL_BELOW + PAGE_SIZE));
-    assert!(!touched(TOUCH_ALL_BELOW + 63 * PAGE_SIZE));
-    assert!(touched(TOUCH_ALL_BELOW + 64 * PAGE_SIZE));
-    assert!(touched(32 << 30));
-    assert!(!touched((32 << 30) + 4 * PAGE_SIZE));
+    const G: u64 = 1 << 30;
+    const W: u64 = TOUCH_WINDOW;
+    // Hand-worked strides. 32 GiB: 31 GiB / 2 MiB = 15872 windows above
+    // 1 GiB, and 15872 / 128 = 124 exactly. 1 TiB: 523776 windows,
+    // 523776 / 128 = 4092 exactly. Up to 1 GiB + 256 MiB every window fits.
+    assert_eq!(touch_stride(0), 1);
+    assert_eq!(touch_stride(G), 1);
+    assert_eq!(touch_stride(G + PAGE_SIZE), 1);
+    assert_eq!(touch_stride(G + 128 * W), 1);
+    assert_eq!(touch_stride(G + 128 * W + PAGE_SIZE), 2);
+    assert_eq!(touch_stride(32 * G), 124);
+    assert_eq!(touch_stride(32 * G + PAGE_SIZE), 125);
+    assert_eq!(touch_stride(1024 * G), 4092);
+    // Everything below 1 GiB; above it whole windows: window 0, then
+    // window 124 for a 32 GiB machine.
+    let s = touch_stride(32 * G);
+    assert!(touched(LOW_MEMORY_END, s));
+    assert!(touched(G - PAGE_SIZE, s));
+    assert!(touched(G, s));
+    assert!(touched(G + W - PAGE_SIZE, s));
+    assert!(!touched(G + W, s));
+    assert!(!touched(G + 123 * W + W - PAGE_SIZE, s));
+    assert!(touched(G + 124 * W, s));
+    assert!(touched(G + 124 * W + W - PAGE_SIZE, s));
+    assert!(!touched(G + 125 * W, s));
+    // On every size up to 4 TiB, the written windows stay within the
+    // budget, and the stride is the smallest that does.
+    let mut top = G;
+    while top <= 4096 * G {
+        let windows = top.saturating_sub(G).div_ceil(W);
+        let st = touch_stride(top);
+        assert!(windows.div_ceil(st) <= TOUCH_WINDOWS_MAX, "top {top:#x}");
+        assert!(
+            st == 1 || windows.div_ceil(st - 1) > TOUCH_WINDOWS_MAX,
+            "top {top:#x}"
+        );
+        top = top * 3 / 2 + PAGE_SIZE;
+    }
 });
 
 ktest!(every_free_frame_is_handed_out_exactly_once, {
@@ -88,6 +136,7 @@ ktest!(every_free_frame_is_handed_out_exactly_once, {
         .max()
         .unwrap();
     let nframes = top.div_ceil(PAGE_SIZE) as usize;
+    let stride = touch_stride(top);
     let mut bits: Vec<u64> = vec![0; nframes.div_ceil(64)];
     let bits_lo = virt_to_phys(bits.as_ptr() as u64);
     let bits_hi = bits_lo + (bits.len() * 8) as u64;
@@ -111,7 +160,7 @@ ktest!(every_free_frame_is_handed_out_exactly_once, {
             "frame {f:#x} handed out twice"
         );
         bits[i / 64] |= 1 << (i % 64);
-        if touched(f) {
+        if touched(f, stride) {
             let p = phys_to_virt(f) as *mut u64;
             // SAFETY: we own frame f now; it is mapped by the direct map.
             unsafe {
@@ -133,7 +182,7 @@ ktest!(every_free_frame_is_handed_out_exactly_once, {
         while m != 0 {
             let f = ((w * 64 + m.trailing_zeros() as usize) as u64) * PAGE_SIZE;
             m &= m - 1;
-            if touched(f) {
+            if touched(f, stride) {
                 let p = phys_to_virt(f) as *const u64;
                 // SAFETY: still ours until freed below.
                 let (tag, last) = unsafe { (p.add(1).read_volatile(), p.add(511).read_volatile()) };
@@ -147,6 +196,12 @@ ktest!(every_free_frame_is_handed_out_exactly_once, {
     }
     assert_eq!(seen, count);
     assert_eq!(checked, written);
+    // What this test made the host back stays within the documented budget.
+    assert!(
+        written * PAGE_SIZE <= TOUCH_ALL_BELOW + TOUCH_WINDOWS_MAX * TOUCH_WINDOW,
+        "wrote {written} frames, over the touch budget"
+    );
+    crate::println!("ktest: drain wrote {written} of {count} frames (window stride {stride})");
     // Small machines (every test VM up to 1 GiB) are checked in full.
     if top <= TOUCH_ALL_BELOW {
         assert_eq!(written, count);
