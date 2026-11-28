@@ -538,17 +538,24 @@ impl<'p, 'a> Parser<'p, 'a> {
         let at = |i: usize| s.get(i);
         // A `|` followed by `=` is the `|=` matcher, not a prefix.
         let bar = |i: usize| delim(at(i), '|') && !delim(at(i + 1), '=');
-        let (ns, prefix, name_at) = match at(0).map(|v| v.token()) {
-            Some(Token::Ident(p)) if bar(1) => {
-                let url = self.ns.lookup(p).ok_or(SelectorError::UndeclaredPrefix)?;
-                (Namespace::Url(url.into()), Some((**p).into()), 2)
-            }
-            Some(Token::Delim('*')) if bar(1) => (Namespace::Any, Some("*".into()), 2),
-            Some(Token::Delim('|')) if bar(0) => (Namespace::None, None, 1),
-            Some(Token::Ident(_)) => (Namespace::None, None, 0),
+        let (written, name_at) = match at(0).map(|v| v.token()) {
+            Some(Token::Ident(p)) if bar(1) => (Written::Named(p), 2),
+            Some(Token::Delim('*')) if bar(1) => (Written::Any, 2),
+            Some(Token::Delim('|')) if bar(0) => (Written::Empty, 1),
+            Some(Token::Ident(_)) => (Written::Implicit, 0),
             _ => return Err(SelectorError::Syntax),
         };
         let local = ident(at(name_at)).ok_or(SelectorError::Syntax)?;
+        // 6.4: no prefix and the empty prefix both mean no namespace;
+        // cssom-1 5.2 serializes a prefix only for a namespace.
+        let (ns, prefix) = match written {
+            Written::Implicit | Written::Empty => (Namespace::None, None),
+            Written::Any => (Namespace::Any, Some("*".into())),
+            Written::Named(p) => {
+                let url = self.ns.lookup(p).ok_or(SelectorError::UndeclaredPrefix)?;
+                (Namespace::Url(url.into()), Some(p.into()))
+            }
+        };
         let mut i = name_at + 1;
         let skip_ws = |i: &mut usize| {
             while s.get(*i).is_some_and(is_ws) {
