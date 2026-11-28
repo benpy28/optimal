@@ -679,14 +679,18 @@ impl Harness {
 
     /// Wraps an already-mounted filesystem whose state is `model`.
     /// The model has no space limit, so a namespace op that allocates may
-    /// fail with `NoSpace` where the model succeeds, but only on a volume
-    /// that really is full: fewer available blocks than the 8 such an op
-    /// asks for (a free inode, its directory entry and their tree paths).
-    /// A `NoSpace` with room left still fails the comparison.
-    fn full_disk_refusal<T, U>(&self, fr: &Result<T>, mr: &core::result::Result<U, Error>) -> bool {
+    /// fail with `NoSpace` where the model succeeds, but only when the
+    /// volume's space check refuses such an op (8 metadata blocks) even
+    /// after the drain `ensure_space` tried. A `NoSpace` from anywhere else
+    /// (an allocation failing inside the op) still fails the comparison.
+    fn full_disk_refusal<T, U>(
+        &mut self,
+        fr: &Result<T>,
+        mr: &core::result::Result<U, Error>,
+    ) -> bool {
         matches!(fr, Err(Error::NoSpace))
             && mr.is_ok()
-            && self.fs.as_ref().unwrap().statfs().available_blocks < 8
+            && !self.fs.as_mut().unwrap().has_room_for(0, 8, false).unwrap()
     }
 
     pub fn from_mounted(
