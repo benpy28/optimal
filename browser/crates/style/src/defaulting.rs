@@ -90,7 +90,7 @@ pub enum Value {
 /// An element's specified values.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Style<'n> {
-    /// Each longhand's, by [`LonghandId`].
+    /// Each longhand's, by [`crate::property::LonghandId`].
     pub longhands: Box<[Value]>,
     /// The custom properties that have a value, sorted by name. Each is a
     /// [`Value::Declared`].

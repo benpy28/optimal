@@ -175,12 +175,21 @@ or canonical, which needs the IANA subtag registry.
 | web-platform-tests `css/css-cascade/layer-rule-invalid-name.html` | 6852422 | 4 / 4 | each `<style>`'s rule count |
 | web-platform-tests `css/css-cascade/parsing/layer.html` | 6852422 | 11 / 11 | `test_valid_rule` / `test_invalid_rule`: a valid `@layer` declares a layer |
 | web-platform-tests `css/css-cascade/parsing/layer-import-parsing.html` | 6852422 | 13 / 13 | a valid layered `@import` declares its layer; with an invalid `layer()` it stays a valid import (the `@import` after it still counts) |
-| web-platform-tests static pages in `css/css-cascade` and `css/css-nesting` | 6852422 | 22 / 22 | the page's `<style>` elements and markup (parsed by `optimal-html`), and each `getComputedStyle` assert written out as (element, property, value) in `crates/style/tests/wpt.rs`: `layers-basic`, `important-vs-inline-001` (first assert), `nesting-layer`, `top-level-parent-pseudo-specificity`, `implicit-nesting-ident`, `nested-error-recovery`, `nested-declarations-matching` |
+| web-platform-tests static pages in `css/css-cascade` and `css/css-nesting` | 6852422 | 49 / 49 | the page's `<style>` elements and markup (parsed by `optimal-html`), and each `getComputedStyle` assert written out as (element, property, value) in `crates/style/tests/wpt.rs`: `layers-basic`, `important-vs-inline-001` (first assert), `nesting-layer`, `top-level-parent-pseudo-specificity`, `implicit-nesting-ident`, `nested-error-recovery`, `nested-declarations-matching`, `revert-rule-basic`, `revert-rule-important`, `revert-rule-layer`, `revert-rule-custom-property`, `revert-rule-revert-layer`, `nesting-revert-rule` (`#test1` to `#test3`), `inherit-initial` |
+| web-platform-tests reftests of the defaulting keywords in `css/css-cascade` | 6852422 | 36 / 36 (20 pages) | each page "passes if there is a filled green square" (or names its condition, or matches a reference page); the specified values that make it so are written out in `crates/style/tests/wpt.rs` with the reasoning: `revert-layer-001` to `-003`, `-005` to `-007`, `-009`, `-012`, `revert-val-001`, `-002`, `unset-val-001`, `-002`, `initial-color-background-001`, `initial-background-color`, `all-prop-001`, `-002`, `all-prop-{inherit,initial,revert,unset}-color`. Pages whose result depends on the user agent sheet get its `display: block` rule for `div` and `p`, copied from the HTML standard's rendering section |
 | web-platform-tests `*crash*.html` in both directories | 6852422 | 14 / 14 | every page collected and cascaded without a panic |
 
-There are no computed values yet, so a value is checked as the cascaded
-value's text, and an expected `rgb(0, 128, 0)` is the computed value of the
-keyword `green` (likewise red, yellow, black).
+There are no computed values yet, so a value is checked as the specified
+value's text (a declaration's value as written, or the property table's
+initial value), and an expected `rgb(0, 128, 0)` is the computed value of
+the keyword `green` (likewise red, yellow, black, and `rgba(0, 0, 0, 0)`
+for `transparent`).
+
+The property table (`crates/style/src/property.rs`, 154 longhands, 29
+shorthands, 2 legacy aliases) is checked against the property definition
+tables of the specs it cites, at csswg-drafts 7027ab6
+(`crates/style/tests/property_table.rs`): every longhand's initial value
+and inherited flag, every shorthand's definition and longhands.
 
 No errata. Two bugs were found by these files and fixed: a `@layer`
 statement inside a style rule is invalid (only at-rules that hold style
@@ -205,8 +214,23 @@ Waiting, with the reason (the rest of both directories):
   `@media` cases of `nested-declarations-matching`;
 - **`@scope`**: `at-scope-*`, `scope-*`, the `@scope` cases of
   `nested-declarations-matching`;
-- **defaulting keywords** (the next step): `all-prop-*`, `revert-*`,
-  `revert-rule-*`, `inherit-initial`, `initial-*`, `inline-style-*`;
+- **defaulting keywords, needing something else first**: script
+  (`revert-val-004` after its class change, `-011`, `all-prop-revert-noop`,
+  `all-prop-revert-layer-noop`, `all-prop-revert-layer` (every property of
+  a browser), `unset-value-storage`, `inline-style-*`), animations and
+  transitions (`revert-layer-008`, `-010`, `-011`, `revert-val-003`, `-006`,
+  `-007`), a user agent sheet with `h1` margins (`revert-val-005`, which
+  also needs logical properties), shadow trees (`revert-layer-004`, `-013`,
+  `-014`, `-015`, `revert-rule-shadow`), `@scope` (`#test4` of
+  `nesting-revert-rule`), `:visited` (`all-prop-*-visited`), XML
+  documents (`all-prop-initial-xml`);
+- **`revert-rule-cycle.tentative.html`** (tentative): it expects a cycle
+  between `revert-rule !important` and `revert-layer` to give `unset`.
+  The spec text rolls back "as if" the reverted declarations were absent;
+  reading that as cumulative, as the other `revert-rule` tests need (a
+  chain of `revert-rule` works), there is no cycle and the result is the
+  lower layer's value (`red` there). Recorded here, not as an erratum,
+  until the test leaves tentative status;
 - **shadow trees**: `layer-slotted-rule`, `layer-order-invalidation-shadow-dom`,
   `host-nesting-*`;
 - **pseudo-element styles**: the `::after` case of

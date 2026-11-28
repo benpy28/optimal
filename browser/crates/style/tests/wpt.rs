@@ -575,6 +575,13 @@ const REFTESTS: &[(&str, bool, &[RefCheck])] = &[
             (".inner", "background-color", "transparent"),
         ],
     ),
+    // A reference-matched page: the later background-color: initial wins
+    // over the color the background shorthand sets, so html's green shows.
+    (
+        "css-cascade/initial-background-color.html",
+        false,
+        &[("#outer", "background-color", "transparent")],
+    ),
     // all: initial keeps direction and unicode-bidi, resets the rest.
     (
         "css-cascade/all-prop-001.html",
@@ -625,7 +632,10 @@ const REFTESTS: &[(&str, bool, &[RefCheck])] = &[
 fn reftests() {
     for (file, ua, checks) in REFTESTS {
         let src = load(file);
-        assert!(src.contains("Test passes if"), "{file}: not a reftest page");
+        assert!(
+            src.contains("Test passes if") || src.contains("rel=\"match\""),
+            "{file}: not a reftest page"
+        );
         let p = page(&src);
         let mut sheets: Vec<(&str, Origin)> = Vec::new();
         if *ua {

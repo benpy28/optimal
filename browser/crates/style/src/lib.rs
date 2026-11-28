@@ -8,14 +8,20 @@
 //!   [`collect`]). [`StyleAttribute`] parses a `style` attribute.
 //! - [`StyleSet::prepare`] gives a [`Cascade`], which sorts the
 //!   declarations that apply to each element ([`cascade`]).
+//! - [`Session::style`] resolves those into each property's specified
+//!   value: inheritance, initial values and the CSS-wide keywords
+//!   ([`defaulting`]), for the longhands of the property table
+//!   ([`property`]) and custom properties.
 //!
 //! Known gaps, each for a later step: `@import` doesn't load sheets; the
 //! conditional group rules (`@media`, `@supports`, `@container`) and
-//! `@scope` are dropped; every declaration is kept whatever its property
-//! and value (no property table yet); no defaulting, value parsing or
-//! computed values; no shadow trees (one encapsulation context), no
-//! animations or transitions, no presentational hints, no pseudo-element
-//! styles.
+//! `@scope` are dropped; values are not parsed against each property's
+//! grammar (only the CSS-wide keyword rules are checked), so no computed
+//! values; arbitrary substitution functions (`var()` and the rest) are not
+//! substituted; the property table has no logical properties, grid,
+//! animation or SVG properties yet; no shadow trees (one encapsulation
+//! context), no animations or transitions, no presentational hints, no
+//! pseudo-element styles.
 #![forbid(unsafe_code)]
 
 pub mod cascade;

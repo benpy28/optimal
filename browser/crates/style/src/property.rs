@@ -1,7 +1,7 @@
 //! The property table: every longhand the engine knows, with whether it is
 //! inherited and its initial value (css-cascade-5 7.1 and 7.2), the
-//! shorthands that set them (css-cascade-5 4), the legacy name aliases
-//! (css-cascade-5 4.1), and the CSS-wide keywords (css-cascade-5 7.3).
+//! shorthands that set them (css-cascade-5 3), the legacy name aliases
+//! (css-cascade-5 3.1), and the CSS-wide keywords (css-cascade-5 7.3).
 //!
 //! Each entry cites the spec whose property definition table it copies,
 //! at csswg-drafts commit 7027ab6; `tests/property_table.rs` reads those
@@ -472,7 +472,8 @@ pub const SHORTHANDS: &[Shorthand] = &[
     },
 ];
 
-/// Legacy name aliases (css-cascade-5 4.1): (old name, new name), sorted.
+/// Legacy name aliases (css-cascade-5 3.1): (old name, new name, the spec
+/// that defines the alias), sorted by old name.
 /// The old name is converted to the new one at parse time.
 pub const ALIASES: &[(&str, &str, &str)] = &[
     ("font-stretch", "font-width", "css-fonts-4"),
@@ -544,7 +545,7 @@ pub fn longhands(target: Target) -> impl Iterator<Item = LonghandId> {
     one.into_iter().chain(many_ids).chain(all_ids)
 }
 
-/// The CSS-wide keywords (css-cascade-5 7.3; css-values-4 2.1.2).
+/// The CSS-wide keywords (css-cascade-5 7.3; css-values-4 #common-keywords).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Keyword {
     /// `initial`
