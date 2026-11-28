@@ -49,6 +49,22 @@ fn refuses_to_make_a_cycle() {
     d.append(b, a);
 }
 
+/// A template's contents count as inside the template (host-including
+/// ancestors), empty or not.
+#[test]
+fn template_cannot_go_into_its_own_contents() {
+    let mut d = Document::new();
+    let t = d.create_element(Namespace::Html, local::TEMPLATE, vec![]);
+    let contents = d.element(t).unwrap().template_contents.unwrap();
+    assert!(d.would_cycle(t, contents));
+    let div = d.create_element(Namespace::Html, local::DIV, vec![]);
+    d.append(contents, div);
+    assert!(d.would_cycle(t, div));
+    assert!(d.would_cycle(t, contents));
+    let other = d.create_element(Namespace::Html, local::DIV, vec![]);
+    assert!(!d.would_cycle(t, other));
+}
+
 #[test]
 #[should_panic(expected = "reference is not a child")]
 fn refuses_foreign_reference_child() {
