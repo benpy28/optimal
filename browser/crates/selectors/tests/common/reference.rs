@@ -1068,6 +1068,9 @@ impl Checker<'_> {
 
 // --- Serialization (cssom-1 5.2) ----------------------------------------
 
+// One branch per bullet of "serialize an identifier", even where two
+// give the same output.
+#[allow(clippy::if_same_then_else)]
 pub fn ident(s: &str) -> String {
     let cs: Vec<char> = s.chars().collect();
     let mut out = String::new();
