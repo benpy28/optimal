@@ -70,31 +70,86 @@ fn clock_every_case() {
     }
 }
 
+fn sources(bits: u8) -> Sources {
+    Sources {
+        deadline_mode: bits & 1 != 0,
+        tsc_calibrated: bits & 2 != 0,
+        tsc_invariant: bits & 4 != 0,
+        lapic_calibrated: bits & 8 != 0,
+        hpet: bits & 16 != 0,
+        pit: bits & 32 != 0,
+    }
+}
+
 #[test]
 fn events_every_case() {
     use Events::*;
-    for deadline in [false, true] {
-        for tsc in [false, true] {
-            for inv in [false, true] {
-                for lapic in [false, true] {
-                    let want = if deadline && tsc && inv {
-                        Some(TscDeadline)
-                    } else if lapic {
-                        Some(LapicOneShot)
-                    } else {
-                        None
-                    };
-                    assert_eq!(
-                        events(deadline, tsc, inv, lapic),
-                        want,
-                        "{deadline} {tsc} {inv} {lapic}"
-                    );
-                }
-            }
-        }
+    // All 64 combinations against the rule written out independently.
+    for bits in 0..64u8 {
+        let s = sources(bits);
+        let want = if s.deadline_mode && s.tsc_calibrated && s.tsc_invariant {
+            Some(TscDeadline)
+        } else if s.lapic_calibrated {
+            Some(LapicOneShot)
+        } else if s.hpet {
+            Some(HpetOneShot)
+        } else if s.pit {
+            Some(PitOneShot)
+        } else {
+            None
+        };
+        assert_eq!(events(s), want, "{s:?}");
     }
-    // Spelled out: a TSC that is not invariant never drives deadlines.
-    assert_eq!(events(true, true, false, true), Some(LapicOneShot));
-    assert_eq!(events(true, true, false, false), None);
-    assert_eq!(events(true, true, true, false), Some(TscDeadline));
+}
+
+#[test]
+fn events_hand_worked() {
+    use Events::*;
+    let none = Sources::default();
+    // A TSC that is not invariant never drives deadlines.
+    let s = Sources {
+        deadline_mode: true,
+        tsc_calibrated: true,
+        lapic_calibrated: true,
+        ..none
+    };
+    assert_eq!(events(s), Some(LapicOneShot));
+    let s = Sources {
+        deadline_mode: true,
+        tsc_calibrated: true,
+        ..none
+    };
+    assert_eq!(events(s), None);
+    let s = Sources {
+        deadline_mode: true,
+        tsc_calibrated: true,
+        tsc_invariant: true,
+        ..none
+    };
+    assert_eq!(events(s), Some(TscDeadline));
+    // The fallbacks, in order: LAPIC one-shot beats the HPET, which
+    // beats the PIT.
+    let all_three = Sources {
+        lapic_calibrated: true,
+        hpet: true,
+        pit: true,
+        ..none
+    };
+    assert_eq!(events(all_three), Some(LapicOneShot));
+    let s = Sources {
+        lapic_calibrated: false,
+        ..all_three
+    };
+    assert_eq!(events(s), Some(HpetOneShot));
+    let s = Sources { hpet: false, ..s };
+    assert_eq!(events(s), Some(PitOneShot));
+    assert_eq!(events(none), None);
+    // An invariant TSC without TSC-deadline mode and nothing else.
+    let s = Sources {
+        tsc_calibrated: true,
+        tsc_invariant: true,
+        pit: true,
+        ..none
+    };
+    assert_eq!(events(s), Some(PitOneShot));
 }

@@ -24,6 +24,7 @@ pub mod cpuid;
 pub mod freq;
 pub mod hpet;
 pub mod lapic;
+pub mod oneshot;
 pub mod pit;
 pub mod pm;
 pub mod refine;

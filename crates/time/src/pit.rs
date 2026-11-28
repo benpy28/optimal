@@ -54,3 +54,40 @@ pub const START: [(u16, u8); 3] = [(COMMAND, MODE0), (CHANNEL2, 0xFF), (CHANNEL2
 pub const fn up(low: u8, high: u8) -> u64 {
     (!u16::from_le_bytes([low, high])) as u64
 }
+
+/// Channel 0's data port: its output is ISA IRQ 0.
+pub const CHANNEL0: u16 = 0x40;
+
+/// Channel 0, low then high byte, mode 0 (interrupt on terminal count),
+/// binary: 00 11 000 0. Written alone it drops OUT, which stays low with
+/// nothing counting until a count is written: channel 0 disarmed.
+pub const MODE0_CH0: u8 = 0b0011_0000;
+
+/// The port writes that arm channel 0 for a one-shot of `count` periods
+/// (crate::oneshot::pit_count, 1 to 65,536): the mode, then the count's
+/// low and high byte, 65,536 written as 0. Writing the mode first each
+/// time puts the channel in a known state whatever was written before
+/// (the low byte alone then drops OUT and the high byte starts the
+/// count), so OUT rises once, when the count runs out: one edge on
+/// IRQ 0.
+pub const fn arm0(count: u32) -> [(u16, u8); 3] {
+    let c = (count & 0xFFFF) as u16;
+    [
+        (COMMAND, MODE0_CH0),
+        (CHANNEL0, c as u8),
+        (CHANNEL0, (c >> 8) as u8),
+    ]
+}
+
+/// Read-back command for channel 0's status alone (Intel 8254 datasheet,
+/// "Read-Back Command"): 11 0 1 001 0, count not latched (bit 5 set),
+/// status latched (bit 4 clear), channel 0 (bit 1). The next read of
+/// [`CHANNEL0`] is the status byte.
+pub const READBACK_STATUS0: u8 = 0b1110_0010;
+
+/// The OUT pin's state in a read-back status byte (bit 7). In mode 0 OUT
+/// is high from terminal count until the next mode or count write: high
+/// means the armed count has run out and its edge has been raised.
+pub const fn out(status: u8) -> bool {
+    status & 0x80 != 0
+}

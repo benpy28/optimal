@@ -1,8 +1,9 @@
 //! Kernel tests for timer events: the boot choice follows the rules, the
 //! LAPIC timer's rate agrees with the reference, every way of arming
-//! (TSC-deadline, one-shot, one-shot in several pieces, periodic) never
-//! fires early, against the clock and against the reference read
-//! independently, and cancelling works.
+//! (TSC-deadline, LAPIC one-shot, HPET one-shot, PIT one-shot, each
+//! one-shot also in several pieces, and periodic) never fires early,
+//! against the clock and against the reference read independently, and
+//! cancelling works, for every source.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -10,9 +11,14 @@ use optimal_apic::lapic as regs;
 use optimal_time::calibrate;
 use optimal_time::counter::delta;
 use optimal_time::lapic as lt;
-use optimal_time::select::{self, Clock, Events};
+use optimal_time::select::{self, Clock, Events, Sources};
 
-use super::{ARMED, CHUNK_CAP, arm_at, cancel, events_now, fires, force_events, get, set_hook};
+use optimal_time::hpet::Route;
+
+use super::{
+    ARMED, CHUNK_CAP, arm_at, cancel, events_now, fires, force_events, get, hpet, hpet_route,
+    release_unused, set_hook,
+};
 use crate::arch::cpu;
 use crate::clock;
 use crate::ktest;
@@ -43,21 +49,46 @@ ktest!(boot_chose_events_by_the_rules, {
     let t = get().expect("timer::init ran");
     let tm = time::get().unwrap();
     assert!(
-        t.lapic.is_some(),
+        t.lapic.is_some() || t.skip.lapic,
         "the LAPIC timer was not measured: {:?}",
         t.warnings
     );
-    let want = select::events(
-        t.deadline_mode,
-        tm.tsc_estimate().is_some() && tm.clock == Some(Clock::Tsc),
-        tm.tsc_features.invariant,
-        t.lapic.is_some(),
-    );
+    assert!(t.lapic.is_none() || !t.skip.lapic);
+    let want = select::events(Sources {
+        deadline_mode: t.deadline_mode && !t.skip.lapic,
+        tsc_calibrated: tm.tsc_estimate().is_some() && tm.clock == Some(Clock::Tsc),
+        tsc_invariant: tm.tsc_features.invariant,
+        lapic_calibrated: t.lapic.is_some(),
+        hpet: t.hpet.is_some(),
+        pit: t.pit.is_some(),
+    });
     assert_eq!(t.events, want);
+    // The fallbacks are set up only when they are needed, and then only
+    // the first that works: the HPET when QEMU's q35 has one.
+    let lapic_events = matches!(want, Some(Events::TscDeadline | Events::LapicOneShot));
+    if lapic_events {
+        assert!(t.hpet.is_none() && t.pit.is_none());
+    }
+    if want == Some(Events::PitOneShot) {
+        assert!(t.hpet.is_none());
+    }
+    // Not the HPET, though it was not ruled out: boot said why.
+    if !lapic_events && !t.skip.hpet && tm.hpet.is_some() && t.hpet.is_none() {
+        assert!(
+            t.warnings
+                .iter()
+                .any(|w| w.starts_with("no HPET timer events: ")),
+            "{:?}",
+            t.warnings
+        );
+    }
     // Now: the boot choice, unless the watchdog fell back from the TSC,
     // which moves TSC-deadline events to one-shot.
-    let now = if crate::time::watchdog::tests::fell_back().is_some() {
-        want.map(|_| Events::LapicOneShot)
+    let now = if crate::time::watchdog::tests::fell_back().is_some()
+        && want == Some(Events::TscDeadline)
+        && t.lapic.is_some()
+    {
+        Some(Events::LapicOneShot)
     } else {
         want
     };
@@ -66,16 +97,27 @@ ktest!(boot_chose_events_by_the_rules, {
     let l = t.lapic_regs.unwrap();
     let lvt = l.read(regs::LVT_TIMER);
     assert_eq!(lvt & 0xFF, 0xF0);
-    assert_eq!(lvt & lt::LVT_MASKED, 0);
+    if matches!(now, Some(Events::TscDeadline | Events::LapicOneShot)) {
+        assert_eq!(lvt & lt::LVT_MASKED, 0);
+    }
     let mode = match now.unwrap() {
         Events::TscDeadline => lt::Mode::TscDeadline,
         Events::LapicOneShot => lt::Mode::OneShot,
+        // The LAPIC timer is not used: masked.
+        Events::HpetOneShot | Events::PitOneShot => {
+            assert_ne!(lvt & lt::LVT_MASKED, 0);
+            lt::Mode::OneShot
+        }
     };
     assert_eq!(lt::lvt_mode(lvt), Some(mode));
 });
 
 ktest!(lapic_rate_agrees_with_the_reference, {
     if no_lapic() {
+        return;
+    }
+    if get().unwrap().skip.lapic {
+        crate::println!("ktest: the LAPIC timer is skipped (notimer=lapic)");
         return;
     }
     // Measured again for up to 500 ms against the calibration reference
@@ -140,10 +182,21 @@ fn hook(now: u64) {
 fn wait_for_hook(limit_ns: u64) -> bool {
     let f = time::get().unwrap().tsc_estimate().unwrap().freq;
     let ticks = f.ns_to_ticks_ceil(limit_ns);
+    // Under QEMU's multi-threaded TCG an HPET one-shot can go unmatched
+    // while the vCPU only spins; reading the HPET's counter as it waits
+    // makes QEMU bring the HPET up to date (the level-line tests saw the
+    // same, crate::irq::level's tests, Dev::fire_until). Real HPETs and
+    // KVM's need nothing; the read only costs time here.
+    let hpet = (events_now() == Some(Events::HpetOneShot))
+        .then(|| time::get().unwrap().hpet.as_ref())
+        .flatten();
     let t0 = cpu::rdtsc();
     while HIT_NS.load(Ordering::SeqCst) == 0 {
         if cpu::rdtsc().wrapping_sub(t0) > ticks {
             return false;
+        }
+        if let Some(h) = hpet {
+            h.counter();
         }
         core::hint::spin_loop();
     }
@@ -197,6 +250,14 @@ fn never_early(what: &str) {
             );
             worst_late = worst_late.max(at - start - d);
         }
+        let (_, e) = fires();
+        if e != early0 {
+            crate::println!(
+                "ktest: {what}: {} early interrupts by {d} ns timers, the last {} ns early",
+                e - early0,
+                super::LAST_EARLY.load(Ordering::SeqCst)
+            );
+        }
     }
     set_hook(None);
     REF_KIND.store(0, Ordering::SeqCst);
@@ -205,8 +266,10 @@ fn never_early(what: &str) {
     }
     let (_, early1) = fires();
     assert_eq!(
-        early1, early0,
-        "{what}: the hardware fired before it was armed for"
+        early1,
+        early0,
+        "{what}: the hardware fired before it was armed for, the last time {} ns early",
+        super::LAST_EARLY.load(Ordering::SeqCst)
     );
     // Lateness depends on the host (a loaded one deschedules the vCPU),
     // so it is reported, and only bounded loosely here.
@@ -214,26 +277,73 @@ fn never_early(what: &str) {
     crate::println!("ktest: {what}: never early, at worst {worst_late} ns late");
 }
 
-ktest!(every_event_mode_never_fires_early, {
-    if no_lapic() {
-        return;
+/// Force each way of arming in turn that this machine has, the HPET by
+/// each of its routes, and run `f` with its name; then put the boot
+/// choice back.
+fn each_source(f: impl Fn(&str, Events)) -> u32 {
+    assert!(get().unwrap().events.is_some(), "timer events on QEMU");
+    let mut n = 0;
+    for (e, only, what) in [
+        (Events::TscDeadline, 0, "tsc-deadline"),
+        (Events::LapicOneShot, 0, "lapic one-shot"),
+        (Events::HpetOneShot, hpet::ONLY_FSB, "hpet one-shot by fsb"),
+        (
+            Events::HpetOneShot,
+            hpet::ONLY_IOAPIC,
+            "hpet one-shot on an i/o apic input",
+        ),
+        (
+            Events::HpetOneShot,
+            hpet::ONLY_LEGACY,
+            "hpet one-shot by legacy replacement",
+        ),
+        (Events::PitOneShot, 0, "pit one-shot"),
+    ] {
+        hpet::ONLY.store(only, Ordering::SeqCst);
+        match force_events(e) {
+            Ok(_) => {
+                if e == Events::HpetOneShot {
+                    let r = hpet_route().expect("HPET events hold a comparator");
+                    assert_eq!(hpet::only_bit(r), only, "{what}: {r:?}");
+                }
+                f(what, e);
+                n += 1;
+            }
+            Err(why) => crate::println!("ktest: {what}: not on this machine ({why})"),
+        }
     }
+    restore_boot_choice();
+    n
+}
+
+/// Events back to the boot choice, the HPET on its boot route, and
+/// whatever else the tests set up given back.
+fn restore_boot_choice() {
     let t = get().unwrap();
     let was = t.events.expect("timer events on QEMU");
-    let mut modes = 0;
-    if super::rates().tsc.is_some() {
-        force_events(Events::TscDeadline).unwrap();
-        never_early("tsc-deadline");
-        modes += 1;
+    hpet::ONLY.store(
+        t.hpet
+            .map_or(0, |(_, named, _)| hpet::only_bit(named.route)),
+        Ordering::SeqCst,
+    );
+    force_events(was).expect("the boot choice still works");
+    hpet::ONLY.store(0, Ordering::SeqCst);
+    release_unused();
+    if let Some((n, named, _)) = t.hpet
+        && was == Events::HpetOneShot
+    {
+        let a = ARMED.lock();
+        let ev = a.hpet.as_ref().expect("the boot comparator");
+        assert_eq!((ev.n, ev.named()), (n, named));
     }
-    force_events(Events::LapicOneShot).unwrap();
-    never_early("lapic one-shot");
-    modes += 1;
-    // In several armings: cap each at 3 ms, so 20 ms takes seven.
+}
+
+/// `what` in several armings: cap each at 3 ms, so 20 ms takes seven.
+fn never_early_in_pieces(what: &str) {
     CHUNK_CAP.store(3_000_000, Ordering::SeqCst);
     let (f0, _) = fires();
     let p0 = super::pieces();
-    never_early("lapic one-shot in 3 ms pieces");
+    never_early(&alloc::format!("{what} in 3 ms pieces"));
     CHUNK_CAP.store(u64::MAX, Ordering::SeqCst);
     let (f1, _) = fires();
     let pieces = super::pieces() - p0;
@@ -241,31 +351,155 @@ ktest!(every_event_mode_never_fires_early, {
     // piece (5 and 20 ms) start with a piece each. Not more interrupts: a
     // piece that fires late (a loaded host deschedules the vCPU) can leave
     // the deadline already passed, and then no further piece is needed.
-    assert!(f1 - f0 >= 21, "only {} interrupts", f1 - f0);
-    assert!(pieces >= 6, "only {pieces} armings in pieces");
+    assert!(f1 - f0 >= 21, "{what}: only {} interrupts", f1 - f0);
+    assert!(pieces >= 6, "{what}: only {pieces} armings in pieces");
     crate::println!(
-        "ktest: {} interrupts and {pieces} armings in pieces for 21 timers in 3 ms pieces",
+        "ktest: {what}: {} interrupts and {pieces} armings in pieces for 21 timers in 3 ms pieces",
         f1 - f0
     );
-    modes += 1;
-    force_events(was);
-    crate::println!("ktest: {modes} ways of arming checked");
+}
+
+ktest!(every_event_mode_never_fires_early, {
+    if no_lapic() {
+        return;
+    }
+    let (r0, m0, s0, p0) = super::hpet_retries();
+    let modes = each_source(|what, e| {
+        never_early(what);
+        if e != Events::TscDeadline {
+            never_early_in_pieces(what);
+        }
+    });
+    // At least the boot choice. Which others there are depends on the
+    // machine and on notimer= (QEMU's pc machine with notimer=lapic has
+    // only the PIT); the tough-conditions scenarios name each one.
+    assert!(modes >= 1, "no way of arming");
+    let (r1, m1, s1, p1) = super::hpet_retries();
+    assert_eq!(m1, m0, "an HPET arming gave up");
+    // QEMU delivers by every route its HPET offers.
+    assert_eq!(p1, p0, "an HPET route failed its delivery probe");
+    crate::println!(
+        "ktest: {modes} ways of arming checked; {} HPET comparator retries, {} interrupts before their arming that its source showed were not its match",
+        r1 - r0,
+        s1 - s0
+    );
+});
+
+// The PIT covers at most 54.9 ms per arming: 150 ms takes at least
+// three, and is still never early. Checked against the clock only (a
+// PIT reference wraps every 55 ms).
+ktest!(pit_reaches_long_deadlines_in_pieces, {
+    if no_lapic() {
+        return;
+    }
+    if let Err(why) = force_events(Events::PitOneShot) {
+        crate::println!("ktest: no PIT events here ({why})");
+        restore_boot_choice();
+        return;
+    }
+    set_hook(Some(hook));
+    let (_, early0) = fires();
+    let p0 = super::pieces();
+    for d in [60_000_000u64, 150_000_000] {
+        HIT_NS.store(0, Ordering::SeqCst);
+        let start = clock::now_ns();
+        arm_at(start + d);
+        assert!(
+            wait_for_hook(5_000_000_000),
+            "a {d} ns PIT timer never fired"
+        );
+        let at = HIT_NS.load(Ordering::SeqCst) - 1;
+        assert!(
+            at >= start + d,
+            "{d} ns PIT timer ran at +{} ns",
+            at - start
+        );
+    }
+    set_hook(None);
+    let pieces = super::pieces() - p0;
+    let (_, early1) = fires();
+    restore_boot_choice();
+    assert_eq!(early1, early0, "the PIT fired before it was armed for");
+    // 60 ms is two armings (one piece), 150 ms at least three (two).
+    assert!(pieces >= 3, "only {pieces} armings in pieces");
+    crate::println!("ktest: pit: 60 and 150 ms timers in {pieces} pieces, never early");
+});
+
+// Every one-shot source the tests set up is given back cleanly: after
+// the tests above, only the boot choice holds anything.
+ktest!(fallbacks_given_back, {
+    if no_lapic() {
+        return;
+    }
+    let t = get().unwrap();
+    let a = ARMED.lock();
+    assert_eq!(a.hpet.is_some(), t.events == Some(Events::HpetOneShot));
+    assert_eq!(a.pit, t.events == Some(Events::PitOneShot));
+    assert_eq!(a.rates.hpet.is_some(), a.hpet.is_some());
+    assert_eq!(a.rates.pit.is_some(), a.pit);
+    drop(a);
+    let h = time::get().unwrap().hpet.as_ref();
+    if let Some(h) = h {
+        // Legacy replacement holds comparator 1 beside comparator 0.
+        let want = t.hpet.map_or(0, |(n, named, _)| match named.route {
+            Route::Legacy if h.caps.comparators > 1 => 0b11,
+            _ => 1u32 << n,
+        });
+        assert_eq!(h.claimed(), want);
+        assert_eq!(
+            super::hpet::legacy_in_use(),
+            t.hpet
+                .is_some_and(|(_, named, _)| named.route == Route::Legacy)
+        );
+    }
 });
 
 ktest!(cancel_and_past_deadlines, {
     if no_lapic() {
         return;
     }
+    let n = each_source(|what, _| {
+        cancel_and_past(what);
+        crate::println!("ktest: {what}: cancel, past and replaced deadlines");
+    });
+    assert!(n >= 1);
+});
+
+fn cancel_and_past(what: &str) {
     set_hook(Some(hook));
     HITS.store(0, Ordering::SeqCst);
     HIT_NS.store(0, Ordering::SeqCst);
-    // Cancelled before it is due: never runs.
-    arm_at(clock::now_ns() + 5_000_000);
-    cancel();
-    assert!(!wait_for_hook(30_000_000), "a cancelled timer ran");
+    // Cancelled before it is due: never runs. Checked only when the
+    // cancel provably came before the deadline (the clock read after it
+    // is short of it): on a loaded host the vCPU can be descheduled
+    // between the two calls for longer than the 5 ms, and the timer then
+    // rightly runs first (loaded-host-tcg-smp8, once). Up to 5 tries.
+    let mut checked = false;
+    for _ in 0..5 {
+        HIT_NS.store(0, Ordering::SeqCst);
+        let deadline = clock::now_ns() + 5_000_000;
+        arm_at(deadline);
+        cancel();
+        let cancelled = clock::now_ns();
+        let ran = wait_for_hook(30_000_000);
+        if cancelled < deadline {
+            assert!(!ran, "{what}: a cancelled timer ran");
+            checked = true;
+            break;
+        }
+    }
+    assert!(
+        checked,
+        "{what}: 5 cancels in a row came after their deadline"
+    );
+    HITS.store(0, Ordering::SeqCst);
+    HIT_NS.store(0, Ordering::SeqCst);
     // A deadline already past runs at once (well within 100 ms).
     arm_at(0);
-    assert!(wait_for_hook(100_000_000), "a past deadline did not run");
+    assert!(
+        wait_for_hook(100_000_000),
+        "{what}: a past deadline did not run"
+    );
     // A new deadline replaces the old one: only the second runs.
     HIT_NS.store(0, Ordering::SeqCst);
     let now = clock::now_ns();
@@ -273,17 +507,24 @@ ktest!(cancel_and_past_deadlines, {
     arm_at(now + 2_000_000);
     assert!(
         wait_for_hook(100_000_000),
-        "the replacing deadline did not run"
+        "{what}: the replacing deadline did not run"
     );
     assert!(!wait_for_hook(0) || HITS.load(Ordering::SeqCst) == 2);
     HIT_NS.store(0, Ordering::SeqCst);
-    assert!(!wait_for_hook(300_000_000), "the replaced deadline ran too");
+    assert!(
+        !wait_for_hook(300_000_000),
+        "{what}: the replaced deadline ran too"
+    );
     set_hook(None);
-    assert_eq!(HITS.load(Ordering::SeqCst), 2);
-});
+    assert_eq!(HITS.load(Ordering::SeqCst), 2, "{what}");
+}
 
 ktest!(periodic_never_runs_fast, {
     if no_lapic() {
+        return;
+    }
+    if get().unwrap().skip.lapic {
+        crate::println!("ktest: the LAPIC timer is skipped (notimer=lapic)");
         return;
     }
     // 1 ms ticks for about 100 ms of the reference, bracketed: the ticks

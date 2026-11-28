@@ -353,14 +353,6 @@ fn reference_name(r: Reference) -> &'static str {
     }
 }
 
-fn events_name(e: Option<Events>) -> &'static str {
-    match e {
-        Some(Events::TscDeadline) => "tsc-deadline",
-        Some(Events::LapicOneShot) => "lapic one-shot",
-        None => "none",
-    }
-}
-
 /// The first line: watching, or why not.
 pub fn first_line(s: Status) -> (String, Vec<String>) {
     let mut w = Vec::new();
@@ -447,7 +439,7 @@ pub fn outcome_line(s: Status) -> Option<(String, Vec<String>)> {
                         line,
                         "the clock is now the {}, events {}",
                         name(k),
-                        events_name(events)
+                        crate::timer::events_name(events)
                     );
                     w.push(format!(
                         "the TSC is unstable, so the clock fell back to the {}",

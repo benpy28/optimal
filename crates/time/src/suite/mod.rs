@@ -7,6 +7,7 @@ mod cpuid;
 mod freq;
 mod hpet;
 mod lapic;
+mod oneshot;
 mod pit_pm;
 mod refine;
 mod select;

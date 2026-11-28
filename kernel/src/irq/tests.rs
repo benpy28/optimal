@@ -284,9 +284,15 @@ ktest!(stray_interrupt_is_counted_and_retired, {
 });
 
 // Every pin of every used I/O APIC holds what the plan says (masked
-// state included: every test puts its line back).
+// state included: every test puts its line back), except the lines timer
+// events use: an HPET comparator's edge line holds its claim's entry,
+// and ISA IRQ 0 is unmasked while the PIT or the HPET's legacy
+// replacement drives events.
 ktest!(ioapic_tables_as_planned, {
     let Some(c) = ctl() else { return };
+    let pit = crate::timer::owns_isa_irq0()
+        .then(|| c.plan.isa_route(0).copied())
+        .flatten();
     for (i, regs) in c.ioapics.iter().enumerate() {
         let table = c.plan.table(i);
         if table.is_empty() {
@@ -296,7 +302,20 @@ ktest!(ioapic_tables_as_planned, {
         for (pin, want) in table.iter().enumerate() {
             let (lo, hi) = regs.entry(pin as u8);
             let got = ioapic::Redirection::decode(lo, hi);
-            assert_eq!(got.entry, *want, "I/O APIC {i} pin {pin}");
+            let mut want = *want;
+            if let Some(e) = super::level::edge_entry(i, pin as u8) {
+                want = ioapic::Redirection {
+                    destination: want.destination,
+                    ..e
+                };
+            }
+            if let Some(r) = pit
+                && r.ioapic == i
+                && usize::from(r.pin) == pin
+            {
+                want.masked = false;
+            }
+            assert_eq!(got.entry, want, "I/O APIC {i} pin {pin}");
             assert!(!got.remote_irr, "I/O APIC {i} pin {pin} awaits an EOI");
         }
     }
@@ -341,6 +360,12 @@ fn pic_vector_counts() -> [u64; 16] {
 // after unmasking (an I/O APIC drops edges on masked pins).
 ktest!(masked_isa_line_stays_quiet, {
     let Some(c) = ctl() else { return };
+    if crate::timer::owns_isa_irq0() {
+        crate::println!(
+            "ktest: timer events come from IRQ 0 (the PIT or the HPET's legacy replacement)"
+        );
+        return;
+    }
     let Some(r) = c.plan.isa_route(0) else {
         crate::println!("ktest: ISA IRQ 0 not routed here; nothing to check");
         return;
@@ -368,6 +393,12 @@ ktest!(masked_isa_line_stays_quiet, {
 // arrives on an 8259 vector.
 ktest!(pit_interrupt_arrives_through_its_route, {
     let Some(c) = ctl() else { return };
+    if crate::timer::owns_isa_irq0() {
+        crate::println!(
+            "ktest: timer events come from IRQ 0 (the PIT or the HPET's legacy replacement)"
+        );
+        return;
+    }
     let Some(r) = c.plan.isa_route(0) else {
         crate::println!("ktest: ISA IRQ 0 not routed here; nothing to check");
         return;

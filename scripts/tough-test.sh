@@ -396,6 +396,64 @@ else
     echo "SKIP: time-watchdog-*-kvm (the host has no invariant TSC for KVM to offer)"
     skipped=$((skipped + 1))
 fi
+# Timer events without the LAPIC timer (kernel/src/timer.rs): notimer=lapic
+# rules both LAPIC modes out, as a machine whose LAPIC timer cannot be
+# measured would, so events come from an HPET comparator by the first
+# route that delivers (kernel/src/timer/hpet.rs): FSB (QEMU's msi=on), an
+# edge on a free I/O APIC input (q35: GSI 16 and up), or legacy
+# replacement on ISA IRQ 0 (QEMU's pc machine routes the HPET only to GSI
+# 2, which is ISA IRQ 0's). With notimer=lapic,hpet, events come from PIT
+# channel 0. The whole test suite then runs on them, forcing every other
+# source this machine has in turn, the HPET by each of its routes.
+NT_ISO=build/optimal-ktest-notimer-lapic.iso
+NTH_ISO=build/optimal-ktest-notimer-lapic-hpet.iso
+NTF_ISO=build/optimal-ktest-notimer-lapic-fsb.iso
+NTFI_ISO=build/optimal-ktest-notimer-lapic-fsb-ioapic.iso
+NTL_ISO=build/optimal-ktest-notimer-lapic-legacy.iso
+HPET_EV='^timer: lapic skipped; hpet comparator [0-9]+ on GSI [0-9]+ [0-9.]+ MHz'
+FSB_EV='^timer: lapic skipped; hpet comparator [0-9]+ by FSB to APIC 0 [0-9.]+ MHz'
+LEG_EV='^timer: lapic skipped; hpet comparator 0 by legacy replacement on ISA IRQ 0 \(GSI 2\) [0-9.]+ MHz'
+PIT_EV='^timer: lapic skipped; pit [0-9.]+ MHz \+/-[0-9.]+ ppm against the'
+HPET_SELF=', the clock itself; notimer lapic; events hpet one-shot; .*; 0 warnings$'
+self_skip() { echo ", the clock itself; notimer $1; events hpet one-shot; .*; 0 warnings\$"; }
+MSI=(-global hpet.msi=on)
+scenario "timer-hpet-events" "boot:$HPET_EV$HPET_SELF" "$NT_ISO" bios q35 512M 2 30 kvm
+has_uefi && scenario "timer-hpet-events-uefi" "boot:$HPET_EV$HPET_SELF" "$NT_ISO" uefi q35 512M 2 30 kvm
+scenario "timer-hpet-events-tcg-smp4" "boot:$HPET_EV$HPET_SELF" "$NT_ISO" bios q35 1G 4 40 tcg -- -cpu max
+# FSB delivery, on q35 and on pc (whose comparators reach no free input).
+scenario "timer-hpet-fsb-events" "boot:$FSB_EV$HPET_SELF" "$NT_ISO" bios q35 512M 2 30 kvm -- "${MSI[@]}"
+has_uefi && scenario "timer-hpet-fsb-events-uefi" "boot:$FSB_EV$HPET_SELF" "$NT_ISO" uefi q35 512M 2 30 kvm -- "${MSI[@]}"
+scenario "timer-hpet-fsb-events-tcg-smp4" "boot:$FSB_EV$HPET_SELF" "$NT_ISO" bios q35 1G 4 40 tcg -- -cpu max "${MSI[@]}"
+scenario "timer-hpet-fsb-events-pc" "boot:$FSB_EV$HPET_SELF" "$NT_ISO" bios pc 512M 2 30 kvm -- "${MSI[@]}"
+# FSB offered but ruled out: the I/O APIC input.
+scenario "timer-hpet-ioapic-events-msi" "boot:$HPET_EV$(self_skip lapic,hpet-fsb)" "$NTF_ISO" bios q35 512M 2 30 kvm -- "${MSI[@]}"
+# Legacy replacement: on pc, where nothing else reaches the CPU, and on
+# q35 with the other two ruled out.
+scenario "timer-hpet-legacy-events-pc" "boot:$LEG_EV$HPET_SELF" "$NT_ISO" bios pc 512M 2 30 kvm
+scenario "timer-hpet-legacy-events-pc-tcg" "boot:$LEG_EV$HPET_SELF" "$NT_ISO" bios pc 512M 2 40 tcg -- -cpu max
+has_uefi && scenario "timer-hpet-legacy-events-pc-uefi" "boot:$LEG_EV$HPET_SELF" "$NT_ISO" uefi pc 512M 2 30 kvm
+scenario "timer-hpet-legacy-events-q35" "boot:$LEG_EV$(self_skip lapic,hpet-fsb,hpet-ioapic)" "$NTFI_ISO" bios q35 512M 2 30 kvm -- "${MSI[@]}"
+scenario "timer-pit-events" "boot:$PIT_EV hpet .*; notimer lapic,hpet; events pit one-shot; .*; 0 warnings$" "$NTH_ISO" bios q35 512M 2 30 kvm
+scenario "timer-pit-events-tcg" "boot:$PIT_EV hpet .*; notimer lapic,hpet; events pit one-shot; .*; 0 warnings$" "$NTH_ISO" bios q35 512M 2 40 tcg -- -cpu max
+# No HPET at all: the PIT, against the 24-bit PM timer as the clock, which
+# only the PIT's events (at most 54.9 ms apart) keep extended.
+scenario "timer-pit-events-pm-clock" "boot:^time: reference pm-timer .*; clock pm-timer; 0 warnings$ && $PIT_EV pm-timer .*; notimer lapic; events pit one-shot; .*; 0 warnings$" "$NT_ISO" bios q35,hpet=off 512M 2 30 kvm -- -cpu host,-invtsc
+# pc with legacy replacement ruled out: no route left, so the PIT, and
+# boot says why.
+scenario "timer-pit-events-pc" "boot:$PIT_EV hpet .*; notimer lapic,hpet-legacy; events pit one-shot; .*; 1 warnings$ && ^timer: warning: no HPET timer events: no free comparator has FSB delivery, no free comparator reaches a free I/O APIC input, legacy replacement ruled out \(routes 0x00000004 0x00000004 0x00000004\)$" "$NTL_ISO" bios pc 512M 2 30 kvm
+# With a TSC clock the HPET's rate is measured against it, the 10 s
+# refinement moves it with the clock, and when the TSC is faked 2000 ppm
+# fast the watchdog falls back to the HPET as the clock, carrying the
+# HPET's rate across (the events stay on the HPET).
+HPET_TSC=' \+/-[0-9.]+ ppm against the tsc over [0-9]+ ms; notimer lapic; events hpet one-shot; .*; 0 warnings$'
+scenario "timer-hpet-events-refine-tcg" "boot:^tscfake: applied: invariant$ && $HPET_EV$HPET_TSC && $REFINED hpet $REFINED_OK" build/optimal-ktest-tsc-invariant-notimer-lapic.iso bios q35 512M 2 40 tcg -- -cpu max
+scenario "timer-hpet-events-watchdog-tcg" "boot:^tscfake: applied: invariant skew\+2000$ && $HPET_EV$HPET_TSC && $WD_ON hpet every 1 s; 0 warnings$ && $WD_RATE$WD_FELL hpet, events hpet one-shot; 1 warnings$ && $(wd_warn hpet)" build/optimal-ktest-tsc-fast-notimer-lapic.iso bios q35 512M 2 50 tcg -- -cpu max
+if [ "$KVM" = yes ] && grep -qw constant_tsc /proc/cpuinfo && grep -qw nonstop_tsc /proc/cpuinfo; then
+    scenario "timer-hpet-events-invtsc" "boot:^time: .*, invariant, .*; clock tsc; 0 warnings$ && $HPET_EV$HPET_TSC && $REFINED hpet $REFINED_OK" "$NT_ISO" bios q35 512M 2 30 kvm -- -cpu host,+invtsc
+else
+    echo "SKIP: timer-hpet-events-invtsc (the host has no invariant TSC for KVM to offer)"
+    skipped=$((skipped + 1))
+fi
 # Timer skew: four slow emulated CPUs taking host time from each other
 # while the boot CPU calibrates.
 scenario "time-tcg-smp4-skew" boot "$ISO" bios q35 1G 4 40 tcg -- -cpu max

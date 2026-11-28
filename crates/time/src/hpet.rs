@@ -242,3 +242,146 @@ pub fn passed(now: u64, deadline: u64, timer_config: u64) -> bool {
         (now as u32).wrapping_sub(deadline as u32) as i32 >= 0
     }
 }
+
+/// A comparator's configuration for a one-shot, edge-triggered interrupt
+/// on I/O APIC input `gsi`: [`level_one_shot`] with Tn_INT_TYPE_CNF
+/// clear. Edge needs no acknowledgement (no status bit to clear, no
+/// masking from interrupt to done), so it is what timer events use.
+/// None if the comparator cannot be routed to `gsi`.
+pub fn edge_one_shot(timer_config: u64, gsi: u32, enabled: bool) -> Option<u64> {
+    level_one_shot(timer_config, gsi, enabled).map(|c| c & !T_LEVEL)
+}
+
+/// Comparator `n`'s FSB Interrupt Route register (section 2.3.9.3): bits
+/// 31:0 Tn_FSB_INT_VAL, the data written, and 63:32 Tn_FSB_INT_ADDR, the
+/// address it is written to.
+pub const fn timer_fsb_route(n: u8) -> u64 {
+    0x110 + 0x20 * n as u64
+}
+
+/// The FSB Interrupt Route register's value for a message: `data`
+/// written to `address` (optimal_apic::msi).
+pub const fn fsb_route(address: u32, data: u32) -> u64 {
+    (address as u64) << 32 | data as u64
+}
+
+/// Tn_FSB_INT_DEL_CAP: the comparator can deliver its interrupt as a
+/// message straight to a local APIC, with no I/O APIC between.
+pub const fn fsb_capable(timer_config: u64) -> bool {
+    timer_config & T_FSB_CAPABLE != 0
+}
+
+/// A comparator's configuration for a one-shot interrupt delivered by
+/// FSB, interrupt enabled or not. A message is an edge, so Tn_INT_TYPE_CNF
+/// is cleared; the route field is written back as read, because FSB
+/// delivery ignores it (section 2.3.8) and a value outside the route
+/// capability is not the kernel's to write. Periodic mode and the forced
+/// 32-bit mode are off. None if the comparator cannot deliver by FSB.
+pub fn fsb_one_shot(timer_config: u64, enabled: bool) -> Option<u64> {
+    if !fsb_capable(timer_config) {
+        return None;
+    }
+    Some(
+        quiet(timer_config) & !(T_LEVEL | T_32BIT_MODE)
+            | T_FSB_ENABLE
+            | if enabled { T_INT_ENABLE } else { 0 },
+    )
+}
+
+/// Comparator 0's configuration for a one-shot, edge interrupt by legacy
+/// replacement (on ISA IRQ 0: the 8259's IRQ 0, I/O APIC input 2),
+/// interrupt enabled or not. The route field is written back as read:
+/// LEG_RT_CNF overrides it for comparators 0 and 1 (section 2.3.8).
+pub fn legacy_one_shot(timer_config: u64, enabled: bool) -> u64 {
+    quiet(timer_config) & !(T_LEVEL | T_32BIT_MODE) | if enabled { T_INT_ENABLE } else { 0 }
+}
+
+/// General Configuration with the counter running and legacy replacement
+/// on: comparator 0 drives IRQ 0 and comparator 1 drives IRQ 8, and the
+/// PIT's and the RTC's own interrupts no longer reach either (section
+/// 2.3.5, LEG_RT_CNF).
+pub const fn legacy_running(config: u64) -> u64 {
+    config | ENABLE | LEGACY_ROUTE
+}
+
+/// How a comparator's interrupt reaches the CPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Route {
+    /// FSB delivery: a message straight to the local APIC.
+    Fsb,
+    /// Edge-triggered through I/O APIC input `gsi`.
+    IoApic(u32),
+    /// Legacy replacement: comparator 0 on ISA IRQ 0, with comparator 1
+    /// (whose interrupt would go to IRQ 8) held quiet beside it.
+    Legacy,
+}
+
+/// The routes [`pick`] may use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Allowed {
+    pub fsb: bool,
+    pub ioapic: bool,
+    pub legacy: bool,
+}
+
+impl Allowed {
+    pub const ALL: Allowed = Allowed {
+        fsb: true,
+        ioapic: true,
+        legacy: true,
+    };
+}
+
+/// A comparator and route for timer events, in this order:
+///
+/// 1. FSB, on the highest-numbered comparator that can deliver by FSB.
+///    No I/O APIC input is used, so none is taken from the devices that
+///    later phases route through the I/O APIC (PCI INTx), and nothing but
+///    the local APIC is involved per interrupt.
+/// 2. Edge through an I/O APIC input `free` accepts ([`pick_level`]'s
+///    choice among the comparators not taken).
+/// 3. Legacy replacement, on comparator 0 with comparator 1, when the
+///    HPET has it (`legacy_capable`, LEG_RT_CAP) and neither is taken. It
+///    takes ISA IRQ 0 from the PIT and IRQ 8 from the RTC, so it comes
+///    last, and the caller allows it only while nothing else needs them.
+///
+/// Comparators 0 and 1 go last in 1 and 2 for [`pick_level`]'s reason.
+/// `configs` holds each comparator's configuration register, comparator 0
+/// first; bit n of `taken` marks comparator n as in use.
+pub fn pick(
+    configs: &[u64],
+    taken: u32,
+    legacy_capable: bool,
+    allowed: Allowed,
+    free: impl Fn(u32) -> bool,
+) -> Option<(u8, Route)> {
+    // Comparator numbers are below 32 (Capabilities::decode).
+    let open = |n: usize| taken & (1 << n) == 0;
+    let fsb = allowed
+        .fsb
+        .then(|| {
+            (0..configs.len())
+                .rev()
+                .find(|&n| open(n) && fsb_capable(configs[n]))
+        })
+        .flatten()
+        .map(|n| (n as u8, Route::Fsb));
+    let ioapic = || {
+        allowed
+            .ioapic
+            .then(|| {
+                (0..configs.len()).rev().filter(|&n| open(n)).find_map(|n| {
+                    (0..32)
+                        .find(|&g| route_cap(configs[n]) & (1 << g) != 0 && free(g))
+                        .map(|g| (n as u8, Route::IoApic(g)))
+                })
+            })
+            .flatten()
+    };
+    let legacy = || {
+        // With a single comparator, bit 1 of `taken` is never set.
+        (allowed.legacy && legacy_capable && !configs.is_empty() && open(0) && open(1))
+            .then_some((0, Route::Legacy))
+    };
+    fsb.or_else(ioapic).or_else(legacy)
+}

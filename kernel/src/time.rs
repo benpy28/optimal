@@ -26,6 +26,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::arch::x86_64::__cpuid_count;
 use core::fmt::Write;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use optimal_acpi::fadt::PmTimer;
 use optimal_apic::lapic;
@@ -78,12 +79,35 @@ pub const CPUID_SLACK_PPB: u64 = 200_000;
 const SAMPLE_TRIES: usize = 8;
 
 /// The HPET, mapped and running.
+/// Below this, an HPET read's low half cannot be from a torn read
+/// ([`Hpet::counter_whole`]): 2^32 - 2^28.
+const SURE_LOW: u32 = 0xF000_0000;
+
 pub struct Hpet {
     regs: u64,
     pub caps: Capabilities,
+    /// Comparators in use, bit n for comparator n (crate::timer takes one
+    /// for timer events when the LAPIC timer cannot be used).
+    claimed: AtomicU32,
 }
 
 impl Hpet {
+    /// Take comparator `n`; false if it is already taken.
+    pub fn claim(&self, n: u8) -> bool {
+        let bit = 1u32 << n;
+        self.claimed.fetch_or(bit, Ordering::SeqCst) & bit == 0
+    }
+
+    /// Give comparator `n` back.
+    pub fn unclaim(&self, n: u8) {
+        self.claimed.fetch_and(!(1u32 << n), Ordering::SeqCst);
+    }
+
+    /// Bit n set: comparator n is taken.
+    pub fn claimed(&self) -> u32 {
+        self.claimed.load(Ordering::SeqCst)
+    }
+
     pub fn read(&self, reg: u64) -> u64 {
         // SAFETY: `regs` maps the HPET's 1 KiB register block uncached
         // (init), and `reg` is a register offset in it, 8-byte aligned.
@@ -97,6 +121,36 @@ impl Hpet {
 
     pub fn counter(&self) -> u64 {
         self.read(hpet::MAIN_COUNTER)
+    }
+
+    /// The main counter, read so that it cannot tear: an emulator that
+    /// takes only 4-byte accesses (QEMU) splits a 64-bit read in two, low
+    /// half first, and a carry between them gives a value 2^32 ticks too
+    /// high. A torn read's low half is the one from just before the carry,
+    /// so it is within a few ticks of 2^32: a read whose low half is under
+    /// 2^32 - 2^28 is whole unless 2^28 ticks (2.7 s at 100 MHz, 18.7 s
+    /// at 14.318 MHz) passed between its two halves. That is one read, as
+    /// before, 15 times in 16. Otherwise two reads with the same high half
+    /// leave no carry between the first one's high half and the second
+    /// one's, so the second one is whole. (Chosen over two reads always:
+    /// that doubled the cost of every HPET clock read, and a test making
+    /// 200,000 of them on KVM ran past its time limit.)
+    pub fn counter_whole(&self) -> u64 {
+        // A 32-bit counter's high half is always 0: nothing to tear.
+        if !self.caps.counter_64bit {
+            return self.counter();
+        }
+        let mut a = self.counter();
+        if (a as u32) < SURE_LOW {
+            return a;
+        }
+        loop {
+            let b = self.counter();
+            if a >> 32 == b >> 32 {
+                return b;
+            }
+            a = b;
+        }
     }
 }
 
@@ -165,6 +219,43 @@ pub fn pit_stop(port_b: u8) {
     unsafe { outb(pit::PORT_B, pit::restore(port_b)) };
 }
 
+/// Arm PIT channel 0 for a one-shot of `count` periods (1 to 65,536;
+/// optimal_time::oneshot::pit_count), raising ISA IRQ 0 once when it runs
+/// out.
+pub fn pit0_arm(count: u32) {
+    let _g = PIT_LOCK.lock();
+    // SAFETY: the PIT's command and channel 0 ports. Channel 0's output is
+    // ISA IRQ 0, which only crate::timer unmasks, and only while it owns
+    // the channel.
+    unsafe {
+        for (port, v) in pit::arm0(count) {
+            outb(port, v);
+        }
+    }
+}
+
+/// Stop PIT channel 0: mode 0 with no count written holds OUT low, so no
+/// edge reaches IRQ 0 (firmware leaves it in mode 3, an 18.2 Hz square
+/// wave).
+pub fn pit0_disarm() {
+    let _g = PIT_LOCK.lock();
+    // SAFETY: as in pit0_arm; the mode write alone changes only channel 0.
+    unsafe { outb(pit::COMMAND, pit::MODE0_CH0) };
+}
+
+/// Has channel 0's armed count run out (its OUT pin, from a read-back
+/// status: optimal_time::pit::out)?
+pub fn pit0_out() -> bool {
+    let _g = PIT_LOCK.lock();
+    // SAFETY: the read-back command latches channel 0's status, which
+    // the next channel 0 read returns; it changes neither the count nor
+    // OUT.
+    unsafe {
+        outb(pit::COMMAND, pit::READBACK_STATUS0);
+        pit::out(inb(pit::CHANNEL0))
+    }
+}
+
 /// Channel 2's count as an up-counter (16 bits).
 pub fn pit_read() -> u64 {
     let _g = PIT_LOCK.lock();
@@ -206,7 +297,13 @@ impl Counter<'_> {
 
     pub fn raw(self) -> Option<u64> {
         match self {
-            Counter::Hpet(h) => Some(h.counter()),
+            // Read whole: on an emulator that splits 64-bit accesses
+            // (QEMU) a carry between the halves would read 2^32 ticks
+            // high, 43 s at 100 MHz, in the clock and in every
+            // measurement. One read 15 times in 16 (Hpet::counter_whole).
+            // Rejected: a 32-bit read extended in software (one read, but
+            // every clock read would take the narrow-counter lock).
+            Counter::Hpet(h) => Some(h.counter_whole()),
             Counter::Pm(p) => p.read(),
             Counter::Pit => Some(pit_read()),
             Counter::Tsc | Counter::TscAt(_) => Some(cpu::rdtsc_ordered()),
@@ -365,10 +462,6 @@ pub enum TscFreq {
 /// after use: [`pit_start`] it before reading it.
 pub struct Time {
     pub hpet: Option<Hpet>,
-    #[cfg_attr(
-        not(feature = "ktest"),
-        expect(dead_code, reason = "tests read it; the scorecard will")
-    )]
     pub hpet_check: HpetCheck,
     pub pm: Option<Pm>,
     pub reference: Option<Reference>,
@@ -459,7 +552,11 @@ fn find_hpet(info: &BootInfo, warnings: &mut Vec<String>) -> Option<Hpet> {
             return None;
         }
     };
-    let h = Hpet { regs: va, caps };
+    let h = Hpet {
+        regs: va,
+        caps,
+        claimed: AtomicU32::new(0),
+    };
     let check = hpet::check_table(caps, table.comparators, table.counter_64bit);
     if let Some((t, hw)) = check.comparators {
         warnings.push(format!(

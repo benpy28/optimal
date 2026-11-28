@@ -33,6 +33,18 @@ fn pit_commands() {
     // Channel 2 (10), latch (00).
     assert_eq!(pit::LATCH, 0x80);
     assert_eq!(pit::START, [(0x43, 0xB0), (0x42, 0xFF), (0x42, 0xFF)]);
+    // Read-back (11), count not latched (1), status latched (0), channel
+    // 0 only (001, counters 2 1 0), reserved (0).
+    assert_eq!(pit::READBACK_STATUS0, 0xE2);
+}
+
+#[test]
+fn pit_out_bit() {
+    // Status: OUT (bit 7), null count, RW 11, mode 000, binary.
+    assert!(pit::out(0b1011_0000));
+    assert!(!pit::out(0b0011_0000));
+    assert!(!pit::out(0x7F));
+    assert!(pit::out(0x80));
 }
 
 #[test]

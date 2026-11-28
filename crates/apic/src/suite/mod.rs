@@ -5,6 +5,7 @@ mod base;
 mod eoi;
 mod ioapic;
 mod lapic;
+mod msi;
 mod pic;
 mod plan;
 mod vectors;

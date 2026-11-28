@@ -95,11 +95,26 @@ ktest!(refinement_finishes_with_the_right_result, {
                     .lapic
                     .map(|l| rf::rescale(l, boot_f, measured.freq).unwrap());
                 assert_eq!(rates.lapic, carried(want));
+                // So did the HPET's or the PIT's, when they drive events.
+                if let Some((_, _, h)) = tm.hpet {
+                    let want = rf::rescale(h, boot_f, measured.freq).unwrap();
+                    assert_eq!(rates.hpet, carried(Some(want)));
+                }
+                if let Some(p) = tm.pit {
+                    let want = rf::rescale(p, boot_f, measured.freq).unwrap();
+                    assert_eq!(rates.pit, carried(Some(want)));
+                }
             } else {
                 if fell.is_none() {
                     assert_eq!(clock::freq(), Some(boot_f));
                 }
                 assert_eq!(rates.lapic, carried(tm.lapic));
+                if let Some((_, _, h)) = tm.hpet {
+                    assert_eq!(rates.hpet, carried(Some(h)));
+                }
+                if let Some(p) = tm.pit {
+                    assert_eq!(rates.pit, carried(Some(p)));
+                }
             }
             // TSC-deadline mode arms with the clock's own frequency.
             if timer::events() == Some(Events::TscDeadline) && fell.is_none() {
