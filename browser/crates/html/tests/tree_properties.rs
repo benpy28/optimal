@@ -199,6 +199,7 @@ fn parse(
         scripting,
         iframe_srcdoc: false,
         collect_errors: true,
+        reference_dom: false,
     };
     let mut p = match context {
         Some(c) => {
@@ -347,6 +348,28 @@ fn hostile_inputs_parse_in_linear_time() {
         }),
         ("li under many divs", |n| {
             format!("<ul>{}{}", "<div>".repeat(n), "<li>".repeat(n))
+        }),
+        ("select options", |n| {
+            format!("<select>{}", "<option>x".repeat(n))
+        }),
+        ("selected options and a selectedcontent", |n| {
+            format!(
+                "<select><button><selectedcontent></button>{}",
+                "<option selected>x".repeat(n)
+            )
+        }),
+        ("options under deep divs", |n| {
+            format!(
+                "<select>{}{}",
+                "<div>".repeat(n),
+                "<option selected>x".repeat(n)
+            )
+        }),
+        ("optgroups", |n| {
+            format!("<select>{}", "<optgroup><option>x".repeat(n))
+        }),
+        ("adoption moving options", |n| {
+            format!("<select>{}", "<b><div><option>x</b></div>".repeat(n))
         }),
         ("many attributes", |n| {
             format!(

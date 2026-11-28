@@ -334,6 +334,7 @@ impl OpenStack {
     }
 
     /// Pop entries until `len` remain.
+    #[cfg(test)]
     pub(crate) fn truncate(&mut self, len: usize) {
         while self.nodes.len() > len {
             self.pop();
@@ -341,6 +342,7 @@ impl OpenStack {
     }
 
     /// Pop everything.
+    #[cfg(test)]
     pub(crate) fn clear(&mut self) {
         self.truncate(0);
     }

@@ -34,6 +34,10 @@ pub struct ParseOptions {
     /// Collect parse errors (tokenizer errors with positions, tree builder
     /// errors with a description).
     pub collect_errors: bool,
+    /// Build the tree in a [`Document::new_reference`] document, which runs
+    /// element behaviour exactly as the standard words it. For tests that
+    /// compare it with the normal, faster document.
+    pub reference_dom: bool,
 }
 
 /// A tree construction parse error. The standard gives these no codes, so
@@ -187,6 +191,9 @@ impl Parser {
     pub fn finish(mut self) -> Parsed {
         self.tokenizer.end();
         self.pump();
+        // The parse ends its task, and with it come the microtasks queued
+        // during parsing (the select element's selectedcontent updates).
+        self.builder.doc.perform_microtask_checkpoint();
         if cfg!(debug_assertions) {
             // Every insertion mode's EOF rule ends in "stop parsing", which
             // is where script execution and load events will hook in.
@@ -344,7 +351,11 @@ const HTML_WS: &[u8] = b"\t\n\x0C\r ";
 impl TreeBuilder {
     fn new(options: ParseOptions) -> Self {
         TreeBuilder {
-            doc: Document::new(),
+            doc: if options.reference_dom {
+                Document::new_reference()
+            } else {
+                Document::new()
+            },
             mode: Mode::Initial,
             original_mode: Mode::Initial,
             template_modes: vec![],
@@ -459,7 +470,40 @@ impl TreeBuilder {
 
     fn replace_open(&mut self, i: usize, el: NodeId) {
         let nn = self.ns_name(el);
+        let old = self.open[i];
         self.open.replace(i, el, nn.0, nn.1);
+        self.finished(old);
+    }
+
+    /// "Finish parsing the children" of an element removed from the stack.
+    fn finished(&mut self, el: NodeId) {
+        if self.is_html(el, local::OPTION) {
+            // Its steps look at the option's children, so its text must be
+            // in the tree first.
+            self.flush_pending_text();
+        }
+        self.doc.children_parsed(el);
+    }
+
+    /// "Pop the current node", if there is one.
+    fn pop_open(&mut self) -> Option<NodeId> {
+        let n = self.open.pop()?;
+        self.finished(n);
+        Some(n)
+    }
+
+    /// Pop until the stack holds `len` elements.
+    fn truncate_open(&mut self, len: usize) {
+        while self.open.len() > len {
+            self.pop_open();
+        }
+    }
+
+    /// "Remove an element from the stack of open elements" at index `i`.
+    fn remove_open(&mut self, i: usize) {
+        let n = self.open[i];
+        self.open.remove(i);
+        self.finished(n);
     }
 
     fn parsing_template_contents(&self) -> bool {
@@ -495,11 +539,11 @@ impl TreeBuilder {
     // ---- Stack of open elements ----------------------------------------------
 
     fn pop(&mut self) -> NodeId {
-        self.open.pop().expect("pop from empty stack")
+        self.pop_open().expect("pop from empty stack")
     }
 
     fn pop_until(&mut self, pred: impl Fn(&Self, NodeId) -> bool) {
-        while let Some(n) = self.open.pop() {
+        while let Some(n) = self.pop_open() {
             if pred(self, n) {
                 return;
             }
@@ -512,7 +556,7 @@ impl TreeBuilder {
 
     fn remove_from_stack(&mut self, node: NodeId) {
         if let Some(i) = self.open.iter().rposition(|&n| n == node) {
-            self.open.remove(i);
+            self.remove_open(i);
         }
     }
 
@@ -536,7 +580,7 @@ impl TreeBuilder {
             if !implied || except.is_some_and(|e| self.is_html(n, e)) {
                 return;
             }
-            self.open.pop();
+            self.pop_open();
         }
     }
 
@@ -567,7 +611,7 @@ impl TreeBuilder {
             ) {
                 return;
             }
-            self.open.pop();
+            self.pop_open();
         }
     }
 
@@ -1032,7 +1076,8 @@ impl TreeBuilder {
 
     fn stop_parsing(&mut self) {
         self.flush_pending_text();
-        self.open.clear();
+        // "Pop all the nodes off the stack of open elements."
+        self.truncate_open(0);
         self.stopped = true;
     }
 
@@ -1491,7 +1536,7 @@ impl TreeBuilder {
                 }
                 let body = self.open[1];
                 self.doc.remove(body);
-                self.open.truncate(1);
+                self.truncate_open(1);
                 self.insert_html_element(t);
                 self.mode = Mode::InFrameset;
                 Done
@@ -2096,7 +2141,7 @@ impl TreeBuilder {
             .iter()
             .rposition(|&n| n == node)
             .expect("target still open");
-        self.open.truncate(i);
+        self.truncate_open(i);
     }
 
     /// The adoption agency algorithm.
@@ -2130,7 +2175,7 @@ impl TreeBuilder {
             }
             let furthest = self.open.special_above(fe_stack);
             let Some(fb_stack) = furthest else {
-                self.open.truncate(fe_stack);
+                self.truncate_open(fe_stack);
                 self.afe.remove(fe_index);
                 return;
             };
@@ -2158,7 +2203,7 @@ impl TreeBuilder {
                     afe_i = None;
                 }
                 let Some(ai) = afe_i else {
-                    self.open.remove(node_index);
+                    self.remove_open(node_index);
                     continue;
                 };
                 let Afe::El(_, node_tok) = self.afe[ai].clone() else {
@@ -3102,7 +3147,7 @@ impl TreeBuilder {
                     }
                     let node = self.open[i];
                     if lower(self, node) == token_name {
-                        self.open.truncate(i);
+                        self.truncate_open(i);
                         return Done;
                     }
                     i -= 1;
