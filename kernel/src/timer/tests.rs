@@ -469,10 +469,31 @@ fn cancel_and_past(what: &str) {
     set_hook(Some(hook));
     HITS.store(0, Ordering::SeqCst);
     HIT_NS.store(0, Ordering::SeqCst);
-    // Cancelled before it is due: never runs.
-    arm_at(clock::now_ns() + 5_000_000);
-    cancel();
-    assert!(!wait_for_hook(30_000_000), "{what}: a cancelled timer ran");
+    // Cancelled before it is due: never runs. Checked only when the
+    // cancel provably came before the deadline (the clock read after it
+    // is short of it): on a loaded host the vCPU can be descheduled
+    // between the two calls for longer than the 5 ms, and the timer then
+    // rightly runs first (loaded-host-tcg-smp8, once). Up to 5 tries.
+    let mut checked = false;
+    for _ in 0..5 {
+        HIT_NS.store(0, Ordering::SeqCst);
+        let deadline = clock::now_ns() + 5_000_000;
+        arm_at(deadline);
+        cancel();
+        let cancelled = clock::now_ns();
+        let ran = wait_for_hook(30_000_000);
+        if cancelled < deadline {
+            assert!(!ran, "{what}: a cancelled timer ran");
+            checked = true;
+            break;
+        }
+    }
+    assert!(
+        checked,
+        "{what}: 5 cancels in a row came after their deadline"
+    );
+    HITS.store(0, Ordering::SeqCst);
+    HIT_NS.store(0, Ordering::SeqCst);
     // A deadline already past runs at once (well within 100 ms).
     arm_at(0);
     assert!(
