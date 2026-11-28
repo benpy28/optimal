@@ -15,6 +15,7 @@ fn main() {
         "OB_DUPLICATE",
         "OB_EXPECT_CMDLINE",
         "OB_EXPECT_MODULES",
+        "OB_EXPECT_VOLUME",
     ] {
         println!("cargo:rerun-if-env-changed={v}");
     }

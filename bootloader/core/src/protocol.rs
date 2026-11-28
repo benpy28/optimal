@@ -181,7 +181,7 @@ pub const KERNEL_BASE_MIN: u64 = 0xffff_ffff_8000_0000;
 // ---- Response layouts (all `repr(C)`, exactly as in the spec) ----
 
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct Uuid {
     pub a: u32,
     pub b: u16,

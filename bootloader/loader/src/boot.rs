@@ -137,18 +137,63 @@ fn regions(buf: &Pages, size: usize, dsize: usize) -> impl Iterator<Item = EfiRe
 }
 
 /// Page-table frames from a block of pages we own (identity mapped).
+/// Page-table frames, from up to PT_CHUNKS separately allocated blocks
+/// below 4 GiB, so the tables never need one large contiguous hole (on a
+/// small, KASLR-fragmented machine there may be none).
 struct PtArena {
-    base: u64,
-    frames: u64,
+    chunks: [(u64, u64); PT_CHUNKS],
+    count: usize,
     used: u64,
+}
+
+const PT_CHUNKS: usize = 64;
+/// Frames per chunk: at least 1 MiB, so a typical handoff is one or two
+/// blocks (each block is one more memory map entry).
+const PT_CHUNK_MIN: u64 = 256;
+
+impl PtArena {
+    /// Allocates `frames` frames below 4 GiB in at most PT_CHUNKS blocks.
+    fn new(frames: u64) -> Option<PtArena> {
+        let per = frames.div_ceil(PT_CHUNKS as u64).max(PT_CHUNK_MIN);
+        let mut a = PtArena {
+            chunks: [(0, 0); PT_CHUNKS],
+            count: 0,
+            used: 0,
+        };
+        let mut left = frames;
+        while left > 0 {
+            let n = left.min(per);
+            let Some(base) = memory::alloc_pages(n, efi::LOADER_DATA, Some(BELOW_4G)) else {
+                a.free();
+                return None;
+            };
+            a.chunks[a.count] = (base, n);
+            a.count += 1;
+            left -= n;
+        }
+        Some(a)
+    }
+
+    fn free(&mut self) {
+        for &(base, n) in &self.chunks[..self.count] {
+            memory::free_pages(base, n);
+        }
+        self.count = 0;
+    }
 }
 
 impl FrameSource for PtArena {
     fn alloc(&mut self) -> Option<u64> {
-        if self.used == self.frames {
-            return None;
+        let mut i = self.used;
+        let mut p = None;
+        for &(base, n) in &self.chunks[..self.count] {
+            if i < n {
+                p = Some(base + i * PAGE);
+                break;
+            }
+            i -= n;
         }
-        let p = self.base + self.used * PAGE;
+        let p = p?;
         self.used += 1;
         // SAFETY: inside the arena we allocated.
         unsafe { ptr::write_bytes(p as *mut u8, 0, PAGE as usize) };
@@ -592,7 +637,7 @@ pub fn run(image: efi::Handle) -> Result<Infallible, efi::Status> {
     let code_page = memory::alloc_pages(1, efi::LOADER_CODE, Some(BELOW_4G));
     let block_page = memory::alloc_pages(1, efi::LOADER_DATA, Some(BELOW_4G));
     let (Some(stack), Some(code_page), Some(block_page)) = (stack, code_page, block_page) else {
-        fail!("out of memory for the handoff");
+        fail!("out of memory for the handoff (kernel stack or trampoline pages)");
     };
     // The handoff page's alias: just below the kernel's lowest page (see handoff.rs).
     let code_alias = layout.base.wrapping_add(slide) - PAGE;
@@ -646,9 +691,20 @@ pub fn run(image: efi::Handle) -> Result<Infallible, efi::Status> {
         Some(h) => h,
         None => fail!("too much physical memory for the chosen paging mode"),
     };
-    let pt_frames =
-        2 * (64 + 6 * entry_cap as u64 + 2 * (phys_end >> 30) + layout.span / (2 << 20) + 8);
-    let pt = Pages::new(pt_frames * PAGE, efi::LOADER_DATA, Some(BELOW_4G));
+    // A proven upper bound (paging::table_frames_bound, fuzzed against the
+    // real Mapper): at most entry_cap HHDM ranges, the kernel span, and the
+    // three single pages mapped below (trampoline, handoff alias, block).
+    let pt_frames = paging::table_frames_bound(&paging::TableBudget {
+        levels,
+        huge_1g: feat.huge_1g,
+        hhdm_ranges: entry_cap as u64,
+        phys_end,
+        kernel_span: layout.span,
+        single_pages: 3,
+    });
+    let Some(mut pt_arena) = PtArena::new(pt_frames) else {
+        fail!("out of memory for the handoff (page tables: {pt_frames} pages below 4 GiB)");
+    };
     let modes = display.as_ref().map_or(0, |d| d.modes.len().min(256));
     let arena_bytes = 64 * 1024
         + entry_cap as u64 * 32
@@ -663,19 +719,14 @@ pub fn run(image: efi::Handle) -> Result<Infallible, efi::Status> {
         + entry.cmdline.len() as u64;
     let arena = Pages::new(arena_bytes, efi::LOADER_DATA, None);
     let mut mapbuf = Pages::new((desc_cap * dsize) as u64, efi::LOADER_DATA, None);
-    let (Some(pt), Some(arena), Some(mapbuf_ref)) = (pt, arena, mapbuf.as_mut()) else {
-        fail!("out of memory for the handoff");
+    let (Some(arena), Some(mapbuf_ref)) = (arena, mapbuf.as_mut()) else {
+        fail!("out of memory for the handoff (memory map and response arena)");
     };
     let mut arena = Arena::new(arena.phys, arena.len() as u64);
     let entries_phys = arena.alloc(entry_cap as u64 * 24, 8).unwrap();
     // SAFETY: entry_cap entries fit in the arena block we just took.
     let entries =
         unsafe { core::slice::from_raw_parts_mut(entries_phys as *mut MemmapEntry, entry_cap) };
-    let mut pt_arena = PtArena {
-        base: pt.phys,
-        frames: pt.pages,
-        used: 0,
-    };
 
     let build = |pt_arena: &mut PtArena,
                  entries: &mut [MemmapEntry],
@@ -794,6 +845,10 @@ pub fn run(image: efi::Handle) -> Result<Infallible, efi::Status> {
         }
         Err(s) => fail!("cannot read the memory map (status {s:#x})"),
     }
+    println!(
+        "Page tables: {} of {pt_frames} reserved frames used, in {} block(s)",
+        pt_arena.used, pt_arena.count
+    );
     println!(
         "Kernel: {} bytes at {:#x}, base revision {rev}, {}-level paging, KASLR {}",
         ksize,

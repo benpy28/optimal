@@ -185,6 +185,68 @@ impl Mapper {
     }
 }
 
+/// What the handoff maps, for `table_frames_bound`.
+#[derive(Clone, Copy, Debug)]
+pub struct TableBudget {
+    pub levels: u32,
+    pub huge_1g: bool,
+    /// Most HHDM ranges there can be (memmap::hhdm_ranges output; at most
+    /// the number of memory map entries).
+    pub hhdm_ranges: u64,
+    /// The HHDM covers physical [0, phys_end) at a 1 GiB-aligned offset.
+    pub phys_end: u64,
+    /// The kernel: one virtually contiguous span mapped with 4 KiB pages.
+    pub kernel_span: u64,
+    /// Other single 4 KiB pages mapped anywhere (trampoline, handoff alias).
+    pub single_pages: u64,
+}
+
+fn ceil_div(a: u64, b: u64) -> u64 {
+    a.div_ceil(b)
+}
+
+/// An upper bound on the frames `Mapper` allocates for a handoff's
+/// mappings, counted level by level. A table at level L (PT = 1, PD = 2,
+/// PDPT = 3, PML4 under 5-level = 4) covers one aligned slot of 2 MiB,
+/// 1 GiB, 512 GiB or 256 TiB, so the tables of a level are at most the
+/// slots the mappings touch at that level, summed over the mappings
+/// (sharing between mappings only lowers the real count):
+///
+/// - HHDM, PT: a PT is needed only in a 2 MiB slot holding a 4 KiB page.
+///   The HHDM offset is 1 GiB aligned, so virtual and physical addresses
+///   agree mod 2 MiB, and 4 KiB pages occur only in the first and last
+///   2 MiB slot of each range: at most 2 per range, and never more than
+///   the window's 2 MiB slots.
+/// - HHDM, PD: with 1 GiB pages, likewise at most 2 per range (the partial
+///   1 GiB slots); without them, every 1 GiB slot of the window. The window
+///   starts 1 GiB aligned, so that is ceil(phys_end / 1 GiB).
+/// - HHDM, PDPT and PML4: the window starts 1 GiB aligned, not 512 GiB
+///   aligned, so it touches ceil(phys_end / unit) + 1 slots.
+/// - Kernel: a contiguous span at any page offset touches at most
+///   ceil(span / unit) + 1 slots at every level.
+/// - Each single page: one table at each level below the root.
+/// - The root: 1.
+///
+/// Checked against the real Mapper by `fuzz_table_frames_bound_holds`.
+pub fn table_frames_bound(b: &TableBudget) -> u64 {
+    let pe = b.phys_end.max(PAGE);
+    let two = 2 * b.hhdm_ranges;
+    let gib = ceil_div(pe, SIZE_1G);
+    let mut n = 1; // root
+    n += two.min(ceil_div(pe, SIZE_2M));
+    n += if b.huge_1g { two.min(gib) } else { gib };
+    n += ceil_div(pe, 512 * SIZE_1G) + 1;
+    if b.levels == 5 {
+        n += ceil_div(pe, 1 << 48) + 1;
+    }
+    let ks = b.kernel_span.max(PAGE);
+    n += ceil_div(ks, SIZE_2M) + 1 + ceil_div(ks, SIZE_1G) + 1 + ceil_div(ks, 512 * SIZE_1G) + 1;
+    if b.levels == 5 {
+        n += ceil_div(ks, 1 << 48) + 1;
+    }
+    n + b.single_pages * (b.levels as u64 - 1)
+}
+
 /// A resolved mapping, for checks and tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Translation {
@@ -436,5 +498,100 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Hand-worked: 4-level, 1 GiB pages, one HHDM range [0, 160 MiB + 4 KiB)
+    /// with phys_end 4 GiB, a 6 MiB kernel, 3 single pages.
+    /// HHDM: PT min(2, 2048) = 2, PD min(2, 4) = 2, PDPT 1 + 1 = 2.
+    /// Kernel: PT 3 + 1 = 4, PD 1 + 1 = 2, PDPT 1 + 1 = 2.
+    /// Singles 3 * 3 = 9. Root 1. Total 2 + 2 + 2 + 4 + 2 + 2 + 9 + 1 = 24.
+    #[test]
+    fn table_frames_bound_by_hand() {
+        let b = TableBudget {
+            levels: 4,
+            huge_1g: true,
+            hhdm_ranges: 1,
+            phys_end: 4 * SIZE_1G,
+            kernel_span: 6 << 20,
+            single_pages: 3,
+        };
+        assert_eq!(table_frames_bound(&b), 24);
+        // Without 1 GiB pages the PD term is every GiB of the window: 4.
+        assert_eq!(
+            table_frames_bound(&TableBudget {
+                huge_1g: false,
+                ..b
+            }),
+            26
+        );
+        // 5-level adds a PML4 term for each: 2 + 2, and a level per single page.
+        assert_eq!(
+            table_frames_bound(&TableBudget { levels: 5, ..b }),
+            24 + 4 + 3
+        );
+    }
+
+    /// Seeded fuzzing of the bound: random handoff-shaped mappings (sorted
+    /// disjoint HHDM ranges, often single pages spaced to defeat sharing,
+    /// at a random 1 GiB-aligned offset; a kernel span at a random page in
+    /// the top 2 GiB; single pages below 4 GiB) mapped by the real Mapper
+    /// never use more frames than `table_frames_bound`.
+    #[test]
+    fn fuzz_table_frames_bound_holds() {
+        crate::fuzzkit::run("pt-bound", 8, |rng| {
+            let levels = if rng.below(4) == 0 { 5 } else { 4 };
+            let huge = rng.below(2) == 0;
+            let phys_end = SIZE_1G * (1 + rng.below(64)) - PAGE * rng.below(4);
+            let mut ranges = std::vec::Vec::new();
+            let mut at = 0u64;
+            let want = 1 + rng.below(48);
+            while (ranges.len() as u64) < want {
+                let gap = match rng.below(3) {
+                    0 => PAGE * rng.below(4),
+                    1 => SIZE_2M * rng.below(3) + PAGE * (1 + rng.below(511)),
+                    _ => SIZE_1G * rng.below(2) + PAGE * rng.below(1 << 18),
+                };
+                let len = match rng.below(3) {
+                    0 => PAGE,
+                    1 => PAGE * (1 + rng.below(1024)),
+                    _ => PAGE * (1 + rng.below(1 << 16)),
+                };
+                let start = at + gap + if ranges.is_empty() { 0 } else { PAGE };
+                if start + len > phys_end {
+                    break;
+                }
+                ranges.push((start, start + len));
+                at = start + len;
+            }
+            let hh = crate::kaslr::higher_half_start(levels);
+            let hhdm = hh + SIZE_1G * rng.below(1 << 14);
+            let mut mem = SimMemory::new(usize::MAX);
+            let mut m = Mapper::new(&mut mem, levels, true, huge).unwrap();
+            for &(s, e) in &ranges {
+                m.map(&mut mem, hhdm + s, s, e - s, RWNX).unwrap();
+            }
+            let span = PAGE * (1 + rng.below(16 << 8));
+            let kvirt = 0u64.wrapping_sub(2 * SIZE_1G) + PAGE * rng.below((SIZE_1G - span) / PAGE);
+            m.map(&mut mem, kvirt, 0x100_0000, span, RX).unwrap();
+            let singles = rng.below(4);
+            for i in 0..singles {
+                let v = PAGE * (1 + i * (1 + rng.below(1 << 18)) * 4);
+                let _ = m.map(&mut mem, v, v, PAGE, RX);
+            }
+            let used = mem.frames.len() as u64;
+            let bound = table_frames_bound(&TableBudget {
+                levels,
+                huge_1g: huge,
+                hhdm_ranges: ranges.len() as u64,
+                phys_end,
+                kernel_span: span,
+                single_pages: singles,
+            });
+            assert!(
+                used <= bound,
+                "used {used} > bound {bound}, {} ranges",
+                ranges.len()
+            );
+        });
     }
 }
