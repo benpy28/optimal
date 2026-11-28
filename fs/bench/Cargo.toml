@@ -1,0 +1,17 @@
+[package]
+name = "optimalfs-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Runs the same workloads on OptimalFS (on a raw block device) and on a mounted Linux file system (ext4), for comparison"
+
+# Its own workspace: the benchmark is a host tool, kept out of the optimalfs
+# crate's build, lint and dependency set.
+[workspace]
+
+[dependencies]
+optimalfs = { path = ".." }
+libc = "0.2"                                                        # MIT OR Apache-2.0
+
+[profile.release]
+debug = true
