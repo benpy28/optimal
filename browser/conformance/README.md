@@ -165,3 +165,68 @@ finish in 5 minutes. `:has()` over a deep chain is still pinned at
 quadratic: it has no cache yet. `:lang()` checks that
 tags and ranges are well-formed (RFC 5646) but not yet that they are valid
 or canonical, which needs the IANA subtag registry.
+
+## Cascade
+
+| Suite | Pinned commit | Passed | Notes |
+|---|---|---|---|
+| web-platform-tests `css/css-cascade/layer-basic.html`, `layer-important.html` | 6852422 | 43 / 43 | each case's `style` read from the script's `testCases` array; both `target` elements must cascade `color` to `green` |
+| web-platform-tests `css/css-cascade/layer-vs-inline-style.html` | 6852422 | 4 / 4 | the case's sheet and inline style; `#target`'s `background-color` must be `#reference`'s (`green`) |
+| web-platform-tests `css/css-cascade/layer-rule-invalid-name.html` | 6852422 | 4 / 4 | each `<style>`'s rule count |
+| web-platform-tests `css/css-cascade/parsing/layer.html` | 6852422 | 11 / 11 | `test_valid_rule` / `test_invalid_rule`: a valid `@layer` declares a layer |
+| web-platform-tests `css/css-cascade/parsing/layer-import-parsing.html` | 6852422 | 13 / 13 | a valid layered `@import` declares its layer; with an invalid `layer()` it stays a valid import (the `@import` after it still counts) |
+| web-platform-tests static pages in `css/css-cascade` and `css/css-nesting` | 6852422 | 22 / 22 | the page's `<style>` elements and markup (parsed by `optimal-html`), and each `getComputedStyle` assert written out as (element, property, value) in `crates/style/tests/wpt.rs`: `layers-basic`, `important-vs-inline-001` (first assert), `nesting-layer`, `top-level-parent-pseudo-specificity`, `implicit-nesting-ident`, `nested-error-recovery`, `nested-declarations-matching` |
+| web-platform-tests `*crash*.html` in both directories | 6852422 | 14 / 14 | every page collected and cascaded without a panic |
+
+There are no computed values yet, so a value is checked as the cascaded
+value's text, and an expected `rgb(0, 128, 0)` is the computed value of the
+keyword `green` (likewise red, yellow, black).
+
+No errata. Two bugs were found by these files and fixed: a `@layer`
+statement inside a style rule is invalid (only at-rules that hold style
+rules nest; `nesting-layer.html`), and an `@import` whose `layer()` holds
+no valid name is still a valid import, with that `layer()` read as a
+condition (`layer-import-parsing.html`).
+
+Waiting, with the reason (the rest of both directories):
+
+- **script**: CSSOM edits and serialization (`layer-cssom-*`,
+  `layer-rules-cssom`, `layer-replaceSync-*`, `layer-stylesheet-*`,
+  `layer-statement-before-import`, `cssom`, `set-selector-text`,
+  `nested-declarations-cssom*`, `serialize-group-rules-with-decls`,
+  `css-nesting/parsing`, `idlharness`), and the tests that change the page
+  and check again (`*invalidation*`, `duplicate-stylesheets`,
+  `import-removal`, the later asserts of `important-vs-inline-*` and of
+  `nested-declarations-matching`);
+- **`@import` loading**: `layer-import`, `import-*`;
+- **conditional rules** (`@media`, `@supports`, `@container`):
+  `layer-media-*`, `conditional-*`, `supports-*`, `nested-media-in-layer`,
+  `mixed-declarations-rules`, `#test1` of `nested-error-recovery` and the
+  `@media` cases of `nested-declarations-matching`;
+- **`@scope`**: `at-scope-*`, `scope-*`, the `@scope` cases of
+  `nested-declarations-matching`;
+- **defaulting keywords** (the next step): `all-prop-*`, `revert-*`,
+  `revert-rule-*`, `inherit-initial`, `initial-*`, `inline-style-*`;
+- **shadow trees**: `layer-slotted-rule`, `layer-order-invalidation-shadow-dom`,
+  `host-nesting-*`;
+- **pseudo-element styles**: the `::after` case of
+  `nested-declarations-matching`;
+- **other at-rules** (`@font-face`, `@keyframes`, `@counter-style`,
+  `@property` in layers): `layer-*-override`;
+- **rendering**: the reftests.
+
+`crates/style/tests/common/reference.rs` is a literal model written
+separately: placement of `@import` and `@namespace` checked against the
+list of every earlier valid rule, layers kept as full names and ordered by
+comparing them segment by segment, nested selectors made absolute as text
+(`& ` written in front) and parsed again, every declaration tried on every
+element with a fresh matcher, and a sort that follows css-cascade-5 6.1
+criterion by criterion. Random sheets (nesting, named, nested, anonymous
+and invalid layers, layer statements, `@namespace` and `@import` in and
+out of place, dropped at-rules, invalid selectors, `!important`, three
+origins) on random trees with style attributes, in and out of quirks mode,
+must give every element the same declarations in the same order (100,000
+cases passed locally). `crates/style/tests/scaling.rs` (with
+`CSS_SCALING=1`) times 14 hostile shapes (many rules, long selector lists,
+many classes, deep and wide trees, many layers, deep layers, deep nesting
+with many rules, long style attributes), which must grow linearly.

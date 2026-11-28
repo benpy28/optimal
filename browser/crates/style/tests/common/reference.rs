@@ -374,11 +374,12 @@ impl Model {
                                 }
                                 Kind::Function(f, args) if f.eq_ignore_ascii_case("layer") => {
                                     let args: Vec<_> = args.collect();
-                                    let Some(n) = layer_name(parsed, strip_ws(&args)) else {
-                                        return;
-                                    };
-                                    layer_of = Some(Some(n));
-                                    conditions = strip_ws(&rest[1..]);
+                                    // Not a <layer-name>: then it is a
+                                    // condition, not the layer clause.
+                                    if let Some(n) = layer_name(parsed, strip_ws(&args)) {
+                                        layer_of = Some(Some(n));
+                                        conditions = strip_ws(&rest[1..]);
+                                    }
                                 }
                                 _ => {}
                             }

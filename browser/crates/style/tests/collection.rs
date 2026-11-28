@@ -124,7 +124,9 @@ fn import_layer_syntax() {
         // Conditions: not evaluated yet, so the layer waits.
         ("@import url(x) layer(a) screen;", 3),
         ("@import url(x) layer supports(display: block);", 3),
-        // Invalid: layer() with no valid name, a bad URL.
+        // layer() without a valid name is a condition (WPT
+        // layer-import-parsing): the import stays, its layer isn't
+        // declared. Invalid: a bad URL.
         ("@import url(x) layer(initial);", 3),
         ("@import url(x) layer();", 3),
         ("@import x layer(a);", 3),
@@ -189,7 +191,7 @@ fn each_element_tries_only_its_buckets() {
     // Each selector is in one bucket: its rightmost compound's ID, else its
     // first class, else its type, else the universal bucket.
     let css = "#i { a: 1 } .x { a: 1 } p { a: 1 } * { a: 1 } #i.x { a: 1 } p.x { a: 1 }
-        .x.y { a: 1 } .y.x { a: 1 } p#i { a: 1 } :is(.x) { a: 1 } div .x { a: 1 }
+        .x.y { a: 1 } .y.x { a: 1 } .x.z { a: 1 } p#i { a: 1 } :is(.x) { a: 1 } div .x { a: 1 }
         a::before { a: 1 } p, .x, #i { a: 1 }";
     let s = set(css);
     let mut t = Tree::new(true, "html");
@@ -204,10 +206,10 @@ fn each_element_tries_only_its_buckets() {
             ss.selectors_tried() - before
         };
         // id i: #i, #i.x, p#i, #i (list) = 4; class x (once, though
-        // written twice, and X lowercased to x): .x, p.x, .x.y, div .x,
-        // .x (list) = 5; type p: p, p (list) = 2; universal: *, :is(.x) =
-        // 2.
-        assert_eq!(tried(full), 13);
+        // written twice, and X lowercased to x): .x, p.x, .x.y, .x.z,
+        // div .x, .x (list) = 6; type p: p, p (list) = 2; universal: *,
+        // :is(.x) = 2.
+        assert_eq!(tried(full), 14);
         // type p and universal.
         assert_eq!(tried(plain), 4);
         // class y: .y.x; universal 2.

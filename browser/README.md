@@ -14,7 +14,7 @@ gates, Optimal ships a borrowed browser.
 | `crates/html` | WHATWG HTML parser | tokenizer done (html5lib-tests 7046/7046); tree builder next |
 | `crates/css` | CSS Syntax Level 3 | tokenizer and parser done (css-tokenizer-tests 287/287, 2 with errata; css-parsing-tests 149/149, 16 with errata), An+B (An+B.json 128/128, WPT 87/87) |
 | `crates/selectors` | Selectors Level 4 | parsing, serialization, specificity and matching done (WPT css/selectors/parsing 352/352, 5 with errata; dom/nodes querySelectorAll 941/941, 8 with errata) |
-| `crates/style` | CSS Cascading and Inheritance Level 5 | style sheet collection (nesting, cascade layers, `@namespace`, style attributes) and the cascade sort done (59 runnable WPT css-cascade and css-nesting cases, 59 passed); defaulting and property values next |
+| `crates/style` | CSS Cascading and Inheritance Level 5 | style sheet collection (nesting, cascade layers, `@namespace`, style attributes) and the cascade sort done (WPT css-cascade and css-nesting: 111 of 111 runnable cases); defaulting and property values next |
 
 ## Building and testing
 

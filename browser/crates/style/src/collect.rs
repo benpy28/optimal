@@ -491,8 +491,11 @@ impl<'p, 'a> Walk<'_, '_, 'p, 'a> {
                 let args: Vec<_> = args.collect();
                 match layer_name(trim(&args)) {
                     Some(n) => (Some(Some(n)), trim(&rest[1..])),
-                    // An invalid layer() makes the rule invalid.
-                    None => return,
+                    // An invalid layer() is not the layer clause: it is
+                    // read as part of the conditions (a <general-enclosed>
+                    // media query), and the rule stays valid (WPT
+                    // css-cascade/parsing/layer-import-parsing).
+                    None => (None, rest),
                 }
             }
             _ => (None, rest),

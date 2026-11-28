@@ -398,3 +398,115 @@ fn page_tree_is_html() {
     assert_eq!(p.tree.nodes[0].ns, HTML);
     assert_eq!(select(&p.tree, "p#x").len(), 1);
 }
+
+/// The string arguments of each call to `f(` in `src`, JavaScript
+/// escapes (`\n`, `\"`, `\'`, `\\`) resolved.
+fn calls(src: &str, f: &str) -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    let mut rest = src;
+    while let Some(i) = rest.find(&format!("{f}(")) {
+        rest = &rest[i + f.len() + 1..];
+        let mut args = Vec::new();
+        loop {
+            rest = rest.trim_start();
+            let Some(q) = rest.chars().next().filter(|c| matches!(c, '\'' | '"')) else {
+                break;
+            };
+            let mut s = String::new();
+            let mut chars = rest[1..].char_indices();
+            let end = loop {
+                let (i, c) = chars.next().expect("closed string");
+                match c {
+                    '\\' => s.push(match chars.next().expect("escape").1 {
+                        'n' => '\n',
+                        c => c,
+                    }),
+                    c if c == q => break i + 2,
+                    c => s.push(c),
+                }
+            };
+            args.push(s);
+            rest = rest[end..].trim_start();
+            match rest.strip_prefix(',') {
+                Some(r) => rest = r,
+                None => break,
+            }
+        }
+        // A definition (`function f(rule, ...)`) has no string arguments.
+        if !args.is_empty() {
+            out.push(args);
+        }
+    }
+    out
+}
+
+/// `parsing/layer.html`: `test_valid_rule` and `test_invalid_rule` on
+/// `@layer`. A valid rule declares a layer; an invalid one declares none.
+#[test]
+fn layer_rule_parsing() {
+    let src = load("css-cascade/parsing/layer.html");
+    let mut n = 0;
+    for (f, valid) in [("test_valid_rule", true), ("test_invalid_rule", false)] {
+        for args in calls(&src, f) {
+            let rule = &args[0];
+            let mut set = StyleSet::new();
+            set.add_sheet(Wtf8::from_str(rule), Origin::Author);
+            assert_eq!(set.layers().len() > 3, valid, "{rule}");
+            n += 1;
+        }
+    }
+    assert_eq!(n, 11);
+}
+
+/// `parsing/layer-import-parsing.html`: a valid layered import declares
+/// its layer; one whose layer() is invalid is still a valid import (its
+/// layer() is read as a condition), so the @import after it still counts.
+#[test]
+fn layer_import_parsing() {
+    let src = load("css-cascade/parsing/layer-import-parsing.html");
+    let mut n = 0;
+    for (f, valid_layer) in [
+        ("test_valid_layer_import", true),
+        ("test_invalid_layer_import", false),
+    ] {
+        for args in calls(&src, f) {
+            let rule = &args[0];
+            let css = format!("{rule} @import url(after.css) layer(after);");
+            let mut set = StyleSet::new();
+            set.add_sheet(Wtf8::from_str(&css), Origin::Author);
+            // Three roots, the rule's layer (A.B declares two), "after".
+            let own = if !valid_layer {
+                0
+            } else if rule.contains("A.B") {
+                2
+            } else {
+                1
+            };
+            assert_eq!(set.layers().len(), 3 + own + 1, "{rule}");
+            n += 1;
+        }
+    }
+    assert_eq!(n, 13);
+}
+
+/// The crash tests: every page's sheets collected and every element
+/// cascaded, without a panic.
+#[test]
+fn crash_tests() {
+    let mut n = 0;
+    for dir in ["css-cascade", "css-nesting"] {
+        let mut files: Vec<_> = std::fs::read_dir(suite_dir().join(dir))
+            .expect("the suite")
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|f| f.contains("crash") && f.ends_with(".html"))
+            .collect();
+        files.sort();
+        for f in files {
+            let p = page(&load(&format!("{dir}/{f}")));
+            let sheets: Vec<&str> = p.styles.iter().map(String::as_str).collect();
+            let _ = cascaded(&sheets, &p.tree, "color");
+            n += 1;
+        }
+    }
+    assert_eq!(n, 14);
+}

@@ -183,7 +183,8 @@ fn key(sel: &optimal_selectors::Selector) -> Key<'_> {
         match s {
             Simple::Id(id) => return Key::Id(id),
             Simple::Class(c) if !matches!(best, Key::Class(_)) => best = Key::Class(c),
-            Simple::Type { local, .. } if matches!(best, Key::Universal) => best = Key::Type(local),
+            // A type selector comes first in a compound, before any class.
+            Simple::Type { local, .. } => best = Key::Type(local),
             _ => {}
         }
     }
