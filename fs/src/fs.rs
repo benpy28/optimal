@@ -2399,12 +2399,11 @@ impl<D: BlockDevice> Filesystem<D> {
                 self.poisoned = true;
                 return Err(e);
             }
-            if self
-                .rebuild(attempted, self.sb_started, relocs.clone())
-                .is_err()
-            {
+            if let Err(re) = self.rebuild(attempted, self.sb_started, relocs.clone()) {
+                // Report why recovery stopped (a lost device, say), not
+                // the write failure that started it.
                 self.poisoned = true;
-                return Err(e);
+                return Err(re);
             }
             if e == Error::NoSpace {
                 return Err(e);
