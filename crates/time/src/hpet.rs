@@ -242,3 +242,12 @@ pub fn passed(now: u64, deadline: u64, timer_config: u64) -> bool {
         (now as u32).wrapping_sub(deadline as u32) as i32 >= 0
     }
 }
+
+/// A comparator's configuration for a one-shot, edge-triggered interrupt
+/// on I/O APIC input `gsi`: [`level_one_shot`] with Tn_INT_TYPE_CNF
+/// clear. Edge needs no acknowledgement (no status bit to clear, no
+/// masking from interrupt to done), so it is what timer events use.
+/// None if the comparator cannot be routed to `gsi`.
+pub fn edge_one_shot(timer_config: u64, gsi: u32, enabled: bool) -> Option<u64> {
+    level_one_shot(timer_config, gsi, enabled).map(|c| c & !T_LEVEL)
+}

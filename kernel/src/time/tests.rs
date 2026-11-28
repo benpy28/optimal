@@ -80,7 +80,9 @@ ktest!(hpet_runs_with_every_comparator_quiet, {
     let config = h.read(hpet::CONFIG);
     assert_eq!(config & hpet::ENABLE, hpet::ENABLE);
     assert_eq!(config & hpet::LEGACY_ROUTE, 0);
-    for n in 0..h.caps.comparators {
+    // Every comparator but one the timer took for its events
+    // (crate::timer's HPET fallback).
+    for n in (0..h.caps.comparators).filter(|&n| h.claimed() & (1 << n) == 0) {
         let c = h.read(hpet::timer_config(n));
         assert_eq!(
             c & (hpet::T_INT_ENABLE | hpet::T_FSB_ENABLE),
