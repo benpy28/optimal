@@ -52,8 +52,33 @@ impl RangeSet {
         true
     }
 
+    /// Adds `[start, start+len)`, merging with whatever part is already
+    /// present (a union, unlike [`insert`](Self::insert)).
+    pub fn add(&mut self, start: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        let mut s = start;
+        let mut e = start + len;
+        // Ranges that overlap or touch [s, e) merge into it.
+        if let Some((&ps, &pe)) = self.map.range(..=s).next_back()
+            && pe >= s
+        {
+            s = ps;
+            e = e.max(pe);
+            self.map.remove(&ps);
+            self.count -= pe - ps;
+        }
+        while let Some((&ns, &ne)) = self.map.range(s..=e).next() {
+            e = e.max(ne);
+            self.map.remove(&ns);
+            self.count -= ne - ns;
+        }
+        self.map.insert(s, e);
+        self.count += e - s;
+    }
+
     /// Removes `[start, start+len)`; every block must be present.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn remove(&mut self, start: u64, len: u64) -> bool {
         if len == 0 {
             return true;

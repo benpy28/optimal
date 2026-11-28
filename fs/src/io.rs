@@ -4,6 +4,7 @@ use crate::crypto::{BlockKind, Sealer};
 use crate::device::{BLOCK_SIZE, BlockDevice};
 use crate::error::{Error, Result};
 use crate::ptr::BlockPtr;
+use crate::rangeset::RangeSet;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -69,6 +70,15 @@ pub struct Io<D> {
     repairs: BTreeMap<u64, Repair>,
     /// Physical blocks found bad since the last commit (counted once each).
     bad_seen: alloc::collections::BTreeSet<u64>,
+    /// Blocks whose write failed twice (the batched request, then the
+    /// block on its own) since [`take_failed`](Self::take_failed) last ran.
+    /// They are still queued in `batch`, unwritten.
+    failed: RangeSet,
+    /// Blocks written since the last successful flush: a failed flush
+    /// leaves their durability unknown.
+    unflushed: RangeSet,
+    /// A flush failed since the last one that worked.
+    flush_failed: bool,
     /// Off for read-only mounts and checks that must not write.
     pub repair_enabled: bool,
     /// How duplicated blocks are read ([`CopyMode::Both`] during recovery).
@@ -84,6 +94,9 @@ impl<D: BlockDevice> Io<D> {
             batch: BTreeMap::new(),
             repairs: BTreeMap::new(),
             bad_seen: alloc::collections::BTreeSet::new(),
+            failed: RangeSet::new(),
+            unflushed: RangeSet::new(),
+            flush_failed: false,
             repair_enabled: true,
             copy_mode: CopyMode::Either,
             stats: IoStats::default(),
@@ -273,33 +286,87 @@ impl<D: BlockDevice> Io<D> {
     }
 
     /// Writes every queued block, merging neighbours into large requests.
+    ///
+    /// The blocks of a request that fails stay queued and are recorded for
+    /// [`take_failed`](Self::take_failed) (they are not retried in place:
+    /// the block layer below has already retried, so the file system only
+    /// retries at a new block). Every other request is still written.
+    /// Returns the first error if any request failed.
     pub fn write_batch(&mut self) -> Result<()> {
         let batch = core::mem::take(&mut self.batch);
-        let mut run: Vec<u8> = Vec::new();
-        let mut run_start = 0u64;
-        let mut run_len = 0u64;
-        for (addr, data) in batch {
-            if run_len > 0 && (addr != run_start + run_len || run_len as usize >= MAX_RUN) {
-                self.write_run(run_start, &run)?;
-                run.clear();
-                run_len = 0;
+        let mut first_err = None;
+        let mut failed = RangeSet::new();
+        let mut wrote_any = false;
+        let mut requests = 0;
+        let mut run: Vec<(u64, Block)> = Vec::new();
+        let mut it = batch.into_iter().peekable();
+        while let Some((addr, data)) = it.next() {
+            run.push((addr, data));
+            let next_joins = it
+                .peek()
+                .is_some_and(|(a, _)| *a == addr + 1 && run.len() < MAX_RUN);
+            if next_joins {
+                continue;
             }
-            if run_len == 0 {
-                run_start = addr;
+            requests += 1;
+            let start = run[0].0;
+            let mut buf = Vec::with_capacity(run.len() * BLOCK_SIZE);
+            for (_, b) in &run {
+                buf.extend_from_slice(&b[..]);
             }
-            run.extend_from_slice(&data[..]);
-            run_len += 1;
+            match self.write_run(start, &buf) {
+                Ok(()) => {
+                    wrote_any = true;
+                    run.clear();
+                }
+                Err(e) => {
+                    failed.add(start, run.len() as u64);
+                    for (a, b) in run.drain(..) {
+                        self.batch.insert(a, b);
+                    }
+                    first_err.get_or_insert(e);
+                }
+            }
         }
-        if run_len > 0 {
-            self.write_run(run_start, &run)?;
+        // When not one request of a batch of several could be written, the
+        // device is failing as a whole (unplugged, dead, refusing writes):
+        // that says nothing about these particular blocks, so none is
+        // marked bad. (A batch of one request that fails can't tell the two
+        // apart; its blocks are marked.)
+        if wrote_any || requests == 1 {
+            for (s, l) in failed.ranges() {
+                self.failed.add(s, l);
+            }
         }
-        Ok(())
+        match first_err {
+            None => Ok(()),
+            Some(e) => Err(e),
+        }
+    }
+
+    /// Blocks that failed to write (see [`write_batch`](Self::write_batch)),
+    /// clearing the record.
+    pub fn take_failed(&mut self) -> RangeSet {
+        core::mem::take(&mut self.failed)
+    }
+
+    /// Takes queued block `a` back out of the batch (one that was never
+    /// written, or failed).
+    pub fn unqueue(&mut self, a: u64) -> Option<Block> {
+        self.batch.remove(&a)
+    }
+
+    /// Whether block `a` was written since the last successful flush.
+    pub fn unflushed(&self, a: u64) -> bool {
+        self.unflushed.overlaps(a, 1)
     }
 
     fn write_run(&mut self, start: u64, data: &[u8]) -> Result<()> {
         self.stats.write_requests += 1;
         self.stats.blocks_written += (data.len() / BLOCK_SIZE) as u64;
-        self.dev.write(start, data).map_err(Error::Io)
+        self.dev.write(start, data).map_err(Error::Io)?;
+        self.unflushed.add(start, (data.len() / BLOCK_SIZE) as u64);
+        Ok(())
     }
 
     pub fn write_now(&mut self, addr: u64, data: &[u8]) -> Result<()> {
@@ -308,6 +375,17 @@ impl<D: BlockDevice> Io<D> {
 
     pub fn flush(&mut self) -> Result<()> {
         self.stats.flushes += 1;
-        self.dev.flush().map_err(Error::Io)
+        if let Err(e) = self.dev.flush() {
+            self.flush_failed = true;
+            return Err(Error::Io(e));
+        }
+        self.unflushed = RangeSet::new();
+        self.flush_failed = false;
+        Ok(())
+    }
+
+    /// Whether a flush failed since the last one that worked.
+    pub fn flush_failed(&self) -> bool {
+        self.flush_failed
     }
 }

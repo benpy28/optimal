@@ -10,7 +10,7 @@ use crate::space::Space;
 use crate::superblock::{
     self, Body, Header, KEYSLOTS, KeySlot, SUITE_PLAIN, SUITE_XCHACHA20POLY1305,
 };
-use crate::tree::{Key, MAX_VALUE, NodeCache, Store, Tree, TreeId};
+use crate::tree::{Key, MAX_VALUE, NodeCache, SpaceOp, Store, Tree, TreeId};
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec;
@@ -388,6 +388,41 @@ pub struct Filesystem<D: BlockDevice> {
     /// chunk-table node pairs) that the commit itself allocated beyond the
     /// trees, newest last, at most [`COST_RING`] entries.
     commit_costs: VecDeque<(u64, u64)>,
+    /// Commits kept failing to write ([`Error::DeviceFailing`]): changes
+    /// stay in memory and reads work, but new changes are refused until a
+    /// [`commit`](Filesystem::commit) succeeds.
+    degraded: bool,
+    /// The commit in progress has started writing superblocks, so its
+    /// generation may be on disk even if it fails.
+    sb_started: bool,
+    /// Early data flushes (dirty data over the limit) that failed since
+    /// the last successful commit.
+    early_flush_failures: u32,
+    /// Attempts the last `commit` call made (tests).
+    pub(crate) last_commit_attempts: u32,
+}
+
+/// Most attempts one [`Filesystem::commit`] call makes (the storage
+/// design's "at most 3 writeback cycles"); early data flushes that fail
+/// this many times before a commit succeeds degrade the volume too.
+pub const COMMIT_ATTEMPTS: u32 = 3;
+
+/// Blocks a failed write condemns together (see
+/// [`Filesystem::note_failed_writes`]): 64 blocks, 256 KiB (a small
+/// flash erase block).
+pub const BAD_GROUP: u64 = 64;
+
+/// A run of file blocks queued for writing by
+/// [`Filesystem::flush_data`], kept until the write is known to have
+/// worked so unwritten blocks can be taken back.
+struct QueuedRun {
+    ino: u64,
+    idx: u64,
+    phys: u64,
+    n: u64,
+    birth: u64,
+    nonce: [u8; NONCE_LEN],
+    macs: Vec<[u8; MAC_LEN]>,
 }
 
 /// Smallest volume `format` accepts. Metadata is stored twice and freed
@@ -490,6 +525,8 @@ impl<D: BlockDevice> Filesystem<D> {
             cache: NodeCache::new(8192),
             latest_snap_gen: 0,
             dead_pending: Vec::new(),
+            log: Vec::new(),
+            written: BTreeMap::new(),
         };
         let body = Body {
             generation: 0,
@@ -539,6 +576,10 @@ impl<D: BlockDevice> Filesystem<D> {
             txn_data: 0,
             txn_meta: 0,
             commit_costs: VecDeque::new(),
+            degraded: false,
+            sb_started: false,
+            early_flush_failures: 0,
+            last_commit_attempts: 0,
         };
         let now = fs.clock.now_ns();
         let root = Attr {
@@ -680,6 +721,8 @@ impl<D: BlockDevice> Filesystem<D> {
                     cache: NodeCache::new(opts.cache_nodes),
                     latest_snap_gen: body.latest_snap_gen,
                     dead_pending: Vec::new(),
+                    log: Vec::new(),
+                    written: BTreeMap::new(),
                 },
                 fs_tree,
                 meta,
@@ -705,6 +748,10 @@ impl<D: BlockDevice> Filesystem<D> {
                 txn_data: 0,
                 txn_meta: 0,
                 commit_costs: VecDeque::new(),
+                degraded: false,
+                sb_started: false,
+                early_flush_failures: 0,
+                last_commit_attempts: 0,
             };
             let check = if clean {
                 Ok(())
@@ -843,6 +890,12 @@ impl<D: BlockDevice> Filesystem<D> {
         &self.store.io.dev
     }
 
+    /// Writes the dirty file data now (tests).
+    #[doc(hidden)]
+    pub fn flush_data_for_tests(&mut self) -> Result<()> {
+        self.flush_data()
+    }
+
     /// Makes the allocator continue its search at block `b` (tests use it
     /// to put data in far regions of huge volumes).
     #[doc(hidden)]
@@ -972,7 +1025,28 @@ impl<D: BlockDevice> Filesystem<D> {
         if self.read_only {
             return Err(Error::ReadOnly);
         }
+        if self.degraded {
+            return Err(Error::DeviceFailing);
+        }
         Ok(())
+    }
+
+    /// Whether commits kept failing to write, so new changes are refused
+    /// (see [`Error::DeviceFailing`]).
+    pub fn degraded(&self) -> bool {
+        self.degraded
+    }
+
+    /// Blocks this mount has found it cannot write to.
+    pub fn bad_blocks(&self) -> u64 {
+        self.store.space.bad.len()
+    }
+
+    /// Most bad blocks a mount accepts before it stops looking for new
+    /// homes for failed writes: 1/64 of the volume, and at least 256 (one
+    /// whole failed 1 MiB request).
+    fn bad_limit(&self) -> u64 {
+        (self.store.space.total_blocks() / 64).max(256)
     }
 
     /// Upper bounds for one commit's own overhead: (logical metadata blocks,
@@ -1101,7 +1175,7 @@ impl<D: BlockDevice> Filesystem<D> {
             // QUARANTINE_COMMITS commits and the minimum time old. Past the
             // time window the caller must wait and retry.
             if self.txn_dirty || self.dirty_blocks > 0 {
-                self.commit_forced()?;
+                self.commit_for_space()?;
                 self.store.space.refresh_releasing(&mut self.store.io)?;
             }
             if self.store.space.allocatable_blocks() < need(self) {
@@ -1113,7 +1187,7 @@ impl<D: BlockDevice> Filesystem<D> {
                     if self.store.space.allocatable_blocks() >= need(self) {
                         break;
                     }
-                    self.commit_forced()?;
+                    self.commit_for_space()?;
                     self.store.space.refresh_releasing(&mut self.store.io)?;
                 }
                 if self.store.space.allocatable_blocks() < need(self) {
@@ -1124,6 +1198,17 @@ impl<D: BlockDevice> Filesystem<D> {
         self.txn_data += data;
         self.txn_meta += meta;
         Ok(())
+    }
+
+    /// A forced commit made by an operation to free space. If it fails to
+    /// write, the volume is rebuilt and degraded, and the operation (which
+    /// has changed nothing yet) is refused with [`Error::DeviceFailing`]
+    /// rather than an I/O error that would stop the volume.
+    fn commit_for_space(&mut self) -> Result<()> {
+        match self.commit_forced() {
+            Err(Error::Io(_)) if !self.poisoned && self.degraded => Err(Error::DeviceFailing),
+            r => r,
+        }
     }
 
     // ---- inode helpers ----
@@ -1860,7 +1945,7 @@ impl<D: BlockDevice> Filesystem<D> {
         a.ctime_ns = now;
         self.put_inode(&a)?;
         if self.dirty_blocks > self.dirty_limit_blocks {
-            self.flush_data()?;
+            self.flush_early()?;
         }
         Ok(data.len())
     }
@@ -1965,66 +2050,320 @@ impl<D: BlockDevice> Filesystem<D> {
     }
 
     /// Writes dirty file data to new extents (not yet committed).
+    ///
+    /// Never loses data: on any failure every block that did not reach the
+    /// device is back in `dirty_data` (decrypted from the write queue if it
+    /// was already sealed), while extents already in the tree keep pointing
+    /// at the unwritten blocks until the next flush replaces them. Blocks
+    /// whose write failed join the bad set. An error that left the tree
+    /// half-changed stops the volume.
     fn flush_data(&mut self) -> Result<()> {
-        let data = core::mem::take(&mut self.dirty_data);
+        let mut data = core::mem::take(&mut self.dirty_data);
         self.dirty_blocks = 0;
-        let generation = self.txn_generation();
-        for (ino, blocks) in data {
-            let mut it = blocks.into_iter().peekable();
-            while let Some((idx, b)) = it.next() {
-                let mut run = vec![b];
-                while run.len() < EXTENT_MAX_BLOCKS as usize {
-                    match it.peek() {
-                        Some((j, _)) if *j == idx + run.len() as u64 => {
-                            run.push(it.next().unwrap().1)
-                        }
-                        _ => break,
-                    }
-                }
-                let mut done = 0u64;
-                while (done as usize) < run.len() {
-                    let want = run.len() as u64 - done;
-                    let (phys, n) = self.store.space.alloc_run(&mut self.store.io, want)?;
-                    let fidx = idx + done;
-                    self.punch(ino, fidx, fidx + n)?;
-                    let nonce = self.store.io.sealer.reserve_nonces(n);
-                    let mut macs = Vec::with_capacity(n as usize);
-                    for j in 0..n {
-                        let mut blk =
-                            core::mem::replace(&mut run[(done + j) as usize], zero_block());
-                        let mac = self.store.io.sealer.seal_with(
-                            BlockKind::Data,
-                            phys + j,
-                            generation,
-                            &crypto::nonce_add(&nonce, j),
-                            &mut blk[..],
-                        );
-                        macs.push(mac);
-                        self.store.io.queue(phys + j, blk);
-                    }
-                    let e = Extent {
-                        phys,
-                        len: n,
-                        birth: generation,
-                        nonce,
-                        macs,
-                    };
-                    self.fs_tree.insert(
-                        &mut self.store,
-                        Key::new(ino, K_EXTENT, fidx),
-                        e.encode(),
-                    )?;
-                    done += n;
-                }
+        let mut queued = Vec::new();
+        let r = self
+            .queue_data(&mut data, &mut queued)
+            .and_then(|()| self.store.io.write_batch());
+        if r.is_err() {
+            self.note_failed_writes();
+            if let Err(e) = self.restore_data(data, queued) {
+                self.poisoned = true;
+                return Err(e);
             }
         }
-        // New blocks can go to the device now; they only become reachable at commit.
-        self.store.io.write_batch()
+        r
+    }
+
+    /// Seals and queues `data` into new extents. Blocks leave `data` only
+    /// as they are queued (and recorded in `queued`).
+    fn queue_data(
+        &mut self,
+        data: &mut BTreeMap<u64, BTreeMap<u64, Block>>,
+        queued: &mut Vec<QueuedRun>,
+    ) -> Result<()> {
+        let generation = self.txn_generation();
+        while let Some(mut entry) = data.first_entry() {
+            let ino = *entry.key();
+            while let Some((&idx, _)) = entry.get().first_key_value() {
+                let mut want = 1;
+                while want < EXTENT_MAX_BLOCKS && entry.get().contains_key(&(idx + want)) {
+                    want += 1;
+                }
+                let (phys, n) = self.store.space.alloc_run(&mut self.store.io, want)?;
+                self.store.log.push(SpaceOp::Data {
+                    addr: phys,
+                    len: n,
+                    ino,
+                    idx,
+                });
+                if let Err(e) = self.punch(ino, idx, idx + n) {
+                    self.poisoned = true;
+                    return Err(e);
+                }
+                let nonce = self.store.io.sealer.reserve_nonces(n);
+                let mut macs = Vec::with_capacity(n as usize);
+                for j in 0..n {
+                    let mut blk = entry.get_mut().remove(&(idx + j)).unwrap();
+                    let mac = self.store.io.sealer.seal_with(
+                        BlockKind::Data,
+                        phys + j,
+                        generation,
+                        &crypto::nonce_add(&nonce, j),
+                        &mut blk[..],
+                    );
+                    macs.push(mac);
+                    self.store.io.queue(phys + j, blk);
+                }
+                queued.push(QueuedRun {
+                    ino,
+                    idx,
+                    phys,
+                    n,
+                    birth: generation,
+                    nonce,
+                    macs: macs.clone(),
+                });
+                let e = Extent {
+                    phys,
+                    len: n,
+                    birth: generation,
+                    nonce,
+                    macs,
+                };
+                if let Err(e) =
+                    self.fs_tree
+                        .insert(&mut self.store, Key::new(ino, K_EXTENT, idx), e.encode())
+                {
+                    self.poisoned = true;
+                    return Err(e);
+                }
+            }
+            entry.remove();
+        }
+        Ok(())
+    }
+
+    /// Puts file blocks a failed flush did not write back into `dirty_data`.
+    fn restore_data(
+        &mut self,
+        data: BTreeMap<u64, BTreeMap<u64, Block>>,
+        queued: Vec<QueuedRun>,
+    ) -> Result<()> {
+        for (ino, blocks) in data {
+            for (idx, b) in blocks {
+                self.put_dirty(ino, idx, b);
+            }
+        }
+        for q in queued {
+            for j in 0..q.n {
+                let Some(mut b) = self.store.io.unqueue(q.phys + j) else {
+                    continue; // written
+                };
+                self.store.io.sealer.open(
+                    BlockKind::Data,
+                    q.phys + j,
+                    q.birth,
+                    &crypto::nonce_add(&q.nonce, j),
+                    &q.macs[j as usize],
+                    &mut b[..],
+                )?;
+                self.put_dirty(q.ino, q.idx + j, b);
+            }
+        }
+        Ok(())
+    }
+
+    fn put_dirty(&mut self, ino: u64, idx: u64, b: Block) {
+        if self
+            .dirty_data
+            .entry(ino)
+            .or_default()
+            .insert(idx, b)
+            .is_none()
+        {
+            self.dirty_blocks += 1;
+        }
+    }
+
+    /// Moves blocks whose write failed into the bad set, each with the
+    /// rest of its aligned group of [`BAD_GROUP`] blocks: failing blocks
+    /// come in regions (a worn flash erase block, a damaged track), and
+    /// finding them one failed commit at a time would take an attempt per
+    /// block.
+    fn note_failed_writes(&mut self) {
+        let failed = self.store.io.take_failed();
+        let total = self.store.space.total_blocks();
+        let (lo, hi) = (
+            crate::space::SB_RESERVED_FRONT,
+            total - crate::space::SB_RESERVED_BACK,
+        );
+        for (s, l) in failed.ranges() {
+            let g0 = (s / BAD_GROUP * BAD_GROUP).max(lo);
+            let g1 = (s + l)
+                .div_ceil(BAD_GROUP)
+                .saturating_mul(BAD_GROUP)
+                .min(hi);
+            self.store.space.bad.add(g0, g1 - g0);
+        }
+    }
+
+    /// The flush a write makes when dirty data passes the limit. Its data
+    /// is already in the open transaction, so a failure to write it is not
+    /// the write's failure: the data stays in memory and the space map is
+    /// rebuilt; the commit tries again (and reports). Repeated failures
+    /// degrade the volume so memory does not grow without bound.
+    fn flush_early(&mut self) -> Result<()> {
+        let Err(e) = self.flush_data() else {
+            return Ok(());
+        };
+        if self.poisoned {
+            return Err(e);
+        }
+        let relocs = self.store.space.relocations.clone();
+        if let Err(r) = self.rebuild(self.txn_generation(), false, relocs) {
+            self.poisoned = true;
+            return Err(r);
+        }
+        self.early_flush_failures += 1;
+        if self.early_flush_failures >= COMMIT_ATTEMPTS
+            || self.store.space.bad.len() > self.bad_limit()
+        {
+            self.degraded = true;
+        }
+        Ok(())
+    }
+
+    /// Rebuilds the in-memory state of the open transaction on top of the
+    /// last committed state after a failed write: the space map is opened
+    /// again from the last commit and the transaction's own changes
+    /// ([`Store::log`]) are replayed onto it; nodes a failed commit wrote
+    /// (birth `attempted`) become dirty again; chunks with a copy on a bad
+    /// block are queued to move; and if a flush failed, file data whose
+    /// durability is now unknown is read back, checked and made dirty
+    /// again so the next commit writes it afresh. The trees, the inode and
+    /// snapshot counters and the dirty data are the transaction's and stay.
+    /// `sb_started`: the failed commit may have reached a superblock, so
+    /// later commits are numbered above it and rewrite every slot.
+    pub(crate) fn rebuild(
+        &mut self,
+        attempted: u64,
+        sb_started: bool,
+        relocs: Vec<u64>,
+    ) -> Result<()> {
+        self.note_failed_writes();
+        let b = &self.body;
+        let mut space = self.store.space.reopen(
+            &mut self.store.io,
+            self.header.chunk_shift,
+            (b.chunk_root, b.chunk_depth),
+            (b.space_root, b.free_log),
+            b.generation,
+            b.commit_time_ns,
+        )?;
+        for op in &self.store.log {
+            match *op {
+                SpaceOp::Free(a, l) => space.free(&mut self.store.io, a, l)?,
+                SpaceOp::Data { addr, len, .. } => space.claim(&mut self.store.io, addr, len)?,
+            }
+        }
+        let bad = space.bad.clone();
+        let mut relocs = relocs;
+        for id in space.chunks_touching(&mut self.store.io, &bad)? {
+            if !relocs.contains(&id) {
+                relocs.push(id);
+            }
+        }
+        space.relocations = relocs;
+        space.refresh_releasing(&mut self.store.io)?;
+        self.store.space = space;
+
+        let mut written = core::mem::take(&mut self.store.written);
+        for a in written.keys() {
+            self.store.cache.forget(*a);
+        }
+        self.fs_tree.unwrite(&mut written, attempted)?;
+        self.meta.unwrite(&mut written, attempted)?;
+        if let Some((&a, _)) = written.first_key_value() {
+            return Err(Error::Corrupt("failed commit wrote an unreachable node", a));
+        }
+        if self.store.io.flush_failed() {
+            self.redirty_unflushed()?;
+        }
+        if sb_started {
+            self.gen_floor = self.gen_floor.max(attempted);
+            self.rewrite_all_slots = true;
+        }
+        Ok(())
+    }
+
+    /// After a failed flush: file blocks of this transaction written since
+    /// the last good flush may not be durable. Each one still in use is
+    /// read back, checked against its MAC and put back into the dirty
+    /// data, so the next commit writes it to a new home and flushes it.
+    /// One that no longer reads back intact is lost: that is an error.
+    fn redirty_unflushed(&mut self) -> Result<()> {
+        let runs: Vec<(u64, u64, u64, u64)> = self
+            .store
+            .log
+            .iter()
+            .filter_map(|op| match *op {
+                SpaceOp::Data {
+                    addr,
+                    len,
+                    ino,
+                    idx,
+                } => Some((addr, len, ino, idx)),
+                SpaceOp::Free(..) => None,
+            })
+            .collect();
+        let mut buf = zero_block();
+        for (addr, len, ino, idx) in runs {
+            for j in 0..len {
+                let (a, i) = (addr + j, idx + j);
+                if !self.store.io.unflushed(a)
+                    || self
+                        .dirty_data
+                        .get(&ino)
+                        .is_some_and(|m| m.contains_key(&i))
+                {
+                    continue;
+                }
+                let Some((start, e)) = self.extent_at(ino, i)? else {
+                    continue;
+                };
+                let r = i - start;
+                if e.phys + r != a {
+                    continue; // replaced since
+                }
+                self.store.io.read_raw(a, &mut buf[..])?;
+                self.store.io.sealer.open(
+                    BlockKind::Data,
+                    a,
+                    e.birth,
+                    &crypto::nonce_add(&e.nonce, r),
+                    &e.macs[r as usize],
+                    &mut buf[..],
+                )?;
+                self.put_dirty(ino, i, core::mem::replace(&mut buf, zero_block()));
+            }
+        }
+        Ok(())
     }
 
     // ---- commit ----
 
     /// Makes every change since the last commit durable, atomically.
+    ///
+    /// A commit that fails to write does not lose the transaction. Blocks
+    /// whose write failed are never used again on this mount, the
+    /// in-memory state is rebuilt on top of the last commit (see
+    /// [`rebuild`](Self::rebuild)), and the commit runs again with new
+    /// homes for everything. It gives up after [`COMMIT_ATTEMPTS`] attempts,
+    /// or once the bad set passes 1/64 of the volume: it then returns the I/O error and the volume is
+    /// degraded ([`Error::DeviceFailing`]) until a later `commit` succeeds.
+    /// A commit refused for space ([`Error::NoSpace`]) is rebuilt the same
+    /// way and the volume stays writable. On disk the volume is always the
+    /// last completed commit.
     pub fn commit(&mut self) -> Result<()> {
         if self.poisoned {
             return Err(Error::Poisoned);
@@ -2034,18 +2373,47 @@ impl<D: BlockDevice> Filesystem<D> {
         if !self.txn_dirty && self.store.io.pending_repairs() == 0 {
             return Ok(());
         }
-        self.check_writable()?;
-        match self.commit_inner() {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                // The on-disk state is still the previous commit, but our
-                // in-memory state is half-written. Refuse further work.
+        if self.read_only {
+            return Err(Error::ReadOnly);
+        }
+        let relocs = self.store.space.relocations.clone();
+        for attempt in 1.. {
+            self.last_commit_attempts = attempt;
+            let attempted = self.txn_generation();
+            self.sb_started = false;
+            let e = match self.commit_inner() {
+                Ok(()) => {
+                    self.degraded = false;
+                    self.early_flush_failures = 0;
+                    self.store.log.clear();
+                    self.store.written.clear();
+                    return Ok(());
+                }
+                Err(e) => e,
+            };
+            // The on-disk state is still the previous commit (or the failed
+            // one, if its superblock landed).
+            self.store.io.discard_batch();
+            self.store.io.discard_repairs();
+            if self.poisoned || !matches!(e, Error::Io(_) | Error::NoSpace) {
                 self.poisoned = true;
-                self.store.io.discard_batch();
-                self.store.io.discard_repairs();
-                Err(e)
+                return Err(e);
+            }
+            if let Err(re) = self.rebuild(attempted, self.sb_started, relocs.clone()) {
+                // Report why recovery stopped (a lost device, say), not
+                // the write failure that started it.
+                self.poisoned = true;
+                return Err(re);
+            }
+            if e == Error::NoSpace {
+                return Err(e);
+            }
+            if attempt >= COMMIT_ATTEMPTS || self.store.space.bad.len() > self.bad_limit() {
+                self.degraded = true;
+                return Err(e);
             }
         }
+        unreachable!()
     }
 
     /// Commits even with no changes (used to cycle quarantined space back).
@@ -2065,7 +2433,11 @@ impl<D: BlockDevice> Filesystem<D> {
         }
         self.flush_data()?;
         let fs_root = self.fs_tree.write(&mut self.store, generation)?;
-        crate::snapshot::flush_deadlist(self)?;
+        if let Err(e) = crate::snapshot::flush_deadlist(self) {
+            // Tree changes a rebuild cannot undo.
+            self.poisoned = true;
+            return Err(e);
+        }
         let meta_root = self.meta.write(&mut self.store, generation)?;
         let cost_from = (
             self.store.space.allocated_l,
@@ -2132,6 +2504,7 @@ impl<D: BlockDevice> Filesystem<D> {
             self.store.space.allocated_pairs - cost_from.1,
         );
         self.store.io.write_batch()?;
+        self.sb_started = true;
         superblock::commit(
             &mut self.store.io,
             &self.header,
