@@ -617,3 +617,53 @@ fn power_cut_sampled_long_workloads() {
         campaign(base_seed() + 72_000 + i, i % 2 == 1, 4096, 250, 200);
     }
 }
+
+/// Device work per iteration of the storage set's dpkg-style loop (create a
+/// 4 KiB file, write it, fsync it, rename it over its target, fsync the
+/// directory), with the log and without it (every fsync a commit). Counts,
+/// not times: in-memory device, plain volume, 4096 blocks, 200 iterations
+/// after 20 warm-up ones. The ext4 comparison (latency on a real device) is
+/// the benchmark step's.
+#[test]
+fn dpkg_style_loop_device_work() {
+    let run = |log: Option<u64>| {
+        let mut fs = format(false, log);
+        let d = fs.mkdir(ROOT_INO, b"pkg", 0o755).unwrap();
+        fs.commit().unwrap();
+        let mut before = None;
+        for i in 0..220u32 {
+            if i == 20 {
+                before = Some(fs.io_stats());
+            }
+            let f = fs.create(d, b"file.new", 0o644).unwrap();
+            fs.write(f, 0, &[i as u8; 4096]).unwrap();
+            fs.fsync(f).unwrap();
+            fs.rename(d, b"file.new", d, b"file").unwrap();
+            fs.fsync(d).unwrap();
+        }
+        let (a, b) = (before.unwrap(), fs.io_stats());
+        let mut fs = crash(fs, false, 15);
+        let f = fs.lookup(d, b"file").unwrap();
+        assert_eq!(data(&mut fs, f), vec![219u8; 4096]);
+        fsck_ok(&mut fs);
+        (
+            (b.blocks_written - a.blocks_written) as f64 / 200.0,
+            (b.flushes - a.flushes) as f64 / 200.0,
+        )
+    };
+    let (lb, lf) = run(None);
+    let (cb, cf) = run(Some(0));
+    eprintln!(
+        "dpkg-style loop, per iteration: intent log {lb:.1} blocks, {lf:.1} flushes; \
+         commits {cb:.1} blocks, {cf:.1} flushes"
+    );
+    // Two batches per iteration (the file: records + inode + 1 block = 2
+    // ring blocks; the directory: the rename record, 1 block) and two
+    // flushes, except that the 64-block ring fills about every 21
+    // iterations and that fsync commits instead.
+    assert!(lb < 4.0 && lf <= 2.1, "log: {lb} blocks, {lf} flushes");
+    assert!(
+        cb > 2.0 * lb && cf > 1.9 * lf,
+        "commits: {cb} blocks, {cf} flushes"
+    );
+}
