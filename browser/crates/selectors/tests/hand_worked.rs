@@ -47,6 +47,12 @@ fn specificity_examples_of_section_15() {
 fn specificity_of_other_selectors() {
     // :has() takes its most specific argument (15).
     assert_eq!(spec(":has(> a, #b .c)"), (1, 1, 0));
+    // A relative selector's specificity is its selector's.
+    let rel = parse_relative_selector("> #a .b", &Namespaces::new()).unwrap();
+    assert_eq!(
+        rel[0].specificity(Specificity::ZERO),
+        Specificity { a: 1, b: 1, c: 0 }
+    );
     // :nth-child() without `of` is one pseudo-class.
     assert_eq!(spec(":nth-child(2n)"), (0, 1, 0));
     // Invalid items of a forgiving list count as zero (16.1).
@@ -211,6 +217,13 @@ fn attribute_selectors() {
     assert_eq!(err("[1]"), SelectorError::Syntax);
     assert_eq!(err("[*]"), SelectorError::Syntax);
     assert_eq!(err("[a b]"), SelectorError::Syntax);
+    // A matcher's two characters are adjacent (16, white-space rules).
+    assert_eq!(err("[a~ b]"), SelectorError::Syntax);
+    assert_eq!(err("[a^ b i]"), SelectorError::Syntax);
+    // `*` is a namespace prefix only with its `|`.
+    assert_eq!(err("[*.b]"), SelectorError::Syntax);
+    assert_eq!(err("[*|=b]"), SelectorError::Syntax);
+    assert_eq!(err("[|=b]"), SelectorError::Syntax);
 }
 
 #[test]
@@ -385,6 +398,16 @@ fn pseudo_elements_and_what_may_follow_them() {
         err("::before:not(:hover .a)"),
         SelectorError::NotAllowedHere
     );
+    // The restriction passes as compound-only too: no combinators even
+    // between allowed pseudo-classes.
+    assert_eq!(
+        err("::before:not(:hover :focus)"),
+        SelectorError::NotAllowedHere
+    );
+    assert_eq!(
+        err("::part(a):not(:hover > :focus)"),
+        SelectorError::NotAllowedHere
+    );
     assert_eq!(err("::before:first-child"), SelectorError::NotAllowedHere);
     assert_eq!(err("::before:has(a)"), SelectorError::NotAllowedHere);
     assert_eq!(err("::before.a"), SelectorError::NotAllowedHere);
@@ -535,7 +558,10 @@ fn nesting_depth_limit() {
     // Deep blocks inside a forgiving argument are walked without recursion,
     // and the kept item gets the closers the end of input left out.
     let blocks = format!(":is({}", "[".repeat(200_000));
-    assert_eq!(ser(&blocks), format!(":is({}{})", "[".repeat(200_000), "]".repeat(200_000)));
+    assert_eq!(
+        ser(&blocks),
+        format!(":is({}{})", "[".repeat(200_000), "]".repeat(200_000))
+    );
     assert_eq!(ser(":is(a, b(c [d"), ":is(a, b(c [d]))");
     assert_eq!(ser(":is(a, (b) c"), ":is(a, (b) c)");
 }

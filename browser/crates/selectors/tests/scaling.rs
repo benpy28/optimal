@@ -17,7 +17,9 @@ fn hostile_selectors_parse_in_linear_time() {
         ("descendants", |n| "a ".repeat(n) + "a"),
         ("children", |n| "a>".repeat(n) + "a"),
         ("forgiving items", |n| format!(":is({})", "1,".repeat(n))),
-        ("forgiving valid items", |n| format!(":is({}a)", "a,".repeat(n))),
+        ("forgiving valid items", |n| {
+            format!(":is({}a)", "a,".repeat(n))
+        }),
         ("deep blocks in :is", |n| format!(":is({}", "[".repeat(n))),
         ("deep parens in :is", |n| format!(":is({}", "(".repeat(n))),
         ("too deep :is", |n| ":is(".repeat(n)),
@@ -31,7 +33,9 @@ fn hostile_selectors_parse_in_linear_time() {
         ("part names", |n| format!("::part({})", "a ".repeat(n))),
         ("lang ranges", |n| format!(":lang({}a)", "a,".repeat(n))),
         ("has arguments", |n| format!(":has({}a)", "> a,".repeat(n))),
-        ("nth of list", |n| format!(":nth-child(2n of {}a)", "a,".repeat(n))),
+        ("nth of list", |n| {
+            format!(":nth-child(2n of {}a)", "a,".repeat(n))
+        }),
     ];
     let ns = Namespaces::new();
     let time = |input: &str| {
@@ -81,7 +85,14 @@ fn hostile_selectors_parse_in_linear_time() {
 #[test]
 fn deepest_accepted_nesting_fits_a_small_stack() {
     let run = || {
-        for f in [":is(", ":not(", ":where(", ":has(", ":nth-child(1 of ", ":host("] {
+        for f in [
+            ":is(",
+            ":not(",
+            ":where(",
+            ":has(",
+            ":nth-child(1 of ",
+            ":host(",
+        ] {
             let n = MAX_NESTING as usize;
             let src = format!("{}a{}", f.repeat(n), ")".repeat(n));
             let r = parse_selector(&src, &Namespaces::new());
@@ -99,7 +110,10 @@ fn deepest_accepted_nesting_fits_a_small_stack() {
             let over = format!("{}a{}", f.repeat(n + 1), ")".repeat(n + 1));
             let r = parse_selector(&over, &Namespaces::new());
             assert!(
-                matches!(r, Err(SelectorError::TooDeep | SelectorError::NotAllowedHere)),
+                matches!(
+                    r,
+                    Err(SelectorError::TooDeep | SelectorError::NotAllowedHere)
+                ),
                 "{f}: {r:?}"
             );
         }

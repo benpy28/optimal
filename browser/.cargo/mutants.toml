@@ -28,4 +28,11 @@ exclude_re = [
     # them anyway; counting whitespace as "other" (the mutant) changes no
     # result. Equivalent. Line-pinned.
     "css/src/parser\\.rs:628:17: delete match arm Token::Whitespace in Parser<'p, 'a, V>::has_curly_block_and_more",
+    # selectors, functional_pseudo_class: marking a forgiving argument as
+    # already scanned for <any-value> only saves rescanning nested :is()
+    # and :where() inside it (everything they hold lies inside the part
+    # scanned), so deleting the field changes no result, only the cost
+    # (the release-build scaling test, CSS_SCALING=1, checks that).
+    # Equivalent. Line-pinned.
+    "selectors/src/parse\\.rs:678:17: delete field any_value_checked from struct Ctx expression in Parser<'p, 'a>::functional_pseudo_class",
 ]

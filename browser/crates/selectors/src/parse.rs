@@ -395,9 +395,6 @@ impl<'p, 'a> Parser<'p, 'a> {
                     *pos += 1;
                     Simple::Id((**name).into())
                 }
-                Kind::Token(Token::Hash(_, HashKind::Unrestricted)) => {
-                    return Err(SelectorError::Syntax);
-                }
                 Kind::Token(Token::Delim('.')) => {
                     let name = ident(s.get(*pos + 1)).ok_or(SelectorError::Syntax)?;
                     *pos += 2;
@@ -417,10 +414,9 @@ impl<'p, 'a> Parser<'p, 'a> {
                     *pos += 1;
                     Simple::Nesting
                 }
-                // A type or universal selector that isn't first.
-                Kind::Token(Token::Ident(_) | Token::Delim('*' | '|')) => {
-                    return Err(SelectorError::Syntax);
-                }
+                // Anything else ends the compound; complex() then refuses
+                // what isn't whitespace or a combinator (a type selector
+                // that isn't first, a hash that isn't an identifier...).
                 _ => break,
             };
             compound.push(simple);
@@ -544,8 +540,10 @@ impl<'p, 'a> Parser<'p, 'a> {
         let bar = |i: usize| delim(at(i), '|') && !delim(at(i + 1), '=');
         let (written, name_at) = match at(0).map(|v| v.token()) {
             Some(Token::Ident(p)) if bar(1) => (Written::Named(p), 2),
-            Some(Token::Delim('*')) if bar(1) => (Written::Any, 2),
-            Some(Token::Delim('|')) if bar(0) => (Written::Empty, 1),
+            // (`*|=` and `|=` here would leave no name, so these need no
+            // look past the `|`.)
+            Some(Token::Delim('*')) if delim(at(1), '|') => (Written::Any, 2),
+            Some(Token::Delim('|')) => (Written::Empty, 1),
             Some(Token::Ident(_)) => (Written::Implicit, 0),
             _ => return Err(SelectorError::Syntax),
         };
@@ -770,9 +768,9 @@ impl<'p, 'a> Parser<'p, 'a> {
     /// A `<compound-selector>` argument (of `:host()`, `:host-context()`,
     /// `::slotted()`).
     fn compound_argument(&self, s: &[V<'_, 'a>], inner: Ctx) -> Result<Vec<Simple>, SelectorError> {
+        // compound_only also rules out pseudo-elements.
         let ctx = Ctx {
             compound_only: true,
-            no_pseudo_elements: true,
             after_element_backed: None,
             ..inner
         };
