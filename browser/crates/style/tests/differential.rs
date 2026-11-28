@@ -39,18 +39,66 @@ impl Gen {
 }
 
 const TOP_SELECTORS: &[&str] = &[
-    "a", "b", "div", "DIV", ".x", ".X", "#i", "#I", "*", "a.x", "div > b", "a b", ".x + .y",
-    "b ~ a", ":is(.x, #i)", ":where(#i)", ":not(.x)", "&", "& .x", "a::before", ":root",
-    "svg|a", "*|b", "|a", "a!", ":nth-child(2)", ":first-child", "[title]", "[class~=y]",
-    ".y.x", "#i.x", ":is(a, .x::after)",
+    "a",
+    "b",
+    "div",
+    "DIV",
+    ".x",
+    ".X",
+    "#i",
+    "#I",
+    "*",
+    "a.x",
+    "div > b",
+    "a b",
+    ".x + .y",
+    "b ~ a",
+    ":is(.x, #i)",
+    ":where(#i)",
+    ":not(.x)",
+    "&",
+    "& .x",
+    "a::before",
+    ":root",
+    "svg|a",
+    "*|b",
+    "|a",
+    "a!",
+    ":nth-child(2)",
+    ":first-child",
+    "[title]",
+    "[class~=y]",
+    ".y.x",
+    "#i.x",
+    ":is(a, .x::after)",
 ];
 const NESTED_SELECTORS: &[&str] = &[
-    "&", "& a", "> b", "+ a", "~ .x", ".x", "a &", "&.x", "& + &", ":is(&, .y)", ":not(&)",
-    "&::before", "> &", ":where(&) b", "b", "#i", "~ &", ":unknown(&)", ">", "& &",
+    "&",
+    "& a",
+    "> b",
+    "+ a",
+    "~ .x",
+    ".x",
+    "a &",
+    "&.x",
+    "& + &",
+    ":is(&, .y)",
+    ":not(&)",
+    "&::before",
+    "> &",
+    ":where(&) b",
+    "b",
+    "#i",
+    "~ &",
+    ":unknown(&)",
+    ">",
+    "& &",
 ];
 const NAMES: &[&str] = &["color", "COLOR", "margin", "--x", "--X", "width"];
 const VALUES: &[&str] = &["red", "1px", "\"blue\"", "f(b)", "{a}", "x y"];
-const LAYERS: &[&str] = &["a", "b", "a.b", "b.a", "c", "A", "a.b.c", "initial", "a .b", "B.c"];
+const LAYERS: &[&str] = &[
+    "a", "b", "a.b", "b.a", "c", "A", "a.b.c", "initial", "a .b", "B.c",
+];
 const NAMESPACES: &[&str] = &[
     "@namespace svg url(http://www.w3.org/2000/svg);",
     "@namespace \"http://www.w3.org/1999/xhtml\";",
@@ -131,7 +179,11 @@ fn rule_list(g: &mut Gen, depth: usize) -> String {
 fn top_rule(g: &mut Gen, depth: usize) -> String {
     match g.below(12) {
         0..=4 => format!("{} {{ {} }}", selector_list(g, TOP_SELECTORS), body(g, 0)),
-        5 | 6 if depth < 2 => format!("@layer {} {{ {} }}", layer_prelude(g), rule_list(g, depth + 1)),
+        5 | 6 if depth < 2 => format!(
+            "@layer {} {{ {} }}",
+            layer_prelude(g),
+            rule_list(g, depth + 1)
+        ),
         7 => format!("@layer {};", g.pick(LAYERS)),
         8 => g.pick(NAMESPACES).to_string(),
         9 => g.pick(IMPORTS).to_string(),
@@ -224,7 +276,10 @@ fn run(seed: u64) {
     }
     let cascade = set.prepare();
     let styles: Vec<Option<StyleAttribute<'_>>> = (0..t.nodes.len())
-        .map(|i| t.attr(i, "style").map(|s| StyleAttribute::parse(Wtf8::from_str(s))))
+        .map(|i| {
+            t.attr(i, "style")
+                .map(|s| StyleAttribute::parse(Wtf8::from_str(s)))
+        })
         .collect();
     let model_styles: Vec<_> = (0..t.nodes.len())
         .map(|i| t.attr(i, "style").map(reference::style_attribute))
@@ -239,8 +294,16 @@ fn run(seed: u64) {
             };
             let want = model.cascade(&e, quirks, mp, md);
             if std::env::var("CASCADE_STATS").is_ok() {
-                let sheet = want.iter().flat_map(|w| &w.1).filter(|i| matches!(i, Id::Sheet(..))).count();
-                eprintln!("STAT {} {} {sheet}", want.len(), want.iter().map(|w| w.1.len()).sum::<usize>());
+                let sheet = want
+                    .iter()
+                    .flat_map(|w| &w.1)
+                    .filter(|i| matches!(i, Id::Sheet(..)))
+                    .count();
+                eprintln!(
+                    "STAT {} {} {sheet}",
+                    want.len(),
+                    want.iter().map(|w| w.1.len()).sum::<usize>()
+                );
             }
             assert_eq!(
                 ids(&set, &got),

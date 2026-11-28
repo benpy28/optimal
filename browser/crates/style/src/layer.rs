@@ -103,14 +103,10 @@ impl Layers {
         id
     }
 
-    /// The number of layers, roots included.
+    /// The number of layers, the three roots included.
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.nodes.len()
-    }
-
-    /// Whether there are no layers besides the roots.
-    pub fn is_empty(&self) -> bool {
-        self.nodes.len() == 3
     }
 
     /// The parent layer (`None` for a root).
@@ -228,7 +224,10 @@ mod tests {
     #[test]
     fn layer_names() {
         assert_eq!(name("a"), Some(vec!["a".into()]));
-        assert_eq!(name(" a.b.c "), Some(vec!["a".into(), "b".into(), "c".into()]));
+        assert_eq!(
+            name(" a.b.c "),
+            Some(vec!["a".into(), "b".into(), "c".into()])
+        );
         // Case is kept: names are identifiers, compared exactly.
         assert_eq!(name("A.b"), Some(vec!["A".into(), "b".into()]));
         assert_eq!(name("a . b"), None);

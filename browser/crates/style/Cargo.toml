@@ -16,4 +16,6 @@ optimal-selectors = { path = "../selectors" }
 optimal-wtf8 = { path = "../wtf8" }
 
 [dev-dependencies]
+optimal-dom = { path = "../dom" }
+optimal-html = { path = "../html" }
 proptest = "1"

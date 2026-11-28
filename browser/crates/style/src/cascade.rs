@@ -80,11 +80,6 @@ impl Level {
             (Origin::UserAgent, true) => Level::ImportantUserAgent,
         }
     }
-
-    /// Whether it is an important level.
-    pub fn important(self) -> bool {
-        self >= Level::ImportantAuthor
-    }
 }
 
 /// A declaration's precedence: a greater one wins. Fields compare in
@@ -188,9 +183,7 @@ fn key(sel: &optimal_selectors::Selector) -> Key<'_> {
         match s {
             Simple::Id(id) => return Key::Id(id),
             Simple::Class(c) if !matches!(best, Key::Class(_)) => best = Key::Class(c),
-            Simple::Type { local, .. } if matches!(best, Key::Universal) => {
-                best = Key::Type(local)
-            }
+            Simple::Type { local, .. } if matches!(best, Key::Universal) => best = Key::Type(local),
             _ => {}
         }
     }
@@ -240,6 +233,7 @@ pub struct Session<'c, 's, 'a, E> {
     matcher: MatchSession<'c, E>,
     /// Scratch space for a nested rule's chain of ancestor rules.
     chain: Vec<&'c SelectorList>,
+    tried: usize,
 }
 
 impl<'s, 'a> Cascade<'s, 'a> {
@@ -260,6 +254,7 @@ impl<'s, 'a> Cascade<'s, 'a> {
             cascade: self,
             matcher: MatchSession::new(&cx),
             chain: Vec::new(),
+            tried: 0,
         };
         f(&mut session)
     }
@@ -272,6 +267,12 @@ impl<'s, 'a> Cascade<'s, 'a> {
 }
 
 impl<'c, 's: 'c, 'a, E: Element> Session<'c, 's, 'a, E> {
+    /// How many selectors the session has tried against elements: the
+    /// candidates from the buckets (for tests of the bucketing).
+    pub fn selectors_tried(&self) -> usize {
+        self.tried
+    }
+
     /// The cascade for `element`, with the declarations of its `style`
     /// attribute if it has one.
     pub fn cascade<'n>(
@@ -309,6 +310,7 @@ impl<'c, 's: 'c, 'a, E: Element> Session<'c, 's, 'a, E> {
             cands.extend_from_slice(b);
         }
         cands.extend_from_slice(&c.universal);
+        self.tried += cands.len();
 
         // The rules that match, each with its most specific matching
         // selector's specificity.

@@ -17,7 +17,10 @@ fn cascaded(sheets: &[(&str, Origin)], t: &Tree, prop: &str) -> Vec<Option<Strin
         set.add_sheet(Wtf8::from_str(s), *o);
     }
     let styles: Vec<_> = (0..t.nodes.len())
-        .map(|i| t.attr(i, "style").map(|s| StyleAttribute::parse(Wtf8::from_str(s))))
+        .map(|i| {
+            t.attr(i, "style")
+                .map(|s| StyleAttribute::parse(Wtf8::from_str(s)))
+        })
         .collect();
     let c = set.prepare();
     c.with_session(false, |s| {
@@ -71,7 +74,10 @@ fn unlayered_beats_layered_whatever_the_specificity() {
     let css = "audio { display: flex; }
         @layer reset { audio[controls] { display: block; } }";
     let t = one("audio", &[("controls", "")]);
-    assert_eq!(ident(&author(css), &t, "display", 1).as_deref(), Some("flex"));
+    assert_eq!(
+        ident(&author(css), &t, "display", 1).as_deref(),
+        Some("flex")
+    );
 }
 
 #[test]
@@ -104,7 +110,10 @@ fn nested_names_are_distinct_layers() {
     let css = "@layer base { p { margin-block: 1; } }
         @layer framework { @layer base { p { margin-block: 2; } } }";
     let t = one("p", &[]);
-    assert_eq!(ident(&author(css), &t, "margin-block", 1).as_deref(), Some("2"));
+    assert_eq!(
+        ident(&author(css), &t, "margin-block", 1).as_deref(),
+        Some("2")
+    );
     // And framework.theme in a later block joins the same layer (third
     // example): the later block's rule is in framework.theme, which comes
     // after framework.default.
@@ -114,7 +123,10 @@ fn nested_names_are_distinct_layers() {
         }
         @layer framework.theme { p { color: rebeccapurple; } }
         @layer framework.default { p { color: blue; } }";
-    assert_eq!(ident(&author(css), &t, "color", 1).as_deref(), Some("rebeccapurple"));
+    assert_eq!(
+        ident(&author(css), &t, "color", 1).as_deref(),
+        Some("rebeccapurple")
+    );
 }
 
 #[test]
@@ -126,7 +138,10 @@ fn anonymous_layers_are_each_distinct() {
     // Within one unnamed layer, foo twice is the same layer, which comes
     // before the anonymous layer's own rules.
     let css = "@layer { p { color: green; } @layer foo { p { color: red; } } @layer foo { p { color: blue; } } }";
-    assert_eq!(ident(&author(css), &t, "color", 1).as_deref(), Some("green"));
+    assert_eq!(
+        ident(&author(css), &t, "color", 1).as_deref(),
+        Some("green")
+    );
     // In separate unnamed layers, foo is two layers: the second wins.
     let css = "@layer { @layer foo { p { color: red; } } } @layer { @layer foo { p { color: blue; } } } @layer { @layer foo { } }";
     assert_eq!(ident(&author(css), &t, "color", 1).as_deref(), Some("blue"));
@@ -140,10 +155,16 @@ fn important_reverses_the_layer_order() {
     let css = "@layer a { p { color: green !important; } }
         @layer b { p { color: red !important; } }
         p { color: blue !important; }";
-    assert_eq!(ident(&author(css), &t, "color", 1).as_deref(), Some("green"));
+    assert_eq!(
+        ident(&author(css), &t, "color", 1).as_deref(),
+        Some("green")
+    );
     // Normal: the later layer, and unlayered over both.
     let css = "@layer a { p { color: red; } } @layer b { p { color: green; } }";
-    assert_eq!(ident(&author(css), &t, "color", 1).as_deref(), Some("green"));
+    assert_eq!(
+        ident(&author(css), &t, "color", 1).as_deref(),
+        Some("green")
+    );
 }
 
 #[test]
@@ -152,7 +173,10 @@ fn layer_statement_sets_the_order_up_front() {
     // order; a's rule wins.
     let t = one("p", &[]);
     let css = "@layer b, a; @layer a { p { color: green; } } @layer b { p { color: red; } }";
-    assert_eq!(ident(&author(css), &t, "color", 1).as_deref(), Some("green"));
+    assert_eq!(
+        ident(&author(css), &t, "color", 1).as_deref(),
+        Some("green")
+    );
 }
 
 #[test]
@@ -172,15 +196,24 @@ fn invalid_layer_rules_are_ignored_with_their_contents() {
     // is declared by its block, after b, and wins. (Had the statement
     // declared a, b would come later and win.)
     let css = "@layer a, initial; @layer b { p { color: red; } } @layer a { p { color: green; } }";
-    assert_eq!(ident(&author(css), &t, "color", 1).as_deref(), Some("green"));
+    assert_eq!(
+        ident(&author(css), &t, "color", 1).as_deref(),
+        Some("green")
+    );
 }
 
 #[test]
 fn origins_and_importance() {
     // 6.1 Origin and Importance.
     let t = one("p", &[]);
-    let ua = ("p { color: ua; } p { width: ua !important; }", Origin::UserAgent);
-    let user = ("p { color: user; } p { margin: user !important; width: user; }", Origin::User);
+    let ua = (
+        "p { color: ua; } p { width: ua !important; }",
+        Origin::UserAgent,
+    );
+    let user = (
+        "p { color: user; } p { margin: user !important; width: user; }",
+        Origin::User,
+    );
     let auth = (
         "p { color: author; margin: author !important; width: author !important; } p { padding: author }",
         Origin::Author,
@@ -197,7 +230,10 @@ fn origins_and_importance() {
     // Unopposed: the only one.
     assert_eq!(ident(&sheets, &t, "padding", 1).as_deref(), Some("author"));
     // Normal user over normal user agent.
-    let sheets = [("p { color: ua; }", Origin::UserAgent), ("p { color: user; }", Origin::User)];
+    let sheets = [
+        ("p { color: ua; }", Origin::UserAgent),
+        ("p { color: user; }", Origin::User),
+    ];
     assert_eq!(ident(&sheets, &t, "color", 1).as_deref(), Some("user"));
 }
 
@@ -208,7 +244,10 @@ fn element_attached_declarations() {
     // important attribute beats important rules in any layer.
     let t = one(
         "p",
-        &[("id", "x"), ("style", "color: attr; margin: attr; width: attr !important")],
+        &[
+            ("id", "x"),
+            ("style", "color: attr; margin: attr; width: attr !important"),
+        ],
     );
     let css = "#x#x { color: rule; }
         p { margin: rule !important; }
@@ -243,7 +282,10 @@ fn specificity_of_the_most_specific_matching_selector() {
 fn order_of_appearance_across_sheets() {
     // 6.1 Order of Appearance: sheets in order; the last wins.
     let t = one("p", &[]);
-    let sheets = [("p { color: first }", Origin::Author), ("p { color: second }", Origin::Author)];
+    let sheets = [
+        ("p { color: first }", Origin::Author),
+        ("p { color: second }", Origin::Author),
+    ];
     assert_eq!(ident(&sheets, &t, "color", 1).as_deref(), Some("second"));
 }
 
@@ -323,7 +365,10 @@ fn nested_group_rules() {
     // to the unlayered "green" though it comes later.
     let t = one("p", &[]);
     let css = "p { color: green; @layer a { color: red; } }";
-    assert_eq!(ident(&author(css), &t, "color", 1).as_deref(), Some("green"));
+    assert_eq!(
+        ident(&author(css), &t, "color", 1).as_deref(),
+        Some("green")
+    );
     // Style rules nested in it take & from the style rule.
     let css = "@layer a { p { @layer b { & { color: deep; } } } }";
     assert_eq!(ident(&author(css), &t, "color", 1).as_deref(), Some("deep"));
@@ -373,7 +418,10 @@ fn namespaces() {
     assert_eq!(ident(&author(css), &t, "color", 2), None);
     // Prefixes are per sheet.
     let sheets = [
-        ("@namespace svg url(http://www.w3.org/2000/svg);", Origin::Author),
+        (
+            "@namespace svg url(http://www.w3.org/2000/svg);",
+            Origin::Author,
+        ),
         ("svg|a { color: svg; }", Origin::Author),
     ];
     assert_eq!(ident(&sheets, &t, "color", 2), None);
@@ -385,7 +433,8 @@ fn import_layers_are_declared_and_placement_is_checked() {
     // the sheet isn't loaded. b is declared by the import, so a comes later
     // and wins.
     let t = one("p", &[]);
-    let css = "@import url(x.css) layer(b); @layer a { p { color: a; } } @layer b { p { color: b; } }";
+    let css =
+        "@import url(x.css) layer(b); @layer a { p { color: a; } } @layer b { p { color: b; } }";
     assert_eq!(ident(&author(css), &t, "color", 1).as_deref(), Some("a"));
     // After "@layer b;" a second @import is invalid (6.4.4.2 note), so its
     // layer a is declared by the block after c: order b, c, a, and a wins.
@@ -443,7 +492,9 @@ fn deep_nesting_is_refused_not_overflowed() {
     // The deepest rule that stays still matches.
     let t = one("p", &[]);
     let c = set.prepare();
-    let count = c.with_session(false, |s| s.cascade(&t.el(1), None).get("color").map(|e| e.len()));
+    let count = c.with_session(false, |s| {
+        s.cascade(&t.el(1), None).get("color").map(|e| e.len())
+    });
     assert_eq!(count, Some(MAX_RULE_NESTING as usize + 1));
     // Each functional pseudo-class level counts too.
     let css = format!(
@@ -455,7 +506,11 @@ fn deep_nesting_is_refused_not_overflowed() {
     set.add_sheet(Wtf8::from_str(&css), Origin::Author);
     assert_eq!(set.refused_too_deep(), 1);
     // Layers nest as deep as the input does.
-    let css = format!("{}p {{ color: deep }}{}", "@layer {".repeat(100_000), "}".repeat(100_000));
+    let css = format!(
+        "{}p {{ color: deep }}{}",
+        "@layer {".repeat(100_000),
+        "}".repeat(100_000)
+    );
     let mut set = StyleSet::new();
     set.add_sheet(Wtf8::from_str(&css), Origin::Author);
     assert_eq!(set.layers().len(), 100_003);

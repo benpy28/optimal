@@ -93,7 +93,14 @@ const OTHER_NOT_APPLIED: &[&str] = &[
     "view-transition",
     "position-try",
 ];
-const CSS_WIDE: &[&str] = &["initial", "inherit", "unset", "revert", "revert-layer", "revert-rule"];
+const CSS_WIDE: &[&str] = &[
+    "initial",
+    "inherit",
+    "unset",
+    "revert",
+    "revert-layer",
+    "revert-rule",
+];
 
 /// The kinds of valid top-level rules, for placement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -289,7 +296,8 @@ impl Model {
                 let values: Vec<_> = parsed.values(prelude.clone()).collect();
                 let pre = strip_ws(&values);
                 match (name.as_str(), block) {
-                    ("layer", None) => {
+                    // Only at-rules holding style rules nest in style rules.
+                    ("layer", None) if style.is_none() => {
                         let names: Option<Vec<Vec<String>>> = pre
                             .split(|v| matches!(v.token(), Token::Comma))
                             .map(|p| layer_name(parsed, strip_ws(p)))
@@ -390,7 +398,11 @@ impl Model {
                             }
                         }
                     }
-                    (n, Some(_)) if top && (GROUP_NOT_APPLIED.contains(&n) || OTHER_NOT_APPLIED.contains(&n)) => {
+                    (n, Some(_))
+                        if top
+                            && (GROUP_NOT_APPLIED.contains(&n)
+                                || OTHER_NOT_APPLIED.contains(&n)) =>
+                    {
                         w.earlier.push(TopKind::Other);
                     }
                     _ => {}
@@ -399,7 +411,13 @@ impl Model {
         }
     }
 
-    fn decls(&mut self, w: &SheetWalk<'_, '_>, d: &[Declaration], layer: &[Seg], style: Option<usize>) {
+    fn decls(
+        &mut self,
+        w: &SheetWalk<'_, '_>,
+        d: &[Declaration],
+        layer: &[Seg],
+        style: Option<usize>,
+    ) {
         let Some(rule) = style else { return };
         for decl in d {
             let order = self.decls.len();
@@ -540,7 +558,8 @@ impl Model {
         let mut applied: Vec<Applied<'_>> = Vec::new();
         for d in &self.decls {
             let r = &self.rules[d.rule];
-            let chain: Vec<&SelectorList> = r.ancestors.iter().map(|&a| &self.rules[a].list).collect();
+            let chain: Vec<&SelectorList> =
+                r.ancestors.iter().map(|&a| &self.rules[a].list).collect();
             let cx = MatchContext {
                 scope: Scope::None,
                 quirks,

@@ -197,8 +197,6 @@ struct Ctx {
     layer: LayerId,
     /// The nearest ancestor style rule.
     style: Option<u32>,
-    /// Directly in the sheet (not in any block).
-    top: bool,
 }
 
 /// What the walk still has to do, last first.
@@ -208,6 +206,9 @@ enum Work<'p> {
 }
 
 /// The placement state of a sheet's top-level rules: what may still come.
+/// Rules inside blocks are only reached after their top-level rule has set
+/// it to [`Phase::Body`] (the walk is in order), so the same checks also
+/// refuse `@import` and `@namespace` anywhere but at the top level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
     /// Only `@layer` statements so far: `@import` and `@namespace` may come.
@@ -225,7 +226,8 @@ enum Phase {
 /// that hold no style rules). They count as rules for the placement of
 /// `@import` and `@namespace`. The group rules may also be nested in style
 /// rules; the others only stand at the top level or in `@layer`.
-const GROUP_RULES_NOT_APPLIED: &[&str] = &["media", "supports", "container", "scope", "starting-style"];
+const GROUP_RULES_NOT_APPLIED: &[&str] =
+    &["media", "supports", "container", "scope", "starting-style"];
 const OTHER_RULES_NOT_APPLIED: &[&str] = &[
     "font-face",
     "keyframes",
@@ -321,7 +323,6 @@ impl<'p, 'a> Walk<'_, '_, 'p, 'a> {
         let ctx = Ctx {
             layer: Layers::root(self.origin),
             style: None,
-            top: true,
         };
         let mut stack: Vec<Work<'p>> = top.iter().rev().map(|&r| Work::Rule(r, ctx)).collect();
         while let Some(w) = stack.pop() {
@@ -370,20 +371,12 @@ impl<'p, 'a> Walk<'_, '_, 'p, 'a> {
                 let Some(id) = self.style_rule(prelude.clone(), ctx) else {
                     return;
                 };
-                if ctx.top {
-                    self.phase = Phase::Body;
-                }
+                self.phase = Phase::Body;
                 let inner = Ctx {
                     layer: ctx.layer,
                     style: Some(id),
-                    top: false,
                 };
-                for &c in children.iter().rev() {
-                    stack.push(match &parsed.rules[c as usize] {
-                        Rule::NestedDeclarations(d) => Work::Decls(d, inner),
-                        _ => Work::Rule(c, inner),
-                    });
-                }
+                stack.extend(children.iter().rev().map(|&c| Work::Rule(c, inner)));
                 stack.push(Work::Decls(declarations, inner));
             }
             Rule::NestedDeclarations(d) => stack.push(Work::Decls(d, ctx)),
@@ -396,18 +389,18 @@ impl<'p, 'a> Walk<'_, '_, 'p, 'a> {
                 let prelude = self.values(prelude.clone());
                 let prelude = trim(&prelude);
                 match (name.as_str(), block) {
-                    ("layer", None) => self.layer_statement(prelude, ctx),
+                    // A statement holds no style rules, so it isn't a nested
+                    // group rule: in a style rule it is invalid
+                    // (css-nesting-1 3.3; WPT css-nesting/nesting-layer).
+                    ("layer", None) if ctx.style.is_none() => self.layer_statement(prelude, ctx),
                     ("layer", Some(items)) => {
                         let Some(layer) = self.layer_block(prelude, ctx) else {
                             return;
                         };
-                        if ctx.top {
-                            self.phase = Phase::Body;
-                        }
+                        self.phase = Phase::Body;
                         let inner = Ctx {
                             layer,
                             style: ctx.style,
-                            top: false,
                         };
                         for item in items.iter().rev() {
                             stack.push(match item {
@@ -416,12 +409,11 @@ impl<'p, 'a> Walk<'_, '_, 'p, 'a> {
                             });
                         }
                     }
-                    ("namespace", None) if ctx.top => self.namespace(prelude),
-                    ("import", None) if ctx.top => self.import(prelude, ctx),
+                    ("namespace", None) => self.namespace(prelude),
+                    ("import", None) => self.import(prelude, ctx),
                     (n, Some(_))
-                        if ctx.top
-                            && (GROUP_RULES_NOT_APPLIED.contains(&n)
-                                || OTHER_RULES_NOT_APPLIED.contains(&n)) =>
+                        if GROUP_RULES_NOT_APPLIED.contains(&n)
+                            || OTHER_RULES_NOT_APPLIED.contains(&n) =>
                     {
                         self.phase = Phase::Body;
                     }
@@ -442,7 +434,7 @@ impl<'p, 'a> Walk<'_, '_, 'p, 'a> {
         for n in &names {
             self.set.layers.path(ctx.layer, n);
         }
-        if ctx.top && matches!(self.phase, Phase::Imports | Phase::Namespaces) {
+        if matches!(self.phase, Phase::Imports | Phase::Namespaces) {
             self.phase = Phase::Body;
         }
     }
@@ -458,7 +450,10 @@ impl<'p, 'a> Walk<'_, '_, 'p, 'a> {
 
     /// `@namespace <namespace-prefix>? [ <string> | <url> ];`
     fn namespace(&mut self, prelude: &[ComponentValue<'_, '_>]) {
-        if !matches!(self.phase, Phase::Start | Phase::Imports | Phase::Namespaces) {
+        if !matches!(
+            self.phase,
+            Phase::Start | Phase::Imports | Phase::Namespaces
+        ) {
             return;
         }
         let (prefix, rest) = match prelude {
@@ -522,7 +517,8 @@ impl<'p, 'a> Walk<'_, '_, 'p, 'a> {
         let list = match parent {
             None => parse_selector_list(self.parsed, prelude, &self.ns).ok()?,
             Some(_) => {
-                let rel = parse_relative_selector_list(self.parsed, prelude.clone(), &self.ns).ok()?;
+                let rel =
+                    parse_relative_selector_list(self.parsed, prelude.clone(), &self.ns).ok()?;
                 let contains = contains_nesting(self.parsed, prelude);
                 debug_assert_eq!(rel.len(), contains.len());
                 SelectorList(
@@ -562,7 +558,11 @@ impl<'p, 'a> Walk<'_, '_, 'p, 'a> {
         let id = self.set.rules.len() as u32;
         self.set.rules.push(StyleRule {
             origin: self.origin,
-            singles: list.0.iter().map(|s| SelectorList(vec![s.clone()])).collect(),
+            singles: list
+                .0
+                .iter()
+                .map(|s| SelectorList(vec![s.clone()]))
+                .collect(),
             nesting_specificity: specificity.iter().copied().max().unwrap_or_default(),
             specificity,
             selectors: list,
@@ -594,32 +594,25 @@ fn string_or_url(v: ComponentValue<'_, '_>) -> Option<String> {
 
 /// For each comma-separated item of a prelude, whether it "contains the
 /// nesting selector": has a `&` delim token at any depth (css-nesting-1,
-/// which counts one even inside an unknown pseudo-class's argument).
+/// which counts one even inside an unknown pseudo-class's argument). A
+/// top-level value's tokens run up to the next top-level value.
 fn contains_nesting(parsed: &Parsed<'_>, range: Range<u32>) -> Vec<bool> {
+    let starts: Vec<(u32, bool)> = parsed
+        .values(range.clone())
+        .map(|v| (v.index(), matches!(v.token(), Token::Comma)))
+        .collect();
     let mut out = vec![false];
-    for v in parsed.values(range) {
-        match v.token() {
-            Token::Comma => out.push(false),
-            _ => {
-                let span = v.index()..v.index() + token_count(v);
-                if span.into_iter().any(|i| matches!(parsed.tokens.get(i).token, Token::Delim('&'))) {
-                    *out.last_mut().expect("not empty") = true;
-                }
-            }
+    for (i, &(start, comma)) in starts.iter().enumerate() {
+        if comma {
+            out.push(false);
+            continue;
+        }
+        let end = starts.get(i + 1).map_or(range.end, |s| s.0);
+        if (start..end).any(|t| matches!(parsed.tokens.get(t).token, Token::Delim('&'))) {
+            *out.last_mut().expect("not empty") = true;
         }
     }
     out
-}
-
-/// How many tokens a component value covers.
-fn token_count(v: ComponentValue<'_, '_>) -> u32 {
-    match v.kind() {
-        Kind::Token(_) => 1,
-        Kind::Function(_, inner) | Kind::Block(_, inner) => {
-            // The opener, the contents, and the closer if there is one.
-            1 + (inner.range().end - inner.range().start) + u32::from(v.is_closed())
-        }
-    }
 }
 
 /// How deeply functional pseudo-classes and pseudo-elements nest in a

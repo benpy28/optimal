@@ -56,7 +56,7 @@ fetch_sparse wpt https://github.com/web-platform-tests/wpt.git 6852422b49e7dc803
 # web-platform-tests again, at the same commit: the CSS syntax tests
 # (css/css-syntax), whose An+B cases the css crate runs, and the selector
 # parsing tests (css/selectors/parsing).
-fetch_sparse wpt-css https://github.com/web-platform-tests/wpt.git 6852422b49e7dc8037d7f130ee07cf991fb73f05 css/css-syntax css/selectors/parsing
+fetch_sparse wpt-css https://github.com/web-platform-tests/wpt.git 6852422b49e7dc8037d7f130ee07cf991fb73f05 css/css-syntax css/selectors/parsing css/css-cascade css/css-nesting
 
 # web-platform-tests again, at the same commit: the Selectors API tests
 # (dom/nodes), whose selectors.js cases and fixture the selectors crate's

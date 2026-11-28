@@ -37,7 +37,10 @@ fn run(css: &str, t: &Tree) -> usize {
     let mut set = StyleSet::new();
     set.add_sheet(Wtf8::from_str(css), Origin::Author);
     let styles: Vec<_> = (0..t.nodes.len())
-        .map(|i| t.attr(i, "style").map(|s| StyleAttribute::parse(Wtf8::from_str(s))))
+        .map(|i| {
+            t.attr(i, "style")
+                .map(|s| StyleAttribute::parse(Wtf8::from_str(s)))
+        })
         .collect();
     let c = set.prepare();
     c.with_session(false, |s| {
@@ -60,12 +63,22 @@ fn hostile_cascades_run_in_linear_time() {
     }
     let cases: &[(&str, Case)] = &[
         ("many class rules", |n| {
-            let css: String = (0..n).map(|i| format!(".c{i} {{ color: red }}\n")).collect();
-            (css, flat(n / 10, |i| vec![("class", format!("c{}", i * 7 % n))]))
+            let css: String = (0..n)
+                .map(|i| format!(".c{i} {{ color: red }}\n"))
+                .collect();
+            (
+                css,
+                flat(n / 10, |i| vec![("class", format!("c{}", i * 7 % n))]),
+            )
         }),
         ("many id rules", |n| {
-            let css: String = (0..n).map(|i| format!("#i{i} {{ color: red }}\n")).collect();
-            (css, flat(n / 10, |i| vec![("id", format!("i{}", i * 3 % n))]))
+            let css: String = (0..n)
+                .map(|i| format!("#i{i} {{ color: red }}\n"))
+                .collect();
+            (
+                css,
+                flat(n / 10, |i| vec![("id", format!("i{}", i * 3 % n))]),
+            )
         }),
         ("long selector list", |n| {
             let list: Vec<String> = (0..n).map(|i| format!(".c{i}")).collect();
@@ -73,15 +86,23 @@ fn hostile_cascades_run_in_linear_time() {
             (css, flat(n / 10, |i| vec![("class", format!("c{i}"))]))
         }),
         ("many classes per element", |n| {
-            let css: String = (0..100).map(|i| format!(".c{i} {{ color: red }}\n")).collect();
+            let css: String = (0..100)
+                .map(|i| format!(".c{i} {{ color: red }}\n"))
+                .collect();
             let classes: Vec<String> = (0..n).map(|i| format!("c{}", i % 200)).collect();
             (css, flat(1, |_| vec![("class", classes.join(" "))]))
         }),
         ("one class repeated", |n| {
-            (".x { color: red }".into(), flat(1, |_| vec![("class", "x ".repeat(n))]))
+            (
+                ".x { color: red }".into(),
+                flat(1, |_| vec![("class", "x ".repeat(n))]),
+            )
         }),
         ("deep tree, descendant rules", |n| {
-            ("a b { color: x } a > a { width: y } :is(a) a a { margin: z }".into(), deep(n / 10, "a"))
+            (
+                "a b { color: x } a > a { width: y } :is(a) a a { margin: z }".into(),
+                deep(n / 10, "a"),
+            )
         }),
         ("wide tree, sibling rules", |n| {
             (
@@ -94,7 +115,10 @@ fn hostile_cascades_run_in_linear_time() {
             (css, flat(20, |_| vec![]))
         }),
         ("many declarations, one property", |n| {
-            (format!("p {{ {} }}", "color: red;".repeat(n)), flat(10, |_| vec![]))
+            (
+                format!("p {{ {} }}", "color: red;".repeat(n)),
+                flat(10, |_| vec![]),
+            )
         }),
         ("many layers", |n| {
             let names: Vec<String> = (0..n / 10).map(|i| format!("l{i}")).collect();
@@ -102,34 +126,52 @@ fn hostile_cascades_run_in_linear_time() {
                 .rev()
                 .map(|i| format!("@layer l{i} {{ p {{ color: c{i} }} }}\n"))
                 .collect();
-            (format!("@layer {};\n{blocks}", names.join(", ")), flat(10, |_| vec![]))
+            (
+                format!("@layer {};\n{blocks}", names.join(", ")),
+                flat(10, |_| vec![]),
+            )
         }),
         ("deep layers", |n| {
             (
-                format!("{}p {{ color: red }}{}", "@layer {".repeat(n), "}".repeat(n)),
+                format!(
+                    "{}p {{ color: red }}{}",
+                    "@layer {".repeat(n),
+                    "}".repeat(n)
+                ),
                 flat(10, |_| vec![]),
             )
         }),
         ("deep nesting, many leaves", |n| {
             let leaves: String = (0..n / 20).map(|_| "& { color: red } ").collect();
             (
-                format!("p {{ {}{}{} }}", "& { ".repeat(200), leaves, "} ".repeat(200)),
+                format!(
+                    "p {{ {}{}{} }}",
+                    "& { ".repeat(200),
+                    leaves,
+                    "} ".repeat(200)
+                ),
                 flat(10, |_| vec![]),
             )
         }),
         ("nested rule lists", |n| {
             let inner: Vec<String> = (0..n / 10).map(|i| format!("> .c{i}")).collect();
-            (format!("div {{ {} {{ color: red }} }}", inner.join(", ")), {
-                let mut t = Tree::new(true, "html");
-                let d = t.add(0, HTML, "div", &[]);
-                for i in 0..n / 10 {
-                    t.add(d, HTML, "p", &[("class", &format!("c{i}"))]);
-                }
-                t
-            })
+            (
+                format!("div {{ {} {{ color: red }} }}", inner.join(", ")),
+                {
+                    let mut t = Tree::new(true, "html");
+                    let d = t.add(0, HTML, "div", &[]);
+                    for i in 0..n / 10 {
+                        t.add(d, HTML, "p", &[("class", &format!("c{i}"))]);
+                    }
+                    t
+                },
+            )
         }),
         ("long style attributes", |n| {
-            (String::new(), flat(10, |_| vec![("style", "color: red;".repeat(n / 10))]))
+            (
+                String::new(),
+                flat(10, |_| vec![("style", "color: red;".repeat(n / 10))]),
+            )
         }),
     ];
     let time = |make: Case, n: usize| {

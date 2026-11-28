@@ -478,6 +478,40 @@ fn scope_and_nesting() {
 }
 
 #[test]
+fn session_matches_each_list_with_its_own_nesting() {
+    // MatchSession::matches_nested: one session (outside nesting) matching
+    // a style sheet's rules, each with the chain of rules it is nested in,
+    // gives what a context with that chain gives.
+    use optimal_selectors::MatchSession;
+    let t = sample(true);
+    let grand = sel("#b");
+    let inner = sel("& > p");
+    let top = sel("& span");
+    let nested = sel("& span");
+    let own = sel("&.A");
+    let cx = MatchContext::new();
+    let session = MatchSession::new(&cx);
+    let matched = |list, nesting: &[&optimal_selectors::SelectorList]| -> Vec<String> {
+        t.subtree(0)
+            .into_iter()
+            .filter(|&n| t.is_element(n) && session.matches_nested(list, nesting, &El::new(&t, n)))
+            .map(|n| t.attr(n, "", "id").unwrap_or("?").to_string())
+            .collect()
+    };
+    // No nesting: & is :scope, which is :root.
+    assert_eq!(matched(&top, &[]), ["s1"]);
+    // Inside #b > (& > p): & is "#b > p".
+    assert_eq!(matched(&nested, &[&grand, &inner]), ["s1"]);
+    assert_eq!(matched(&own, &[&grand, &inner]), ["p1"]);
+    // Inside #b alone: &.A needs #b to have class A, which it hasn't.
+    assert!(matched(&own, &[&grand]).is_empty());
+    let own_b = sel("&#b");
+    assert_eq!(matched(&own_b, &[&grand]), ["b"]);
+    // The context's own nesting is not used.
+    assert!(!session.matches(&own_b, &El::new(&t, t.by_id(0, "b").unwrap())));
+}
+
+#[test]
 fn query_all_returns_descendants_in_tree_order() {
     let t = sample(true);
     let b = t.by_id(0, "b").unwrap();

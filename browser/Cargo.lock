@@ -163,6 +163,8 @@ name = "optimal-style"
 version = "0.1.0"
 dependencies = [
  "optimal-css",
+ "optimal-dom",
+ "optimal-html",
  "optimal-selectors",
  "optimal-wtf8",
  "proptest",
