@@ -72,7 +72,7 @@ jobs:
       fail-fast: false
       matrix:
         case: [r3, r4, r5, r6, pie, entry, la57, tpm, iommu-intel, iommu-amd, smp, smp-r3, smp-x2apic, big, small, tiny, headless, old-cpu, cd, usb, nvme, virtio,
-               quirk-r3, quirk, quirk-x2apic, quirk-apic-off, quirk-iommu-intel, quirk-iommu-amd]
+               quirk-r3, quirk, quirk-x2apic, quirk-x2apic-mp, quirk-apic-off, quirk-iommu-intel, quirk-iommu-amd]
     defaults:
       run:
         working-directory: bootloader

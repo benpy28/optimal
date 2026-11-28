@@ -2526,6 +2526,10 @@ fn madt_cpus(ph: &Phys, madt: u64, len: u32, out: &mut [(u32, u32); 512]) -> usi
 /// The MP response, then every AP released one at a time and its state
 /// compared with what the spec promises (the BSP's, plus RDI and a stack).
 fn mp(t: &mut T, c: &Ctx, es: &crate::EntryState) {
+    if !req::WANT_MP {
+        t.skip("mp", "not requested in this case (OB_MP=0)");
+        return;
+    }
     let Some(r) = c.need(t, "mp", &req::MP, 4) else {
         return;
     };

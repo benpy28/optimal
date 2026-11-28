@@ -9,7 +9,7 @@
 # Cases: r3 r4 r5 r6 pie entry la57 tpm iommu-intel iommu-amd smp smp-r3 smp-x2apic big small tiny
 #        cd usb nvme virtio (device matrix: the boot medium on each controller)
 #        headless old-cpu
-#        quirk-r3 quirk quirk-x2apic quirk-apic-off quirk-iommu-intel
+#        quirk-r3 quirk quirk-x2apic quirk-x2apic-mp quirk-apic-off quirk-iommu-intel
 #        quirk-iommu-amd
 #
 # The quirk-* cases boot through the firmware-quirk injector (quirk/), which
@@ -27,7 +27,7 @@ export OB_EXPECT_CMDLINE="conformance case=$case_name" OB_EXPECT_MODULES=1 OB_EX
 # How the boot medium is attached: sata (q35's AHCI, the default), cd, usb,
 # nvme or virtio. The device matrix cases below set it.
 MEDIUM=sata
-export OB_REVISION=3 OB_PIE=0 OB_PAGING=4 OB_ENTRY_REQ=0 OB_X2APIC=0
+export OB_REVISION=3 OB_PIE=0 OB_PAGING=4 OB_ENTRY_REQ=0 OB_X2APIC=0 OB_MP=1
 QEMU=(-machine q35 -m 512M)
 TPM=0
 QUIRKS=""
@@ -58,17 +58,23 @@ case "$case_name" in
     old-cpu) QEMU+=(-cpu qemu64,-nx,-pdpe1gb); export QEMU_ACCEL=tcg ;;
     quirk-r3) QUIRKS="pic ioapic lapic" ;;
     quirk) OB_REVISION=5; QUIRKS="pic ioapic lapic" ;;
-    quirk-x2apic) OB_REVISION=6; QUIRKS="pic ioapic x2apic lapic"; QEMU+=(-cpu max,+x2apic)
+    # Without the MP request: the loader must program the LAPIC in the
+    # x2APIC mode the firmware left. (With it, x2APIC is turned off first,
+    # which quirk-x2apic-mp tests.)
+    quirk-x2apic|quirk-x2apic-mp) OB_REVISION=6; QUIRKS="pic ioapic x2apic lapic"; QEMU+=(-cpu max,+x2apic)
+        if [ "$case_name" = quirk-x2apic ]; then OB_MP=0; fi
         # QEMU 8.2's emulator has no x2APIC; refuse rather than run weaker.
         if [ ! -w /dev/kvm ] || [ "${QEMU_ACCEL:-auto}" = tcg ]; then
-            echo "quirk-x2apic needs KVM (QEMU 8.2 cannot emulate x2APIC)"; exit 1
+            echo "$case_name needs KVM (QEMU 8.2 cannot emulate x2APIC)"; exit 1
         fi ;;
     # Limine v11.4.1 leaves a globally disabled local APIC disabled (base
     # revision 5 says it must be enabled with SVR 0x1FF), so this case runs
     # under Optimal Boot only unless loaders are given explicitly.
     # QEMU's emulated APIC cannot be re-enabled once disabled, so this needs
     # KVM's in-kernel APIC to test anything.
-    quirk-apic-off) OB_REVISION=5; QUIRKS="pic ioapic apic-off"; loaders="${2:-optimal}"
+    # Without the MP request, whose mode change would re-enable the APIC
+    # before platform::init_lapic gets to.
+    quirk-apic-off) OB_REVISION=5; OB_MP=0; QUIRKS="pic ioapic apic-off"; loaders="${2:-optimal}"
         if [ ! -w /dev/kvm ] || [ "${QEMU_ACCEL:-auto}" = tcg ]; then
             echo "quirk-apic-off needs KVM (QEMU's emulated APIC cannot be re-enabled)"; exit 1
         fi ;;

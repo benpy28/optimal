@@ -1228,7 +1228,7 @@ pub fn run(image: efi::Handle) -> Result<Infallible, efi::Status> {
             // processor_id, lapic_id; reserved, goto_address and
             // extra_argument stay 0 (the arena is zeroed).
             // SAFETY: infos[i] has 32 zeroed bytes in the arena.
-            unsafe { ptr::write(plan.infos[i] as *mut [u32; 2], [c.uid, c.apic_id]) };
+            unsafe { ptr::write_volatile(plan.infos[i] as *mut [u32; 2], [c.uid, c.apic_id]) };
         }
         let parking = mp::Parking {
             block: block_page,

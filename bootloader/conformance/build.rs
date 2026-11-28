@@ -13,6 +13,7 @@ fn main() {
         "OB_PAGING",
         "OB_ENTRY_REQ",
         "OB_X2APIC",
+        "OB_MP",
         "OB_DUPLICATE",
         "OB_EXPECT_CMDLINE",
         "OB_EXPECT_MODULES",

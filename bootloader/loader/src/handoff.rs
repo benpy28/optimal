@@ -19,6 +19,7 @@ use core::arch::global_asm;
 
 /// Data the trampoline reads; lives at the start of a page below 4 GiB.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct Block {
     pub cr3: u64,            // 0x00
     pub cr4: u64,            // 0x08

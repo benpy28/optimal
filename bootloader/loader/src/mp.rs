@@ -552,7 +552,7 @@ pub fn start_all(plan: &mut Plan, p: &Parking) {
         ptr::copy_nonoverlapping(code.as_ptr(), l as *mut u8, code.len());
         let gdt_lin = (l + START_PARAMS + core::mem::offset_of!(StartParams, gdt) as u64) as u32;
         let far = (l + off32) as u32;
-        ptr::write(
+        ptr::write_volatile(
             params,
             StartParams {
                 started: 0,
@@ -599,17 +599,22 @@ pub fn start_all(plan: &mut Plan, p: &Parking) {
         // This AP's Block: the BSP's, with its own stack, GDT, entry
         // (the parking loop), argument (its info, as the kernel sees it),
         // and no identity-map removal (the BSP does that, last).
-        // SAFETY: the Block page is ours, identity mapped; no AP is using it.
-        let b = unsafe { &mut *(p.block as *mut Block) };
-        // SAFETY: Block is plain data.
-        unsafe { ptr::copy_nonoverlapping(&saved as *const Block, b, 1) };
+        //
+        // Every write another CPU reads is volatile: the compiler sees no
+        // reader of the Block page (the AP reads it through its own
+        // mappings), so plain stores here are dead to it (the next AP's copy
+        // and the final restore overwrite them) and may be dropped or moved
+        // past the IPIs. Found by `smp-r3`, which booted with a stale Block.
+        let mut nb: Block = saved;
         // SAFETY: gdt[i] has room for the GDT (arena, sized by arena_bytes).
-        unsafe { ptr::write(gdt[i] as *mut [u64; 9], handoff::GDT) };
-        handoff::set_gdtr(&mut b.gdtr_high, gdt[i] + p.hhdm);
-        b.low_entry = 0;
-        b.stack_top = top + p.hhdm;
-        b.entry = p.park;
-        b.arg = info[i] + p.hhdm;
+        unsafe { ptr::write_volatile(gdt[i] as *mut [u64; 9], handoff::GDT) };
+        handoff::set_gdtr(&mut nb.gdtr_high, gdt[i] + p.hhdm);
+        nb.low_entry = 0;
+        nb.stack_top = top + p.hhdm;
+        nb.entry = p.park;
+        nb.arg = info[i] + p.hhdm;
+        // SAFETY: the Block page is ours, identity mapped; no AP is using it.
+        unsafe { ptr::write_volatile(p.block as *mut Block, nb) };
         // SAFETY: the params are ours and no AP is running the start code.
         unsafe {
             ptr::write_volatile(&raw mut (*params).started, 0);
@@ -646,5 +651,5 @@ pub fn start_all(plan: &mut Plan, p: &Parking) {
         }
     }
     // SAFETY: every AP is parked or stopped; the page is the BSP's again.
-    unsafe { ptr::write(p.block as *mut Block, saved) };
+    unsafe { ptr::write_volatile(p.block as *mut Block, saved) };
 }

@@ -499,7 +499,11 @@ the MADT and parks it for the kernel, as the Limine protocol describes.
   MTRRs and `extra_argument`. It also checks the response against its own
   reading of the MADT. Cases: `smp` (8 CPUs, base revision 5), `smp-r3`
   (4 CPUs, base revision 3), and `smp-x2apic` (8 CPUs asking for x2APIC;
-  needs KVM). Every other case has one CPU and checks a BSP-only response.
+  needs KVM). `quirk-x2apic-mp` has the firmware leave x2APIC on with the
+  MP request not asking for it, so the loader must turn it off (KVM).
+  `quirk-x2apic` and `quirk-apic-off` leave the MP request out, so they
+  still test LAPIC set-up in the firmware's own APIC state. Every other
+  case has one CPU and checks a BSP-only response.
   All run under ours and under Limine.
 - **Not covered yet:** more than 255 CPUs (x2APIC-only ids), firmware with
   x2APIC locked, and real hardware.
