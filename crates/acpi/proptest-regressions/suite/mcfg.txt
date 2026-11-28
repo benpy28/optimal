@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 6822ce85fad53ed4ba64b168caa9d8790a440397b7878c007421be9cd45d6903 # entries_round_trip: duplicate entries [A, (0,0,0,0), A], A = (0, 2, 63, 118)

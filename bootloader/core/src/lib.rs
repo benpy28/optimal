@@ -5,7 +5,10 @@
 
 pub mod acpi;
 pub mod config;
+pub mod devpath;
 pub mod elf;
+#[cfg(test)]
+pub mod fuzzkit;
 pub mod kaslr;
 pub mod memmap;
 pub mod paging;

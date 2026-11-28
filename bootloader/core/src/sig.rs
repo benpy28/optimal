@@ -157,4 +157,95 @@ mod tests {
         assert!(!ct_eq(b"abc", b"abd"));
         assert!(!ct_eq(b"abc", b"ab"));
     }
+
+    /// Signature malleability: adding the group order L to s gives a second
+    /// encoding of the same signature. verify_strict must refuse it, or one
+    /// signed config would have two valid .sig files.
+    #[test]
+    fn non_canonical_s_is_refused() {
+        // L = 2^252 + 27742317777372353535851937790883648493, little endian.
+        const L: [u8; 32] = [
+            0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9,
+            0xde, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10,
+        ];
+        let k = SigningKey::from_bytes(&[7u8; 32]);
+        let trusted = [k.verifying_key().to_bytes()];
+        let cfg = b"optimal-boot-config 1\n";
+        let mut tried = 0;
+        // s + L only fits in 32 bytes when s < 2^256 - L; try a few configs.
+        for extra in 0u8..16 {
+            let mut c = cfg.to_vec();
+            c.push(extra);
+            let s = sign(&k, &c);
+            assert_eq!(verify(&c, &s, &trusted), Ok(0));
+            let mut m = s.clone();
+            let mut carry = 0u16;
+            for i in 0..32 {
+                let v = m[72 + i] as u16 + L[i] as u16 + carry;
+                m[72 + i] = v as u8;
+                carry = v >> 8;
+            }
+            if carry == 0 {
+                tried += 1;
+                assert_eq!(verify(&c, &m, &trusted), Err(SigError::Invalid));
+            }
+        }
+        assert!(tried > 0);
+    }
+
+    /// A trusted key that is not a valid curve point, or is of small order,
+    /// never verifies anything.
+    #[test]
+    fn malformed_and_weak_keys_are_refused() {
+        let k = SigningKey::from_bytes(&[9u8; 32]);
+        let cfg = b"x";
+        // The identity point (small order): y = 1.
+        let mut weak = [0u8; 32];
+        weak[0] = 1;
+        let mut s = sign(&k, cfg);
+        s[8..40].copy_from_slice(&key_id(&weak));
+        assert_eq!(verify(cfg, &s, &[weak]), Err(SigError::Invalid));
+        // y = 2 is not on the curve.
+        let mut bad = [0u8; 32];
+        bad[0] = 2;
+        s[8..40].copy_from_slice(&key_id(&bad));
+        assert_eq!(verify(cfg, &s, &[bad]), Err(SigError::BadKey));
+    }
+
+    /// Seeded fuzzing: random configs signed by one of several trusted keys
+    /// verify, and any mutation of the config or of the signature file that
+    /// changes a byte is refused.
+    #[test]
+    fn fuzz_any_change_is_refused() {
+        let keys: Vec<SigningKey> = (1..=4u8)
+            .map(|i| SigningKey::from_bytes(&[i; 32]))
+            .collect();
+        let trusted: Vec<[u8; 32]> = keys.iter().map(|k| k.verifying_key().to_bytes()).collect();
+        // Each case signs and verifies up to three times (about 100x the cost
+        // of a case of the other parsers), so it runs a tenth of the cases.
+        let n = crate::fuzzkit::cases().div_ceil(10);
+        crate::fuzzkit::run_n("sig", 5, n, |rng| {
+            let cfg: Vec<u8> = (0..rng.below(512)).map(|_| rng.next() as u8).collect();
+            let who = rng.below(4) as usize;
+            let s = sign(&keys[who], &cfg);
+            let k = 1 + rng.below(4) as usize;
+            let pool = &trusted[4 - k..];
+            let want = if who >= 4 - k {
+                Ok(who - (4 - k))
+            } else {
+                Err(SigError::UnknownKey)
+            };
+            assert_eq!(verify(&cfg, &s, pool), want);
+            let mut s2 = s.clone();
+            crate::fuzzkit::mutate(rng, &mut s2);
+            if s2 != s {
+                assert!(verify(&cfg, &s2, pool).is_err(), "mutated sig accepted");
+            }
+            let mut c2 = cfg.clone();
+            crate::fuzzkit::mutate(rng, &mut c2);
+            if c2 != cfg {
+                assert!(verify(&c2, &s, pool).is_err(), "mutated config accepted");
+            }
+        });
+    }
 }

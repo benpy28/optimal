@@ -6,7 +6,7 @@
 # under Limine is a bug in the check (or a Limine bug, to be confirmed
 # against the spec), and one that fails only under ours is a bug in ours.
 #
-# Cases: r3 r4 r5 r6 pie entry la57 tpm iommu-intel iommu-amd smp big small
+# Cases: r3 r4 r5 r6 pie entry la57 tpm iommu-intel iommu-amd smp big small tiny
 #        headless old-cpu
 #        quirk-r3 quirk quirk-x2apic quirk-apic-off quirk-iommu-intel
 #        quirk-iommu-amd
@@ -22,7 +22,7 @@ FW=${OVMF_CODE:-/usr/share/OVMF/OVMF_CODE_4M.fd}
 
 # The module every run carries: byte i = (i*167 + 13) mod 256, 100003 bytes.
 python3 -c "import sys; sys.stdout.buffer.write(bytes((i*167+13)&0xff for i in range(100003)))" > "$OUT/pattern"
-export OB_EXPECT_CMDLINE="conformance case=$case_name" OB_EXPECT_MODULES=1
+export OB_EXPECT_CMDLINE="conformance case=$case_name" OB_EXPECT_MODULES=1 OB_EXPECT_VOLUME=gpt
 export OB_REVISION=3 OB_PIE=0 OB_PAGING=4 OB_ENTRY_REQ=0
 QEMU=(-machine q35 -m 512M)
 TPM=0
@@ -41,6 +41,9 @@ case "$case_name" in
     smp) OB_REVISION=5; QEMU=(-machine q35 -m 2G -smp 8) ;;
     big) OB_REVISION=4; QEMU=(-machine q35 -m 6G) ;;
     small) QEMU=(-machine q35 -m 160M) ;;
+    # 128 MiB: the old ~38 MiB single-block page-table reservation failed
+    # here every boot. (Limine 11.4.1 itself runs out of memory at 96 MiB.)
+    tiny) QEMU=(-machine q35 -m 128M) ;;
     headless) OB_REVISION=5; QEMU+=(-vga none) ;;
     old-cpu) QEMU+=(-cpu qemu64,-nx,-pdpe1gb); export QEMU_ACCEL=tcg ;;
     quirk-r3) QUIRKS="pic ioapic lapic" ;;

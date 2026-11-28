@@ -36,6 +36,13 @@ jobs:
       - name: Core tests (release)
         run: cargo test -p optimal-boot-core --release
 
+      # DESIGN.md item 8: 10^5 seeded cases per parser (signatures 10^4, each
+      # signs and verifies), at release speed with overflow checks on.
+      - name: Parser fuzzing (10^5 cases per parser)
+        env:
+          OPTIMAL_FUZZ_CASES: "100000"
+        run: cargo test -p optimal-boot-core --profile fuzz fuzz
+
   loader:
     runs-on: ubuntu-24.04
     defaults:
@@ -64,7 +71,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        case: [r3, r4, r5, r6, pie, entry, la57, tpm, iommu-intel, iommu-amd, smp, big, small, headless, old-cpu,
+        case: [r3, r4, r5, r6, pie, entry, la57, tpm, iommu-intel, iommu-amd, smp, big, small, tiny, headless, old-cpu,
                quirk-r3, quirk, quirk-x2apic, quirk-apic-off, quirk-iommu-intel, quirk-iommu-amd]
     defaults:
       run:
