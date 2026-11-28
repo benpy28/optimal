@@ -19,9 +19,12 @@
 //! 6. order of appearance.
 //!
 //! The output of the cascade is each property's declarations in that
-//! order, the first being the cascaded value ([`Cascaded`]). Defaulting
-//! (`initial`, `inherit`, `revert` and the rest) works on that list in the
-//! next step.
+//! order, the first being the cascaded value ([`Cascaded`]). A shorthand
+//! declaration is a declaration of each of its longhands (css-cascade-5
+//! #shorthand: "exactly as if expanded in place"), `all` of every longhand
+//! but `direction` and `unicode-bidi`, so the lists are by longhand (and by
+//! name for custom properties). Defaulting (`initial`, `inherit`, `revert`
+//! and the rest) works on those lists ([`crate::defaulting`]).
 //!
 //! Design choices (chosen, why, rejected):
 //!
@@ -50,6 +53,11 @@ use optimal_selectors::{
 use std::collections::HashMap;
 
 use crate::collect::{Origin, StyleAttribute, StyleSet};
+use crate::property::{Classified, Keyword, LONGHANDS, Target, longhands};
+
+/// The block id of element-attached declarations: the style attribute
+/// counts as one rule for `revert-rule`.
+pub const ATTACHED_BLOCK: u32 = u32::MAX;
 
 /// Origin and importance, in increasing precedence (6.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -118,10 +126,16 @@ pub struct Entry {
     pub source: Source,
     /// Its precedence.
     pub priority: Priority,
+    /// Its value's CSS-wide keyword, if it is one.
+    pub keyword: Option<Keyword>,
+    /// The rule it is in, for `revert-rule`: its [`crate::Block::id`], or
+    /// [`ATTACHED_BLOCK`].
+    pub block: u32,
 }
 
 /// The output of the cascade for one element: for each property that has
 /// declarations, the declarations in decreasing precedence. Properties are
+/// longhands (by their names in [`LONGHANDS`]) and custom properties,
 /// sorted by name.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Cascaded<'n> {
@@ -334,6 +348,13 @@ impl<'c, 's: 'c, 'a, E: Element> Session<'c, 's, 'a, E> {
         matched.sort_unstable();
 
         let mut entries: Vec<(&'n str, Entry)> = Vec::new();
+        let mut push = |name: &'n str, c: Classified, e: Entry| {
+            if c.target == Target::Custom {
+                entries.push((name, e));
+            } else {
+                entries.extend(longhands(c.target).map(|l| (LONGHANDS[l as usize].name, e)));
+            }
+        };
         let mut i = 0;
         while i < matched.len() {
             let (r, mut spec) = matched[i];
@@ -346,8 +367,9 @@ impl<'c, 's: 'c, 'a, E: Element> Session<'c, 's, 'a, E> {
                 for d in block.decls.clone() {
                     let decl = &set.decls()[d as usize];
                     let important = decl.decl.important;
-                    entries.push((
+                    push(
                         &decl.name,
+                        decl.classified,
                         Entry {
                             source: Source::Rule(d),
                             priority: Priority {
@@ -357,15 +379,18 @@ impl<'c, 's: 'c, 'a, E: Element> Session<'c, 's, 'a, E> {
                                 specificity: spec,
                                 order: decl.order,
                             },
+                            keyword: decl.classified.keyword,
+                            block: block.id,
                         },
-                    ));
+                    );
                 }
             }
         }
         if let Some(style) = style {
-            for (i, (name, d)) in style.decls.iter().enumerate() {
-                entries.push((
+            for (i, (name, d, cl)) in style.decls.iter().enumerate() {
+                push(
                     name,
+                    *cl,
                     Entry {
                         source: Source::Attribute(i as u32),
                         priority: Priority {
@@ -375,8 +400,10 @@ impl<'c, 's: 'c, 'a, E: Element> Session<'c, 's, 'a, E> {
                             specificity: Specificity::ZERO,
                             order: set.end_order() + i as u32,
                         },
+                        keyword: cl.keyword,
+                        block: ATTACHED_BLOCK,
                     },
-                ));
+                );
             }
         }
         entries.sort_unstable_by(|a, b| a.0.cmp(b.0).then(b.1.priority.cmp(&a.1.priority)));

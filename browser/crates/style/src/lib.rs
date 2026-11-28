@@ -20,10 +20,14 @@
 
 pub mod cascade;
 pub mod collect;
+pub mod defaulting;
 pub mod layer;
+pub mod property;
 
-pub use cascade::{Cascade, Cascaded, Entry, Level, Priority, Session, Source};
+pub use cascade::{ATTACHED_BLOCK, Cascade, Cascaded, Entry, Level, Priority, Session, Source};
+pub use defaulting::{Outcome, Style, Value, resolve};
 pub use collect::{
     Block, Decl, MAX_RULE_NESTING, Origin, Sheet, SheetId, StyleAttribute, StyleRule, StyleSet,
 };
 pub use layer::{LayerId, Layers};
+pub use property::{Classified, Keyword, PropertyValidity, Target};

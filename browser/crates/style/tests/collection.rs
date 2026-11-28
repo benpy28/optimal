@@ -192,9 +192,9 @@ fn element_attached_declarations_come_after_every_sheet() {
 fn each_element_tries_only_its_buckets() {
     // Each selector is in one bucket: its rightmost compound's ID, else its
     // first class, else its type, else the universal bucket.
-    let css = "#i { a: 1 } .x { a: 1 } p { a: 1 } * { a: 1 } #i.x { a: 1 } p.x { a: 1 }
-        .x.y { a: 1 } .y.x { a: 1 } .x.z { a: 1 } p#i { a: 1 } :is(.x) { a: 1 } div .x { a: 1 }
-        a::before { a: 1 } p, .x, #i { a: 1 }";
+    let css = "#i { order: 1 } .x { order: 1 } p { order: 1 } * { order: 1 } #i.x { order: 1 } p.x { order: 1 }
+        .x.y { order: 1 } .y.x { order: 1 } .x.z { order: 1 } p#i { order: 1 } :is(.x) { order: 1 } div .x { order: 1 }
+        a::before { order: 1 } p, .x, #i { order: 1 }";
     let s = set(css);
     let mut t = Tree::new(true, "html");
     let full = t.add(0, HTML, "p", &[("id", "i"), ("class", "x X x")]);

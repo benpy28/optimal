@@ -107,11 +107,11 @@ fn nested_names_are_distinct_layers() {
     // 6.4.2, second example: framework.base is not base. "base" is
     // declared first, so framework.base (inside framework, declared later)
     // comes after it and wins.
-    let css = "@layer base { p { margin-block: 1; } }
-        @layer framework { @layer base { p { margin-block: 2; } } }";
+    let css = "@layer base { p { z-index: 1; } }
+        @layer framework { @layer base { p { z-index: 2; } } }";
     let t = one("p", &[]);
     assert_eq!(
-        ident(&author(css), &t, "margin-block", 1).as_deref(),
+        ident(&author(css), &t, "z-index", 1).as_deref(),
         Some("2")
     );
     // And framework.theme in a later block joins the same layer (third
@@ -224,11 +224,11 @@ fn origins_and_importance() {
     // Normal: author over user over user agent.
     assert_eq!(ident(&sheets, &t, "color", 1).as_deref(), Some("author"));
     // Important: user over author.
-    assert_eq!(ident(&sheets, &t, "margin", 1).as_deref(), Some("user"));
+    assert_eq!(ident(&sheets, &t, "margin-top", 1).as_deref(), Some("user"));
     // Important user agent over everything.
     assert_eq!(ident(&sheets, &t, "width", 1).as_deref(), Some("ua"));
     // Unopposed: the only one.
-    assert_eq!(ident(&sheets, &t, "padding", 1).as_deref(), Some("author"));
+    assert_eq!(ident(&sheets, &t, "padding-left", 1).as_deref(), Some("author"));
     // Normal user over normal user agent.
     let sheets = [
         ("p { color: ua; }", Origin::UserAgent),
@@ -254,7 +254,7 @@ fn element_attached_declarations() {
         @layer a { p { width: rule !important; } }";
     let s = author(css);
     assert_eq!(ident(&s, &t, "color", 1).as_deref(), Some("attr"));
-    assert_eq!(ident(&s, &t, "margin", 1).as_deref(), Some("rule"));
+    assert_eq!(ident(&s, &t, "margin-top", 1).as_deref(), Some("rule"));
     assert_eq!(ident(&s, &t, "width", 1).as_deref(), Some("attr"));
     // User important still beats author important attributes.
     let sheets = [("p { width: user !important }", Origin::User)];

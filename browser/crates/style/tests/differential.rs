@@ -8,9 +8,10 @@
 
 mod common;
 
-use common::reference::{self, Id, Model};
+use common::reference::{self, Id, MValue, Model};
 use common::tree::{HTML, SVG, Tree};
-use optimal_style::{Cascaded, Origin, Source, StyleAttribute, StyleSet};
+use optimal_style::{Cascaded, Origin, Source, Style, StyleAttribute, StyleSet, Value};
+use optimal_style::property::LONGHANDS;
 use optimal_wtf8::Wtf8;
 use proptest::prelude::*;
 
@@ -94,8 +95,48 @@ const NESTED_SELECTORS: &[&str] = &[
     ">",
     "& &",
 ];
-const NAMES: &[&str] = &["color", "COLOR", "margin", "--x", "--X", "width"];
-const VALUES: &[&str] = &["red", "1px", "\"blue\"", "f(b)", "{a}", "x y"];
+const NAMES: &[&str] = &[
+    "color",
+    "COLOR",
+    "margin",
+    "margin-top",
+    "--x",
+    "--X",
+    "width",
+    "display",
+    "all",
+    "ALL",
+    "direction",
+    "border",
+    "border-top-color",
+    "font-stretch",
+    "font-width",
+    "white-space",
+    "text-wrap-mode",
+    "nope",
+    "-webkit-nope",
+];
+const VALUES: &[&str] = &[
+    "red",
+    "1px",
+    "\"blue\"",
+    "f(b)",
+    "{a}",
+    "x y",
+    "initial",
+    "INHERIT",
+    "unset",
+    "revert",
+    "revert-layer",
+    "revert-rule",
+    "Revert-Layer",
+    "red initial",
+    "var(--x)",
+    "var(--x) inherit",
+    "f(var(--y))",
+    "--f(1)",
+    "default",
+];
 const LAYERS: &[&str] = &[
     "a", "b", "a.b", "b.a", "c", "A", "a.b.c", "initial", "a .b", "B.c",
 ];
@@ -259,6 +300,32 @@ fn ids(set: &StyleSet<'_>, c: &Cascaded<'_>) -> Vec<(String, Vec<Id>)> {
         .collect()
 }
 
+fn id(set: &StyleSet<'_>, s: Source) -> Id {
+    match s {
+        Source::Rule(d) => {
+            let d = &set.decls()[d as usize];
+            Id::Sheet(d.sheet as usize, d.decl.name)
+        }
+        Source::Attribute(i) => Id::Attribute(i as usize),
+    }
+}
+
+/// The production specified values as the model writes them.
+fn mstyle(set: &StyleSet<'_>, s: &Style<'_>) -> Vec<(String, MValue)> {
+    let v = |v: Value| match v {
+        Value::Initial => MValue::Initial,
+        Value::Declared { source, up } => MValue::Declared(id(set, source), up),
+    };
+    let mut out: Vec<(String, MValue)> = LONGHANDS
+        .iter()
+        .zip(s.longhands.iter())
+        .map(|(l, &x)| (l.name.to_string(), v(x)))
+        .chain(s.custom.iter().map(|&(n, x)| (n.to_string(), v(x))))
+        .collect();
+    out.sort();
+    out
+}
+
 fn run(seed: u64) {
     let mut g = Gen(seed | 1);
     let n = 1 + g.below(3);
@@ -284,7 +351,24 @@ fn run(seed: u64) {
     let model_styles: Vec<_> = (0..t.nodes.len())
         .map(|i| t.attr(i, "style").map(reference::style_attribute))
         .collect();
+    let elements: Vec<_> = (0..t.nodes.len()).map(|i| (t.el(i), t.nodes[i].parent)).collect();
+    let model_attrs: Vec<_> = (0..t.nodes.len())
+        .map(|i| t.attr(i, "style").map(reference::style_attribute))
+        .collect();
+    let model_specified = model.styles(&elements, quirks, &model_attrs);
     cascade.with_session(quirks, |s| {
+        let mut specified: Vec<Style<'_>> = Vec::new();
+        for i in 0..t.nodes.len() {
+            let initial = Style::initial();
+            let parent = t.nodes[i].parent.map_or(&initial, |p| &specified[p]);
+            let got = s.style(&t.el(i), styles[i].as_ref(), parent);
+            assert_eq!(
+                mstyle(&set, &got),
+                model_specified[i],
+                "specified values: seed {seed}, element {i}\nsheets: {sheets:#?}\ntree: {t:#?}\nquirks {quirks}"
+            );
+            specified.push(got);
+        }
         for i in 0..t.nodes.len() {
             let e = t.el(i);
             let got = s.cascade(&e, styles[i].as_ref());

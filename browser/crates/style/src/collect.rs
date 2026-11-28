@@ -29,22 +29,30 @@
 //! declared, as css-cascade-5 6.4.3 asks even when loading fails, unless
 //! it has import conditions); the conditional group rules (`@media`,
 //! `@supports`, `@container`) and `@scope` are dropped with their
-//! contents; every declaration is kept, whatever its name and value,
-//! until the property table can check them.
+//! contents.
+//!
+//! Declarations are checked by the property table ([`crate::property`]):
+//! an unknown property, or a misused CSS-wide keyword, makes a declaration
+//! invalid, and the parser drops it (css-syntax-3 "valid in the current
+//! context"). Each kept declaration records what it sets and its keyword.
 //!
 //! Design choices (chosen, why, rejected):
 //!
-//! - **Parse with every rule accepted, then check validity in one walk.**
+//! - **The parser checks declarations; the walk checks rules.**
 //!   css-syntax-3 asks the parser whether each rule and declaration is
-//!   "valid in the current context". That depends on context the parser
-//!   doesn't have (whether an ancestor is a style rule), so the sheet is
-//!   parsed with [`AcceptAll`] and the walk here drops what is invalid.
-//!   This gives the same rules and declarations: a rule the parser would
-//!   have refused only changes where a run of declarations is split into
-//!   a nested declarations rule, and the pieces of a split run match the
-//!   same elements with the same specificity, in the same order. Rejected:
-//!   a validity hook that tracks the open blocks, which needs the parser
-//!   to report them.
+//!   "valid in the current context". A declaration's validity depends only
+//!   on its property and value, so the parser asks the property table
+//!   ([`PropertyValidity`]). This matters: an invalid declaration is
+//!   re-read as a qualified rule, and if that rule has a `{}` block it
+//!   splits the run of declarations around it into a nested declarations
+//!   rule, which `revert-rule` can tell apart. A rule's validity depends on
+//!   context the parser doesn't have (whether an ancestor is a style rule),
+//!   so rules are accepted and the walk here drops what is invalid. That
+//!   gives the same rules and declarations: the parser treats a returned
+//!   rule and an invalid rule error alike (both split the run of
+//!   declarations there), and drops what is inside an invalid rule either
+//!   way. Rejected: a rule validity hook that tracks the open blocks,
+//!   which needs the parser to report them.
 //! - **The walk is iterative** (an explicit stack), because blocks nest as
 //!   deep as the input does.
 //! - **Nested style rules are limited in depth.** Matching follows `&`
@@ -57,7 +65,7 @@
 //!   limit. No real style sheet comes near it; the spec sets no limit.
 
 use optimal_css::{
-    AcceptAll, BlockItem, ComponentValue, Declaration, Kind, Parsed, Rule, RuleId, Token, Values,
+    BlockItem, ComponentValue, Declaration, Kind, Parsed, Rule, RuleId, Token, Values,
     parse_declaration_list, parse_stylesheet,
 };
 use optimal_selectors::{
@@ -68,6 +76,7 @@ use optimal_wtf8::Wtf8;
 use std::ops::Range;
 
 use crate::layer::{LayerId, Layers, layer_name, split_commas, trim};
+use crate::property::{Classified, PropertyValidity, classify};
 
 /// A cascade origin (css-cascade-5 6.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -107,6 +116,10 @@ pub struct Decl {
     pub sheet: SheetId,
     /// The declaration as parsed (its value is in the sheet's tokens).
     pub decl: Declaration,
+    /// What it sets, and its CSS-wide keyword.
+    pub classified: Classified,
+    /// The rule it is in: the id of its [`Block`].
+    pub block: u32,
     /// Its place in the order of appearance of all sheets' declarations.
     pub order: u32,
 }
@@ -115,6 +128,9 @@ pub struct Decl {
 /// own declarations or a nested declarations rule.
 #[derive(Clone, Debug)]
 pub struct Block {
+    /// Its id: blocks are numbered in order of appearance across all
+    /// sheets. Each is a rule of its own for `revert-rule`.
+    pub id: u32,
     /// The cascade layer it is in.
     pub layer: LayerId,
     /// Its declarations, as indices into [`StyleSet::decls`].
@@ -151,6 +167,7 @@ pub struct StyleSet<'a> {
     sheets: Vec<Sheet<'a>>,
     rules: Vec<StyleRule>,
     decls: Vec<Decl>,
+    blocks: u32,
     layers: Layers,
     refused: usize,
 }
@@ -161,17 +178,22 @@ pub struct StyleSet<'a> {
 pub struct StyleAttribute<'a> {
     /// The parse.
     pub parsed: Parsed<'a>,
-    /// The declarations, with their names as in [`Decl::name`].
-    pub decls: Vec<(Box<str>, Declaration)>,
+    /// The valid declarations, with their names as in [`Decl::name`], and
+    /// what each sets.
+    pub decls: Vec<(Box<str>, Declaration, Classified)>,
 }
 
 impl<'a> StyleAttribute<'a> {
     /// Parses a `style` attribute's value.
     pub fn parse(text: Wtf8<'a>) -> Self {
-        let (parsed, list) = parse_declaration_list(text, &mut AcceptAll);
+        let (parsed, list) = parse_declaration_list(text, &mut PropertyValidity);
         let decls = list
             .into_iter()
-            .map(|d| (property_name(parsed.name(d.name)), d))
+            .filter_map(|d| {
+                let name = property_name(parsed.name(d.name));
+                let c = classify(&name, parsed.values(d.value.clone()))?;
+                Some((name, d, c))
+            })
             .collect();
         StyleAttribute { parsed, decls }
     }
@@ -249,11 +271,14 @@ impl<'a> StyleSet<'a> {
     /// Parses `text` as a style sheet of `origin` and adds its rules after
     /// those of the sheets added before.
     pub fn add_sheet(&mut self, text: Wtf8<'a>, origin: Origin) -> SheetId {
-        let (parsed, top) = parse_stylesheet(text, &mut AcceptAll);
+        let (parsed, top) = parse_stylesheet(text, &mut PropertyValidity);
         self.add_parsed(parsed, &top, origin)
     }
 
-    /// Adds an already parsed sheet (`top` its top-level rules).
+    /// Adds an already parsed sheet (`top` its top-level rules). It should
+    /// have been parsed with [`PropertyValidity`]: invalid declarations
+    /// are dropped here too, but only the parser can split runs of
+    /// declarations where css-syntax-3 does.
     pub fn add_parsed(&mut self, parsed: Parsed<'a>, top: &[RuleId], origin: Origin) -> SheetId {
         let id = self.sheets.len() as SheetId;
         Walk {
@@ -341,16 +366,28 @@ impl<'p, 'a> Walk<'_, '_, 'p, 'a> {
             return;
         }
         let start = self.set.decls.len() as u32;
+        let block = self.set.blocks;
         for d in decls {
+            let name = property_name(self.parsed.name(d.name));
+            let Some(classified) = classify(&name, self.parsed.values(d.value.clone())) else {
+                continue;
+            };
             self.set.decls.push(Decl {
-                name: property_name(self.parsed.name(d.name)),
+                name,
                 sheet: self.sheet,
                 decl: d.clone(),
+                classified,
+                block,
                 order: self.set.decls.len() as u32,
             });
         }
         let end = self.set.decls.len() as u32;
+        if start == end {
+            return;
+        }
+        self.set.blocks += 1;
         self.set.rules[style as usize].blocks.push(Block {
+            id: block,
             layer: ctx.layer,
             decls: start..end,
         });
