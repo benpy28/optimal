@@ -41,7 +41,9 @@ case "$case_name" in
     smp) OB_REVISION=5; QEMU=(-machine q35 -m 2G -smp 8) ;;
     big) OB_REVISION=4; QEMU=(-machine q35 -m 6G) ;;
     small) QEMU=(-machine q35 -m 160M) ;;
-    tiny) QEMU=(-machine q35 -m 96M) ;;
+    # 128 MiB: the old ~38 MiB single-block page-table reservation failed
+    # here every boot. (Limine 11.4.1 itself runs out of memory at 96 MiB.)
+    tiny) QEMU=(-machine q35 -m 128M) ;;
     headless) OB_REVISION=5; QEMU+=(-vga none) ;;
     old-cpu) QEMU+=(-cpu qemu64,-nx,-pdpe1gb); export QEMU_ACCEL=tcg ;;
     quirk-r3) QUIRKS="pic ioapic lapic" ;;
