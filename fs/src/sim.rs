@@ -93,6 +93,13 @@ pub struct Faults {
     /// A failed flush also loses every write it had not yet made durable
     /// (as a kernel may drop the pages of a failed writeback).
     pub failed_flush_loses_cache: bool,
+    /// Reads with index (counting every read since the device was made,
+    /// from 0) in `[.0, .0 + .1)` fail: a transient read error. Two in a
+    /// row defeat a metadata read's second copy.
+    pub fail_reads: Option<(u64, u64)>,
+    /// Reads `fail_reads` picks return damaged data instead of an error
+    /// (a flipped bit: a checksum failure, not an I/O error).
+    pub fail_reads_corrupt: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +113,8 @@ pub struct CrashDevice {
     /// Writes completed so far.
     pub writes: u64,
     pub flushes: u64,
+    /// Reads requested so far (failed ones included).
+    pub reads: u64,
     /// Lose power when `writes + flushes` reaches this value.
     pub cut_at: Option<u64>,
     powered: bool,
@@ -127,6 +136,7 @@ impl CrashDevice {
             ops: 0,
             writes: 0,
             flushes: 0,
+            reads: 0,
             cut_at: None,
             powered: true,
             faults: Faults::default(),
@@ -266,6 +276,19 @@ impl BlockDevice for CrashDevice {
     fn read(&mut self, block: u64, buf: &mut [u8]) -> Result<(), IoError> {
         self.step(false)?;
         let n = check_range(self.blocks, block, buf.len())?;
+        let index = self.reads;
+        self.reads += 1;
+        let damage = if let Some((from, count)) = self.faults.fail_reads
+            && index >= from
+            && index - from < count
+        {
+            if !self.faults.fail_reads_corrupt {
+                return Err(IoError::Failed);
+            }
+            true
+        } else {
+            false
+        };
         if self.faults.read_error_one_in > 0 && self.rng.chance(1, self.faults.read_error_one_in) {
             return Err(IoError::Failed);
         }
@@ -279,6 +302,9 @@ impl BlockDevice for CrashDevice {
                     dst.copy_from_slice(&self.durable[off..off + BLOCK_SIZE]);
                 }
             }
+        }
+        if damage {
+            buf[n as usize / 2 * BLOCK_SIZE + 100] ^= 0x10;
         }
         Ok(())
     }

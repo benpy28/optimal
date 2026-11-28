@@ -47,10 +47,12 @@ fn slots(dev: &mut CrashDevice) -> Vec<(u32, u64)> {
 /// The commit's second superblock write fails once, after the first one
 /// reached slot 1 or 0 with generation g+1. That copy may survive on disk
 /// with roots the retry frees and reuses, so the retry must be numbered
-/// g+2 (never a second, different g+1) and must overwrite all four slots
-/// (so no stale g+1 copy outranks older good ones).
+/// g+2 (never a second, different g+1) and must overwrite every slot that
+/// still takes writes (so no stale g+1 copy outranks older good ones). The
+/// slot whose write failed is not written again on this mount; the next
+/// mount tries it again.
 #[test]
-fn failed_superblock_write_numbers_above_it_and_rewrites_every_slot() {
+fn failed_superblock_write_numbers_above_it_and_writes_around_the_slot() {
     let setup = || {
         let mut fs = fresh();
         fs.create(ROOT_INO, b"a", 0o644).unwrap();
@@ -67,27 +69,50 @@ fn failed_superblock_write_numbers_above_it_and_rewrites_every_slot() {
     fs.commit().unwrap();
     let trace = fs.device_mut().trace.take().unwrap();
     let total = 4096;
-    let sb: Vec<u64> = trace
+    let addr_slot = |b: u64| [0, 1, total - 1, total - 2].iter().position(|&a| a == b);
+    let sb: Vec<(u64, u32)> = trace
         .iter()
         .enumerate()
-        .filter(|(_, (b, _))| [0, 1, total - 2, total - 1].contains(b))
-        .map(|(i, _)| first + i as u64)
+        .filter_map(|(i, (b, _))| addr_slot(*b).map(|s| (first + i as u64, s as u32)))
         .collect();
     assert_eq!(sb.len(), 2, "an ordinary commit writes its own pair");
+    let dead = sb[1].1;
 
     let mut fs = setup();
-    fs.device_mut().faults.fail_write_at = Some(sb[1]);
+    fs.device_mut().faults.fail_write_at = Some(sb[1].0);
     fs.commit().unwrap();
     assert_eq!(
         fs.generation(),
         g + 2,
         "retry numbered above the failed commit"
     );
+    assert_eq!(fs.dead_slots, 1 << dead);
+    // Later commits on this mount write two live slots each, never the dead one.
+    for _ in 0..3 {
+        fs.create(ROOT_INO, format!("c{}", fs.generation()).as_bytes(), 0o644)
+            .unwrap();
+        fs.device_mut().trace = Some(Vec::new());
+        fs.commit().unwrap();
+        let t = fs.device_mut().trace.take().unwrap();
+        let written: Vec<u32> = t
+            .iter()
+            .filter_map(|(b, _)| addr_slot(*b).map(|s| s as u32))
+            .collect();
+        assert_eq!(written.len(), 2, "two copies of every commit: {written:?}");
+        assert!(!written.contains(&dead));
+    }
+    let gen_now = fs.generation();
     let mut dev = fs.into_device();
+    let v = slots(&mut dev);
+    for (s, sg) in &v {
+        if *s == dead {
+            assert!(*sg < g + 2, "dead slot {s} was written: {v:?}");
+        }
+    }
     assert_eq!(
-        slots(&mut dev),
-        vec![(0, g + 2), (1, g + 2), (2, g + 2), (3, g + 2)],
-        "every slot rewritten"
+        v.iter().filter(|(_, x)| *x == gen_now).count(),
+        2,
+        "newest commit on two slots: {v:?}"
     );
     let mut fs = Filesystem::mount(
         dev,
@@ -96,10 +121,18 @@ fn failed_superblock_write_numbers_above_it_and_rewrites_every_slot() {
         Box::new(ZeroClock),
     )
     .unwrap();
+    assert_eq!(fs.generation(), gen_now);
     let ino = fs.lookup(ROOT_INO, b"b").unwrap();
     let mut buf = vec![0u8; 10_000];
     assert_eq!(fs.read(ino, 0, &mut buf).unwrap(), 10_000);
     assert!(buf.iter().all(|&x| x == 7));
+    // A new mount tries every slot again (the failure was transient).
+    assert_eq!(fs.dead_slots, 0);
+    fs.create(ROOT_INO, b"after", 0o644).unwrap();
+    fs.commit().unwrap();
+    fs.create(ROOT_INO, b"after2", 0o644).unwrap();
+    fs.commit().unwrap();
+    assert_eq!(fs.dead_slots, 0);
 }
 
 /// Blocks in the bad set are never reported as available, free or not:

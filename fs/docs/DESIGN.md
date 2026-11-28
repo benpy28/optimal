@@ -240,6 +240,37 @@ file system only ever retries at a new block. In this crate:
 
 - Reads never poison anything. A read that fails returns the error and the
   volume carries on.
+- **Operations are all or nothing.** An operation that fails part way (a
+  read error or checksum failure in the middle of a rename, say) is undone
+  in memory before it returns its error, and the volume stays writable
+  (`Filesystem::op`). While an operation runs, the trees log every item
+  they change with its old value (`Store::undo`; the old value is moved
+  there, not copied), and file data an item stops pointing at is logged as
+  released. Undo puts the items back newest first and takes those releases
+  out of the transaction's space-map log, and only if there were any (or a
+  free failed part way) rebuilds the space map from the last commit and the
+  log, as a failed commit does. Tree nodes made dirty on the way stay
+  dirty: they hold the same items, and the free of their old copy stays in
+  the log. Changes to the dirty file data (a deleted file's, a shrunk
+  file's tail) are queued and made only once the operation succeeded; a
+  write puts its data in after its last step that can fail. Snapshot
+  operations, which replace whole trees and free blocks a tree still
+  points at, keep the whole trees instead (dirty nodes are shared, so that
+  is a pointer copy; they commit first, so the trees are clean) and replay
+  the space-map log up to the checkpoint. A commit inside an operation
+  moves the checkpoint past it, since what is durable is not undone; a
+  snapshot operation whose own commit fails is undone too. So a snapshot
+  rollback that fails after its middle commit keeps the newer snapshots it
+  already deleted.
+- **Commits undo their own tree changes the same way**: a data flush that
+  fails while building extents (a read in the punch of old extents, or no
+  space) is undone as a whole, its allocations taken out of the log and
+  every block back in dirty memory; a snapshot deadlist append that fails
+  is undone item by item and its pending list kept. Then the commit is
+  rebuilt and retried as below. A read the commit needed that failed its
+  checksum is retried the same way, since the damage may have been in
+  transit; if it persists, the commit attempts run out and the volume
+  degrades.
 - **A commit whose writes fail keeps its transaction.** The blocks of every
   failed request join a per-mount bad set, widened to their aligned group
   of 64 blocks (256 KiB; failing blocks come in regions, such as a worn
@@ -281,20 +312,36 @@ file system only ever retries at a new block. In this crate:
 - A commit refused for space inside the commit (space accounting makes this
   a bug, but it is handled) is rebuilt the same way and returns `NoSpace`;
   the volume stays writable.
+- **Superblock slots that fail are written around.** A slot is a fixed
+  block and cannot move, so a slot whose write fails is not written again
+  on this mount (a later mount, or a commit on a degraded volume, tries it
+  again), and the retry writes around it. With a dead slot every commit
+  still lands on two slots: its own pair's live slots, then live slots of
+  the other pair, one slot per flushed wave, so at most one copy is in
+  flight and a power cut leaves either the new commit or the previous one
+  whole on some slot. With fewer than two live slots the commit is refused
+  before any write and the volume degrades (`Error::DeviceFailing`):
+  overwriting the one copy left in place could tear it with nothing to fall
+  back to. A dead slot may keep an old copy; it is older than every live
+  one, so mount only reaches it if all live copies fail, and then checks
+  it like any fallback.
 - **Still stops the volume** (`Error::Poisoned`, remount to continue, the
-  disk holds the last good commit): an error that leaves a tree half
-  changed, that is a read or corruption error in the middle of a mutating
-  operation, or in a commit's own tree changes (the snapshot deadlist
-  append, the punch before writing file data); and a rebuild that can't
-  read the last commit back. Rolling back a half-applied operation with the
-  same log is on the "Not done yet" list.
-- Superblock slots are fixed blocks: a slot that fails every write makes
-  every commit to its pair fail, and the volume degrades. Writing around a
-  dead slot is on the "Not done yet" list.
+  disk holds the last good commit): a failure while undoing an operation
+  or rebuilding after a failed commit (both read the last commit back, so
+  a device that stopped reading stops the volume), an unwritten file block
+  that no longer reads back intact, and internal inconsistencies other than
+  checksum failures.
 - The VFS (the file system track, after 4a) owns errseq, page retention
   while a device is gone, and the read-only switch.
 
-What it costs on the success path: one log entry (at most 40 bytes) per
+What undo costs on the success path: one undo record per changed tree
+item (key and moved old value, no copy) and per data release, dropped when
+the operation returns; see "Testing" for the measurement. Rejected: copying
+the trees per operation with copy-on-write in memory (tried first; creates
+went from about 4 to 15 microseconds, since every operation then copies
+each node it touches).
+
+What the rebuild costs on the success path: one log entry (at most 40 bytes) per
 space-map change made through the trees or the data path (freed tree nodes
 and extents, data runs), one reference-count increment per tree node a
 commit writes, and a range set of blocks written since the last flush.
@@ -320,7 +367,8 @@ the heaviest testing in the project:
   compared, full state is compared regularly, and fsck runs throughout.
 - **Write failures** (`tests/write_fail.rs`): every write of a random
   workload (with snapshots and remounts) failing for good, its blocks gone
-  bad, and every flush failing once: every operation still succeeds and
+  bad (a superblock slot included: commits write around it), and every
+  flush failing once: every operation still succeeds and
   matches the model, fsck is clean, a remount shows the committed state. A
   failed write followed by a power cut at each of the next 24 write
   points: mount gives the last returned commit or a state the interrupted
@@ -333,6 +381,30 @@ the heaviest testing in the project:
   in the available count, a mid-transaction rebuild reproducing the space
   map exactly, the attempt bound and the bad-set limit. 18 hand mutations
   of the safeguards, 18 caught.
+- **Operations failing part way** (`tests/op_undo.rs`): a random workload
+  with snapshots, remounts, frequent commits and the node cache dropped
+  before each operation fails the k-th and (k+1)-th device read of every
+  operation, for every k from 0 to 11, half the runs as an I/O error and
+  half as damaged data. After each failure the volume is not stopped, the
+  live tree and every snapshot equal the model before the operation, a
+  commit and fsck are clean, and the operation retried succeeds. Unit
+  tests (`src/op_undo_tests.rs`): hand-worked superblock wave plans, a
+  slot dead for good (each later commit on two other slots, remount finds
+  it again), two dead slots, three dead slots (degraded, changes readable,
+  a commit lands them once the device works), an unlink failing at each
+  read point after its data was released (data intact, fsck exact; also
+  under a snapshot, then deleting the snapshot), a truncate failing part
+  way (dirty data untouched), a commit whose data flush fails at each read
+  point, a snapshot whose commit fails for good, losing a third slot, and
+  the counters a failed create or snapshot moved. 29 hand mutations of the
+  new safeguards, 26 caught. Survivors: deferring the drop of a shrunk
+  file's dirty blocks and undoing a deadlist append item by item guard
+  conditions no current path reaches (a file with dirty data always has a
+  dirty inode leaf, so nothing after the drop reads; after a deadlist
+  append's first insert its path is dirty, so later inserts cannot read).
+  The flag for a space-map free that fails part way is reachable but not
+  yet tested: it needs a bitmap read to fail in the middle of one
+  multi-block free that spans two bitmap blocks (32768 blocks each).
 - **Lying drives**: flushes are acknowledged but lost for 1 to 8 commits,
   then power is cut. Images are steered into the worst cases (every later
   superblock write landed; or only the newest pair landed and the other pair
@@ -388,6 +460,18 @@ the heaviest testing in the project:
   undo log inside the space map (every internal copy-on-write step would
   need an inverse); replaying whole operations (inode numbers, times and
   hashes would have to be replayed exactly).
+- An operation that fails part way is undone from an undo log of the tree
+  items it changed (old values moved in, no copies) and the data it
+  released. Rejected: copy-on-write snapshots of the trees per operation
+  (each operation copies every node it touches, about 4x slower creates);
+  stopping the volume (one transient read error would end all writes).
+  Snapshot operations keep whole trees instead: they replace trees and
+  free blocks still referenced, which an item log can't express.
+- A superblock slot whose write fails is written around for the mount,
+  with each commit still on two slots, one per flushed wave. Rejected:
+  persisting dead slots (format change; a mount retries them, which costs
+  one failed attempt); allowing a single live slot (an in-place overwrite
+  of the only copy can tear).
 - Failed writes move to new blocks and condemn their 256 KiB group for the
   mount, and are not retried in place: the block layer already retried, and
   writing again to a region that just failed is what repair avoids too. A
@@ -458,7 +542,7 @@ the file system track is done.
 | Hibernation region, stage 1 to 2 migration | | open, kernel integration |
 | Optional features: vault region (F3), travel class key (F5), remove a file from every snapshot (F12) | | open |
 | Per-file fsync intent log, benchmarked under background writeback; it also carries namespace operations (directory fsync, link, rename, O_TMPFILE plus linkat), syncfs latency has a published bound, and a dpkg-style create, fsync, rename, directory-fsync loop joins the tests | FORMAT body (root reserved) | open (next but one) |
-| Error policy: failed write retried at a new block, at most 3 writeback cycles | Errors | done for commits and data flushes; half-applied operations still stop the volume (Not done yet) |
+| Error policy: failed write retried at a new block, at most 3 writeback cycles | Errors | done: commits, data flushes and dead superblock slots; operations that fail part way are undone |
 | Metadata stored twice: 64-byte pointers with logical addresses, paired chunks, copy-on-write chunk table in every root set, MAC binds the logical address | Duplicated metadata; FORMAT "Duplicated metadata" | done |
 | The two copies differ; no (copy 1 key, nonce) pair repeats | Duplicated metadata; FORMAT "The second copy" | done (copy 1 checked through the parent's MAC rather than a trailer tag, as agreed in design review) |
 | Online scrub | Duplicated metadata (`scrub_metadata`) | done for metadata on an idle volume; online (concurrent) scrub open |
@@ -469,19 +553,16 @@ the file system track is done.
 
 ## Not done yet (tracked, in order)
 
-1. Rolling back a half-applied operation (a read or corruption error in the
-   middle of one) with the transaction log instead of stopping the volume,
-   and writing around a superblock slot that fails every write.
-2. The per-file fsync intent log (its records can build on the
+1. The per-file fsync intent log (its records can build on the
    transaction log of `Store::log`), with an fsync-under-writeback benchmark.
-3. Benchmarks against ext4 (fio-style workloads on the same device),
+2. Benchmarks against ext4 (fio-style workloads on the same device),
    including a scrub that reads copy 1 first.
-4. Kani proofs for the space map, chunk table and tree invariants.
-5. Inline data for small files and an AES-GCM-style suite.
-6. Concurrency (the API is `&mut self` today; the kernel will wrap it first).
-7. A metadata reserve sized for real disks (2%, 256 MiB to 8 GiB), online
+3. Kani proofs for the space map, chunk table and tree invariants.
+4. Inline data for small files and an AES-GCM-style suite.
+5. Concurrency (the API is `&mut self` today; the kernel will wrap it first).
+6. A metadata reserve sized for real disks (2%, 256 MiB to 8 GiB), online
    scrub, a rescue mount and an export tool.
-8. Orphan handling for files that are unlinked while still open (needs the VFS).
-9. Kernel VFS integration (the file system track, after 4a), including the
+7. Orphan handling for files that are unlinked while still open (needs the VFS).
+8. Kernel VFS integration (the file system track, after 4a), including the
    key hierarchy, TRIM, suspend and hibernation rules, and zeroing freed
    page-cache frames of encrypted volumes.

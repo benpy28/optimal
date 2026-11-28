@@ -635,6 +635,11 @@ pub struct Harness {
     pub seed: u64,
     pub mounts: u64,
     pub ops_done: u64,
+    /// Node cache size for remounts (small: more reads reach the device).
+    pub cache_nodes: usize,
+    /// `apply` returns checksum failures ([`Error::Corrupt`]) like I/O
+    /// errors instead of failing the comparison (injected damage).
+    pub pass_faults: bool,
 }
 
 /// Metadata chunk size for a run: `OFS_CHUNK` if set, otherwise spread
@@ -674,6 +679,8 @@ impl Harness {
             seed,
             mounts: 0,
             ops_done: 0,
+            cache_nodes: 512,
+            pass_faults: false,
         })
     }
 
@@ -709,6 +716,8 @@ impl Harness {
             seed,
             mounts: 100,
             ops_done: 0,
+            cache_nodes: 512,
+            pass_faults: false,
         }
     }
 
@@ -756,6 +765,11 @@ impl Harness {
         macro_rules! cmp {
             ($real:expr, $model:expr) => {{
                 let real = $real;
+                if let Err(e @ (Error::Io(_) | Error::Corrupt(..))) = &real
+                    && self.pass_faults
+                {
+                    return Err(e.clone());
+                }
                 if let Err(Error::Io(e)) = &real {
                     return Err(Error::Io(*e));
                 }
@@ -884,6 +898,11 @@ impl Harness {
                 if let Err(Error::Io(e)) = r {
                     return Err(Error::Io(e));
                 }
+                if let Err(e @ Error::Corrupt(..)) = &r
+                    && self.pass_faults
+                {
+                    return Err(e.clone());
+                }
                 if r == Err(Error::NoSpace) {
                     return Ok(());
                 }
@@ -900,6 +919,11 @@ impl Harness {
                 let r = self.fs().snapshot_delete(id);
                 if let Err(Error::Io(e)) = r {
                     return Err(Error::Io(e));
+                }
+                if let Err(e @ Error::Corrupt(..)) = &r
+                    && self.pass_faults
+                {
+                    return Err(e.clone());
                 }
                 cmp!(
                     r,
@@ -919,6 +943,11 @@ impl Harness {
                 let r = self.fs().rollback(id);
                 if let Err(Error::Io(e)) = r {
                     return Err(Error::Io(e));
+                }
+                if let Err(e @ Error::Corrupt(..)) = &r
+                    && self.pass_faults
+                {
+                    return Err(e.clone());
                 }
                 cmp!(
                     r,
@@ -945,7 +974,10 @@ impl Harness {
                 self.mounts += 1;
                 let fs = Filesystem::mount(
                     dev,
-                    &mount_opts(self.enc),
+                    &MountOptions {
+                        cache_nodes: self.cache_nodes,
+                        ..mount_opts(self.enc)
+                    },
                     &mut Rng::new(self.seed ^ self.mounts),
                     Box::new(ZeroClock),
                 )?;
