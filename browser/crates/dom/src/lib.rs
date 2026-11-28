@@ -24,6 +24,7 @@
 
 #![forbid(unsafe_code)]
 
+mod link_cut;
 pub mod names;
 pub mod select;
 
@@ -151,6 +152,8 @@ pub struct Document {
     pub quirks_mode: QuirksMode,
     /// Element behaviour bookkeeping: microtasks, ancestor-context memos.
     pub(crate) model: select::Model,
+    /// The host-including tree, for ancestor checks at any depth.
+    ancestry: link_cut::LinkCut,
 }
 
 impl Default for Document {
@@ -179,6 +182,11 @@ impl Document {
             model: select::Model {
                 flagged: vec![false],
                 ..select::Model::default()
+            },
+            ancestry: {
+                let mut a = link_cut::LinkCut::default();
+                a.push();
+                a
             },
         }
     }
@@ -211,6 +219,7 @@ impl Document {
             data,
         });
         self.model.flagged.push(false);
+        self.ancestry.push();
         id
     }
 
@@ -224,10 +233,6 @@ impl Document {
     ) -> NodeId {
         let template_contents = (namespace == Namespace::Html && local == local::TEMPLATE)
             .then(|| self.create(NodeData::DocumentFragment));
-        let host = NodeId(u32::try_from(self.nodes.len()).expect("more than 4 billion nodes"));
-        if let Some(c) = template_contents {
-            self.model.hosts.insert(c, host);
-        }
         let behaviour = select::Behaviour::for_new_element(namespace, local, &attributes);
         let relevant = behaviour.is_relevant();
         let id = self.create(NodeData::Element(Element {
@@ -239,6 +244,12 @@ impl Document {
         }));
         if relevant {
             self.model.flagged[id.index()] = true;
+        }
+        if let Some(c) = template_contents {
+            // Contents count as inside their template, for the
+            // host-including ancestor check. The fragment never gets a
+            // parent of its own.
+            self.ancestry.link(c.0, id.0);
         }
         id
     }
@@ -328,23 +339,17 @@ impl Document {
     /// template's contents count as being inside the template, so a
     /// template cannot go into its own contents. A node with no children
     /// and no template contents can only cycle by being `parent`, which
-    /// keeps the parser's inserts (always of new, empty nodes) O(1) at any
-    /// depth.
-    pub fn would_cycle(&self, child: NodeId, parent: NodeId) -> bool {
+    /// keeps the parser's inserts of new, empty nodes O(1). Other nodes
+    /// take O(log n) amortised, at any depth (a link-cut tree; a walk to
+    /// the root made repeated moves deep in a tree quadratic).
+    pub fn would_cycle(&mut self, child: NodeId, parent: NodeId) -> bool {
         let contents = self.element(child).and_then(|e| e.template_contents);
         let has_contents = contents.is_some_and(|c| self.nodes[c.index()].first_child.is_some());
         if self.nodes[child.index()].first_child.is_none() && !has_contents {
             // Below an empty node there is only an empty contents fragment.
             return child == parent || contents == Some(parent);
         }
-        let mut n = Some(parent);
-        while let Some(x) = n {
-            if x == child {
-                return true;
-            }
-            n = self.parent(x).or_else(|| self.model.hosts.get(&x).copied());
-        }
-        false
+        self.ancestry.is_inclusive_ancestor(child.0, parent.0)
     }
 
     /// Does the node have an element child?
@@ -378,6 +383,7 @@ impl Document {
         c.parent = None;
         c.prev_sibling = None;
         c.next_sibling = None;
+        self.ancestry.cut(child.0);
     }
 
     /// The DOM's "pre-insert" and "insert": insert `child` into `parent`
@@ -446,6 +452,7 @@ impl Document {
             Some(r) => self.nodes[r.index()].prev_sibling = Some(child),
             None => self.nodes[parent.index()].last_child = Some(child),
         }
+        self.ancestry.link(child.0, parent.0);
     }
 
     /// Append `child` to `parent`.
@@ -497,6 +504,20 @@ impl Document {
                     .is_some_and(|p| self.is_inclusive_ancestor(id, p)),
                 "cycle"
             );
+        }
+        // The link-cut tree holds exactly the host-including parents.
+        let mut host = vec![None; self.nodes.len()];
+        for (i, n) in self.nodes.iter().enumerate() {
+            if let NodeData::Element(e) = &n.data
+                && let Some(c) = e.template_contents
+            {
+                host[c.index()] = Some(i as u32);
+            }
+        }
+        let mut ancestry = self.ancestry.clone();
+        for (i, n) in self.nodes.iter().enumerate() {
+            let expected = n.parent.map(|p| p.0).or(host[i]);
+            assert_eq!(ancestry.tree_parent(i as u32), expected, "ancestry of {i}");
         }
         self.check_behaviour();
     }

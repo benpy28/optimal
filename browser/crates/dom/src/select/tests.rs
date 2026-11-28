@@ -1196,7 +1196,11 @@ fn apply(docs: &mut [Document; 2], op: &Op) {
                 let (a, b) = (pick(a), pick(b));
                 let ok = d.element(a).is_some()
                     && d.element(b).is_some()
-                    && !d.children(a).any(|c| d.would_cycle(c, b));
+                    && !d
+                        .children(a)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .any(|c| d.would_cycle(c, b));
                 if ok {
                     d.move_children(a, b);
                 }

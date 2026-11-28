@@ -164,8 +164,6 @@ pub(crate) struct Model {
     pub(crate) microtasks: VecDeque<NodeId>,
     /// Counts insert and remove operations, for `SelectState::settled_op`.
     pub(crate) op: u64,
-    /// Template contents fragment to its template (the fragment's host).
-    pub(crate) hosts: HashMap<NodeId, NodeId>,
     /// Work done, so tests can check the fast paths are taken.
     pub(crate) stats: Stats,
 }
