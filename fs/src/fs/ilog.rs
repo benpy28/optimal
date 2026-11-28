@@ -971,7 +971,7 @@ mod tests {
     #[test]
     fn pending_records_never_outgrow_the_ring() {
         let mut fs = Filesystem::format(
-            CrashDevice::new(4096, 3),
+            CrashDevice::new(1 << 16, 3),
             &FormatOptions {
                 passphrase: None,
                 kdf: crate::KdfParams::INSECURE_FAST_FOR_TESTS,
@@ -986,6 +986,9 @@ mod tests {
         fs.mark_dirty();
         fs.commit().unwrap();
         let cap = fs.ilog.capacity_bytes();
+        // A volume big enough that no create commits for space (which
+        // would end the chain instead).
+        let g0 = fs.generation();
         let mut most = 0;
         let mut i = 0;
         while fs.ilog.tracking() {
@@ -995,6 +998,7 @@ mod tests {
             i += 1;
             assert!(i < 1000, "records never filled a 16-block ring");
         }
+        assert_eq!(fs.generation(), g0, "the records, not a commit, ended it");
         assert!(most <= cap, "{most} bytes held for a {cap}-byte ring");
         assert!(fs.ilog.pending.is_empty());
         let g = fs.generation();
