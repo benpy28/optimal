@@ -62,17 +62,32 @@ jobs:
           swapon --show || true
           mke2fs -V 2>&1 | head -1; cryptsetup --version
           sysctl vm.dirty_ratio vm.dirty_background_ratio vm.dirty_expire_centisecs vm.dirty_writeback_centisecs
-      - name: Free the temporary disk
+      - name: Pick the benchmark device
         id: disk
         run: |
-          # The runner's second disk (mounted at /mnt, holding the swap file)
-          # is the benchmark partition: nothing else writes to it once freed.
-          src=$(findmnt -n -o SOURCE /mnt)
-          disk=$(lsblk -n -o PKNAME "$src")
-          root=$(lsblk -n -o PKNAME "$(findmnt -n -o SOURCE /)")
-          [ -n "$disk" ] && [ "$disk" != "$root" ] || { echo "no separate temporary disk"; exit 1; }
-          sudo swapoff -a
-          sudo umount /mnt
+          # A separate temporary disk at /mnt (older Azure runners) is used
+          # raw once freed. Otherwise (runners whose root is a dm snapshot
+          # over EBS and instance storage, nothing free) a fully allocated
+          # 17 GiB file on the root file system behind a direct-I/O loop
+          # device: both file systems then run on the same loop, dm and EBS
+          # stack, and flushes go all the way down.
+          src=$(findmnt -n -o SOURCE /mnt || true)
+          disk=""
+          if [ -n "$src" ]; then
+            disk=$(lsblk -n -o PKNAME "$src")
+            root=$(lsblk -n -o PKNAME "$(findmnt -n -o SOURCE /)")
+            [ "$disk" != "$root" ] || disk=""
+          fi
+          if [ -n "$disk" ]; then
+            sudo swapoff -a
+            sudo umount /mnt
+          else
+            findmnt -n -o SOURCE,FSTYPE,OPTIONS /
+            sudo fallocate -l 17G /var/tmp/bench.img
+            src=$(sudo losetup -f --show --direct-io=on /var/tmp/bench.img)
+            disk=$(basename "$src")
+            cat /sys/block/$disk/loop/dio
+          fi
           for f in queue/rotational queue/write_cache queue/scheduler queue/logical_block_size queue/physical_block_size device/model; do
             echo "$disk $f: $(cat /sys/block/$disk/$f 2>/dev/null)"
           done
