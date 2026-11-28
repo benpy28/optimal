@@ -64,3 +64,32 @@ stops differing from the suite.
 The suite has no expected parse errors, so error kinds and offsets are
 checked against a literal model of the spec (`crates/css/tests/common/reference.rs`)
 on random inputs, together with every token, value and offset.
+
+## CSS parser
+
+| Suite | Pinned commit | Passed | Notes |
+|---|---|---|---|
+| SimonSapin/css-parsing-tests | 203ce36 | 149 / 149 | component_value_list, one_component_value, declaration_list, one_declaration, rule_list, one_rule, stylesheet and blocks_contents; stylesheet_bytes, An+B and color files are for later stages |
+
+The suite follows the 2021 Candidate Recommendation; we follow the 2026
+text of css-syntax-3 section 5 (nested rules, nested declarations,
+speculative declaration parsing, custom properties keep their original
+text). Two kinds of difference are handled:
+
+- Mechanical conversions of the expected output: the suite's
+  `["error", "eof-in-string"]`, `["error", "eof-in-url"]` and
+  `["error", "invalid"]` markers, which its reference implementation puts
+  in the tree where a parse error happened, are dropped (the spec reports
+  parse errors apart, and ours are checked against the model below), and
+  the 2021 match tokens (`~=`, `|=`, `^=`, `$=`, `*=`, `||`) are split into
+  the two delims the 2026 tokenizer gives.
+- [`css-parsing-errata.json`](css-parsing-errata.json) replaces the
+  expected output of 16 tests where the 2026 text gives a different tree,
+  each with the section it follows. The harness fails if an erratum stops
+  differing from the suite.
+
+Parse error kinds and offsets are checked against a literal recursive
+model of section 5 (`crates/css/tests/common/parse_reference.rs`) on
+random token streams for all seven entry points. A hostile-input test
+times 15 input shapes (deep nesting, unclosed blocks, long speculative
+declarations) at three sizes and fails on worse than linear growth.
