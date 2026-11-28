@@ -480,3 +480,73 @@ fn failed_operations_put_counters_back() {
     }
     assert!(failed >= 4, "only {failed} failures");
 }
+
+/// A space-map free that fails part way: the range spans the first two
+/// bitmap blocks (32768 blocks each), so the free changes the first bitmap
+/// and then reads the second. When that read fails the map has changed
+/// with nothing logged ([`Store::space_unlogged`]), and the undo must
+/// rebuild it: otherwise the first half of the range stays free in memory
+/// while still in use, and the next allocation hands it out again.
+///
+/// No current path frees such a range (data runs come from one bitmap
+/// block, metadata frees are one block), so this drives [`Store::free`]
+/// inside an operation directly; the guard is for crafted images and
+/// future callers.
+///
+/// [`Store::space_unlogged`]: crate::tree::Store::space_unlogged
+/// [`Store::free`]: crate::tree::Store::free
+#[test]
+fn free_failing_on_its_second_bitmap_block_is_undone() {
+    const BIG: u64 = 33_000;
+    const START: u64 = crate::space::BITS_PER_BMP - 8;
+    let mut base = Filesystem::format(
+        CrashDevice::new(BIG, 9),
+        &opts(),
+        &mut Rng::new(1),
+        Box::new(ZeroClock),
+    )
+    .unwrap();
+    {
+        let s = &mut base.store;
+        s.space.claim(&mut s.io, START, 16).unwrap();
+    }
+    base.mark_dirty();
+    base.commit().unwrap();
+    let image = base.unmount().unwrap();
+    let mut hit = 0;
+    for k in 0.. {
+        let mut fs = remount_dev(image.clone());
+        let d = fs.device_mut();
+        d.faults.fail_reads = Some((d.reads + k, 2));
+        let r = fs.op(|fs| fs.store.free(START, 16));
+        fs.device_mut().faults.fail_reads = None;
+        match r {
+            Ok(()) => break,
+            Err(Error::Io(_)) => {
+                assert!(!fs.poisoned());
+                hit += fs.unlogged_rebuilds;
+                // Every block of the range is still in use: an allocation
+                // from its start lands after it.
+                fs.set_alloc_cursor_for_tests(START);
+                let s = &mut fs.store;
+                let (got, _) = s.space.alloc_run(&mut s.io, 1).unwrap();
+                assert!(
+                    !(START..START + 16).contains(&got),
+                    "k {k}: block {got} of the range handed out again"
+                );
+            }
+            Err(e) => panic!("k {k}: {e:?}"),
+        }
+    }
+    assert!(hit >= 1, "no read failure landed inside the free");
+}
+
+fn remount_dev(dev: CrashDevice) -> Filesystem<CrashDevice> {
+    Filesystem::mount(
+        dev,
+        &MountOptions::default(),
+        &mut Rng::new(3),
+        Box::new(ZeroClock),
+    )
+    .unwrap()
+}

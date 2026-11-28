@@ -402,9 +402,12 @@ the heaviest testing in the project:
   conditions no current path reaches (a file with dirty data always has a
   dirty inode leaf, so nothing after the drop reads; after a deadlist
   append's first insert its path is dirty, so later inserts cannot read).
-  The flag for a space-map free that fails part way is reachable but not
-  yet tested: it needs a bitmap read to fail in the middle of one
-  multi-block free that spans two bitmap blocks (32768 blocks each).
+  The flag for a space-map free that fails part way is tested directly
+  (`free_failing_on_its_second_bitmap_block_is_undone`: a free spanning two
+  bitmap blocks whose second bitmap read fails; without the rebuild the
+  first half is handed out again). No current path makes such a free (data
+  runs come from one bitmap block, metadata frees are one block), so the
+  guard is defence for crafted images and future callers.
 - **Lying drives**: flushes are acknowledged but lost for 1 to 8 commits,
   then power is cut. Images are steered into the worst cases (every later
   superblock write landed; or only the newest pair landed and the other pair

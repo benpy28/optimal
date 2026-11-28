@@ -409,6 +409,9 @@ pub struct Filesystem<D: BlockDevice> {
     op_data: Vec<DataChange>,
     /// Operations rolled back after failing part way (tests).
     pub(crate) ops_undone: u64,
+    /// Undos that rebuilt the space map because a free failed part way
+    /// ([`Store::space_unlogged`]) (tests).
+    pub(crate) unlogged_rebuilds: u64,
     /// Superblock slots (bit per slot) a write failed on during this
     /// mount; commits write around them (see [`superblock::plan_waves`]).
     pub(crate) dead_slots: u8,
@@ -638,6 +641,7 @@ impl<D: BlockDevice> Filesystem<D> {
             undo_spare: Vec::new(),
             op_data: Vec::new(),
             ops_undone: 0,
+            unlogged_rebuilds: 0,
             dead_slots: 0,
         };
         let now = fs.clock.now_ns();
@@ -817,6 +821,7 @@ impl<D: BlockDevice> Filesystem<D> {
                 undo_spare: Vec::new(),
                 op_data: Vec::new(),
                 ops_undone: 0,
+                unlogged_rebuilds: 0,
                 dead_slots: 0,
             };
             let check = if clean {
@@ -1040,6 +1045,29 @@ impl<D: BlockDevice> Filesystem<D> {
     /// nodes go to the device (cold-cache benchmarks, fault tests).
     pub fn drop_caches(&mut self) {
         self.store.cache.clear();
+    }
+
+    /// A file's extents as (first physical block, blocks), in file order
+    /// (tests).
+    pub fn extents_for_tests(&mut self, ino: u64) -> Result<Vec<(u64, u64)>> {
+        let mut out = Vec::new();
+        let mut err = None;
+        self.fs_tree.scan(
+            &mut self.store,
+            &Key::new(ino, K_EXTENT, 0),
+            &Key::new(ino, K_EXTENT, u64::MAX),
+            &mut |_, v| {
+                match Extent::decode(v, ino) {
+                    Ok(e) => out.push((e.phys, e.len)),
+                    Err(e) => {
+                        err = Some(e);
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            },
+        )?;
+        err.map_or(Ok(out), Err)
     }
 
     /// Operations undone after failing part way, since mount (tests).
@@ -1908,6 +1936,7 @@ impl<D: BlockDevice> Filesystem<D> {
         self.txn_data = cp.txn_data;
         self.txn_meta = cp.txn_meta;
         let mut rebuild = core::mem::take(&mut self.store.space_unlogged);
+        self.unlogged_rebuilds += rebuild as u64;
         if let Some((fs_tree, meta)) = cp.trees {
             self.fs_tree = fs_tree;
             self.meta = meta;
