@@ -110,6 +110,7 @@ static_names! {
     TABLE => "table", TBODY => "tbody", TD => "td", TEMPLATE => "template", TEXTAREA => "textarea",
     TFOOT => "tfoot", TH => "th", THEAD => "thead", TITLE => "title", TR => "tr", TRACK => "track",
     TT => "tt", U => "u", UL => "ul", VAR => "var", WBR => "wbr", XMP => "xmp",
+    DATALIST => "datalist", SELECTEDCONTENT => "selectedcontent",
     // MathML.
     MATH => "math", MI => "mi", MO => "mo", MN => "mn", MS => "ms", MTEXT => "mtext",
     ANNOTATION_XML => "annotation-xml", MGLYPH => "mglyph", MALIGNMARK => "malignmark",
@@ -121,6 +122,8 @@ static_names! {
     ACTUATE => "actuate", ARCROLE => "arcrole", HREF => "href", ROLE => "role", SHOW => "show",
     LANG => "lang", SPACE => "space", CHARSET => "charset", HTTP_EQUIV => "http-equiv",
     CONTENT => "content", SHADOWROOTMODE => "shadowrootmode", ID => "id", CLASS => "class",
+    // Attributes element behaviour looks at.
+    SELECTED => "selected", DISABLED => "disabled", MULTIPLE => "multiple",
 }
 
 fn static_index() -> &'static HashMap<&'static [u8], u32> {

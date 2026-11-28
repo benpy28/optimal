@@ -15,6 +15,7 @@ fn options(scripting: bool) -> ParseOptions {
         scripting,
         iframe_srcdoc: false,
         collect_errors: true,
+        reference_dom: false,
     }
 }
 

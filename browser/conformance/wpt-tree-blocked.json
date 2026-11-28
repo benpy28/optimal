@@ -1,27 +1,4 @@
 {
-  "reason_by_group": {
-    "select-element-model": "The expected tree shows <selectedcontent> filled with a clone of the selected <option>. That is not tree construction: it is the select element's DOM behaviour (option insertion, post-connection and children-parsed steps, the selectedness setting algorithm and 'update a select's descendant selectedcontent elements', HTML 4.10.7 and 4.10.10). It needs the DOM's element-behaviour hooks, the next stage. The harness fails if one of these starts passing, so the list can't go stale."
-  },
-  "blocked": [
-    {
-      "file": "webkit02.dat",
-      "data": "<select><button><selectedcontent></button><option>X",
-      "group": "select-element-model"
-    },
-    {
-      "file": "webkit02.dat",
-      "data": "<select><button><selectedcontent></button><option>x<i>i<b>ib</i>b",
-      "group": "select-element-model"
-    },
-    {
-      "file": "webkit02.dat",
-      "data": "<select><button><selectedcontent></button><option>X<option>Y",
-      "group": "select-element-model"
-    },
-    {
-      "file": "webkit02.dat",
-      "data": "<select><button><selectedcontent></button><option>X<option selected>Y",
-      "group": "select-element-model"
-    }
-  ]
+  "reason_by_group": {},
+  "blocked": []
 }

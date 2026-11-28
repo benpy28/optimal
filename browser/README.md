@@ -11,7 +11,8 @@ gates, Optimal ships a borrowed browser.
 | Crate | What it is | Status |
 |---|---|---|
 | `crates/wtf8` | Web strings: UTF-8 that can also hold lone surrogates | done |
-| `crates/html` | WHATWG HTML parser | tokenizer done (html5lib-tests 7046/7046); tree builder next |
+| `crates/dom` | Arena DOM, with the element behaviour that changes the tree while parsing (the `select` element model) | the subset parsing needs |
+| `crates/html` | WHATWG HTML parser | tokenizer done (html5lib-tests 7046/7046); tree builder done (WPT 3898/3898 runnable) |
 | `crates/css` | CSS Syntax Level 3 | tokenizer done (css-tokenizer-tests 287/287, 2 with errata); parser next |
 
 ## Building and testing
