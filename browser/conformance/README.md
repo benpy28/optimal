@@ -47,3 +47,20 @@ which the harness and the property tests check.
 [`wpt-tree-errata.json`](wpt-tree-errata.json) holds corrections where a
 tree expectation contradicts the standard. It is empty: no tree expectation
 needed correcting.
+
+## CSS tokenizer
+
+| Suite | Pinned commit | Passed | Notes |
+|---|---|---|---|
+| romainmenke/css-tokenizer-tests | 0db1d12 | 287 / 287 | token type, raw text, start and end index, and the structured value (unescaped value, numeric value, type flag, sign, unit); each test run whole, one code point at a time, and in random chunks, which must all give the same tokens and errors |
+
+The suite reports comments as tokens, as our tokenizer does, so they are
+compared too. [`css-tokenizer-errata.json`](css-tokenizer-errata.json)
+corrects 2 tests where the suite contradicts css-syntax-3 4.3.4: after
+`url(`, all whitespace but the last code point belongs to the function
+token. Types and values are unchanged; the harness fails if an erratum
+stops differing from the suite.
+
+The suite has no expected parse errors, so error kinds and offsets are
+checked against a literal model of the spec (`crates/css/tests/common/reference.rs`)
+on random inputs, together with every token, value and offset.
