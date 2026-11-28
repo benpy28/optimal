@@ -1,5 +1,6 @@
 //! Level-triggered I/O APIC lines, and the pins whose Remote IRR stays
-//! set.
+//! set; and edge-triggered lines on plan-free GSIs ([`claim_edge`], for
+//! the HPET's timer events), which share the claim rules.
 //!
 //! A level line is held masked from the moment its interrupt arrives
 //! until its handler says it is done (design/drivers.md, `IrqHandle`), so
@@ -99,6 +100,13 @@ pub struct Line {
     plan_entry: Redirection,
 }
 
+/// By vector: 0, or VALID | ioapic << 8 | pin, for edge lines
+/// ([`claim_edge`]). Their interrupts go through the ordinary handler
+/// table (crate::irq::set_handler): an edge needs no masking and no
+/// I/O APIC EOI.
+static EDGES: [AtomicU32; 256] = [const { AtomicU32::new(0) }; 256];
+/// By vector: an edge line's unmasked entry's low dword.
+static EDGE_LOWS: [AtomicU32; 256] = [const { AtomicU32::new(0) }; 256];
 /// By vector: 0, or VALID | ioapic << 8 | pin.
 static LINES: [AtomicU32; 256] = [const { AtomicU32::new(0) }; 256];
 /// By vector: the unmasked entry's low dword.
@@ -221,6 +229,7 @@ pub fn free(c: &Controllers, gsi: u32) -> Result<(usize, u8), ClaimError> {
     }
     if LINES
         .iter()
+        .chain(EDGES.iter())
         .any(|l| l.load(Ordering::SeqCst) == line_word(i, pin))
     {
         return Err(ClaimError::PinBusy { gsi });
@@ -305,6 +314,119 @@ pub fn claim_isa(irq: u8, handler: LevelHandler) -> Result<Line, ClaimError> {
         },
         handler,
     )
+}
+
+/// A claimed edge-triggered line. Starts masked: [`Edge::unmask`] it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Edge {
+    pub gsi: u32,
+    /// MADT index of the I/O APIC.
+    pub ioapic: usize,
+    pub pin: u8,
+    pub vector: u8,
+    /// The entry when unmasked.
+    pub entry: Redirection,
+    /// The plan's entry for the pin, put back by [`Edge::release`].
+    plan_entry: Redirection,
+}
+
+/// Claim `gsi` as an edge-triggered, active-high line on `vector`, from
+/// the device range up to the kernel's own I/O APIC vectors (0x40 to
+/// 0xED), with `handler` run for each interrupt (the local APIC gets its
+/// EOI after it, as for any handler-table vector).
+pub fn claim_edge(gsi: u32, vector: u8, handler: super::Handler) -> Result<Edge, ClaimError> {
+    let c = controllers().ok_or(ClaimError::Off)?;
+    if !(vectors::DEVICE_FIRST..vectors::UNROUTED).contains(&vector) {
+        return Err(ClaimError::NotDeviceVector(vector));
+    }
+    let _g = CLAIM.lock();
+    let (ioapic, pin) = free(c, gsi)?;
+    let destination = c.plan.destination.ok_or(ClaimError::NoDestination)?;
+    let v = usize::from(vector);
+    if HANDLERS[v].load(Ordering::SeqCst) != 0
+        || LINES[v].load(Ordering::SeqCst) != 0
+        || EDGES[v].load(Ordering::SeqCst) != 0
+    {
+        return Err(ClaimError::VectorBusy(vector));
+    }
+    let entry = Redirection {
+        vector,
+        delivery: Delivery::Fixed,
+        logical: false,
+        active_low: false,
+        level: false,
+        masked: false,
+        destination,
+    };
+    let regs = c.ioapics[ioapic].expect("a used I/O APIC is mapped");
+    let masked = Redirection {
+        masked: true,
+        ..entry
+    };
+    {
+        let _g = IOAPIC_LOCK.lock();
+        for (reg, val) in masked.writes(pin).expect("pins are below MAX_PINS") {
+            regs.write(reg, val);
+        }
+    }
+    HANDLERS[v].store(handler as usize, Ordering::SeqCst);
+    EDGE_LOWS[v].store(entry.encode().0, Ordering::SeqCst);
+    EDGES[v].store(line_word(ioapic, pin), Ordering::SeqCst);
+    Ok(Edge {
+        gsi,
+        ioapic,
+        pin,
+        vector,
+        entry,
+        plan_entry: optimal_apic::plan::unrouted(destination),
+    })
+}
+
+impl Edge {
+    fn regs(&self) -> IoApicRegs {
+        let c = controllers().expect("a line exists only while interrupts are on");
+        c.ioapics[self.ioapic].expect("a used I/O APIC is mapped")
+    }
+
+    pub fn unmask(&self) {
+        let regs = self.regs();
+        let _g = IOAPIC_LOCK.lock();
+        write_low(regs, self.pin, self.entry.encode().0);
+    }
+
+    /// Give the line up: the pin goes back to the plan's (masked) entry
+    /// and the vector's handler is cleared.
+    pub fn release(self) {
+        let regs = self.regs();
+        let _c = CLAIM.lock();
+        {
+            let _g = IOAPIC_LOCK.lock();
+            write_low(regs, self.pin, self.entry.encode().0 | ioapic::MASKED);
+            let back = Redirection {
+                masked: true,
+                ..self.plan_entry
+            };
+            for (reg, val) in back.writes(self.pin).expect("pins are below MAX_PINS") {
+                regs.write(reg, val);
+            }
+        }
+        let v = usize::from(self.vector);
+        EDGES[v].store(0, Ordering::SeqCst);
+        EDGE_LOWS[v].store(0, Ordering::SeqCst);
+        HANDLERS[v].store(0, Ordering::SeqCst);
+    }
+}
+
+/// The unmasked entry of the edge line claimed on `ioapic`'s `pin`, if
+/// one is (tests compare pins against the plan, and a claimed pin holds
+/// its claim's entry instead).
+#[cfg(feature = "ktest")]
+pub fn edge_entry(ioapic: usize, pin: u8) -> Option<Redirection> {
+    let word = line_word(ioapic, pin);
+    EDGES
+        .iter()
+        .position(|e| e.load(Ordering::SeqCst) == word)
+        .map(|v| Redirection::decode(EDGE_LOWS[v].load(Ordering::SeqCst), 0).entry)
 }
 
 /// CLAIM is held.

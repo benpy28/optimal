@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 58beb4efa6523aec6c89751ebe9572443ba1666f197738335cf78eed68cd9276 # shrinks to f = Freq { num: 100000000000000, den: 91 }, ppb = 0, wide = false

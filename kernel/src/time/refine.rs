@@ -32,7 +32,6 @@ use optimal_time::calibrate::{self, Estimate, Refused, Sample};
 use optimal_time::counter::{self, Extend};
 use optimal_time::cpuid::Source;
 use optimal_time::freq::Freq;
-use optimal_time::lapic as lt;
 use optimal_time::refine::{self as rf, Boot, Outcome};
 use optimal_time::select::{Clock, Reference};
 
@@ -290,18 +289,13 @@ fn finish(run: &mut Run, rates: &mut Rates) -> Result<Status, Failure> {
     let outcome = rf::decide(run.boot, measured);
     if outcome.adopts() {
         let old = clock::freq().ok_or(Failure::Rebase)?;
-        // Everything that can fail is worked out before anything changes.
-        let lapic = match rates.lapic {
-            Some(l) => Some(rf::rescale(l, old, measured.freq).ok_or(Failure::Rescale)?),
-            None => None,
-        };
+        // Everything that can fail is worked out before anything changes:
+        // every counter's rate against the clock moves with it.
+        let new = rates.rescaled(old, measured.freq).ok_or(Failure::Rescale)?;
         if !clock::rebase(measured.freq) {
             return Err(Failure::Rebase);
         }
-        rates.lapic = lapic;
-        if let Some(l) = lapic {
-            rates.longest_ns = lt::longest_ns(l.freq, l.ppb);
-        }
+        *rates = new;
         if rates.tsc.is_some() {
             rates.tsc = Some(measured.freq);
         }

@@ -1,4 +1,5 @@
-//! Timer events: the boot CPU's local APIC timer on vector 0xF0.
+//! Timer events: the boot CPU's local APIC timer on vector 0xF0, else an
+//! HPET comparator or the PIT (see 5. below).
 //!
 //! 1. Measure the LAPIC timer's count rate against the kernel clock's own
 //!    counter (crate::clock::counter), so its error bound is relative to
@@ -22,6 +23,14 @@
 //!    done in interrupt context, where the watchdog fires; the carried
 //!    bound is exact, and only makes one-shot events a little later at
 //!    worst, never early.)
+//!
+//! 5. When neither LAPIC mode can be used (its rate could not be measured,
+//!    or the `notimer=lapic` boot option, a quirk switch and the test
+//!    that the fallbacks work), events come from an HPET comparator in
+//!    one-shot edge mode on a plan-free I/O APIC input ([`hpet`]), else
+//!    PIT channel 0 in mode 0 on ISA IRQ 0 ([`pit`]), each with its rate
+//!    measured against the clock like the LAPIC timer's
+//!    (optimal_time::select::events, optimal_time::oneshot).
 //!
 //! Never early: arming rounds up at the fastest rate the bound allows
 //! (optimal_time::lapic), and on every interrupt the handler reads the
@@ -47,7 +56,9 @@ use optimal_time::calibrate::Estimate;
 use optimal_time::cpuid;
 use optimal_time::freq::Freq;
 use optimal_time::lapic::{self as lt, Mode};
-use optimal_time::select::{self, Clock, Events};
+use optimal_time::oneshot;
+use optimal_time::refine as rf;
+use optimal_time::select::{self, Clock, Events, Sources};
 use optimal_time::watchdog as wd;
 
 use crate::arch::apic::Lapic;
@@ -57,10 +68,11 @@ use crate::sync::{IrqSpinLock, Once};
 use crate::time::watchdog::Poll;
 use crate::time::{self, Counter, Time};
 
-/// The LAPIC timer's measurement at boot stops once its bound is this
-/// tight: 100 ppm, which makes a timer at most 0.01% late. The count rate
-/// only decides how late a one-shot timer can be (never early), so it
-/// needs far less than the clock.
+/// The LAPIC timer's measurement at boot (and the HPET's or the PIT's,
+/// when they drive events) stops once its bound is this tight: 100 ppm,
+/// which makes a timer at most 0.01% late. The count rate only decides
+/// how late a one-shot timer can be (never early), so it needs far less
+/// than the clock.
 const LAPIC_GOAL_PPB: u64 = 100_000;
 /// And after this long at most.
 const LAPIC_WINDOW_NS: u64 = 50_000_000;
@@ -85,8 +97,46 @@ pub struct Timer {
     /// The longest one-shot arming (optimal_time::lapic::longest_ns), at
     /// boot.
     pub longest_ns: u64,
+    /// Sources the `notimer=` boot option ruled out.
+    pub skip: Skip,
+    /// The HPET comparator and GSI events use, when they come from the
+    /// HPET, and its rate against the clock at boot.
+    pub hpet: Option<(u8, u32, Estimate)>,
+    /// The PIT's rate against the clock at boot, when events come from it.
+    pub pit: Option<Estimate>,
     lapic_regs: Option<Lapic>,
     pub warnings: Vec<String>,
+}
+
+/// What `notimer=` (words `lapic`, `hpet`, `pit`, comma-separated) rules
+/// out. `lapic` covers both LAPIC modes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Skip {
+    pub lapic: bool,
+    pub hpet: bool,
+    pub pit: bool,
+}
+
+impl Skip {
+    /// Parse the option's value. Unknown words are returned, to be
+    /// reported; the known ones still apply.
+    pub fn parse(words: &str) -> (Skip, Vec<&str>) {
+        let mut s = Skip::default();
+        let mut unknown = Vec::new();
+        for w in words.split(',').filter(|w| !w.is_empty()) {
+            match w {
+                "lapic" => s.lapic = true,
+                "hpet" => s.hpet = true,
+                "pit" => s.pit = true,
+                w => unknown.push(w),
+            }
+        }
+        (s, unknown)
+    }
+
+    fn any(self) -> bool {
+        self.lapic || self.hpet || self.pit
+    }
 }
 
 static STATE: Once<Timer> = Once::new();
@@ -103,6 +153,78 @@ pub struct Rates {
     pub longest_ns: u64,
     /// The TSC's frequency, in TSC-deadline mode (the clock's).
     pub tsc: Option<Freq>,
+    /// The HPET's rate against the clock, while a comparator is set up
+    /// for events, and that comparator's configuration (its width decides
+    /// the longest arming).
+    pub hpet: Option<Estimate>,
+    pub hpet_config: u64,
+    /// optimal_time::oneshot::hpet_longest_ns for it.
+    pub hpet_longest_ns: u64,
+    /// The PIT's rate against the clock, while channel 0 is set up.
+    pub pit: Option<Estimate>,
+    /// optimal_time::oneshot::pit_longest_ns for it.
+    pub pit_longest_ns: u64,
+}
+
+impl Rates {
+    const NONE: Rates = Rates {
+        lapic: None,
+        longest_ns: 0,
+        tsc: None,
+        hpet: None,
+        hpet_config: 0,
+        hpet_longest_ns: 0,
+        pit: None,
+        pit_longest_ns: 0,
+    };
+
+    /// Work out each longest arming again from the rates.
+    fn limits(mut self) -> Rates {
+        if let Some(l) = self.lapic {
+            self.longest_ns = lt::longest_ns(l.freq, l.ppb);
+        }
+        if let Some(h) = self.hpet {
+            self.hpet_longest_ns = oneshot::hpet_longest_ns(h.freq, h.ppb, self.hpet_config);
+        }
+        if let Some(p) = self.pit {
+            self.pit_longest_ns = oneshot::pit_longest_ns(p.freq, p.ppb);
+        }
+        self
+    }
+
+    /// Every counter's rate restated for a clock whose frequency moves
+    /// from `from` to `to` (crate::time::refine): each moves by the same
+    /// factor (optimal_time::refine::rescale). The TSC's own frequency is
+    /// the refinement's to set. None if any rate does not fit.
+    pub fn rescaled(self, from: Freq, to: Freq) -> Option<Rates> {
+        let r = |e: Option<Estimate>| match e {
+            Some(e) => rf::rescale(e, from, to).map(Some),
+            None => Some(None),
+        };
+        Some(
+            Rates {
+                lapic: r(self.lapic)?,
+                hpet: r(self.hpet)?,
+                pit: r(self.pit)?,
+                ..self
+            }
+            .limits(),
+        )
+    }
+
+    /// Every counter's rate, measured against a clock that turned out to
+    /// be within `bound_ppb` of its fallback, restated against the
+    /// fallback (optimal_time::watchdog::carry).
+    fn carried(self, bound_ppb: u64) -> Rates {
+        let c = |e: Option<Estimate>| e.map(|e| wd::carry(e, bound_ppb));
+        Rates {
+            lapic: c(self.lapic),
+            hpet: c(self.hpet),
+            pit: c(self.pit),
+            ..self
+        }
+        .limits()
+    }
 }
 
 struct Armed {
@@ -116,8 +238,17 @@ struct Armed {
     watchdog: Option<u64>,
     /// What the hardware is armed for (clock ns).
     hw: Option<u64>,
+    /// False when an interrupt may legitimately come before `hw`: the
+    /// HPET comparator was moved further ahead after the counter got to
+    /// it first, and the value it replaced may have matched as it went
+    /// (optimal_time::oneshot::Programmed::retries).
+    hw_sure: bool,
     periodic: bool,
     rates: Rates,
+    /// The HPET comparator set up for events, if any.
+    hpet: Option<hpet::Ev>,
+    /// PIT channel 0 and ISA IRQ 0 are set up for events.
+    pit: bool,
 }
 
 static ARMED: IrqSpinLock<Armed> = IrqSpinLock::new(Armed {
@@ -126,18 +257,18 @@ static ARMED: IrqSpinLock<Armed> = IrqSpinLock::new(Armed {
     refine: None,
     watchdog: None,
     hw: None,
+    hw_sure: true,
     periodic: false,
-    rates: Rates {
-        lapic: None,
-        longest_ns: 0,
-        tsc: None,
-    },
+    rates: Rates::NONE,
+    hpet: None,
+    pit: false,
 });
 
 /// The expiry hook, a `fn(u64)` as usize; 0 for none.
 static HOOK: AtomicUsize = AtomicUsize::new(0);
-/// How events are programmed now: 0 none, 1 TSC-deadline, 2 one-shot.
-/// Tests can switch it ([`force_events`]).
+/// How events are programmed now: 0 none, 1 TSC-deadline, 2 LAPIC
+/// one-shot, 3 HPET one-shot, 4 PIT one-shot. Tests can switch it
+/// ([`force_events`]).
 static EVENTS: AtomicU8 = AtomicU8::new(0);
 
 /// Tests: the longest piece one arming may cover, to exercise deadlines
@@ -146,6 +277,8 @@ static CHUNK_CAP: AtomicU64 = AtomicU64::new(u64::MAX);
 
 static FIRES: AtomicU64 = AtomicU64::new(0);
 static EARLY: AtomicU64 = AtomicU64::new(0);
+/// How early (ns) the last early interrupt came, for failure reports.
+static LAST_EARLY: AtomicU64 = AtomicU64::new(0);
 /// One-shot armings that covered only a piece of their wait.
 static PIECES: AtomicU64 = AtomicU64::new(0);
 static PERIODIC_TICKS: AtomicU64 = AtomicU64::new(0);
@@ -155,6 +288,8 @@ fn encode(e: Option<Events>) -> u8 {
         None => 0,
         Some(Events::TscDeadline) => 1,
         Some(Events::LapicOneShot) => 2,
+        Some(Events::HpetOneShot) => 3,
+        Some(Events::PitOneShot) => 4,
     }
 }
 
@@ -162,7 +297,19 @@ fn events_now() -> Option<Events> {
     match EVENTS.load(Ordering::SeqCst) {
         1 => Some(Events::TscDeadline),
         2 => Some(Events::LapicOneShot),
+        3 => Some(Events::HpetOneShot),
+        4 => Some(Events::PitOneShot),
         _ => None,
+    }
+}
+
+pub fn events_name(e: Option<Events>) -> &'static str {
+    match e {
+        Some(Events::TscDeadline) => "tsc-deadline",
+        Some(Events::LapicOneShot) => "lapic one-shot",
+        Some(Events::HpetOneShot) => "hpet one-shot",
+        Some(Events::PitOneShot) => "pit one-shot",
+        None => "none",
     }
 }
 
@@ -214,7 +361,8 @@ fn set_mode(l: Lapic, e: Option<Events>) {
             regs::LVT_TIMER,
             lt::lvt(vectors::LAPIC_TIMER, Mode::OneShot, false),
         ),
-        None => l.write(
+        // The LAPIC timer is not used: masked.
+        None | Some(Events::HpetOneShot | Events::PitOneShot) => l.write(
             regs::LVT_TIMER,
             lt::lvt(vectors::LAPIC_TIMER, Mode::OneShot, true),
         ),
@@ -225,6 +373,16 @@ fn set_mode(l: Lapic, e: Option<Events>) {
 pub fn init(t: &'static Time) -> &'static Timer {
     let mut warnings = Vec::new();
     let leaf6 = (__cpuid_count(0, 0).eax >= 6).then(|| __cpuid_count(6, 0).eax);
+    let skip = match crate::boot::arg(crate::bootinfo::get().cmdline(), "notimer") {
+        Some(words) => {
+            let (skip, unknown) = Skip::parse(words);
+            for w in unknown {
+                warnings.push(format!("notimer: unknown word {w:?}, ignored"));
+            }
+            skip
+        }
+        None => Skip::default(),
+    };
     let mut timer = Timer {
         lapic: None,
         against: None,
@@ -232,6 +390,9 @@ pub fn init(t: &'static Time) -> &'static Timer {
         deadline_mode: t.tsc_features.deadline,
         arat: leaf6.is_some_and(cpuid::arat),
         longest_ns: 0,
+        skip,
+        hpet: None,
+        pit: None,
         lapic_regs: None,
         warnings: Vec::new(),
     };
@@ -248,20 +409,52 @@ pub fn init(t: &'static Time) -> &'static Timer {
     };
     let l = c.lapic;
     timer.lapic_regs = Some(l);
-    if let Some(against) = clock::counter() {
-        timer.against = Some(counter_name(against));
+    // Masked and disarmed until the choice is made.
+    set_mode(l, None);
+    let against = clock::counter();
+    timer.against = against.map(counter_name);
+    if !skip.lapic
+        && let Some(against) = against
+    {
         match calibrate(l, against) {
             Ok(e) => timer.lapic = Some(e),
             Err(e) => warnings.push(format!("could not measure the LAPIC timer: {e}")),
         }
     }
     let tsc_clock = clock::kind() == Some(Clock::Tsc);
-    timer.events = select::events(
-        timer.deadline_mode,
-        t.tsc_estimate().is_some() && tsc_clock,
-        t.tsc_features.invariant,
-        timer.lapic.is_some(),
-    );
+    let mut sources = Sources {
+        deadline_mode: timer.deadline_mode && !skip.lapic,
+        tsc_calibrated: t.tsc_estimate().is_some() && tsc_clock,
+        tsc_invariant: t.tsc_features.invariant,
+        lapic_calibrated: timer.lapic.is_some(),
+        hpet: false,
+        pit: false,
+    };
+    timer.events = select::events(sources);
+    // The fallbacks are set up (and their rates measured, up to 50 ms
+    // each) only when they are needed.
+    let mut hpet_ev = None;
+    if timer.events.is_none() && !skip.hpet && t.hpet.is_some() {
+        match hpet::setup() {
+            Ok((ev, rate)) => {
+                timer.hpet = Some((ev.n, ev.edge.gsi, rate));
+                sources.hpet = true;
+                hpet_ev = Some((ev, rate));
+            }
+            Err(e) => warnings.push(format!("no HPET timer events: {e}")),
+        }
+        timer.events = select::events(sources);
+    }
+    if timer.events.is_none() && !skip.pit {
+        match pit::setup() {
+            Ok(rate) => {
+                timer.pit = Some(rate);
+                sources.pit = true;
+            }
+            Err(e) => warnings.push(format!("no PIT timer events: {e}")),
+        }
+        timer.events = select::events(sources);
+    }
     if timer.events == Some(Events::TscDeadline) {
         tsc = match clock::counter() {
             Some(Counter::TscAt(f)) => Some(f),
@@ -270,12 +463,21 @@ pub fn init(t: &'static Time) -> &'static Timer {
     }
     if let Some(e) = timer.lapic {
         timer.longest_ns = lt::longest_ns(e.freq, e.ppb);
-        if timer.events == Some(Events::LapicOneShot) && e.ppb > time::WARN_PPB {
-            warnings.push(format!(
-                "the LAPIC timer could only be measured to within {} ppm, so timers can be that late",
-                time::Ppb(e.ppb)
-            ));
-        }
+    }
+    // The rate that times one-shot events, if it is loose.
+    let rate = match timer.events {
+        Some(Events::LapicOneShot) => timer.lapic.map(|e| ("LAPIC timer", e)),
+        Some(Events::HpetOneShot) => timer.hpet.map(|(_, _, e)| ("HPET", e)),
+        Some(Events::PitOneShot) => timer.pit.map(|e| ("PIT", e)),
+        _ => None,
+    };
+    if let Some((what, e)) = rate
+        && e.ppb > time::WARN_PPB
+    {
+        warnings.push(format!(
+            "the {what} could only be measured to within {} ppm, so timers can be that late",
+            time::Ppb(e.ppb)
+        ));
     }
     match (timer.events, clock::housekeeping_ns()) {
         (None, Some(hk)) => warnings.push(format!(
@@ -296,7 +498,18 @@ pub fn init(t: &'static Time) -> &'static Timer {
         lapic: timer.lapic,
         longest_ns: timer.longest_ns,
         tsc,
+        ..Rates::NONE
     };
+    if let Some((ev, rate)) = hpet_ev {
+        a.rates.hpet = Some(rate);
+        a.rates.hpet_config = ev.on;
+        a.hpet = Some(ev);
+    }
+    if let Some(rate) = timer.pit {
+        a.rates.pit = Some(rate);
+        a.pit = true;
+    }
+    a.rates = a.rates.limits();
     // The 10 s refinement starts now, driven from interrupt() (or says
     // why not).
     a.refine = time::refine::start(t, clock::now_ns(), timer.events.is_some());
@@ -345,15 +558,22 @@ fn program(a: &mut Armed) {
         .min();
     let Some(due) = due else {
         a.hw = None;
-        match events_now() {
-            // SAFETY: as in set_mode; 0 disarms.
-            Some(Events::TscDeadline) => unsafe { cpu::write_msr(lt::TSC_DEADLINE_MSR, 0) },
-            _ => l.write(regs::TIMER_INITIAL, 0),
-        }
+        disarm(a, l, events_now());
         return;
     };
     let now = clock::now_ns();
     let wait = due.saturating_sub(now).saturating_add(CONVERSION_PAD_NS);
+    let cap = CHUNK_CAP.load(Ordering::Relaxed);
+    // Covers the whole wait, or this is one of several armings.
+    let reached = |a: &mut Armed, ns: u64| {
+        a.hw = Some(if ns == wait {
+            due
+        } else {
+            PIECES.fetch_add(1, Ordering::Relaxed);
+            now.saturating_add(ns - CONVERSION_PAD_NS.min(ns))
+        });
+    };
+    a.hw_sure = true;
     match events_now() {
         Some(Events::TscDeadline) => {
             let f = a
@@ -369,21 +589,45 @@ fn program(a: &mut Armed) {
         }
         Some(Events::LapicOneShot) => {
             let e = a.rates.lapic.expect("one-shot mode has the LAPIC's rate");
-            let ns = wait
-                .min(a.rates.longest_ns)
-                .min(CHUNK_CAP.load(Ordering::Relaxed));
+            let ns = wait.min(a.rates.longest_ns).min(cap);
             let arm = lt::arm(e.freq, e.ppb, ns).expect("longest_ns always arms");
-            // Covers the whole wait, or this is one of several armings.
-            a.hw = Some(if ns == wait {
-                due
-            } else {
-                PIECES.fetch_add(1, Ordering::Relaxed);
-                now.saturating_add(ns - CONVERSION_PAD_NS.min(ns))
-            });
+            reached(a, ns);
             l.write(regs::TIMER_DIVIDE, arm.dcr());
             l.write(regs::TIMER_INITIAL, arm.count);
         }
+        Some(Events::HpetOneShot) => {
+            let e = a.rates.hpet.expect("HPET events have the HPET's rate");
+            let ns = wait.min(a.rates.hpet_longest_ns).min(cap);
+            let ev = a.hpet.as_mut().expect("HPET events have a comparator");
+            let ticks =
+                oneshot::hpet_ticks(e.freq, e.ppb, ns, ev.on).expect("hpet_longest_ns always arms");
+            let sure = ev.arm(ticks);
+            reached(a, ns);
+            a.hw_sure = sure;
+        }
+        Some(Events::PitOneShot) => {
+            let e = a.rates.pit.expect("PIT events have the PIT's rate");
+            let ns = wait.min(a.rates.pit_longest_ns).min(cap);
+            let count = oneshot::pit_count(e.freq, e.ppb, ns).expect("pit_longest_ns always arms");
+            reached(a, ns);
+            time::pit0_arm(count);
+        }
         None => a.hw = None,
+    }
+}
+
+/// Stop the hardware `e` programs from firing.
+fn disarm(a: &mut Armed, l: Lapic, e: Option<Events>) {
+    match e {
+        // SAFETY: as in set_mode; 0 disarms.
+        Some(Events::TscDeadline) => unsafe { cpu::write_msr(lt::TSC_DEADLINE_MSR, 0) },
+        Some(Events::LapicOneShot) | None => l.write(regs::TIMER_INITIAL, 0),
+        Some(Events::HpetOneShot) => {
+            if let Some(ev) = a.hpet.as_mut() {
+                ev.disarm();
+            }
+        }
+        Some(Events::PitOneShot) => time::pit0_disarm(),
     }
 }
 
@@ -393,19 +637,18 @@ fn program(a: &mut Armed) {
 /// that can fail is the switch itself, done first: when it fails nothing
 /// else changes. With the timer's lock held.
 fn fall_back(a: &mut Armed, now: u64, floor_ns: u64, bound_ppb: u64) {
-    let lapic = a.rates.lapic.map(|r| wd::carry(r, bound_ppb));
+    let carried = a.rates.carried(bound_ppb);
     let to = clock::switch(floor_ns);
     if to.is_some() {
-        a.rates.lapic = lapic;
-        if let Some(l) = lapic {
-            a.rates.longest_ns = lt::longest_ns(l.freq, l.ppb);
-        }
+        a.rates = carried;
         // TSC-deadline events are timed by the TSC, which is no longer
         // trusted. Without a LAPIC rate they stay: every event is still
         // checked against the clock, so none is early, only late by
-        // whatever the TSC does.
+        // whatever the TSC does. (HPET and PIT events, whose rates are
+        // carried across too, only ever run when there is no LAPIC rate,
+        // and TSC-deadline events never run alongside them.)
         if events_now() == Some(Events::TscDeadline)
-            && lapic.is_some()
+            && a.rates.lapic.is_some()
             && let Some(l) = STATE.get().and_then(|t| t.lapic_regs)
         {
             EVENTS.store(encode(Some(Events::LapicOneShot)), Ordering::SeqCst);
@@ -440,9 +683,10 @@ pub fn interrupt() {
         PERIODIC_TICKS.fetch_add(1, Ordering::Relaxed);
         return;
     }
-    let early = a.hw.is_some_and(|hw| now < hw);
+    let early = a.hw_sure && a.hw.is_some_and(|hw| now < hw);
     if early {
         EARLY.fetch_add(1, Ordering::Relaxed);
+        LAST_EARLY.store(a.hw.unwrap_or(0).saturating_sub(now), Ordering::Relaxed);
     }
     a.hw = None;
     if a.housekeeping.is_some_and(|h| h <= now) {
@@ -604,49 +848,162 @@ pub fn hold<R>(f: impl FnOnce() -> R) -> R {
 }
 
 /// Tests: program events another way (one-shot on a machine with
-/// TSC-deadline mode, say). Returns the previous way. Refused (None) when
-/// the new way lacks what it needs.
+/// TSC-deadline mode, say, or the HPET or the PIT on a machine whose
+/// LAPIC timer works). Returns the previous way. Refused (Err) when the
+/// new way lacks what it needs. The HPET and PIT are set up (and their
+/// rates measured) the first time they are asked for; [`release_unused`]
+/// gives them back.
 #[cfg(feature = "ktest")]
-pub fn force_events(e: Events) -> Option<Events> {
-    let t = STATE.get()?;
-    let l = t.lapic_regs?;
+pub fn force_events(e: Events) -> Result<Option<Events>, String> {
+    let t = STATE.get().ok_or("no timer")?;
+    let l = t.lapic_regs.ok_or("no local APIC")?;
+    // Set up outside the lock: measuring takes up to 50 ms.
+    let new_hpet = match e {
+        Events::HpetOneShot if ARMED.lock().hpet.is_none() => Some(hpet::setup()?),
+        _ => None,
+    };
+    let new_pit = match e {
+        Events::PitOneShot if !ARMED.lock().pit => Some(pit::setup()?),
+        _ => None,
+    };
     let mut a = ARMED.lock();
+    if let Some((ev, rate)) = new_hpet {
+        a.rates.hpet = Some(rate);
+        a.rates.hpet_config = ev.on;
+        a.hpet = Some(ev);
+    }
+    if let Some(rate) = new_pit {
+        a.rates.pit = Some(rate);
+        a.pit = true;
+    }
+    a.rates = a.rates.limits();
     match e {
-        Events::TscDeadline if a.rates.tsc.is_none() => return None,
-        Events::LapicOneShot if a.rates.lapic.is_none() => return None,
+        Events::TscDeadline if a.rates.tsc.is_none() => return Err(String::from("no TSC rate")),
+        Events::LapicOneShot if a.rates.lapic.is_none() => {
+            return Err(String::from("no LAPIC timer rate"));
+        }
         _ => {}
     }
     let was = events_now();
+    disarm(&mut a, l, was);
+    // QEMU's PIT keeps counting through a mode write (the 8254 datasheet
+    // says the write resets it), so a count armed before the switch can
+    // still raise IRQ 0 once: masked while the PIT is not the source, the
+    // I/O APIC drops that edge.
+    if was == Some(Events::PitOneShot) && e != Events::PitOneShot {
+        let _ = crate::irq::isa_mask(0);
+    }
+    if e == Events::PitOneShot && was != Some(Events::PitOneShot) {
+        let _ = crate::irq::isa_unmask(0);
+    }
+    a.hw = None;
     EVENTS.store(encode(Some(e)), Ordering::SeqCst);
     set_mode(l, Some(e));
     program(&mut a);
-    was
+    Ok(was)
+}
+
+/// Tests: give back the HPET comparator and PIT channel 0 if events no
+/// longer come from them.
+#[cfg(feature = "ktest")]
+pub fn release_unused() {
+    let mut a = ARMED.lock();
+    let now = events_now();
+    if now != Some(Events::HpetOneShot)
+        && let Some(ev) = a.hpet.take()
+    {
+        ev.release();
+        a.rates.hpet = None;
+    }
+    if now != Some(Events::PitOneShot) && a.pit {
+        pit::release();
+        a.pit = false;
+        a.rates.pit = None;
+    }
+}
+
+/// Is PIT channel 0 (and ISA IRQ 0) the timer's? Other users of the PIT's
+/// channel 0 (tests) must leave it alone then.
+#[cfg_attr(not(feature = "ktest"), expect(dead_code, reason = "tests read it"))]
+pub fn owns_pit() -> bool {
+    ARMED.lock().pit
+}
+
+/// HPET comparator retries and misses since boot
+/// (optimal_time::oneshot::hpet_program).
+#[cfg_attr(
+    not(feature = "ktest"),
+    expect(dead_code, reason = "tests read them; the scorecard will")
+)]
+pub fn hpet_retries() -> (u64, u64) {
+    (
+        hpet::RETRIES.load(Ordering::SeqCst),
+        hpet::MISSED.load(Ordering::SeqCst),
+    )
 }
 
 pub fn report(t: &Timer) {
+    let clock_ms = |window: u64| {
+        clock::counter()
+            .and_then(|c| c.freq())
+            .map_or(0, |f| f.ticks_to_ns(window) / 1_000_000)
+    };
+    let against = t.against.unwrap_or("clock");
     let mut line = String::from("timer: lapic ");
     match (t.lapic, t.against) {
         (Some(e), Some(against)) => {
-            let ms = clock::counter()
-                .and_then(|c| c.freq())
-                .map_or(0, |f| f.ticks_to_ns(e.window) / 1_000_000);
             let _ = write!(
                 line,
-                "{} +/-{} ppm against the {against} over {ms} ms",
+                "{} +/-{} ppm against the {against} over {} ms",
                 time::Mhz(e.freq),
-                time::Ppb(e.ppb)
+                time::Ppb(e.ppb),
+                clock_ms(e.window)
             );
         }
+        _ if t.skip.lapic => line.push_str("skipped"),
         _ => line.push_str("unknown"),
+    }
+    if let Some((n, gsi, e)) = t.hpet {
+        let _ = write!(
+            line,
+            "; hpet comparator {n} on GSI {gsi} {}",
+            time::Mhz(e.freq)
+        );
+        if e.ppb == 0 && e.window == 0 {
+            line.push_str(", the clock itself");
+        } else {
+            let _ = write!(
+                line,
+                " +/-{} ppm against the {against} over {} ms",
+                time::Ppb(e.ppb),
+                clock_ms(e.window)
+            );
+        }
+    }
+    if let Some(e) = t.pit {
+        let _ = write!(
+            line,
+            "; pit {} +/-{} ppm against the {against} over {} ms",
+            time::Mhz(e.freq),
+            time::Ppb(e.ppb),
+            clock_ms(e.window)
+        );
+    }
+    if t.skip.any() {
+        let words: Vec<&str> = [
+            (t.skip.lapic, "lapic"),
+            (t.skip.hpet, "hpet"),
+            (t.skip.pit, "pit"),
+        ]
+        .into_iter()
+        .filter_map(|(on, w)| on.then_some(w))
+        .collect();
+        let _ = write!(line, "; notimer {}", words.join(","));
     }
     let _ = write!(
         line,
         "; events {}; {}; {} warnings",
-        match t.events {
-            Some(Events::TscDeadline) => "tsc-deadline",
-            Some(Events::LapicOneShot) => "lapic one-shot",
-            None => "none",
-        },
+        events_name(t.events),
         if t.arat { "arat" } else { "no arat" },
         t.warnings.len()
     );
@@ -655,6 +1012,9 @@ pub fn report(t: &Timer) {
         crate::println!("timer: warning: {w}");
     }
 }
+
+mod hpet;
+mod pit;
 
 #[cfg(feature = "ktest")]
 mod tests;

@@ -73,25 +73,57 @@ pub enum Events {
     TscDeadline,
     /// The local APIC timer counting down at its own calibrated rate.
     LapicOneShot,
+    /// An HPET comparator in one-shot mode (crate::oneshot): armed with
+    /// two MMIO reads and one write, and its interrupt comes through an
+    /// I/O APIC pin.
+    HpetOneShot,
+    /// PIT channel 0 in mode 0 on ISA IRQ 0 (crate::oneshot): three port
+    /// writes per arming, and at most 54.9 ms per arming.
+    PitOneShot,
+}
+
+/// What the kernel has to program timer events with.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Sources {
+    /// CPUID 01h ECX bit 24.
+    pub deadline_mode: bool,
+    /// The TSC's frequency is known.
+    pub tsc_calibrated: bool,
+    pub tsc_invariant: bool,
+    /// The LAPIC timer's rate was measured.
+    pub lapic_calibrated: bool,
+    /// An HPET comparator is routed to a free I/O APIC input and its rate
+    /// against the clock was measured.
+    pub hpet: bool,
+    /// ISA IRQ 0 is routed and the PIT's rate against the clock was
+    /// measured.
+    pub pit: bool,
 }
 
 /// TSC-deadline mode when the CPU has it and the TSC is invariant with a
-/// known frequency; otherwise one-shot when the LAPIC timer's rate is
-/// known. A TSC that is not invariant can change rate with the CPU's
-/// power state, while the LAPIC timer's bus or crystal clock does not, so
-/// then the LAPIC timer's own count is the better measure. (ROADMAP 1c
-/// falls back further to the HPET and then the PIT; those come with their
-/// own step.)
-pub fn events(
-    deadline_mode: bool,
-    tsc_calibrated: bool,
-    tsc_invariant: bool,
-    lapic_calibrated: bool,
-) -> Option<Events> {
-    if deadline_mode && tsc_calibrated && tsc_invariant {
+/// known frequency; otherwise LAPIC one-shot when the LAPIC timer's rate
+/// is known; otherwise an HPET comparator; otherwise the PIT.
+///
+/// A TSC that is not invariant can change rate with the CPU's power
+/// state, while the LAPIC timer's bus or crystal clock does not, so then
+/// the LAPIC timer's own count is the better measure. The LAPIC timer
+/// beats the HPET because it is per CPU and armed with register writes
+/// local to the CPU (an MSR write, or two in x2APIC mode), with no
+/// interrupt routing; the HPET beats the PIT because one arming covers
+/// seconds rather than 54.9 ms, at a finer tick (10 MHz or faster against
+/// 1.19 MHz), with one MMIO write rather than three port writes.
+/// (The kernel idles only with `hlt` so far, where the LAPIC timer keeps
+/// running with or without ARAT; deeper C-states, when they come, must
+/// add ARAT to this choice.)
+pub fn events(s: Sources) -> Option<Events> {
+    if s.deadline_mode && s.tsc_calibrated && s.tsc_invariant {
         Some(Events::TscDeadline)
-    } else if lapic_calibrated {
+    } else if s.lapic_calibrated {
         Some(Events::LapicOneShot)
+    } else if s.hpet {
+        Some(Events::HpetOneShot)
+    } else if s.pit {
+        Some(Events::PitOneShot)
     } else {
         None
     }

@@ -26,6 +26,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::arch::x86_64::__cpuid_count;
 use core::fmt::Write;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use optimal_acpi::fadt::PmTimer;
 use optimal_apic::lapic;
@@ -81,9 +82,28 @@ const SAMPLE_TRIES: usize = 8;
 pub struct Hpet {
     regs: u64,
     pub caps: Capabilities,
+    /// Comparators in use, bit n for comparator n (crate::timer takes one
+    /// for timer events when the LAPIC timer cannot be used).
+    claimed: AtomicU32,
 }
 
 impl Hpet {
+    /// Take comparator `n`; false if it is already taken.
+    pub fn claim(&self, n: u8) -> bool {
+        let bit = 1u32 << n;
+        self.claimed.fetch_or(bit, Ordering::SeqCst) & bit == 0
+    }
+
+    /// Give comparator `n` back.
+    pub fn unclaim(&self, n: u8) {
+        self.claimed.fetch_and(!(1u32 << n), Ordering::SeqCst);
+    }
+
+    /// Bit n set: comparator n is taken.
+    pub fn claimed(&self) -> u32 {
+        self.claimed.load(Ordering::SeqCst)
+    }
+
     pub fn read(&self, reg: u64) -> u64 {
         // SAFETY: `regs` maps the HPET's 1 KiB register block uncached
         // (init), and `reg` is a register offset in it, 8-byte aligned.
@@ -163,6 +183,30 @@ pub fn pit_stop(port_b: u8) {
     let _g = PIT_LOCK.lock();
     // SAFETY: restores port B's writable bits as they were.
     unsafe { outb(pit::PORT_B, pit::restore(port_b)) };
+}
+
+/// Arm PIT channel 0 for a one-shot of `count` periods (1 to 65,536;
+/// optimal_time::oneshot::pit_count), raising ISA IRQ 0 once when it runs
+/// out.
+pub fn pit0_arm(count: u32) {
+    let _g = PIT_LOCK.lock();
+    // SAFETY: the PIT's command and channel 0 ports. Channel 0's output is
+    // ISA IRQ 0, which only crate::timer unmasks, and only while it owns
+    // the channel.
+    unsafe {
+        for (port, v) in pit::arm0(count) {
+            outb(port, v);
+        }
+    }
+}
+
+/// Stop PIT channel 0: mode 0 with no count written holds OUT low, so no
+/// edge reaches IRQ 0 (firmware leaves it in mode 3, an 18.2 Hz square
+/// wave).
+pub fn pit0_disarm() {
+    let _g = PIT_LOCK.lock();
+    // SAFETY: as in pit0_arm; the mode write alone changes only channel 0.
+    unsafe { outb(pit::COMMAND, pit::MODE0_CH0) };
 }
 
 /// Channel 2's count as an up-counter (16 bits).
@@ -365,10 +409,6 @@ pub enum TscFreq {
 /// after use: [`pit_start`] it before reading it.
 pub struct Time {
     pub hpet: Option<Hpet>,
-    #[cfg_attr(
-        not(feature = "ktest"),
-        expect(dead_code, reason = "tests read it; the scorecard will")
-    )]
     pub hpet_check: HpetCheck,
     pub pm: Option<Pm>,
     pub reference: Option<Reference>,
@@ -459,7 +499,11 @@ fn find_hpet(info: &BootInfo, warnings: &mut Vec<String>) -> Option<Hpet> {
             return None;
         }
     };
-    let h = Hpet { regs: va, caps };
+    let h = Hpet {
+        regs: va,
+        caps,
+        claimed: AtomicU32::new(0),
+    };
     let check = hpet::check_table(caps, table.comparators, table.counter_64bit);
     if let Some((t, hw)) = check.comparators {
         warnings.push(format!(

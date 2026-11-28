@@ -396,6 +396,40 @@ else
     echo "SKIP: time-watchdog-*-kvm (the host has no invariant TSC for KVM to offer)"
     skipped=$((skipped + 1))
 fi
+# Timer events without the LAPIC timer (kernel/src/timer.rs): notimer=lapic
+# rules both LAPIC modes out, as a machine whose LAPIC timer cannot be
+# measured would, so events come from an HPET comparator on a free I/O
+# APIC input; with notimer=lapic,hpet, or where no comparator reaches a
+# free input (QEMU's pc machine routes the HPET only to GSI 2, which is
+# ISA IRQ 0's), from PIT channel 0. The whole test suite then runs on
+# them, forcing every other source this machine has in turn.
+NT_ISO=build/optimal-ktest-notimer-lapic.iso
+NTH_ISO=build/optimal-ktest-notimer-lapic-hpet.iso
+HPET_EV='^timer: lapic skipped; hpet comparator [0-9]+ on GSI [0-9]+ [0-9.]+ MHz'
+PIT_EV='^timer: lapic skipped; pit [0-9.]+ MHz \+/-[0-9.]+ ppm against the'
+HPET_SELF=', the clock itself; notimer lapic; events hpet one-shot; .*; 0 warnings$'
+scenario "timer-hpet-events" "boot:$HPET_EV$HPET_SELF" "$NT_ISO" bios q35 512M 2 30 kvm
+has_uefi && scenario "timer-hpet-events-uefi" "boot:$HPET_EV$HPET_SELF" "$NT_ISO" uefi q35 512M 2 30 kvm
+scenario "timer-hpet-events-tcg-smp4" "boot:$HPET_EV$HPET_SELF" "$NT_ISO" bios q35 1G 4 40 tcg -- -cpu max
+scenario "timer-pit-events" "boot:$PIT_EV hpet .*; notimer lapic,hpet; events pit one-shot; .*; 0 warnings$" "$NTH_ISO" bios q35 512M 2 30 kvm
+scenario "timer-pit-events-tcg" "boot:$PIT_EV hpet .*; notimer lapic,hpet; events pit one-shot; .*; 0 warnings$" "$NTH_ISO" bios q35 512M 2 40 tcg -- -cpu max
+# No HPET at all: the PIT, against the 24-bit PM timer as the clock, which
+# only the PIT's events (at most 54.9 ms apart) keep extended.
+scenario "timer-pit-events-pm-clock" "boot:^time: reference pm-timer .*; clock pm-timer; 0 warnings$ && $PIT_EV pm-timer .*; notimer lapic; events pit one-shot; .*; 0 warnings$" "$NT_ISO" bios q35,hpet=off 512M 2 30 kvm -- -cpu host,-invtsc
+scenario "timer-pit-events-pc" "boot:$PIT_EV hpet .*; notimer lapic; events pit one-shot; .*; 1 warnings$ && ^timer: warning: no HPET timer events: no comparator reaches a free I/O APIC input \(routes 0x00000004 0x00000004 0x00000004\)$" "$NT_ISO" bios pc 512M 2 30 kvm
+# With a TSC clock the HPET's rate is measured against it, the 10 s
+# refinement moves it with the clock, and when the TSC is faked 2000 ppm
+# fast the watchdog falls back to the HPET as the clock, carrying the
+# HPET's rate across (the events stay on the HPET).
+HPET_TSC=' \+/-[0-9.]+ ppm against the tsc over [0-9]+ ms; notimer lapic; events hpet one-shot; .*; 0 warnings$'
+scenario "timer-hpet-events-refine-tcg" "boot:^tscfake: applied: invariant$ && $HPET_EV$HPET_TSC && $REFINED hpet $REFINED_OK" build/optimal-ktest-tsc-invariant-notimer-lapic.iso bios q35 512M 2 40 tcg -- -cpu max
+scenario "timer-hpet-events-watchdog-tcg" "boot:^tscfake: applied: invariant skew\+2000$ && $HPET_EV$HPET_TSC && $WD_ON hpet every 1 s; 0 warnings$ && $WD_RATE$WD_FELL hpet, events hpet one-shot; 1 warnings$ && $(wd_warn hpet)" build/optimal-ktest-tsc-fast-notimer-lapic.iso bios q35 512M 2 50 tcg -- -cpu max
+if [ "$KVM" = yes ] && grep -qw constant_tsc /proc/cpuinfo && grep -qw nonstop_tsc /proc/cpuinfo; then
+    scenario "timer-hpet-events-invtsc" "boot:^time: .*, invariant, .*; clock tsc; 0 warnings$ && $HPET_EV$HPET_TSC && $REFINED hpet $REFINED_OK" "$NT_ISO" bios q35 512M 2 30 kvm -- -cpu host,+invtsc
+else
+    echo "SKIP: timer-hpet-events-invtsc (the host has no invariant TSC for KVM to offer)"
+    skipped=$((skipped + 1))
+fi
 # Timer skew: four slow emulated CPUs taking host time from each other
 # while the boot CPU calibrates.
 scenario "time-tcg-smp4-skew" boot "$ISO" bios q35 1G 4 40 tcg -- -cpu max

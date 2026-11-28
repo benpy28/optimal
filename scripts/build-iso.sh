@@ -59,6 +59,15 @@ make_iso "$BUILD/optimal-kernel-ktest" "$BUILD/optimal-ktest-tsc-fast.iso" "tscf
 make_iso "$BUILD/optimal-kernel-ktest" "$BUILD/optimal-ktest-tsc-slow.iso" "tscfake=invariant,skew-1500"
 make_iso "$BUILD/optimal-kernel-ktest" "$BUILD/optimal-ktest-tsc-drift.iso" "tscfake=invariant,skew+200"
 make_iso "$BUILD/optimal-kernel-ktest" "$BUILD/optimal-ktest-tsc-back.iso" "tscfake=invariant,back"
+# Timer events without the LAPIC timer (kernel/src/timer.rs, notimer=):
+# from the HPET, and with the HPET ruled out too, from the PIT.
+make_iso "$BUILD/optimal-kernel-ktest" "$BUILD/optimal-ktest-notimer-lapic.iso" "notimer=lapic"
+make_iso "$BUILD/optimal-kernel-ktest" "$BUILD/optimal-ktest-notimer-lapic-hpet.iso" "notimer=lapic,hpet"
+# HPET events timed against a TSC clock (under TCG, by tscfake=invariant):
+# the 10 s refinement moves the HPET's rate with the clock, and when the
+# TSC is faked 2000 ppm fast the watchdog's fallback carries it across.
+make_iso "$BUILD/optimal-kernel-ktest" "$BUILD/optimal-ktest-tsc-invariant-notimer-lapic.iso" "tscfake=invariant notimer=lapic"
+make_iso "$BUILD/optimal-kernel-ktest" "$BUILD/optimal-ktest-tsc-fast-notimer-lapic.iso" "tscfake=invariant,skew+2000 notimer=lapic"
 for name in "${!CRASHTESTS[@]}"; do
     make_iso "$BUILD/optimal-kernel" "$BUILD/crash-$name.iso" "crashtest=$name"
 done

@@ -117,10 +117,6 @@ pub type Handler = fn(&mut InterruptFrame);
 
 /// Route `vector` to `handler`. The vector must be one the kernel's map
 /// gives to devices or tests (not exceptions, PIC, spurious or error).
-#[cfg_attr(
-    not(feature = "ktest"),
-    expect(dead_code, reason = "first user outside tests is the timer (1c3)")
-)]
 pub fn set_handler(vector: u8, handler: Handler) {
     assert!(
         (vectors::ISA_BASE..vectors::UNROUTED).contains(&vector),
@@ -227,10 +223,6 @@ fn eoi_if_in_service(lapic: Option<Lapic>, vector: u8) {
 /// it. A level-triggered ISA IRQ must be claimed as a level line instead
 /// (level::claim_isa), which masks it from interrupt to done and ends it at
 /// the I/O APIC; unmasking one here panics.
-#[cfg_attr(
-    not(feature = "ktest"),
-    expect(dead_code, reason = "first user outside tests is the timer (1c3)")
-)]
 pub fn isa_unmask(irq: u8) -> Result<(), NotRouted> {
     set_isa_mask(irq, false)
 }
@@ -243,10 +235,6 @@ pub fn isa_mask(irq: u8) -> Result<(), NotRouted> {
     set_isa_mask(irq, true)
 }
 
-#[cfg_attr(
-    not(feature = "ktest"),
-    expect(dead_code, reason = "only isa_mask and isa_unmask call it")
-)]
 fn set_isa_mask(irq: u8, masked: bool) -> Result<(), NotRouted> {
     let Some(c) = controllers() else {
         return Err(NotRouted::NoIoApic {

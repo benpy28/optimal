@@ -40,6 +40,11 @@ pub mod vectors {
     /// First and last vector for other device interrupts (later phases).
     pub const DEVICE_FIRST: u8 = 0x40;
     pub const DEVICE_LAST: u8 = 0xDF;
+    /// An HPET comparator driving timer events (the fallback when the
+    /// local APIC timer cannot be used), through an I/O APIC pin. In the
+    /// highest class below the local APIC's own vectors, above every
+    /// device.
+    pub const HPET_TIMER: u8 = 0xED;
     /// Unrouted I/O APIC pins are left masked and point here, so if one
     /// is ever unmasked by mistake the kernel can say which.
     pub const UNROUTED: u8 = 0xEE;

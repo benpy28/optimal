@@ -85,8 +85,17 @@ const REVECTOR: u8 = 2;
 fn device(c: &Controllers) -> Result<Dev, &'static str> {
     let t = crate::time::get().ok_or("no time setup")?;
     let h = t.hpet.as_ref().ok_or("no HPET")?;
+    // Comparators the timer took for its events are left out (a zero
+    // configuration has no routes).
+    let taken = h.claimed();
     let configs: Vec<u64> = (0..h.caps.comparators)
-        .map(|n| h.read(hpet::timer_config(n)))
+        .map(|n| {
+            if taken & (1 << n) != 0 {
+                0
+            } else {
+                h.read(hpet::timer_config(n))
+            }
+        })
         .collect();
     let (n, gsi) = hpet::pick_level(&configs, |g| free(c, g).is_ok())
         .ok_or("no HPET comparator reaches a free I/O APIC input")?;
