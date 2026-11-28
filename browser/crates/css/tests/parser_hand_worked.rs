@@ -378,3 +378,32 @@ fn deep_nesting_does_not_recurse() {
         drop(p);
     }
 }
+
+#[test]
+fn views_report_lengths_and_spans() {
+    use optimal_css::parse_component_values;
+    let (p, range) = parse_component_values(Wtf8::from_str(""));
+    assert!(p.tokens.is_empty());
+    assert_eq!(p.tokens.len(), 0);
+    assert!(p.values(range).is_empty());
+
+    // "a (b c) d": a, ws, block, ws, d.
+    let src = "a (b /**/c) d";
+    let (p, range) = parse_component_values(Wtf8::from_str(src));
+    assert!(!p.tokens.is_empty());
+    assert_eq!(p.tokens.len(), 9, "comments are not in the list");
+    let values = p.values(range);
+    assert!(!values.is_empty());
+    let spans: Vec<&str> = values.map(|v| &src[v.span()]).collect();
+    assert_eq!(spans, ["a", " ", "(b /**/c)", " ", "d"]);
+    let block = { values }.nth(2).unwrap();
+    let optimal_css::Kind::Block(_, inner) = block.kind() else {
+        panic!("a block")
+    };
+    assert!(!inner.is_empty());
+    let (p2, r2) = parse_component_values(Wtf8::from_str("()"));
+    let optimal_css::Kind::Block(_, empty) = p2.values(r2).next().unwrap().kind() else {
+        panic!("a block")
+    };
+    assert!(empty.is_empty());
+}
