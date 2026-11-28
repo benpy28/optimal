@@ -478,7 +478,8 @@ impl Document {
         let mut stack = vec![root];
         while let Some(n) = stack.pop() {
             self.model.stats.visited += 1;
-            if clear && !reference {
+            // (A literal document keeps no memos.)
+            if clear {
                 self.model.memo.remove(&n);
             }
             if self.behaviour(n).is_relevant() {
@@ -1352,7 +1353,11 @@ impl Document {
                             .copied()
                             .filter(|&o| self.selectedness(o))
                             .collect();
-                        assert_eq!(selected, st.selected.into_iter().collect::<Vec<_>>());
+                        assert_eq!(
+                            selected,
+                            st.selected.into_iter().collect::<Vec<_>>(),
+                            "settled record"
+                        );
                         if st.selected.is_none() && self.display_size(n) == 1 {
                             assert!(
                                 list.iter().all(|&o| self.option_disabled(o)),

@@ -1258,3 +1258,15 @@ proptest! {
         }
     }
 }
+
+#[test]
+#[should_panic(expected = "settled record")]
+fn invariants_catch_a_wrong_settled_record() {
+    let (mut d, s) = doc_with_select(&[]);
+    let a = el(&mut d, "option", &[]);
+    let b = el(&mut d, "option", &[]);
+    d.append(s, a);
+    d.append(s, b);
+    d.select_state(s).selected = Some(b);
+    d.check_invariants();
+}
