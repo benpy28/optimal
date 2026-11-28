@@ -124,6 +124,8 @@ fn import_layer_syntax() {
         // Conditions: not evaluated yet, so the layer waits.
         ("@import url(x) layer(a) screen;", 3),
         ("@import url(x) layer supports(display: block);", 3),
+        // Only layer() is the layer clause, whatever the function holds.
+        ("@import url(x) supports(a);", 3),
         // layer() without a valid name is a condition (WPT
         // layer-import-parsing): the import stays, its layer isn't
         // declared. Invalid: a bad URL.
