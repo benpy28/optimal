@@ -392,8 +392,19 @@ the heaviest testing in the project:
   slot dead for good (each later commit on two other slots, remount finds
   it again), two dead slots, three dead slots (degraded, changes readable,
   a commit lands them once the device works), an unlink failing at each
-  read point after its data was released (data intact, fsck exact), and a
-  truncate failing part way (dirty data untouched).
+  read point after its data was released (data intact, fsck exact; also
+  under a snapshot, then deleting the snapshot), a truncate failing part
+  way (dirty data untouched), a commit whose data flush fails at each read
+  point, a snapshot whose commit fails for good, losing a third slot, and
+  the counters a failed create or snapshot moved. 29 hand mutations of the
+  new safeguards, 26 caught. Survivors: deferring the drop of a shrunk
+  file's dirty blocks and undoing a deadlist append item by item guard
+  conditions no current path reaches (a file with dirty data always has a
+  dirty inode leaf, so nothing after the drop reads; after a deadlist
+  append's first insert its path is dirty, so later inserts cannot read).
+  The flag for a space-map free that fails part way is reachable but not
+  yet tested: it needs a bitmap read to fail in the middle of one
+  multi-block free that spans two bitmap blocks (32768 blocks each).
 - **Lying drives**: flushes are acknowledged but lost for 1 to 8 commits,
   then power is cut. Images are steered into the worst cases (every later
   superblock write landed; or only the newest pair landed and the other pair

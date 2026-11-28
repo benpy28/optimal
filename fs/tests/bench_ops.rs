@@ -36,7 +36,7 @@ fn one(commit_every: u32) -> [f64; 4] {
     let mut inos = Vec::new();
     for i in 0..n {
         inos.push(fs.create(d, format!("file-{i}").as_bytes(), 0o644).unwrap());
-        if commit_every > 0 && i % commit_every == 0 {
+        if commit_every > 0 && i.is_multiple_of(commit_every) {
             fs.commit().unwrap();
         }
     }
@@ -44,7 +44,7 @@ fn one(commit_every: u32) -> [f64; 4] {
     let t = Instant::now();
     for (i, &f) in inos.iter().enumerate() {
         fs.write(f, (i % 7) as u64 * 100, b"hello world").unwrap();
-        if commit_every > 0 && i as u32 % commit_every == 0 {
+        if commit_every > 0 && (i as u32).is_multiple_of(commit_every) {
             fs.commit().unwrap();
         }
     }
@@ -58,7 +58,7 @@ fn one(commit_every: u32) -> [f64; 4] {
             format!("g-{i}").as_bytes(),
         )
         .unwrap();
-        if commit_every > 0 && i % commit_every == 0 {
+        if commit_every > 0 && i.is_multiple_of(commit_every) {
             fs.commit().unwrap();
         }
     }
@@ -66,7 +66,7 @@ fn one(commit_every: u32) -> [f64; 4] {
     let t = Instant::now();
     for i in 0..n {
         fs.unlink(d, format!("g-{i}").as_bytes()).unwrap();
-        if commit_every > 0 && i % commit_every == 0 {
+        if commit_every > 0 && i.is_multiple_of(commit_every) {
             fs.commit().unwrap();
         }
     }
