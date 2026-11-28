@@ -487,14 +487,32 @@ the heaviest testing in the project:
   through a directory fsync or an unrelated file's fsync, a background
   writer's data left out, shrink and regrow with early-flushed blocks read
   back, a commit ending the chain, the fallbacks to a commit, read-only
-  replay writing nothing, fsync after a clean mount), the ring block layout
-  worked by hand, and a batch that fails to replay, does not decode, or has
-  a flipped bit. Power cuts at every write point of random workloads with
+  replay writing nothing, fsync after a clean mount, a ring flush that
+  fails with and without losing the cache, fsync on a degraded volume and
+  after a fallback to a history commit), the ring block layout worked by
+  hand, a batch that fails to replay, does not decode, or has a flipped
+  bit, marked blocks and pending records staying bounded, replay refusing
+  a commit for space, and a header ring or body chain start out of range
+  refused. The hand tests mount with a 256 KiB dirty limit so big writes
+  flush early (with format's 64 MiB limit they never did, which hid a
+  wrong test: a ring flush that loses the cache must fail the fsync, not
+  commit lost blocks). Power cuts at every write point of random workloads with
   fsyncs mixed in (plain and encrypted, and sampled long runs): the
   harness keeps the state replay must rebuild (the last commit, every
   namespace operation since, each file's data as of its last logged state)
   and the mounted volume must equal it before or after the interrupted
-  call, pass fsck and keep working.
+  call, pass fsck and keep working. 31 hand mutations of the log's
+  guards: 26 caught. Survivors, guards no current path reaches: the
+  sequence check (a chain never outgrows the ring, so no block of its
+  generation sits at a wrong position); turning the log off after an
+  operation that committed part way (the only commit inside an operation
+  is its space check, which runs before it changes anything, so its record
+  still applies on top) and after a snapshot operation (each commits
+  first, which the same check catches); turning it off after a failed
+  commit (the retry lands and starts a new chain, or the volume is
+  degraded and fsync commits; a commit refused for space never wrote its
+  superblock); a state record shrinking the file (every shrink is a record
+  replayed before it).
 - **Lying drives**: flushes are acknowledged but lost for 1 to 8 commits,
   then power is cut. Images are steered into the worst cases (every later
   superblock write landed; or only the newest pair landed and the other pair
