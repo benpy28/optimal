@@ -79,6 +79,10 @@ pub const CPUID_SLACK_PPB: u64 = 200_000;
 const SAMPLE_TRIES: usize = 8;
 
 /// The HPET, mapped and running.
+/// Below this, an HPET read's low half cannot be from a torn read
+/// ([`Hpet::counter_whole`]): 2^32 - 2^28.
+const SURE_LOW: u32 = 0xF000_0000;
+
 pub struct Hpet {
     regs: u64,
     pub caps: Capabilities,
@@ -122,15 +126,24 @@ impl Hpet {
     /// The main counter, read so that it cannot tear: an emulator that
     /// takes only 4-byte accesses (QEMU) splits a 64-bit read in two, low
     /// half first, and a carry between them gives a value 2^32 ticks too
-    /// high. Two reads with the same high half leave no carry between the
-    /// first one's high half and the second one's, so the second one is
-    /// whole.
+    /// high. A torn read's low half is the one from just before the carry,
+    /// so it is within a few ticks of 2^32: a read whose low half is under
+    /// 2^32 - 2^28 is whole unless 2^28 ticks (2.7 s at 100 MHz, 18.7 s
+    /// at 14.318 MHz) passed between its two halves. That is one read, as
+    /// before, 15 times in 16. Otherwise two reads with the same high half
+    /// leave no carry between the first one's high half and the second
+    /// one's, so the second one is whole. (Chosen over two reads always:
+    /// that doubled the cost of every HPET clock read, and a test making
+    /// 200,000 of them on KVM ran past its time limit.)
     pub fn counter_whole(&self) -> u64 {
         // A 32-bit counter's high half is always 0: nothing to tear.
         if !self.caps.counter_64bit {
             return self.counter();
         }
         let mut a = self.counter();
+        if (a as u32) < SURE_LOW {
+            return a;
+        }
         loop {
             let b = self.counter();
             if a >> 32 == b >> 32 {
@@ -287,11 +300,9 @@ impl Counter<'_> {
             // Read whole: on an emulator that splits 64-bit accesses
             // (QEMU) a carry between the halves would read 2^32 ticks
             // high, 43 s at 100 MHz, in the clock and in every
-            // measurement. Two reads where one would do on hardware that
-            // reads 64 bits at once; chosen over a 32-bit read extended
-            // in software (one read, but every clock read would take the
-            // narrow-counter lock), left for when SMP makes the trade
-            // measurable.
+            // measurement. One read 15 times in 16 (Hpet::counter_whole).
+            // Rejected: a 32-bit read extended in software (one read, but
+            // every clock read would take the narrow-counter lock).
             Counter::Hpet(h) => Some(h.counter_whole()),
             Counter::Pm(p) => p.read(),
             Counter::Pit => Some(pit_read()),
