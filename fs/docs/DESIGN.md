@@ -69,7 +69,78 @@ slots. Losses more than 8 commits back are outside the promise and go to
 the rescue mount. Full commits are rate-limited by the VFS (fsync bursts go
 to the intent log), so 8 commits span real time.
 
-Two flushes per commit, no journal, no double writes of data.
+Two flushes per commit, no journal, no double writes of data (except file
+data an `fsync` puts in the intent log, below, which the next commit writes
+again).
+
+## Intent log (fsync without a commit)
+
+Code: `src/fs/ilog.rs`; format: FORMAT "Intent log". Storage design: the
+per-file fsync intent log that carries file data and namespace operations.
+
+- **Where.** A ring of blocks set aside at format, right after the front
+  superblock slots: 1/64 of the volume, 16 to 16384 blocks (64 KiB at the
+  1024-block minimum, 64 MiB from 4 GiB up). It is marked used in the space
+  map for good, so nothing else lands there and no allocation, claim or
+  quarantine is involved. Each commit's superblock body names the ring
+  position where its *chain* starts (after the previous chain, so wear
+  moves round the ring).
+- **What `fsync(f)` writes.** One *batch*: every namespace and attribute
+  record since the last commit or batch (create, mkdir, symlink, link,
+  unlink, rmdir, rename, setattr, truncate: arguments, new inode number and
+  the clock readings the operation took), plus a *state record* for `f`
+  (its inode and every block changed since it was last committed or
+  logged). A file renamed or linked in those records gets a state record
+  too: once the rename is durable, the target is the complete new file
+  (the storage design's replace-by-rename row). Writes add no record; they
+  mark blocks. A directory fsync writes the records alone. Then one flush.
+  Example (the hand test): mkdir, create, a 10,000-byte write, a setattr,
+  fsync: 4 ring blocks and 1 flush, against a commit's tree paths, space
+  map, root block, chunk table, 2 superblocks and 2 flushes.
+- **What it leaves out.** Other files' data: a background writer's blocks
+  never ride along with an unrelated fsync (test: 2 MiB of another file
+  dirty, the fsync of a 4 KiB file writes 2 ring blocks). Namespace records
+  all go into every batch because their order matters and they are small.
+- **Blocks.** Each ring block is sealed on its own (nonce and MAC inside
+  it, kind 10, its address and the chain's commit generation as associated
+  data) and carries its sequence number in the chain and a last-of-batch
+  flag. Replay reads from the chain start until a block fails to verify
+  (an older chain's block has another generation), has the wrong sequence
+  number, or the ring ends, and applies only complete batches. A batch
+  starts on a fresh block: no block that was flushed is written again while
+  its chain is live, so a torn write loses only the batch in flight.
+- **Replay** runs at mount after an unclean shutdown, after recovery picked
+  the commit: the records go through the ordinary operations, with the
+  recorded clock readings, so inode numbers, every timestamp and directory
+  sizes come out identical (the hand test compares whole inodes); state
+  records put the inode and blocks back. A writable mount then commits, and
+  the chain is done. A read-only mount replays in memory and writes
+  nothing. Replay never commits part way (a space check that would need a
+  commit refuses instead). A commit from a history ring (fallback mount)
+  has no chain recorded and replays nothing.
+- **A batch that fails to apply** (only a bug could log one: the original
+  operations succeeded on the same state) or does not decode is never
+  applied half way: mount starts again and applies only the batches before
+  it, and reports it (`LogStats::replay_stopped`).
+- **When fsync commits instead.** No ring; a read-only or degraded volume;
+  a commit that failed since the last good one (its superblock may have
+  landed with a new chain start); a commit made inside an operation (to
+  free space); a snapshot operation; a file with more changed blocks than
+  the ring; a batch that does not fit in the rest of the ring; or a log
+  write or flush that fails (after a failed flush, data written since the
+  last good one is made dirty again first, as for a failed commit). A
+  commit is always correct, so every refusal falls back to it.
+- **Lying drives.** The log does not change the K = 8 fallback promise: a
+  fallback mounts a commit as before and replays its chain only if that
+  commit's own superblock body was read. The VFS's one-commit-per-second
+  limit is what keeps 8 commits spread over real time; fsync bursts in
+  between go to the ring.
+- **Not done yet.** The fsync-latency benchmarks against ext4 (fsync of a
+  4 KiB file alone and while a background writer streams, the 1,000-fsync
+  burst, the dpkg-style loop; storage set 4a) and the published `syncfs`
+  bound need the benchmark step. Large fsyncs log their data inline (twice
+  written); writing big runs in place and logging pointers (as ZFS does
+  for large writes) waits for those numbers.
 
 ## Integrity and encryption
 
@@ -408,6 +479,20 @@ the heaviest testing in the project:
   first half is handed out again). No current path makes such a free (data
   runs come from one bitmap block, metadata frees are one block), so the
   guard is defence for crafted images and future callers.
+- **Intent log** (`tests/intent_log.rs`, `src/fs/ilog.rs` unit tests):
+  hand cases for each promise (file fsync with whole inodes and inode
+  numbers compared after a power cut, directory fsync, replace by rename
+  through a directory fsync or an unrelated file's fsync, a background
+  writer's data left out, shrink and regrow with early-flushed blocks read
+  back, a commit ending the chain, the fallbacks to a commit, read-only
+  replay writing nothing, fsync after a clean mount), the ring block layout
+  worked by hand, and a batch that fails to replay, does not decode, or has
+  a flipped bit. Power cuts at every write point of random workloads with
+  fsyncs mixed in (plain and encrypted, and sampled long runs): the
+  harness keeps the state replay must rebuild (the last commit, every
+  namespace operation since, each file's data as of its last logged state)
+  and the mounted volume must equal it before or after the interrupted
+  call, pass fsck and keep working.
 - **Lying drives**: flushes are acknowledged but lost for 1 to 8 commits,
   then power is cut. Images are steered into the worst cases (every later
   superblock write landed; or only the newest pair landed and the other pair
@@ -447,6 +532,29 @@ the heaviest testing in the project:
   `OFS_SEED=<seed>`.
 
 ## Decision log
+
+- Intent log in a fixed ring set at format, like a journal. Why: no
+  allocator interplay (log blocks need no claim at mount, no quarantine, no
+  space-accounting term, no pre-allocated chain head per commit) and
+  sequential writes. Rejected: a ZIL-style chain of allocated blocks
+  (claimed at mount, freed through quarantine, one head block allocated by
+  every commit).
+- Logical records replayed through the ordinary operations with their
+  recorded clock readings. Why: small batches, and replay reuses the code
+  the model-based tests already check. Rejected: logging changed tree
+  blocks (physical, much larger per fsync, and it ties the log to node
+  layout).
+- Per-file data, all namespace records in every batch. Why: a background
+  writer's data stays out of other files' fsyncs, while namespace order
+  stays exact. Rejected: logging the whole open transaction (an fsync
+  would carry every dirty byte on the volume).
+- File data inline in the ring for now. Why: simplest correct form; the
+  benchmarks decide whether large runs should go in place. Rejected for
+  now: in-place data with logged pointers (needs claims at mount).
+- A batch that fails to replay makes mount start over with the batches
+  before it. Why: no half-applied batch, no new undo machinery for a case
+  only a bug reaches. Rejected: failing the mount (it would then try an
+  older commit and lose more).
 
 - Copy-on-write tree, not a journal: atomic commits and snapshots fall out
   of it, and data is written once. Rejected: ext4-style journaling (double
@@ -544,7 +652,7 @@ the file system track is done.
 | Rate limit on full commits | VFS (Crash consistency notes it) | with the VFS |
 | Hibernation region, stage 1 to 2 migration | | open, kernel integration |
 | Optional features: vault region (F3), travel class key (F5), remove a file from every snapshot (F12) | | open |
-| Per-file fsync intent log, benchmarked under background writeback; it also carries namespace operations (directory fsync, link, rename, O_TMPFILE plus linkat), syncfs latency has a published bound, and a dpkg-style create, fsync, rename, directory-fsync loop joins the tests | FORMAT body (root reserved) | open (next but one) |
+| Per-file fsync intent log, benchmarked under background writeback; it also carries namespace operations (directory fsync, link, rename, O_TMPFILE plus linkat), syncfs latency has a published bound, and a dpkg-style create, fsync, rename, directory-fsync loop joins the tests | Intent log; FORMAT "Intent log" | done: the log, namespace operations and replay, power-cut tested (O_TMPFILE waits for orphan handling in the VFS); open: the benchmarks against ext4 and the published syncfs bound |
 | Error policy: failed write retried at a new block, at most 3 writeback cycles | Errors | done: commits, data flushes and dead superblock slots; operations that fail part way are undone |
 | Metadata stored twice: 64-byte pointers with logical addresses, paired chunks, copy-on-write chunk table in every root set, MAC binds the logical address | Duplicated metadata; FORMAT "Duplicated metadata" | done |
 | The two copies differ; no (copy 1 key, nonce) pair repeats | Duplicated metadata; FORMAT "The second copy" | done (copy 1 checked through the parent's MAC rather than a trailer tag, as agreed in design review) |
@@ -556,10 +664,11 @@ the file system track is done.
 
 ## Not done yet (tracked, in order)
 
-1. The per-file fsync intent log (its records can build on the
-   transaction log of `Store::log`), with an fsync-under-writeback benchmark.
-2. Benchmarks against ext4 (fio-style workloads on the same device),
-   including a scrub that reads copy 1 first.
+1. Benchmarks against ext4 (fio-style workloads on the same device),
+   including a scrub that reads copy 1 first, and the intent log's: fsync
+   latency alone and under background writeback, the fsync burst, the
+   dpkg-style loop, and a published `syncfs` bound.
+2. In-place data for large fsyncs if those benchmarks call for it.
 3. Kani proofs for the space map, chunk table and tree invariants.
 4. Inline data for small files and an AES-GCM-style suite.
 5. Concurrency (the API is `&mut self` today; the kernel will wrap it first).

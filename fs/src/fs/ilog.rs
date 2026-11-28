@@ -647,7 +647,6 @@ impl<D: BlockDevice> Filesystem<D> {
         let mut stream: Vec<u8> = Vec::new();
         let mut applied = 0u64;
         let mut b = zero_block();
-        let saved_limit = self.dirty_limit_blocks;
         for seq in 0..len {
             let addr = self.ring_addr(seq);
             if self.store.io.read_raw(addr, &mut b[..]).is_err() {
@@ -696,19 +695,16 @@ impl<D: BlockDevice> Filesystem<D> {
                 }
             };
             stream.clear();
-            // Replay holds the batches in memory (bounded by the ring), so
-            // a read-only mount writes nothing.
-            self.dirty_limit_blocks = usize::MAX;
+            // Replayed data stays dirty in memory (state records never
+            // flush early), so a read-only mount writes nothing.
             let n = recs.len() as u64;
             if self.apply_batch(recs).is_err() {
-                self.dirty_limit_blocks = saved_limit;
                 return Err(ReplayStop { batches: applied });
             }
             applied += 1;
             self.ilog.stats.replayed_batches += 1;
             self.ilog.stats.replayed_records += n;
         }
-        self.dirty_limit_blocks = saved_limit;
         if limit.is_some() {
             self.ilog.stats.replay_stopped = true;
         }

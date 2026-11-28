@@ -353,6 +353,95 @@ fn read_only_mount_replays_without_writing() {
     fsck_ok(&mut fs);
 }
 
+/// A link makes the linked file's data ride along like a rename does: the
+/// new name is never durable without the data.
+#[test]
+fn link_carries_the_file_data() {
+    let mut fs = format(false, None);
+    let f = fs.create(ROOT_INO, b"tmp", 0o644).unwrap();
+    fs.write(f, 0, &[7u8; 6000]).unwrap();
+    fs.link(f, ROOT_INO, b"final").unwrap();
+    fs.unlink(ROOT_INO, b"tmp").unwrap();
+    fs.fsync(ROOT_INO).unwrap();
+    let mut fs = crash(fs, false, 10);
+    assert_eq!(fs.lookup(ROOT_INO, b"final"), Ok(f));
+    assert_eq!(data(&mut fs, f), vec![7u8; 6000]);
+    fsck_ok(&mut fs);
+}
+
+/// Snapshot operations change whole trees, which records don't describe:
+/// the next fsync commits, so the snapshot and what came after it are
+/// durable together.
+#[test]
+fn fsync_after_a_snapshot_commits() {
+    let mut fs = format(false, None);
+    let f = fs.create(ROOT_INO, b"f", 0o644).unwrap();
+    let id = fs.snapshot_create(b"s").unwrap();
+    fs.write(f, 0, b"after").unwrap();
+    let g = fs.generation();
+    fs.fsync(f).unwrap();
+    assert_eq!(fs.generation(), g + 1, "fsync must commit after a snapshot");
+    let mut fs = crash(fs, false, 11);
+    let ids: Vec<u64> = fs.snapshot_list().unwrap().iter().map(|s| s.id).collect();
+    assert_eq!(ids, vec![id]);
+    assert_eq!(data(&mut fs, f), b"after");
+    // And logging resumes after that commit.
+    fs.write(f, 0, b"again").unwrap();
+    let g = fs.generation();
+    fs.fsync(f).unwrap();
+    assert_eq!(fs.generation(), g);
+    let mut fs = crash(fs, false, 12);
+    assert_eq!(data(&mut fs, f), b"again");
+    fsck_ok(&mut fs);
+}
+
+/// A ring write that fails: fsync falls back to a full commit and still
+/// returns success with everything durable.
+#[test]
+fn failed_ring_write_falls_back_to_a_commit() {
+    let mut fs = format(false, None);
+    let f = fs.create(ROOT_INO, b"f", 0o644).unwrap();
+    fs.write(f, 0, b"payload").unwrap();
+    let d = fs.device_mut();
+    d.faults.fail_write_at = Some(d.writes);
+    let g = fs.generation();
+    fs.fsync(f).unwrap();
+    assert_eq!(fs.generation(), g + 1);
+    assert_eq!(fs.intent_log_stats().fsync_commits, 1);
+    let mut fs = crash(fs, false, 13);
+    assert_eq!(data(&mut fs, f), b"payload");
+    fsck_ok(&mut fs);
+}
+
+/// The ring flush fails and loses the device cache, which held a file's
+/// early-flushed blocks: before committing instead, fsync must make that
+/// data dirty again, or the commit would point at blocks that never landed.
+#[test]
+fn failed_ring_flush_rewrites_unflushed_data() {
+    for enc in [false, true] {
+        let mut fs = format(enc, None);
+        let big = fs.create(ROOT_INO, b"big", 0o644).unwrap();
+        let f = fs.create(ROOT_INO, b"f", 0o644).unwrap();
+        fs.commit().unwrap();
+        let body: Vec<u8> = (0..600_000u32).map(|i| (i % 253) as u8).collect();
+        fs.write(big, 0, &body).unwrap();
+        assert!(
+            fs.io_stats().blocks_written > 0,
+            "the big write flushed early"
+        );
+        fs.write(f, 0, b"small").unwrap();
+        let d = fs.device_mut();
+        d.faults.fail_flush_at = Some(d.flushes);
+        d.faults.failed_flush_loses_cache = true;
+        fs.fsync(f).unwrap();
+        assert_eq!(fs.intent_log_stats().fsync_commits, 1);
+        let mut fs = crash(fs, enc, 14);
+        assert_eq!(data(&mut fs, big), body, "enc {enc}");
+        assert_eq!(data(&mut fs, f), b"small");
+        fsck_ok(&mut fs);
+    }
+}
+
 // ---- power cuts at every write point ----
 
 struct Reference {
