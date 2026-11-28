@@ -371,6 +371,20 @@ fn hostile_inputs_parse_in_linear_time() {
         ("adoption moving options", |n| {
             format!("<select>{}", "<b><div><option>x</b></div>".repeat(n))
         }),
+        // Each </b> runs the adoption agency with the div as furthest
+        // block, and the next <b><div> opens inside it: one level deeper
+        // each time (issue 31).
+        ("adoption nesting deeper", |n| "<b><div>x</b>".repeat(n)),
+        // Every </b> moves the same div, with all its content, under the
+        // next b down: a deep target and a big subtree each time.
+        ("adoption moving one div down", |n| {
+            format!(
+                "{}<div>{}{}",
+                (0..n).map(|i| format!("<b id={i}>")).collect::<String>(),
+                "<p>x".repeat(n),
+                "</b>".repeat(n)
+            )
+        }),
         ("many attributes", |n| {
             format!(
                 "<div {}>",

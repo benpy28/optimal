@@ -39,6 +39,7 @@ fn main() {
         "adoption with many divs",
         &format!("<b>{}</b>", "<div>".repeat(n)),
     );
+    time("adoption nesting deeper", &"<b><div>x</b>".repeat(n / 5));
     time("end tags of nothing", &"</div>".repeat(n));
     time(
         "select options",

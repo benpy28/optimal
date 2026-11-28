@@ -311,3 +311,18 @@ proptest! {
         prop_assert_eq!(d.node_count(), ids.len());
     }
 }
+
+/// The plain ancestor walk: inclusive, and only upwards.
+#[test]
+fn inclusive_ancestors() {
+    let mut d = Document::new();
+    let a = d.create_element(Namespace::Html, local::DIV, vec![]);
+    let b = d.create_element(Namespace::Html, local::DIV, vec![]);
+    let c = d.create_element(Namespace::Html, local::DIV, vec![]);
+    d.append(Document::ROOT, a);
+    d.append(a, b);
+    assert!(d.is_inclusive_ancestor(a, a));
+    assert!(d.is_inclusive_ancestor(Document::ROOT, b));
+    assert!(!d.is_inclusive_ancestor(b, a));
+    assert!(!d.is_inclusive_ancestor(c, b));
+}

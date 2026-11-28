@@ -834,7 +834,7 @@ impl TreeBuilder {
     /// must not make a node its own ancestor, a document has at most one
     /// element child, and the reference child must be a child of the parent.
     /// Where it fails, the standard's insert steps are skipped.
-    fn can_insert_element(&self, el: NodeId, loc: Loc) -> bool {
+    fn can_insert_element(&mut self, el: NodeId, loc: Loc) -> bool {
         !self.doc.would_cycle(el, loc.parent)
             && !(loc.parent == Document::ROOT && self.doc.has_element_child(Document::ROOT))
             && loc
