@@ -27,5 +27,5 @@ exclude_re = [
     # whitespace in it sits between two other values and `other` is set by
     # them anyway; counting whitespace as "other" (the mutant) changes no
     # result. Equivalent. Line-pinned.
-    "css/src/parser\\.rs:632:17: delete match arm Token::Whitespace in Parser<'p, 'a, V>::has_curly_block_and_more",
+    "css/src/parser\\.rs:628:17: delete match arm Token::Whitespace in Parser<'p, 'a, V>::has_curly_block_and_more",
 ]

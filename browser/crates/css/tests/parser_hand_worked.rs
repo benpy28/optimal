@@ -469,3 +469,42 @@ fn declaration_edge_cases_5_5_6() {
     let names: Vec<&str> = list.iter().map(|d| p.name(d.name)).collect();
     assert_eq!(names, ["b"]);
 }
+
+#[test]
+fn custom_property_runs_to_the_closer_5_5_6() {
+    // A custom property's value is consumed up to the block's "}".
+    let src = "a{--x: y }";
+    let (r, _) = common::parse_json(Wtf8::from_str(src), Entry::Stylesheet);
+    assert_eq!(
+        readable(src, &r),
+        json!([["qr", "a", [["d", "--x", "y", false]], []]])
+    );
+    assert_eq!(r[0][2][0][4], json!([7, 8]));
+
+    // Rejected by the context, it is re-read as a rule whose prelude looks
+    // like a custom property (5.5.3): in a block, its remnants run to the
+    // "}" and nothing is made; the "}" still closes "a".
+    struct NoCustom;
+    impl Validity for NoCustom {
+        fn declaration(
+            &mut self,
+            p: &Parsed<'_>,
+            d: &optimal_css::Declaration,
+            _nested: bool,
+        ) -> bool {
+            !p.name(d.name).starts_with("--")
+        }
+    }
+    let (p, rules) =
+        optimal_css::parse_stylesheet(Wtf8::from_str("a{--v:b{c} d} e{}"), &mut NoCustom);
+    assert_eq!(rules.len(), 2);
+    let Rule::Qualified {
+        declarations,
+        children,
+        ..
+    } = &p.rules[rules[0] as usize]
+    else {
+        panic!("a qualified rule")
+    };
+    assert!(declarations.is_empty() && children.is_empty());
+}
