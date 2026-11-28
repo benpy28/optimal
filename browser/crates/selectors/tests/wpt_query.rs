@@ -27,9 +27,11 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 fn suite_dir() -> PathBuf {
-    std::env::var_os("WPT_DOM").map(PathBuf::from).unwrap_or_else(|| {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../build/wpt-dom/dom/nodes")
-    })
+    std::env::var_os("WPT_DOM")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../build/wpt-dom/dom/nodes")
+        })
 }
 
 /// One `{...}` entry of a selector array.
@@ -46,7 +48,11 @@ struct Entry {
 fn entries(toks: &[Tok], name: &str) -> Vec<Entry> {
     let start = toks
         .windows(3)
-        .position(|w| w[0] == Tok::Word("var".into()) && w[1] == Tok::Word(name.into()) && w[2] == Tok::Punct('='))
+        .position(|w| {
+            w[0] == Tok::Word("var".into())
+                && w[1] == Tok::Word(name.into())
+                && w[2] == Tok::Punct('=')
+        })
         .unwrap_or_else(|| panic!("no {name}"));
     let mut i = start + 3;
     assert_eq!(toks[i], Tok::Punct('['));
@@ -117,10 +123,14 @@ struct Setup {
 }
 
 fn setup() -> Setup {
-    let src = std::fs::read_to_string(suite_dir().join("ParentNode-querySelector-All-content.html"))
-        .expect("the WPT dom/nodes suite (run browser/scripts/fetch-test-suites.sh)");
+    let src =
+        std::fs::read_to_string(suite_dir().join("ParentNode-querySelector-All-content.html"))
+            .expect("the WPT dom/nodes suite (run browser/scripts/fetch-test-suites.sh)");
     let parsed = parse_document(&src, ParseOptions::default());
-    assert_eq!(parsed.document.quirks_mode, optimal_dom::QuirksMode::NoQuirks);
+    assert_eq!(
+        parsed.document.quirks_mode,
+        optimal_dom::QuirksMode::NoQuirks
+    );
     let mut t = Tree::from_dom(&parsed.document);
     // The page loads the fixture with the fragment #target.
     t.target = t.by_id(0, "target");
@@ -132,7 +142,10 @@ fn setup() -> Setup {
     }
     for prefix in ["any-namespace", "no-namespace"] {
         let holder = t.element(HTML, "div", &[("id", prefix)]);
-        for (k, ns) in [HTML, HTML, "", "http://www.example.org/ns"].into_iter().enumerate() {
+        for (k, ns) in [HTML, HTML, "", "http://www.example.org/ns"]
+            .into_iter()
+            .enumerate()
+        {
             let id = format!("{prefix}-div{}", k + 1);
             let d = t.element(ns, "div", &[("id", &id)]);
             t.append(holder, d);
@@ -209,7 +222,8 @@ fn wpt_query_selector_all() {
     let valid = entries(&toks, "validSelectors");
     let errata: BTreeMap<String, Value> = serde_json::from_str(
         &std::fs::read_to_string(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../conformance/wpt-query-errata.json"),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../conformance/wpt-query-errata.json"),
         )
         .unwrap(),
     )
@@ -235,7 +249,10 @@ fn wpt_query_selector_all() {
         for e in &invalid {
             cases += 1;
             if qsa(t, n, &e.selector).is_some() {
-                failures.push(format!("{label}: {}: {:?} should not parse", e.name, e.selector));
+                failures.push(format!(
+                    "{label}: {}: {:?} should not parse",
+                    e.name, e.selector
+                ));
             }
         }
         // runSpecialSelectorTests: null and undefined, and tree order.
@@ -248,7 +265,12 @@ fn wpt_query_selector_all() {
         }
         cases += 1;
         let all: Vec<usize> = qsa(t, n, "*").unwrap().into_iter().map(|r| r.2).collect();
-        let order: Vec<usize> = t.subtree(n).into_iter().skip(1).filter(|&x| t.is_element(x)).collect();
+        let order: Vec<usize> = t
+            .subtree(n)
+            .into_iter()
+            .skip(1)
+            .filter(|&x| t.is_element(x))
+            .collect();
         if all != order {
             failures.push(format!("{label}: * is not in tree order"));
         }
@@ -262,22 +284,41 @@ fn wpt_query_selector_all() {
             let expect: Vec<String> = match errata.get(&key) {
                 Some(v) => {
                     used.insert(key.clone());
-                    assert_ne!(v["expect"], serde_json::json!(e.expect), "erratum {key} agrees with the suite");
-                    v["expect"].as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect()
+                    assert_ne!(
+                        v["expect"],
+                        serde_json::json!(e.expect),
+                        "erratum {key} agrees with the suite"
+                    );
+                    v["expect"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|x| x.as_str().unwrap().to_string())
+                        .collect()
                 }
                 None => e.expect.clone(),
             };
             let Some(got) = qsa(t, n, &e.selector) else {
-                failures.push(format!("{label}: {}: {:?} did not parse", e.name, e.selector));
+                failures.push(format!(
+                    "{label}: {}: {:?} did not parse",
+                    e.name, e.selector
+                ));
                 continue;
             };
-            let ids: Vec<String> = got.iter().map(|r| r.0.clone().unwrap_or_default()).collect();
+            let ids: Vec<String> = got
+                .iter()
+                .map(|r| r.0.clone().unwrap_or_default())
+                .collect();
             if ids != expect || got.iter().any(|r| r.1) {
                 failures.push(format!(
                     "{label}: {}: {:?}\n  expected {expect:?}\n  got      {ids:?}{}",
                     e.name,
                     e.selector,
-                    if got.iter().any(|r| r.1) { " (with clones)" } else { "" }
+                    if got.iter().any(|r| r.1) {
+                        " (with clones)"
+                    } else {
+                        ""
+                    }
                 ));
             }
         }

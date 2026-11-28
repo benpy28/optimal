@@ -76,11 +76,17 @@ fn extended_filter(tag: &[u8], range: &[u8]) -> bool {
 /// Whether `tag` is a well-formed language tag (RFC 5646 2.1's
 /// `Language-Tag` production), ASCII case-insensitively.
 pub fn well_formed(tag: &[u8]) -> bool {
-    if GRANDFATHERED.iter().any(|g| g.as_bytes().eq_ignore_ascii_case(tag)) {
+    if GRANDFATHERED
+        .iter()
+        .any(|g| g.as_bytes().eq_ignore_ascii_case(tag))
+    {
         return true;
     }
     let subtags: Vec<&[u8]> = tag.split(|&b| b == b'-').collect();
-    if subtags.iter().any(|s| s.is_empty() || s.len() > 8 || !s.iter().all(u8::is_ascii_alphanumeric)) {
+    if subtags
+        .iter()
+        .any(|s| s.is_empty() || s.len() > 8 || !s.iter().all(u8::is_ascii_alphanumeric))
+    {
         return false;
     }
     let alpha = |s: &[u8]| s.iter().all(u8::is_ascii_alphabetic);
@@ -113,11 +119,16 @@ pub fn well_formed(tag: &[u8]) -> bool {
         i += 1;
     }
     // ["-" region]: 2ALPHA / 3DIGIT
-    if i < n && ((subtags[i].len() == 2 && alpha(subtags[i])) || (subtags[i].len() == 3 && digit(subtags[i]))) {
+    if i < n
+        && ((subtags[i].len() == 2 && alpha(subtags[i]))
+            || (subtags[i].len() == 3 && digit(subtags[i])))
+    {
         i += 1;
     }
     // *("-" variant): 5*8alphanum / (DIGIT 3alphanum)
-    while i < n && (subtags[i].len() >= 5 || (subtags[i].len() == 4 && subtags[i][0].is_ascii_digit())) {
+    while i < n
+        && (subtags[i].len() >= 5 || (subtags[i].len() == 4 && subtags[i][0].is_ascii_digit()))
+    {
         i += 1;
     }
     // *("-" extension): singleton 1*("-" (2*8alphanum))

@@ -85,7 +85,7 @@ Each choice below is logged as: chosen, why, rejected.
 | 1 | `optimal-wtf8`: web strings (UTF-8 plus lone surrogates) | property tests against a UTF-16 model |
 | 2 | `optimal-html`: tokenizer | html5lib-tests tokenizer suite, 100%, with error codes and positions, under any input chunking |
 | 3 | `optimal-html`: tree builder, `optimal-dom` | WPT `html/syntax/parsing` (the html5lib tree tests), 100% |
-| 4 | `optimal-css` (syntax), `optimal-selectors`, then cascade | WPT `css/css-syntax`, `css/selectors`, `css/css-cascade` |
+| 4 | `optimal-css` (syntax), `optimal-selectors`, then cascade | WPT `css/css-syntax`, `css/selectors`, `dom/nodes` (Selectors API), `css/css-cascade` |
 | 5 | `optimal-style`, `optimal-layout` (block, inline, text), `optimal-paint` (software rasterizer into a framebuffer) | WPT reftests for CSS 2 box model, inline and block |
 | 6 | Flexbox and grid | WPT `css/css-flexbox`, `css/css-grid` |
 | 7 | `optimal-js`: ECMAScript engine (interpreter first) | test262 |

@@ -13,7 +13,7 @@ gates, Optimal ships a borrowed browser.
 | `crates/wtf8` | Web strings: UTF-8 that can also hold lone surrogates | done |
 | `crates/html` | WHATWG HTML parser | tokenizer done (html5lib-tests 7046/7046); tree builder next |
 | `crates/css` | CSS Syntax Level 3 | tokenizer and parser done (css-tokenizer-tests 287/287, 2 with errata; css-parsing-tests 149/149, 16 with errata), An+B (An+B.json 128/128, WPT 87/87) |
-| `crates/selectors` | Selectors Level 4 | parsing, serialization and specificity done (WPT css/selectors/parsing 352/352, 5 with errata); matching next |
+| `crates/selectors` | Selectors Level 4 | parsing, serialization, specificity and matching done (WPT css/selectors/parsing 352/352, 5 with errata; dom/nodes querySelectorAll 941/941, 8 with errata); cascade next |
 
 ## Building and testing
 

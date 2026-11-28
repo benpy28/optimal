@@ -151,7 +151,11 @@ impl Tree {
     }
 
     pub fn first_element_child(&self, n: usize) -> Option<usize> {
-        self.nodes[n].children.iter().copied().find(|&c| self.is_element(c))
+        self.nodes[n]
+            .children
+            .iter()
+            .copied()
+            .find(|&c| self.is_element(c))
     }
 
     /// Copy an `optimal-dom` document.
@@ -225,9 +229,16 @@ impl<'t> El<'t> {
         let cs = &self.t.nodes[p].children;
         let idx = self.node().index;
         let found = if forward {
-            cs[idx + 1..].iter().copied().find(|&c| self.t.is_element(c))
+            cs[idx + 1..]
+                .iter()
+                .copied()
+                .find(|&c| self.t.is_element(c))
         } else {
-            cs[..idx].iter().rev().copied().find(|&c| self.t.is_element(c))
+            cs[..idx]
+                .iter()
+                .rev()
+                .copied()
+                .find(|&c| self.t.is_element(c))
         };
         found.map(|i| El { t: self.t, i })
     }
@@ -253,7 +264,9 @@ impl<'t> El<'t> {
             return false;
         }
         match local {
-            "button" | "input" | "select" | "textarea" => self.has_attr("disabled") || self.in_disabled_fieldset(),
+            "button" | "input" | "select" | "textarea" => {
+                self.has_attr("disabled") || self.in_disabled_fieldset()
+            }
             "optgroup" => self.has_attr("disabled"),
             "option" => {
                 self.has_attr("disabled")
@@ -287,7 +300,10 @@ impl<'t> El<'t> {
     }
 
     fn input_type(&self) -> String {
-        self.t.attr(self.i, "", "type").unwrap_or("text").to_ascii_lowercase()
+        self.t
+            .attr(self.i, "", "type")
+            .unwrap_or("text")
+            .to_ascii_lowercase()
     }
 
     /// An option's selectedness, from its select's "selectedness setting
@@ -303,12 +319,21 @@ impl<'t> El<'t> {
             .into_iter()
             .filter(|&n| self.t.is_element(n) && El { t: self.t, i: n }.is_html("option"))
             .map(|n| El { t: self.t, i: n })
-            .filter(|o| o.parent_element() == Some(select) || o.parent_element().is_some_and(|p| p.is_html("optgroup") && p.parent_element() == Some(select)))
+            .filter(|o| {
+                o.parent_element() == Some(select)
+                    || o.parent_element().is_some_and(|p| {
+                        p.is_html("optgroup") && p.parent_element() == Some(select)
+                    })
+            })
             .collect();
         if select.has_attr("multiple") {
             return self.has_attr("selected");
         }
-        let size = select.t.attr(select.i, "", "size").and_then(|s| s.parse::<u32>().ok()).unwrap_or(1);
+        let size = select
+            .t
+            .attr(select.i, "", "size")
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(1);
         match options.iter().rposition(|o| o.has_attr("selected")) {
             Some(last) => options[last] == *self,
             None if size <= 1 => options.iter().find(|o| !o.actually_disabled()) == Some(self),
@@ -334,17 +359,22 @@ impl Element for El<'_> {
         self.sibling(true)
     }
     fn first_element_child(&self) -> Option<Self> {
-        self.t.first_element_child(self.i).map(|i| El { t: self.t, i })
+        self.t
+            .first_element_child(self.i)
+            .map(|i| El { t: self.t, i })
     }
     fn same_parent(&self, other: &Self) -> bool {
         self.node().parent.is_some() && self.node().parent == other.node().parent
     }
     fn any_non_element_child(&self, mut f: impl FnMut(Option<&[u8]>) -> bool) -> bool {
-        self.node().children.iter().any(|&c| match &self.t.nodes[c].kind {
-            Kind::Text(s) => f(Some(s.as_bytes())),
-            Kind::Comment | Kind::Element { .. } => false,
-            Kind::Document | Kind::Fragment => f(None),
-        })
+        self.node()
+            .children
+            .iter()
+            .any(|&c| match &self.t.nodes[c].kind {
+                Kind::Text(s) => f(Some(s.as_bytes())),
+                Kind::Comment | Kind::Element { .. } => false,
+                Kind::Document | Kind::Fragment => f(None),
+            })
     }
     fn is_html_element_in_html_document(&self) -> bool {
         self.t.html && self.data().0 == HTML
@@ -371,9 +401,11 @@ impl Element for El<'_> {
     fn state(&self, pc: PseudoClassKeyword) -> bool {
         use PseudoClassKeyword as K;
         let link = (self.is_html("a") || self.is_html("area")) && self.has_attr("href");
-        let form = ["button", "input", "select", "textarea", "optgroup", "option", "fieldset"]
-            .iter()
-            .any(|n| self.is_html(n));
+        let form = [
+            "button", "input", "select", "textarea", "optgroup", "option", "fieldset",
+        ]
+        .iter()
+        .any(|n| self.is_html(n));
         match pc {
             // No history: every link is unvisited.
             K::Link | K::AnyLink => link,
@@ -405,7 +437,10 @@ impl Element for El<'_> {
                 return f(v.as_bytes());
             }
             let ns = e.data().0;
-            if let Some(v) = e.t.attr(e.i, "", "lang").filter(|_| ns == HTML || ns == SVG) {
+            if let Some(v) =
+                e.t.attr(e.i, "", "lang")
+                    .filter(|_| ns == HTML || ns == SVG)
+            {
                 return f(v.as_bytes());
             }
             cur = e.parent_element();
@@ -415,7 +450,12 @@ impl Element for El<'_> {
     fn directionality(&self) -> Direction {
         let mut cur = Some(*self);
         while let Some(e) = cur {
-            match e.t.attr(e.i, "", "dir").map(str::to_ascii_lowercase).as_deref() {
+            match e
+                .t
+                .attr(e.i, "", "dir")
+                .map(str::to_ascii_lowercase)
+                .as_deref()
+            {
                 Some("rtl") => return Direction::Rtl,
                 Some("ltr") => return Direction::Ltr,
                 Some("auto") => panic!("the test tree has no dir=auto"),

@@ -28,4 +28,15 @@ exclude_re = [
     # them anyway; counting whitespace as "other" (the mutant) changes no
     # result. Equivalent. Line-pinned.
     "css/src/parser\\.rs:628:17: delete match arm Token::Whitespace in Parser<'p, 'a, V>::has_curly_block_and_more",
+    # selectors matching, Matcher::complex: the restart results only cut
+    # the search short. Without the (RestartDescendant, SubsequentSibling)
+    # arm, the sibling loop goes on trying earlier siblings, which all fail
+    # for the same reason (the nearest descendant combinator to the right
+    # needs another element); returning RestartDescendant instead of Global
+    # when the ancestors run out lets outer descendant loops keep climbing
+    # an ancestor chain that has already failed. Same results, more work;
+    # the differential test against the full-backtracking model checks the
+    # results and the scaling test the cost. Equivalent. Line-pinned.
+    "selectors/src/matching\\.rs:413:21: delete match arm \\(Res::RestartDescendant, Combinator::SubsequentSibling\\) in Matcher<'c, E>::complex",
+    "selectors/src/matching\\.rs:428:21: delete match arm Combinator::Descendant \\| Combinator::Child in Matcher<'c, E>::complex",
 ]

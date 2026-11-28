@@ -114,6 +114,7 @@ matching prefix.
 | Suite | Pinned commit | Passed | Notes |
 |---|---|---|---|
 | web-platform-tests `css/selectors/parsing` | 6852422 | 352 / 352 | every `test_valid_selector`, `test_invalid_selector` and related call, read from the files' JavaScript; each run through "parse a selector" and as a style rule's prelude (the two must agree), and each valid serialization parsed again (it must give itself back) |
+| web-platform-tests `dom/nodes` (Selectors API) | 6852422 | 941 / 941 | `selectors.js` against `ParentNode-querySelector-All-content.html` parsed with `optimal-html`, set up as `ParentNode-querySelector-All.js` does (namespaced elements, clones, appended divs), in the document, element, detached element and fragment contexts: every `querySelectorAll` case, the invalid selectors, `null`/`undefined` tag names and `*` in tree order |
 
 Four files are left out because their features are Selectors Level 5 or
 tentative: `parse-heading.html` (`:heading`), the two
@@ -138,3 +139,22 @@ serializations must parse back to themselves with the same specificity.
 `crates/selectors/tests/scaling.rs` times 17 hostile shapes (long
 compounds and lists, deep blocks in forgiving arguments, nesting past the
 limit) at three sizes with `CSS_SCALING=1`.
+
+For matching, the XHTML variant of the Selectors API tests
+(`ParentNode-querySelector-All-xht.xht`) waits for an XML parser, and the
+`matches()` and scoped cases of `selectors.js` (`scopedSelectors`) and the
+other `dom/nodes` querySelector tests, which build their trees from script,
+wait for the script engine. [`wpt-query-errata.json`](wpt-query-errata.json)
+records 8 cases (2 selectors in 4 contexts): selectors-4 13.2 now lets an
+`:empty` element hold document white space, so `<p> </p>` is empty.
+`crates/selectors/tests/common/match_reference.rs` is a literal model of
+matching (every candidate tried, `:has()` searching the whole tree), run
+against random trees (any namespace, text, comments, a fragment) and random
+selectors for every element, with no scoping root, an element, the
+document and a fragment as the scoping root, with and without quirks mode
+and a nesting parent; `query_all` must equal filtering the subtree. The
+scaling test also times matching: linear on wide trees for 12 hostile
+selectors, and at worst quadratic (pinned) for deep ancestor chains and long
+sibling runs, which each element may walk in full. `:lang()` checks that
+tags and ranges are well-formed (RFC 5646) but not yet that they are valid
+or canonical, which needs the IANA subtag registry.

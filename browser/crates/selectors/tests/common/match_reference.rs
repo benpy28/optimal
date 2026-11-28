@@ -10,8 +10,8 @@
 
 use super::tree::{HTML, Kind, Tree};
 use optimal_selectors::{
-    AttrCase, AttrMatcher, Combinator, Forgiving, ForgivingItem, Namespace, PseudoClass, PseudoClassKeyword as K,
-    RelativeSelector, Selector, SelectorList, Simple, Unit, lang_matches,
+    AttrCase, AttrMatcher, Combinator, Forgiving, ForgivingItem, Namespace, PseudoClass,
+    PseudoClassKeyword as K, RelativeSelector, Selector, SelectorList, Simple, Unit, lang_matches,
 };
 
 /// The scoping root: none, an element, or the tree's root node (virtual).
@@ -50,7 +50,12 @@ impl Model<'_> {
 
     fn element_siblings(&self, n: usize) -> Vec<usize> {
         match self.t.nodes[n].parent {
-            Some(p) => self.t.nodes[p].children.iter().copied().filter(|&c| self.t.is_element(c)).collect(),
+            Some(p) => self.t.nodes[p]
+                .children
+                .iter()
+                .copied()
+                .filter(|&c| self.t.is_element(c))
+                .collect(),
             None => vec![n],
         }
     }
@@ -119,7 +124,9 @@ impl Model<'_> {
             Combinator::NextSibling => self.preceding(n).into_iter().take(1).collect(),
             Combinator::SubsequentSibling => self.preceding(n),
         };
-        candidates.into_iter().any(|x| self.upto(s, i - 1, x, anchor))
+        candidates
+            .into_iter()
+            .any(|x| self.upto(s, i - 1, x, anchor))
     }
 
     fn unit(&self, u: &Unit, n: usize) -> bool {
@@ -130,7 +137,9 @@ impl Model<'_> {
             // Featureless: every simple selector must be allowed to match,
             // and :has() needs another one beside it.
             return u.compound.iter().all(|s| self.on_virtual(s))
-                && u.compound.iter().any(|s| !matches!(s, Simple::PseudoClass(PseudoClass::Has(_))));
+                && u.compound
+                    .iter()
+                    .any(|s| !matches!(s, Simple::PseudoClass(PseudoClass::Has(_))));
         }
         u.compound.iter().all(|s| self.simple(s, n))
     }
@@ -142,7 +151,9 @@ impl Model<'_> {
                 None => true,
                 Some((last, outer)) => self.outer(outer).list(last, VIRTUAL),
             },
-            Simple::PseudoClass(PseudoClass::Is(f) | PseudoClass::Where(f)) => self.forgiving(f, VIRTUAL),
+            Simple::PseudoClass(PseudoClass::Is(f) | PseudoClass::Where(f)) => {
+                self.forgiving(f, VIRTUAL)
+            }
             Simple::PseudoClass(PseudoClass::Has(r)) => self.has(r, VIRTUAL),
             _ => false,
         }
@@ -158,7 +169,8 @@ impl Model<'_> {
     }
 
     fn forgiving(&self, f: &Forgiving, n: usize) -> bool {
-        f.0.iter().any(|i| matches!(i, ForgivingItem::Valid(s) if self.complex(s, n, None)))
+        f.0.iter()
+            .any(|i| matches!(i, ForgivingItem::Valid(s) if self.complex(s, n, None)))
     }
 
     fn data(&self, n: usize) -> (&str, &str, &[super::tree::Attr]) {
@@ -182,10 +194,24 @@ impl Model<'_> {
 
     fn simple(&self, s: &Simple, n: usize) -> bool {
         let (ns, local, attrs) = self.data(n);
-        let same = |a: &str, b: &str| if self.quirks { a.to_ascii_lowercase() == b.to_ascii_lowercase() } else { a == b };
+        let same = |a: &str, b: &str| {
+            if self.quirks {
+                a.eq_ignore_ascii_case(b)
+            } else {
+                a == b
+            }
+        };
         match s {
-            Simple::Type { ns: want, local: name, .. } => {
-                let name = if self.html(n) { name.to_ascii_lowercase() } else { name.to_string() };
+            Simple::Type {
+                ns: want,
+                local: name,
+                ..
+            } => {
+                let name = if self.html(n) {
+                    name.to_ascii_lowercase()
+                } else {
+                    name.to_string()
+                };
                 Self::ns_ok(want, ns) && name == local
             }
             Simple::Universal { ns: want, .. } => Self::ns_ok(want, ns),
@@ -195,7 +221,11 @@ impl Model<'_> {
                 .attr(n, "", "class")
                 .is_some_and(|v| v.split_ascii_whitespace().any(|w| same(w, c))),
             Simple::Attribute(a) => {
-                let name = if self.html(n) { a.local.to_ascii_lowercase() } else { a.local.to_string() };
+                let name = if self.html(n) {
+                    a.local.to_ascii_lowercase()
+                } else {
+                    a.local.to_string()
+                };
                 attrs.iter().any(|at| {
                     Self::ns_ok(&a.ns, &at.ns)
                         && at.local == name
@@ -205,13 +235,52 @@ impl Model<'_> {
                                 let listed = self.html(n)
                                     && at.ns.is_empty()
                                     && [
-                                        "accept", "accept-charset", "align", "alink", "axis", "bgcolor", "charset",
-                                        "checked", "clear", "codetype", "color", "compact", "declare", "defer", "dir",
-                                        "direction", "disabled", "enctype", "face", "frame", "hreflang", "http-equiv",
-                                        "lang", "language", "link", "media", "method", "multiple", "nohref",
-                                        "noresize", "noshade", "nowrap", "readonly", "rel", "rev", "rules", "scope",
-                                        "scrolling", "selected", "shape", "target", "text", "type", "valign",
-                                        "valuetype", "vlink",
+                                        "accept",
+                                        "accept-charset",
+                                        "align",
+                                        "alink",
+                                        "axis",
+                                        "bgcolor",
+                                        "charset",
+                                        "checked",
+                                        "clear",
+                                        "codetype",
+                                        "color",
+                                        "compact",
+                                        "declare",
+                                        "defer",
+                                        "dir",
+                                        "direction",
+                                        "disabled",
+                                        "enctype",
+                                        "face",
+                                        "frame",
+                                        "hreflang",
+                                        "http-equiv",
+                                        "lang",
+                                        "language",
+                                        "link",
+                                        "media",
+                                        "method",
+                                        "multiple",
+                                        "nohref",
+                                        "noresize",
+                                        "noshade",
+                                        "nowrap",
+                                        "readonly",
+                                        "rel",
+                                        "rev",
+                                        "rules",
+                                        "scope",
+                                        "scrolling",
+                                        "selected",
+                                        "shape",
+                                        "target",
+                                        "text",
+                                        "type",
+                                        "valign",
+                                        "valuetype",
+                                        "vlink",
                                     ]
                                     .contains(&at.local.as_str());
                                 let ci = match a.case {
@@ -226,8 +295,14 @@ impl Model<'_> {
                                 };
                                 match m {
                                     AttrMatcher::Equals => value == v,
-                                    AttrMatcher::Includes => value.split_ascii_whitespace().any(|w| w == v) && !v.is_empty() && !v.contains(|c: char| c.is_ascii_whitespace()),
-                                    AttrMatcher::DashMatch => value == v || value.starts_with(&format!("{v}-")),
+                                    AttrMatcher::Includes => {
+                                        value.split_ascii_whitespace().any(|w| w == v)
+                                            && !v.is_empty()
+                                            && !v.contains(|c: char| c.is_ascii_whitespace())
+                                    }
+                                    AttrMatcher::DashMatch => {
+                                        value == v || value.starts_with(&format!("{v}-"))
+                                    }
                                     AttrMatcher::Prefix => !v.is_empty() && value.starts_with(&v),
                                     AttrMatcher::Suffix => !v.is_empty() && value.ends_with(&v),
                                     AttrMatcher::Substring => !v.is_empty() && value.contains(&v),
@@ -253,7 +328,9 @@ impl Model<'_> {
     }
 
     fn is_root(&self, n: usize) -> bool {
-        self.t.nodes[n].parent.is_some_and(|p| matches!(self.t.nodes[p].kind, Kind::Document))
+        self.t.nodes[n]
+            .parent
+            .is_some_and(|p| matches!(self.t.nodes[p].kind, Kind::Document))
     }
 
     fn same_type(&self, a: usize, b: usize) -> bool {
@@ -267,43 +344,69 @@ impl Model<'_> {
             PseudoClass::Keyword(k) => match k {
                 K::Root => self.is_root(n),
                 K::Scope => self.scope_matches(n),
-                K::Empty => self.t.nodes[n].children.iter().all(|&c| match &self.t.nodes[c].kind {
-                    Kind::Comment => true,
-                    Kind::Text(s) => s.chars().all(|c| matches!(c, ' ' | '\t' | '\n' | '\r')),
-                    _ => false,
-                }),
+                K::Empty => self.t.nodes[n]
+                    .children
+                    .iter()
+                    .all(|&c| match &self.t.nodes[c].kind {
+                        Kind::Comment => true,
+                        Kind::Text(s) => s.chars().all(|c| matches!(c, ' ' | '\t' | '\n' | '\r')),
+                        _ => false,
+                    }),
                 K::FirstChild => self.preceding(n).is_empty(),
                 K::LastChild => self.following(n).is_empty(),
                 K::OnlyChild => self.preceding(n).is_empty() && self.following(n).is_empty(),
                 K::FirstOfType => !self.preceding(n).iter().any(|&x| self.same_type(x, n)),
                 K::LastOfType => !self.following(n).iter().any(|&x| self.same_type(x, n)),
-                K::OnlyOfType => !self.preceding(n).iter().chain(&self.following(n)).any(|&x| self.same_type(x, n)),
+                K::OnlyOfType => !self
+                    .preceding(n)
+                    .iter()
+                    .chain(&self.following(n))
+                    .any(|&x| self.same_type(x, n)),
                 K::Host | K::HasSlotted => false,
                 // The tree's own states.
-                other => optimal_selectors::Element::state(&super::tree::El::new(self.t, n), *other),
+                other => {
+                    optimal_selectors::Element::state(&super::tree::El::new(self.t, n), *other)
+                }
             },
             PseudoClass::Is(f) | PseudoClass::Where(f) => self.forgiving(f, n),
             PseudoClass::Not(l) => !self.list(l, n),
             PseudoClass::Has(r) => self.has(r, n),
             PseudoClass::NthChild(anb, of) => {
                 let ok = |x: usize| of.as_ref().is_none_or(|l| self.list(l, x));
-                ok(n) && anb.matches(1 + self.preceding(n).into_iter().filter(|&x| ok(x)).count() as u32)
+                ok(n)
+                    && anb.matches(
+                        1 + self.preceding(n).into_iter().filter(|&x| ok(x)).count() as u32,
+                    )
             }
             PseudoClass::NthLastChild(anb, of) => {
                 let ok = |x: usize| of.as_ref().is_none_or(|l| self.list(l, x));
-                ok(n) && anb.matches(1 + self.following(n).into_iter().filter(|&x| ok(x)).count() as u32)
+                ok(n)
+                    && anb.matches(
+                        1 + self.following(n).into_iter().filter(|&x| ok(x)).count() as u32,
+                    )
             }
-            PseudoClass::NthOfType(anb) => {
-                anb.matches(1 + self.preceding(n).into_iter().filter(|&x| self.same_type(x, n)).count() as u32)
+            PseudoClass::NthOfType(anb) => anb.matches(
+                1 + self
+                    .preceding(n)
+                    .into_iter()
+                    .filter(|&x| self.same_type(x, n))
+                    .count() as u32,
+            ),
+            PseudoClass::NthLastOfType(anb) => anb.matches(
+                1 + self
+                    .following(n)
+                    .into_iter()
+                    .filter(|&x| self.same_type(x, n))
+                    .count() as u32,
+            ),
+            PseudoClass::Lang(ranges) => {
+                optimal_selectors::Element::with_language(&super::tree::El::new(self.t, n), |tag| {
+                    ranges.iter().any(|r| lang_matches(tag, r.as_bytes()))
+                })
             }
-            PseudoClass::NthLastOfType(anb) => {
-                anb.matches(1 + self.following(n).into_iter().filter(|&x| self.same_type(x, n)).count() as u32)
-            }
-            PseudoClass::Lang(ranges) => optimal_selectors::Element::with_language(&super::tree::El::new(self.t, n), |tag| {
-                ranges.iter().any(|r| lang_matches(tag, r.as_bytes()))
-            }),
             PseudoClass::Dir(d) => {
-                let dir = optimal_selectors::Element::directionality(&super::tree::El::new(self.t, n));
+                let dir =
+                    optimal_selectors::Element::directionality(&super::tree::El::new(self.t, n));
                 (d.eq_ignore_ascii_case("ltr") && dir == optimal_selectors::Direction::Ltr)
                     || (d.eq_ignore_ascii_case("rtl") && dir == optimal_selectors::Direction::Rtl)
             }
@@ -314,7 +417,12 @@ impl Model<'_> {
     /// :has(): some element of the whole tree matches a relative selector
     /// absolutized with this element as its anchor.
     fn has(&self, rel: &[RelativeSelector], anchor: usize) -> bool {
-        let all: Vec<usize> = (0..self.t.nodes.len()).filter(|&x| self.t.is_element(x)).collect();
-        rel.iter().any(|r| all.iter().any(|&x| self.complex(&r.selector, x, Some((anchor, r.combinator)))))
+        let all: Vec<usize> = (0..self.t.nodes.len())
+            .filter(|&x| self.t.is_element(x))
+            .collect();
+        rel.iter().any(|r| {
+            all.iter()
+                .any(|&x| self.complex(&r.selector, x, Some((anchor, r.combinator))))
+        })
     }
 }

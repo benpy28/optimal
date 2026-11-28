@@ -125,3 +125,131 @@ fn deepest_accepted_nesting_fits_a_small_stack() {
         .join()
         .unwrap();
 }
+
+mod common;
+
+/// Matching cost: `query_all` over a wide tree grows linearly with its
+/// size for hostile selectors (long combinator chains that almost match,
+/// nested logical pseudo-classes, :has(), `of S`). Two costs are not
+/// linear, by design, and are pinned at quadratic instead: climbing a deep
+/// chain of ancestors (each element can look at all of its ancestors) and
+/// scanning a long run of siblings (each can look at all earlier ones), as
+/// in every engine that matches right to left without ancestor or index
+/// caches. Release builds with `CSS_SCALING=1` only.
+#[test]
+fn matching_cost_grows_linearly_on_wide_trees() {
+    use common::tree::{El, HTML, Tree};
+    use optimal_selectors::{MatchContext, Scope, query_all};
+    if std::env::var_os("CSS_SCALING").is_none() {
+        return;
+    }
+    // n elements: rows of 8 under the root, each row three levels deep
+    // (div > p > span), with a few classes and attributes.
+    let wide = |n: usize| {
+        let mut t = Tree::new(true);
+        let r = t.element(HTML, "html", &[]);
+        t.append(0, r);
+        for k in 0..n / 24 {
+            let row = t.element(
+                HTML,
+                "div",
+                &[("class", if k % 3 == 0 { "a b" } else { "b" })],
+            );
+            t.append(r, row);
+            for j in 0..8 {
+                let p = t.element(HTML, "p", &[("title", "x-y")]);
+                t.append(row, p);
+                let s = t.element(
+                    HTML,
+                    "span",
+                    &[("data-k", if j % 2 == 0 { "1" } else { "2" })],
+                );
+                t.append(p, s);
+            }
+        }
+        t
+    };
+    let deep = |n: usize| {
+        let mut t = Tree::new(true);
+        let mut p = 0;
+        for _ in 0..n {
+            let e = t.element(HTML, "div", &[]);
+            t.append(p, e);
+            p = e;
+        }
+        t
+    };
+    let siblings = |n: usize| {
+        let mut t = Tree::new(true);
+        let r = t.element(HTML, "html", &[]);
+        t.append(0, r);
+        for _ in 0..n {
+            let e = t.element(HTML, "p", &[]);
+            t.append(r, e);
+        }
+        t
+    };
+    let time = |t: &Tree, s: &str| {
+        let list = parse_selector(s, &Namespaces::new()).unwrap();
+        let cx = MatchContext {
+            scope: Scope::Root {
+                first_child: t.first_element_child(0).map(|i| El::new(t, i)),
+            },
+            ..MatchContext::new()
+        };
+        (0..3)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                std::hint::black_box(query_all(&list, &cx).len());
+                start.elapsed()
+            })
+            .min()
+            .unwrap()
+    };
+    let slack = std::time::Duration::from_millis(20);
+    let n = 20_000;
+    for s in [
+        "x div p span",
+        "div p span span",
+        "html > div > p > span",
+        "div.a > p:not([title^=y]) + p span[data-k='2']",
+        "div ~ div > p ~ p span",
+        ":is(:is(:is(div p))) span:not(:is(.a *))",
+        "div:has(> p > span[data-k='3'])",
+        "p:has(+ p span)",
+        "span:nth-child(1 of :is(p *, span))",
+        "p:nth-of-type(2n+1):nth-last-child(odd)",
+        ":not(:has(*)):empty",
+        "[title|=x i], [data-k$='1' s]",
+    ] {
+        let (a, b, c) = (
+            time(&wide(n), s),
+            time(&wide(4 * n), s),
+            time(&wide(16 * n), s),
+        );
+        println!("{s:48} n={n}: {a:?}, 4n: {b:?}, 16n: {c:?}");
+        assert!(
+            b <= a * 8 + slack || c <= b * 8 + slack,
+            "{s}: {a:?} -> {b:?} -> {c:?} is not linear"
+        );
+    }
+    // Quadratic at worst (16x for 4x), not worse.
+    let d = 500;
+    for (name, make, s) in [
+        ("deep chain", &deep as &dyn Fn(usize) -> Tree, "x div div"),
+        ("deep chain, :has", &deep, "div:has(x)"),
+        ("siblings", &siblings, "x ~ p"),
+        ("siblings, nth", &siblings, "p:nth-child(2n of p)"),
+    ] {
+        let (a, b, c) = (
+            time(&make(d), s),
+            time(&make(4 * d), s),
+            time(&make(16 * d), s),
+        );
+        println!("{name:20} {s:24} n={d}: {a:?}, 4n: {b:?}, 16n: {c:?}");
+        assert!(
+            b <= a * 32 + slack || c <= b * 32 + slack,
+            "{name}: {a:?} -> {b:?} -> {c:?} is worse than quadratic"
+        );
+    }
+}

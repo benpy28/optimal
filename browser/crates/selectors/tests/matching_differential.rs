@@ -7,7 +7,9 @@ mod common;
 
 use common::match_reference::{Model, RefScope};
 use common::tree::{El, HTML, Kind, Tree};
-use optimal_selectors::{MatchContext, Namespaces, Scope, SelectorList, matches, parse_selector, query_all};
+use optimal_selectors::{
+    MatchContext, Namespaces, Scope, SelectorList, matches, parse_selector, query_all,
+};
 use proptest::prelude::*;
 
 /// A random tree: (parent choice, node kind) pairs, each node attached
@@ -35,7 +37,10 @@ const ATTRS: &[(&str, &str)] = &[
 
 fn spec() -> impl Strategy<Value = Spec> {
     (
-        prop::collection::vec((any::<usize>(), any::<u8>(), any::<u8>(), any::<u8>()), 1..14),
+        prop::collection::vec(
+            (any::<usize>(), any::<u8>(), any::<u8>(), any::<u8>()),
+            1..14,
+        ),
         any::<bool>(),
     )
         .prop_map(|(nodes, html)| Spec { nodes, html })
@@ -51,14 +56,20 @@ fn build(s: &Spec) -> (Tree, usize) {
     for &(p, k, a, b) in &s.nodes {
         let parent = elements[p % elements.len()];
         let n = match k % 8 {
-            0 => t.create(Kind::Text(if a % 2 == 0 { " \n".into() } else { "t".into() })),
+            0 => t.create(Kind::Text(if a % 2 == 0 {
+                " \n".into()
+            } else {
+                "t".into()
+            })),
             1 => t.create(Kind::Comment),
             _ => {
                 let ns = NSS[(a as usize) % NSS.len()];
                 let local = NAMES[(b as usize) % NAMES.len()];
                 let mut attrs = Vec::new();
                 for (bit, at) in ATTRS.iter().enumerate() {
-                    if (u32::from(a) * 7 + u32::from(b) * 13 + bit as u32 * 5) % 3 == 0 && !attrs.iter().any(|(k2, _): &(&str, &str)| *k2 == at.0) {
+                    if (u32::from(a) * 7 + u32::from(b) * 13 + bit as u32 * 5) % 3 == 0
+                        && !attrs.iter().any(|(k2, _): &(&str, &str)| *k2 == at.0)
+                    {
                         attrs.push(*at);
                     }
                 }
@@ -79,11 +90,61 @@ fn build(s: &Spec) -> (Tree, usize) {
 }
 
 const PARTS: &[&str] = &[
-    "*", "*", "*", "*", "a", "div", ":not(c)", ":not(.x)", ":is(a, div, b)", "a", "b", "c", "C", "*", "div", "|a", "*|b", "x|a", ".x", ".X", "#i", "[title]", "[TITLE]", "[*|title]", "[x|title]",
-    "[class~=y]", "[class~=Y i]", "[type=a]", "[type=a s]", "[title|=a]", "[title^=a]", "[title$=c]", "[title*='b c']",
-    "[data-v]", "[data-v='']", ":root", ":empty", ":first-child", ":last-child", ":only-child", ":first-of-type",
-    ":last-of-type", ":only-of-type", ":nth-child(2n+1)", ":nth-last-child(-n+2)", ":nth-of-type(2)",
-    ":nth-last-of-type(odd)", ":scope", "&", ":lang(en)", ":lang(\"\")", ":lang('*')", ":dir(ltr)", ":not(a)", ":is(a, .x)",
+    "*",
+    "*",
+    "*",
+    "*",
+    "a",
+    "div",
+    ":not(c)",
+    ":not(.x)",
+    ":is(a, div, b)",
+    "a",
+    "b",
+    "c",
+    "C",
+    "*",
+    "div",
+    "|a",
+    "*|b",
+    "x|a",
+    ".x",
+    ".X",
+    "#i",
+    "[title]",
+    "[TITLE]",
+    "[*|title]",
+    "[x|title]",
+    "[class~=y]",
+    "[class~=Y i]",
+    "[type=a]",
+    "[type=a s]",
+    "[title|=a]",
+    "[title^=a]",
+    "[title$=c]",
+    "[title*='b c']",
+    "[data-v]",
+    "[data-v='']",
+    ":root",
+    ":empty",
+    ":first-child",
+    ":last-child",
+    ":only-child",
+    ":first-of-type",
+    ":last-of-type",
+    ":only-of-type",
+    ":nth-child(2n+1)",
+    ":nth-last-child(-n+2)",
+    ":nth-of-type(2)",
+    ":nth-last-of-type(odd)",
+    ":scope",
+    "&",
+    ":lang(en)",
+    ":lang(\"\")",
+    ":lang('*')",
+    ":dir(ltr)",
+    ":not(a)",
+    ":is(a, .x)",
 ];
 
 const COMB: &[&str] = &[" ", " ", " > ", " + ", " ~ "];
@@ -92,7 +153,9 @@ fn compound() -> impl Strategy<Value = String> {
     let leaf = prop::collection::vec(prop::sample::select(PARTS), 1..3).prop_map(|v| {
         // A type or universal selector must come first.
         let mut v = v;
-        v.sort_by_key(|p| !(p.starts_with(|c: char| c.is_ascii_alphabetic() || c == '*' || c == '|')));
+        v.sort_by_key(|p| {
+            !(p.starts_with(|c: char| c.is_ascii_alphabetic() || c == '*' || c == '|'))
+        });
         let first = v[0];
         let mut s = first.to_string();
         for p in &v[1..] {
@@ -150,7 +213,13 @@ fn elements(t: &Tree) -> Vec<usize> {
     (0..t.nodes.len()).filter(|&n| t.is_element(n)).collect()
 }
 
-fn check(t: &Tree, list: &SelectorList, scope: RefScope, quirks: bool, nesting: &[&SelectorList]) -> Result<(), TestCaseError> {
+fn check(
+    t: &Tree,
+    list: &SelectorList,
+    scope: RefScope,
+    quirks: bool,
+    nesting: &[&SelectorList],
+) -> Result<(), TestCaseError> {
     let cx_scope = match scope {
         RefScope::None => Scope::None,
         RefScope::Element(e) => Scope::Element(El::new(t, e)),
@@ -222,7 +291,9 @@ fn share_of_matches() {
     for _ in 0..2000 {
         let s = spec().new_tree(&mut runner).unwrap().current();
         let sel = selector().new_tree(&mut runner).unwrap().current();
-        let Ok(list) = parse_selector(&sel, &namespaces()) else { continue };
+        let Ok(list) = parse_selector(&sel, &namespaces()) else {
+            continue;
+        };
         parsed += 1;
         let (t, _) = build(&s);
         let hits = elements(&t)
@@ -234,18 +305,4 @@ fn share_of_matches() {
     println!("{parsed} of 2000 parsed; {mixed} matched some elements but not all");
     assert!(parsed > 1500, "{parsed}");
     assert!(mixed * 8 > parsed, "{mixed} of {parsed}");
-}
-
-#[test]
-#[ignore]
-fn print_samples() {
-    use proptest::strategy::ValueTree;
-    use proptest::test_runner::TestRunner;
-    let mut runner = TestRunner::deterministic();
-    for _ in 0..15 {
-        let sel = selector().new_tree(&mut runner).unwrap().current();
-        let s = spec().new_tree(&mut runner).unwrap().current();
-        let (t, _) = build(&s);
-        println!("{sel}   [{} elements]", elements(&t).len());
-    }
 }

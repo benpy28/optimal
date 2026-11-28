@@ -151,7 +151,11 @@ impl<E> Default for MatchContext<'_, E> {
 /// "Match a selector against an element" (17.2): whether any selector in
 /// `list` matches `element`.
 pub fn matches<E: Element>(list: &SelectorList, element: &E, cx: &MatchContext<'_, E>) -> bool {
-    Matcher { cx, nesting: cx.nesting }.list(list, &Node::El(element.clone()))
+    Matcher {
+        cx,
+        nesting: cx.nesting,
+    }
+    .list(list, &Node::El(element.clone()))
 }
 
 /// "Match a selector against a tree" (17.4) for a scoped selector, as the
@@ -160,7 +164,10 @@ pub fn matches<E: Element>(list: &SelectorList, element: &E, cx: &MatchContext<'
 /// or a virtual root.
 pub fn query_all<E: Element>(list: &SelectorList, cx: &MatchContext<'_, E>) -> Vec<E> {
     let mut out = Vec::new();
-    let m = Matcher { cx, nesting: cx.nesting };
+    let m = Matcher {
+        cx,
+        nesting: cx.nesting,
+    };
     let (first, stop) = match &cx.scope {
         Scope::Element(e) => (e.first_element_child(), Some(e.clone())),
         Scope::Root { first_child } => (first_child.clone(), None),
@@ -240,26 +247,76 @@ fn is_ws(b: u8) -> bool {
 /// elements in HTML documents (HTML 4.16.2). Applied to attributes in no
 /// namespace: the list names HTML's own attributes, which have none.
 const CASE_INSENSITIVE_VALUES: &[&str] = &[
-    "accept", "accept-charset", "align", "alink", "axis", "bgcolor", "charset", "checked",
-    "clear", "codetype", "color", "compact", "declare", "defer", "dir", "direction",
-    "disabled", "enctype", "face", "frame", "hreflang", "http-equiv", "lang", "language",
-    "link", "media", "method", "multiple", "nohref", "noresize", "noshade", "nowrap",
-    "readonly", "rel", "rev", "rules", "scope", "scrolling", "selected", "shape", "target",
-    "text", "type", "valign", "valuetype", "vlink",
+    "accept",
+    "accept-charset",
+    "align",
+    "alink",
+    "axis",
+    "bgcolor",
+    "charset",
+    "checked",
+    "clear",
+    "codetype",
+    "color",
+    "compact",
+    "declare",
+    "defer",
+    "dir",
+    "direction",
+    "disabled",
+    "enctype",
+    "face",
+    "frame",
+    "hreflang",
+    "http-equiv",
+    "lang",
+    "language",
+    "link",
+    "media",
+    "method",
+    "multiple",
+    "nohref",
+    "noresize",
+    "noshade",
+    "nowrap",
+    "readonly",
+    "rel",
+    "rev",
+    "rules",
+    "scope",
+    "scrolling",
+    "selected",
+    "shape",
+    "target",
+    "text",
+    "type",
+    "valign",
+    "valuetype",
+    "vlink",
 ];
 
 /// `sel`, ASCII-lowercased, is identical to `name`.
 fn eq_lowered(sel: &[u8], name: &[u8]) -> bool {
-    sel.len() == name.len() && sel.iter().zip(name).all(|(s, n)| s.to_ascii_lowercase() == *n)
+    sel.len() == name.len()
+        && sel
+            .iter()
+            .zip(name)
+            .all(|(s, n)| s.to_ascii_lowercase() == *n)
 }
 
 fn eq(a: &[u8], b: &[u8], ascii_ci: bool) -> bool {
-    if ascii_ci { a.eq_ignore_ascii_case(b) } else { a == b }
+    if ascii_ci {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
 }
 
 impl<'c, E: Element> Matcher<'c, E> {
     fn list(&self, list: &SelectorList, node: &Node<E>) -> bool {
-        list.0.iter().any(|s| self.complex(s, node, None) == Res::Matched)
+        list.0
+            .iter()
+            .any(|s| self.complex(s, node, None) == Res::Matched)
     }
 
     fn parent(&self, n: &Node<E>) -> Option<Node<E>> {
@@ -268,7 +325,9 @@ impl<'c, E: Element> Matcher<'c, E> {
                 Some(p) => Some(Node::El(p)),
                 // A child of the virtual root, if it is the scoping root.
                 None => match &self.cx.scope {
-                    Scope::Root { first_child: Some(f) } if f.same_parent(e) => Some(Node::Root),
+                    Scope::Root {
+                        first_child: Some(f),
+                    } if f.same_parent(e) => Some(Node::Root),
                     _ => None,
                 },
             },
@@ -315,7 +374,13 @@ impl<'c, E: Element> Matcher<'c, E> {
     /// a complex selector against an element", 17.2), right to left. With an
     /// anchor, the leftmost compound selector must also be joined to it.
     fn complex(&self, sel: &Selector, node: &Node<E>, anchor: Anchor<'_, E>) -> Res {
-        let unit = |i: usize| if i == 0 { &sel.first } else { &sel.rest[i - 1].1 };
+        let unit = |i: usize| {
+            if i == 0 {
+                &sel.first
+            } else {
+                &sel.rest[i - 1].1
+            }
+        };
         let comb = |i: usize| sel.rest[i - 1].0;
         // Matching unit i at n: the compound selector, then for the
         // leftmost one the anchor.
@@ -404,9 +469,15 @@ impl<'c, E: Element> Matcher<'c, E> {
             Simple::Nesting if self.nesting.is_empty() => true,
             Simple::Nesting => {
                 let (last, outer) = self.nesting.split_last().expect("not empty");
-                Matcher { cx: self.cx, nesting: outer }.list(last, &Node::Root)
+                Matcher {
+                    cx: self.cx,
+                    nesting: outer,
+                }
+                .list(last, &Node::Root)
             }
-            Simple::PseudoClass(PseudoClass::Is(f) | PseudoClass::Where(f)) => self.forgiving(f, &Node::Root),
+            Simple::PseudoClass(PseudoClass::Is(f) | PseudoClass::Where(f)) => {
+                self.forgiving(f, &Node::Root)
+            }
             Simple::PseudoClass(PseudoClass::Has(rel)) => self.has(rel, &Node::Root),
             // :not() can only match when its argument is allowed to match
             // and doesn't; every selector allowed to match the virtual root
@@ -435,13 +506,18 @@ impl<'c, E: Element> Matcher<'c, E> {
             Simple::Universal { ns, .. } => Self::namespace(ns, e.namespace()),
             Simple::Id(id) => e.id().is_some_and(|v| eq(v, id.as_bytes(), self.cx.quirks)),
             Simple::Class(c) => e.class_attribute().is_some_and(|v| {
-                v.split(|&b| is_ws(b)).any(|w| eq(w, c.as_bytes(), self.cx.quirks))
+                v.split(|&b| is_ws(b))
+                    .any(|w| eq(w, c.as_bytes(), self.cx.quirks))
             }),
             Simple::Attribute(a) => Self::attribute(a, e),
             Simple::PseudoClass(pc) => self.pseudo_class(pc, e),
             Simple::Nesting => match self.nesting.split_last() {
                 None => self.scope(e),
-                Some((last, outer)) => Matcher { cx: self.cx, nesting: outer }.list(last, &Node::El(e.clone())),
+                Some((last, outer)) => Matcher {
+                    cx: self.cx,
+                    nesting: outer,
+                }
+                .list(last, &Node::El(e.clone())),
             },
         }
     }
@@ -462,7 +538,11 @@ impl<'c, E: Element> Matcher<'c, E> {
             if !Self::namespace(&a.ns, ns) {
                 return false;
             }
-            let named = if html { eq_lowered(sel, local) } else { sel == local };
+            let named = if html {
+                eq_lowered(sel, local)
+            } else {
+                sel == local
+            };
             if !named {
                 return false;
             }
@@ -474,7 +554,9 @@ impl<'c, E: Element> Matcher<'c, E> {
                 Some(AttrCase::Sensitive) => false,
                 None => {
                     html && ns.is_empty()
-                        && CASE_INSENSITIVE_VALUES.iter().any(|n| n.as_bytes() == local)
+                        && CASE_INSENSITIVE_VALUES
+                            .iter()
+                            .any(|n| n.as_bytes() == local)
                 }
             };
             Self::value(*m, value, v.as_bytes(), ci)
@@ -495,11 +577,11 @@ impl<'c, E: Element> Matcher<'c, E> {
             }
             AttrMatcher::Prefix => !v.is_empty() && starts(value),
             AttrMatcher::Suffix => {
-                !v.is_empty() && value.len() >= v.len() && eq(&value[value.len() - v.len()..], v, ci)
+                !v.is_empty()
+                    && value.len() >= v.len()
+                    && eq(&value[value.len() - v.len()..], v, ci)
             }
-            AttrMatcher::Substring => {
-                !v.is_empty() && value.windows(v.len()).any(|w| eq(w, v, ci))
-            }
+            AttrMatcher::Substring => !v.is_empty() && value.windows(v.len()).any(|w| eq(w, v, ci)),
         }
     }
 
@@ -520,13 +602,17 @@ impl<'c, E: Element> Matcher<'c, E> {
                 K::Empty => {
                     e.first_element_child().is_none()
                         && !e.any_non_element_child(|t| match t {
-                            Some(data) => !data.iter().all(|&b| matches!(b, b' ' | b'\t' | b'\n' | b'\r')),
+                            Some(data) => !data
+                                .iter()
+                                .all(|&b| matches!(b, b' ' | b'\t' | b'\n' | b'\r')),
                             None => true,
                         })
                 }
                 K::FirstChild => e.prev_sibling_element().is_none(),
                 K::LastChild => e.next_sibling_element().is_none(),
-                K::OnlyChild => e.prev_sibling_element().is_none() && e.next_sibling_element().is_none(),
+                K::OnlyChild => {
+                    e.prev_sibling_element().is_none() && e.next_sibling_element().is_none()
+                }
                 K::FirstOfType => Self::count_of_type(e, E::prev_sibling_element) == 0,
                 K::LastOfType => Self::count_of_type(e, E::next_sibling_element) == 0,
                 K::OnlyOfType => {
@@ -539,8 +625,12 @@ impl<'c, E: Element> Matcher<'c, E> {
             PseudoClass::Is(f) | PseudoClass::Where(f) => self.forgiving(f, &Node::El(e.clone())),
             PseudoClass::Not(list) => !self.list(list, &Node::El(e.clone())),
             PseudoClass::Has(rel) => self.has(rel, &Node::El(e.clone())),
-            PseudoClass::NthChild(anb, of) => self.nth(*anb, of.as_ref(), e, E::prev_sibling_element),
-            PseudoClass::NthLastChild(anb, of) => self.nth(*anb, of.as_ref(), e, E::next_sibling_element),
+            PseudoClass::NthChild(anb, of) => {
+                self.nth(*anb, of.as_ref(), e, E::prev_sibling_element)
+            }
+            PseudoClass::NthLastChild(anb, of) => {
+                self.nth(*anb, of.as_ref(), e, E::next_sibling_element)
+            }
             PseudoClass::NthOfType(anb) => {
                 anb.matches(Self::count_of_type(e, E::prev_sibling_element).saturating_add(1))
             }
@@ -582,7 +672,13 @@ impl<'c, E: Element> Matcher<'c, E> {
     /// `:nth-child()` and `:nth-last-child()` (13.3.1, 13.3.2): the index
     /// counts the siblings in direction `step` that match `of`, and with
     /// `of` the element must match it too.
-    fn nth(&self, anb: optimal_css::AnB, of: Option<&SelectorList>, e: &E, step: fn(&E) -> Option<E>) -> bool {
+    fn nth(
+        &self,
+        anb: optimal_css::AnB,
+        of: Option<&SelectorList>,
+        e: &E,
+        step: fn(&E) -> Option<E>,
+    ) -> bool {
         if of.is_some_and(|of| !self.list(of, &Node::El(e.clone()))) {
             return false;
         }
@@ -601,12 +697,25 @@ impl<'c, E: Element> Matcher<'c, E> {
     /// matches some element.
     fn has(&self, rel: &[RelativeSelector], anchor: &Node<E>) -> bool {
         rel.iter().any(|r| {
-            let siblings = matches!(r.combinator, Combinator::NextSibling | Combinator::SubsequentSibling);
+            let siblings = matches!(
+                r.combinator,
+                Combinator::NextSibling | Combinator::SubsequentSibling
+            );
             // Whether the subject can lie below the first compound
             // selector's element (any descendant or child combinator after
             // the leading one).
-            let deeper = r.selector.rest.iter().any(|(c, _)| matches!(c, Combinator::Descendant | Combinator::Child));
-            let try_at = |x: &E| self.complex(&r.selector, &Node::El(x.clone()), Some((anchor, r.combinator))) == Res::Matched;
+            let deeper = r
+                .selector
+                .rest
+                .iter()
+                .any(|(c, _)| matches!(c, Combinator::Descendant | Combinator::Child));
+            let try_at = |x: &E| {
+                self.complex(
+                    &r.selector,
+                    &Node::El(x.clone()),
+                    Some((anchor, r.combinator)),
+                ) == Res::Matched
+            };
             if siblings {
                 let Node::El(a) = anchor else { return false };
                 let mut s = a.next_sibling_element();
@@ -614,7 +723,8 @@ impl<'c, E: Element> Matcher<'c, E> {
                     if try_at(&x) || (deeper && Self::any_descendant(&x, &try_at)) {
                         return true;
                     }
-                    if r.combinator == Combinator::NextSibling && !deeper && r.selector.rest.is_empty() {
+                    // `+ X` reaches only the next sibling.
+                    if r.combinator == Combinator::NextSibling && r.selector.rest.is_empty() {
                         return false;
                     }
                     s = x.next_sibling_element();
