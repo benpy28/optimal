@@ -30,6 +30,9 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
+      - name: Hold the host clock steady (no NTP slewing under the guests' clocks)
+        run: ./scripts/steady-host-clock.sh
+
       - name: Install QEMU, xorriso and UEFI firmware
         run: |
           sudo apt-get update
@@ -82,6 +85,9 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+
+      - name: Hold the host clock steady (no NTP slewing under the guests' clocks)
+        run: ./scripts/steady-host-clock.sh
 
       - name: Install QEMU, firmware, signing and stress tools
         run: |

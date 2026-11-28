@@ -134,6 +134,14 @@ impl IoApicRegs {
         let (lo, hi) = ioapic::redirection_regs(pin).expect("pin past MAX_PINS");
         (self.read(lo), self.read(hi))
     }
+
+    /// Write `vector` to the EOI register (version 0x20 and later). The
+    /// caller checked optimal_apic::eoi::IoApic::has_eoi, so the register
+    /// exists and is inside the mapped page.
+    pub fn eoi(self, vector: u8) {
+        // SAFETY: as in read; +0x40 is in the same page (eoi_in_page).
+        unsafe { ((self.regs + ioapic::EOI) as *mut u32).write_volatile(u32::from(vector)) }
+    }
 }
 
 /// Give a slow 8259 time between commands: a write to the POST port 0x80,

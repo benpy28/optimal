@@ -84,7 +84,16 @@ ktest!(lapic_registers_as_planned, {
     for (reg, v) in lapic::setup(c.version, c.plan.lint[0], c.plan.lint[1]) {
         let got = l.read(reg);
         match reg {
-            lapic::SVR => assert_eq!(got & 0x13FF, v, "SVR"),
+            // Bit 12 is set after lapic::setup in directed-EOI mode
+            // (irq::level's tests check it against the EOI rule).
+            lapic::SVR => {
+                let suppress = if c.eoi == optimal_apic::eoi::Mode::Directed {
+                    lapic::SVR_SUPPRESS_EOI_BROADCAST
+                } else {
+                    0
+                };
+                assert_eq!(got & 0x13FF, v | suppress, "SVR");
+            }
             lapic::TPR => assert_eq!(got & 0xFF, 0, "TPR"),
             lapic::ESR => {}
             lapic::TIMER_INITIAL | lapic::LVT_TIMER => {}

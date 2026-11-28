@@ -172,3 +172,73 @@ pub fn start(config: u64, timers: &[u64]) -> impl Iterator<Item = (u64, u64)> + 
         )
         .chain(core::iter::once((CONFIG, running(config))))
 }
+
+/// Comparator configuration: Tn_INT_ROUTE_CNF, the I/O APIC input the
+/// comparator's interrupt goes to (bits 13:9).
+pub const T_ROUTE_SHIFT: u32 = 9;
+pub const T_ROUTE: u64 = 0x1F << T_ROUTE_SHIFT;
+
+/// Tn_INT_ROUTE_CAP (bits 63:32): bit n set means the comparator can be
+/// routed to I/O APIC input n.
+pub const fn route_cap(timer_config: u64) -> u32 {
+    (timer_config >> 32) as u32
+}
+
+/// A comparator's configuration for a one-shot, level-triggered
+/// interrupt on I/O APIC input `gsi`, interrupt enabled or not. Periodic
+/// mode, FSB delivery and the forced 32-bit mode are off, and other bits
+/// are written back as read. None if the comparator cannot be routed to
+/// `gsi` (Tn_INT_ROUTE_CAP).
+pub fn level_one_shot(timer_config: u64, gsi: u32, enabled: bool) -> Option<u64> {
+    if gsi >= 32 || route_cap(timer_config) & (1 << gsi) == 0 {
+        return None;
+    }
+    Some(
+        quiet(timer_config) & !(T_ROUTE | T_32BIT_MODE)
+            | u64::from(gsi) << T_ROUTE_SHIFT
+            | T_LEVEL
+            | if enabled { T_INT_ENABLE } else { 0 },
+    )
+}
+
+/// The comparator value `ticks` after main counter value `now`. A
+/// comparator without Tn_SIZE_CAP compares only the low 32 bits, so its
+/// value wraps there.
+pub fn deadline(now: u64, ticks: u64, timer_config: u64) -> u64 {
+    let t = now.wrapping_add(ticks);
+    if timer_config & T_64BIT_CAPABLE != 0 {
+        t
+    } else {
+        t & 0xFFFF_FFFF
+    }
+}
+
+/// A comparator and I/O APIC input for a level-triggered interrupt: the
+/// highest-numbered comparator that can reach an input `free` accepts, on
+/// the lowest such input. Comparators 0 and 1 go last because they are
+/// the legacy-replacement ones and the only ones the specification
+/// requires; comparator 0 is also the only one it requires to be
+/// periodic-capable. `configs` holds each comparator's configuration
+/// register, comparator 0 first.
+pub fn pick_level(configs: &[u64], free: impl Fn(u32) -> bool) -> Option<(u8, u32)> {
+    configs.iter().enumerate().rev().find_map(|(n, &c)| {
+        (0..32)
+            .find(|&g| route_cap(c) & (1 << g) != 0 && free(g))
+            .map(|g| (n as u8, g))
+    })
+}
+
+/// Has main counter value `now` reached comparator value `deadline`?
+/// Compared in the comparator's width, as a signed distance, so it is
+/// right across a wrap while the two are within half the width apart. A
+/// comparator matches only on equality, so a deadline the counter passed
+/// before the comparator was enabled is missed until the counter wraps
+/// (2^64 ticks: never); after arming, the caller checks this and arms
+/// again further ahead.
+pub fn passed(now: u64, deadline: u64, timer_config: u64) -> bool {
+    if timer_config & T_64BIT_CAPABLE != 0 {
+        now.wrapping_sub(deadline) as i64 >= 0
+    } else {
+        (now as u32).wrapping_sub(deadline as u32) as i32 >= 0
+    }
+}
