@@ -6,7 +6,8 @@
 # under Limine is a bug in the check (or a Limine bug, to be confirmed
 # against the spec), and one that fails only under ours is a bug in ours.
 #
-# Cases: r3 r4 r5 r6 pie entry la57 tpm iommu-intel iommu-amd smp big small
+# Cases: r3 r4 r5 r6 pie entry la57 tpm iommu-intel iommu-amd smp big small tiny
+#        cd usb nvme virtio (device matrix: the boot medium on each controller)
 #        headless old-cpu
 #        quirk-r3 quirk quirk-x2apic quirk-apic-off quirk-iommu-intel
 #        quirk-iommu-amd
@@ -22,7 +23,10 @@ FW=${OVMF_CODE:-/usr/share/OVMF/OVMF_CODE_4M.fd}
 
 # The module every run carries: byte i = (i*167 + 13) mod 256, 100003 bytes.
 python3 -c "import sys; sys.stdout.buffer.write(bytes((i*167+13)&0xff for i in range(100003)))" > "$OUT/pattern"
-export OB_EXPECT_CMDLINE="conformance case=$case_name" OB_EXPECT_MODULES=1
+export OB_EXPECT_CMDLINE="conformance case=$case_name" OB_EXPECT_MODULES=1 OB_EXPECT_VOLUME=gpt
+# How the boot medium is attached: sata (q35's AHCI, the default), cd, usb,
+# nvme or virtio. The device matrix cases below set it.
+MEDIUM=sata
 export OB_REVISION=3 OB_PIE=0 OB_PAGING=4 OB_ENTRY_REQ=0
 QEMU=(-machine q35 -m 512M)
 TPM=0
@@ -41,6 +45,9 @@ case "$case_name" in
     smp) OB_REVISION=5; QEMU=(-machine q35 -m 2G -smp 8) ;;
     big) OB_REVISION=4; QEMU=(-machine q35 -m 6G) ;;
     small) QEMU=(-machine q35 -m 160M) ;;
+    # 128 MiB: the old ~38 MiB single-block page-table reservation failed
+    # here every boot. (Limine 11.4.1 itself runs out of memory at 96 MiB.)
+    tiny) QEMU=(-machine q35 -m 128M) ;;
     headless) OB_REVISION=5; QEMU+=(-vga none) ;;
     old-cpu) QEMU+=(-cpu qemu64,-nx,-pdpe1gb); export QEMU_ACCEL=tcg ;;
     quirk-r3) QUIRKS="pic ioapic lapic" ;;
@@ -62,6 +69,11 @@ case "$case_name" in
     quirk-iommu-intel) OB_REVISION=5; QUIRKS="pic ioapic lapic vtd"
         QEMU=(-machine q35,kernel-irqchip=split -m 512M -device intel-iommu,intremap=on) ;;
     quirk-iommu-amd) OB_REVISION=5; QUIRKS="pic ioapic lapic amdvi"; QEMU+=(-device amd-iommu) ;;
+    # Device matrix: the same kernel and config from each kind of medium.
+    cd) MEDIUM=cd; OB_EXPECT_VOLUME=optical ;;
+    usb) MEDIUM=usb ;;
+    nvme) MEDIUM=nvme ;;
+    virtio) MEDIUM=virtio ;;
     *) echo "unknown case $case_name"; exit 2 ;;
 esac
 CMDLINE="$OB_EXPECT_CMDLINE"
@@ -71,6 +83,16 @@ if [ -n "$QUIRKS" ]; then
     cargo build -q --release -p optimal-boot-quirk --target x86_64-unknown-uefi
     export QUIRK_EFI=$PWD/target/x86_64-unknown-uefi/release/optimal-boot-quirk.efi QUIRKS
 fi
+
+# attach <medium> <image>: QEMU arguments for a raw disk image.
+attach() {
+    case "$1" in
+        sata) echo "-drive format=raw,file=$2" ;;
+        usb) echo "-device qemu-xhci,id=xhci -drive if=none,id=boot,format=raw,file=$2 -device usb-storage,bus=xhci.0,drive=boot,bootindex=0" ;;
+        nvme) echo "-drive if=none,id=boot,format=raw,file=$2 -device nvme,serial=optimal0,drive=boot,bootindex=0" ;;
+        virtio) echo "-drive if=none,id=boot,format=raw,file=$2 -device virtio-blk-pci,drive=boot,bootindex=0" ;;
+    esac
+}
 
 status=0
 for l in $loaders; do
@@ -92,7 +114,15 @@ for l in $loaders; do
             mcopy -i "$esp" "$QUIRK_EFI" ::EFI/BOOT/BOOTX64.EFI
             mcopy -i "$esp" "$OUT/QUIRKS.TXT" ::EFI/BOOT/QUIRKS.TXT
         fi
-        drive=(-drive format=raw,file="$OUT/disk.img")
+        if [ "$MEDIUM" = cd ]; then
+            drive=(-cdrom "$OUT/optimal.iso")
+        else
+            drive=($(attach "$MEDIUM" "$OUT/disk.img"))
+        fi
+    elif [ "$MEDIUM" != sata ] && [ "$MEDIUM" != cd ]; then
+        # A GPT disk on the same controller as ours.
+        CMDLINE="$CMDLINE" MODULES="$OUT/pattern" scripts/limine-image.sh "$kernel" "$OUT/limine-$case_name.img"
+        drive=($(attach "$MEDIUM" "$OUT/limine-$case_name.img"))
     elif [ -n "$QUIRKS" ]; then
         # A GPT disk rather than a CD, so the injector can sit in front.
         CMDLINE="$CMDLINE" MODULES="$OUT/pattern" scripts/limine-image.sh "$kernel" "$OUT/limine-$case_name.img"

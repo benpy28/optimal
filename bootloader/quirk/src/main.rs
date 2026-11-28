@@ -42,6 +42,7 @@ use core::ffi::c_void;
 use core::fmt::{self, Write};
 use core::ptr;
 use optimal_boot_core::acpi::{self, Madt, PhysRead};
+use optimal_boot_core::devpath;
 
 /// One kind of firmware sloppiness. The words are what QUIRKS.TXT holds.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -781,37 +782,26 @@ extern "efiapi" fn efi_main(image: efi::Handle, st: *mut efi::SystemTable) -> St
     let Some(dp) = protocol::<efi::DevicePath>(bs, dev, &efi::DEVICE_PATH_GUID) else {
         fatal!(con, "the boot volume has no device path");
     };
+    let base = dp as *const u8;
+    let measured = devpath::measure(
+        // SAFETY: `measure` asks only for headers at node boundaries reached
+        // through checked node lengths; the firmware path is readable
+        // through its End node.
+        |off| Some(unsafe { ptr::read_unaligned(base.add(off) as *const [u8; 4]) }),
+        devpath::MAX_LEN,
+    );
     let mut path = [0u8; 1024];
-    let mut len = 0usize;
-    // SAFETY: a firmware device path: nodes with 16-bit lengths, ending in
-    // an End node (type 0x7f, subtype 0xff). Copied node by node, bounded.
-    unsafe {
-        let mut p = dp as *const u8;
-        loop {
-            let (t, sub) = (*p, *p.add(1));
-            let l = u16::from_le_bytes([*p.add(2), *p.add(3)]) as usize;
-            if t == 0x7f && sub == 0xff {
-                break;
-            }
-            if l < 4 || len + l > path.len() - 64 {
-                fatal!(
-                    con,
-                    "the boot volume's device path is malformed or too long"
-                );
-            }
-            ptr::copy_nonoverlapping(p, path.as_mut_ptr().add(len), l);
-            len += l;
-            p = p.add(l);
-        }
-    }
-    // Media / File Path node, then End.
-    let node_len = 4 + 2 * NEXT_PATH.len();
-    path[len..len + 4].copy_from_slice(&[4, 4, node_len as u8, (node_len >> 8) as u8]);
-    for (i, c) in NEXT_PATH.iter().enumerate() {
-        path[len + 4 + 2 * i..len + 6 + 2 * i].copy_from_slice(&c.to_le_bytes());
-    }
-    len += node_len;
-    path[len..len + 4].copy_from_slice(&[0x7f, 0xff, 4, 0]);
+    let built = measured.map(|len| {
+        // SAFETY: the measured nodes, End node included, are readable.
+        let src = unsafe { core::slice::from_raw_parts(base, len) };
+        devpath::with_file(src, &NEXT_PATH, &mut path)
+    });
+    let Ok(Ok(Some(_))) = built else {
+        fatal!(
+            con,
+            "the boot volume's device path is malformed or too long"
+        );
+    };
 
     let mut next: efi::Handle = ptr::null_mut();
     let s_load = (bs.load_image)(

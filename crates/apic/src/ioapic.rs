@@ -9,6 +9,13 @@ pub const IOREGSEL: u64 = 0x00;
 pub const IOWIN: u64 = 0x10;
 pub const REG_ID: u8 = 0x00;
 pub const REG_VERSION: u8 = 0x01;
+/// The EOI register of a version 0x20 or later I/O APIC (Intel ICH and
+/// PCH I/O APICs; the 82093AA, version 0x11, has none): a 32-bit MMIO
+/// register at +0x40, not reached through IOREGSEL. Writing a vector to it
+/// clears Remote IRR in every level-triggered entry on that vector.
+pub const EOI: u64 = 0x40;
+/// The first I/O APIC version with the EOI register.
+pub const EOI_VERSION: u8 = 0x20;
 
 /// IOREGSEL is 8 bits and the table starts at 0x10 with two registers per
 /// entry, so an I/O APIC can have at most 120 pins. A version register
@@ -32,6 +39,12 @@ pub fn address_ok(address: u64) -> bool {
     address != 0 && address.is_multiple_of(16) && address % 4096 <= 4096 - 0x14
 }
 
+/// Can the EOI register of an I/O APIC at `address` be reached through
+/// the same one-page mapping as IOREGSEL and IOWIN? It ends at +0x44.
+pub fn eoi_in_page(address: u64) -> bool {
+    address_ok(address) && address % 4096 <= 4096 - 0x44
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Version {
     pub version: u8,
@@ -49,6 +62,11 @@ impl Version {
 
     pub fn pins(self) -> u16 {
         u16::from(self.max_entry) + 1
+    }
+
+    /// Does this I/O APIC have the EOI register ([`EOI`])?
+    pub fn has_eoi(self) -> bool {
+        self.version >= EOI_VERSION
     }
 }
 
@@ -98,10 +116,10 @@ impl Delivery {
 }
 
 pub const MASKED: u32 = 1 << 16;
+pub const REMOTE_IRR: u32 = 1 << 14;
 const LOGICAL: u32 = 1 << 11;
 const PENDING: u32 = 1 << 12;
 const ACTIVE_LOW: u32 = 1 << 13;
-const REMOTE_IRR: u32 = 1 << 14;
 const LEVEL: u32 = 1 << 15;
 
 /// One redirection table entry.

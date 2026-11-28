@@ -22,3 +22,13 @@ opt-level = 3
 debug = 1
 codegen-units = 1
 lto = true
+
+# Release speed with the arithmetic checks of a debug build, for the parser
+# fuzz runs (DESIGN.md item 8): an overflow in a parser panics here instead
+# of wrapping silently as it would in the shipped loader.
+[profile.fuzz]
+inherits = "release"
+overflow-checks = true
+debug-assertions = true
+lto = false
+codegen-units = 16
