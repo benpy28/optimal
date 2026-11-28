@@ -185,14 +185,15 @@ fn crash_tiny_disk() {
         ..Default::default()
     };
     for i in 0..3 * scale() {
-        campaign(base_seed() + 40_000 + i, i % 2 == 0, 400, 80, 400, &cfg);
+        campaign(base_seed() + 40_000 + i, i % 2 == 0, 1024, 80, 400, &cfg);
     }
 }
 
 /// Nightly soak case (reported as seed 0x78c4c2f0 = seed ^ cut): after
-/// recovery the 400-block volume is full, and a create must be refused with
+/// recovery a small volume is full, and a create must be refused with
 /// `NoSpace` (the harness used to expect success because its model has no
-/// space limit).
+/// space limit). Found on 400 blocks, below today's minimum volume size, so
+/// it now runs on the smallest allowed volume.
 #[test]
 fn tiny_disk_full_after_recovery() {
     let cfg = GenCfg {
@@ -200,6 +201,6 @@ fn tiny_disk_full_after_recovery() {
         max_offset: 300_000,
         ..Default::default()
     };
-    let rf = reference(0x78c4c291, true, 400, 80, &cfg);
-    crash_at(0x78c4c291, true, 400, &rf, 97, 2);
+    let rf = reference(0x78c4c291, true, 1024, 80, &cfg);
+    crash_at(0x78c4c291, true, 1024, &rf, 97, 2);
 }

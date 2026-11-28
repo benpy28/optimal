@@ -96,6 +96,13 @@ pub struct Space {
     /// Blocks freed by recent commits, still quarantined (oldest first).
     pub held: VecDeque<FreedBatch>,
     held_blocks: u64,
+    /// Logical metadata blocks allocated since this `Space` was loaded (a
+    /// counter, so callers can measure what a step allocated).
+    pub allocated_l: u64,
+    /// The same for chunk-table node pairs.
+    pub allocated_pairs: u64,
+    /// See [`refresh_releasing`](Self::refresh_releasing).
+    releasing_slots: u64,
     /// Free-log blocks of the last commit.
     log_addrs: Vec<u64>,
     /// Old copies of space tables that became garbage this transaction.
@@ -180,6 +187,9 @@ impl Space {
             freed_now: RangeSet::new(),
             held: VecDeque::new(),
             held_blocks: 0,
+            allocated_l: 0,
+            allocated_pairs: 0,
+            releasing_slots: 0,
             log_addrs: Vec::new(),
             pending_table_frees: Vec::new(),
             cursor: SB_RESERVED_FRONT,
@@ -354,14 +364,36 @@ impl Space {
         self.free_total
     }
 
+    /// Metadata slots a commit can take without mapping a new chunk: free
+    /// slots of mapped chunks that are neither quarantined nor in a chunk
+    /// that may be released at the next commit.
+    pub fn usable_meta_slots(&self) -> u64 {
+        let quarantined =
+            self.freed_now_l.len() + self.held.iter().map(|h| h.lset.len()).sum::<u64>();
+        self.chunks
+            .free_slots()
+            .saturating_sub(quarantined + self.releasing_slots)
+    }
+
+    /// Counts the slots of chunks the next commit may release (empty ones
+    /// among those that may have become empty), for
+    /// [`usable_meta_slots`](Self::usable_meta_slots).
+    pub fn refresh_releasing<D: BlockDevice>(&mut self, io: &mut Io<D>) -> Result<()> {
+        let mut n = 0;
+        for &id in &self.maybe_empty {
+            let e = self.chunks.entry(io, id)?;
+            if e.mapped() && e.used == 0 {
+                n += e.len as u64;
+            }
+        }
+        self.releasing_slots = n;
+        Ok(())
+    }
+
     /// Free blocks that can actually be allocated right now.
     pub fn allocatable_blocks(&self) -> u64 {
         self.free_total
             .saturating_sub(self.freed_now.len() + self.held_blocks)
-    }
-
-    pub fn quarantined_blocks(&self) -> u64 {
-        self.freed_now.len() + self.held_blocks
     }
 
     /// The table at `(level, idx)`, loading (or synthesising) it if needed.
@@ -621,6 +653,7 @@ impl Space {
         io: &mut Io<D>,
         n: u64,
     ) -> Result<Vec<(u64, u64)>> {
+        self.allocated_l += n;
         let mut out = Vec::new();
         let mut left = n;
         while left > 0 {
@@ -738,6 +771,7 @@ impl Space {
 
     /// Two single blocks for a chunk-table node's copies.
     fn alloc_pair<D: BlockDevice>(&mut self, io: &mut Io<D>) -> Result<(u64, u64)> {
+        self.allocated_pairs += 1;
         let (p0, p1, _) = self.alloc_chunk_runs(io, 1, false)?;
         Ok((p0, p1))
     }
@@ -1300,7 +1334,6 @@ impl Space {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn levels(&self) -> u32 {
         self.levels
     }
