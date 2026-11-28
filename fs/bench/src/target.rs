@@ -361,25 +361,28 @@ impl Ofs {
 // ----------------------------------------------------- mounted file system
 
 enum Node {
-    File(File),
+    File(PathBuf, File),
     Dir(PathBuf, File),
 }
 
 /// A mounted file system (ext4 here), through ordinary system calls.
 pub struct Posix {
     root: PathBuf,
+    /// The block device it is mounted from (remounted to drop caches).
+    dev: String,
     nodes: HashMap<H, Node>,
     next: H,
 }
 
 impl Posix {
-    pub fn new(mnt: &str) -> Posix {
+    pub fn new(mnt: &str, dev: &str) -> Posix {
         let root = PathBuf::from(mnt);
         let f = File::open(&root).expect("open mount point");
         let mut nodes = HashMap::new();
         nodes.insert(1, Node::Dir(root.clone(), f));
         Posix {
             root,
+            dev: dev.into(),
             nodes,
             next: 2,
         }
@@ -388,13 +391,13 @@ impl Posix {
     fn dir(&self, d: H) -> &PathBuf {
         match &self.nodes[&d] {
             Node::Dir(p, _) => p,
-            Node::File(_) => panic!("not a directory"),
+            Node::File(..) => panic!("not a directory"),
         }
     }
 
     fn file(&self, f: H) -> &File {
         match &self.nodes[&f] {
-            Node::File(f) => f,
+            Node::File(_, f) => f,
             Node::Dir(..) => panic!("not a file"),
         }
     }
@@ -433,7 +436,7 @@ impl Target for Posix {
             .mode(0o644)
             .open(&p)
             .expect("create");
-        self.add(Node::File(f))
+        self.add(Node::File(p, f))
     }
     fn close(&mut self, f: H) {
         self.nodes.remove(&f);
@@ -450,7 +453,7 @@ impl Target for Posix {
     fn fsync_dir(&mut self, d: H) {
         match &self.nodes[&d] {
             Node::Dir(_, f) => f.sync_all().expect("fsync dir"),
-            Node::File(_) => panic!("not a directory"),
+            Node::File(..) => panic!("not a directory"),
         }
     }
     fn rename(&mut self, sd: H, s: &str, dd: H, d: &str) {
@@ -471,10 +474,46 @@ impl Target for Posix {
         let r = unsafe { libc::syncfs(f.as_raw_fd()) };
         assert_eq!(r, 0, "syncfs: {}", std::io::Error::last_os_error());
     }
+    /// Unmounts and mounts again, then drops the kernel's caches, as the
+    /// OptimalFS side remounts. `drop_caches` alone is not enough: metadata
+    /// buffers still held by the journal (committed, not yet checkpointed)
+    /// stay in memory, so a following "cold" stat read 8 KiB instead of the
+    /// directory and inode tables. Handles are reopened by path.
     fn drop_caches(&mut self) {
         root_only("dropping caches");
         self.syncfs();
-        // Drops the page cache of open files too, so reads go to the device.
+        let paths: Vec<(H, bool, PathBuf)> = self
+            .nodes
+            .iter()
+            .map(|(&h, n)| match n {
+                Node::File(p, _) => (h, false, p.clone()),
+                Node::Dir(p, _) => (h, true, p.clone()),
+            })
+            .collect();
+        self.nodes.clear();
+        let run = |args: &[&str]| {
+            let st = std::process::Command::new(args[0])
+                .args(&args[1..])
+                .status()
+                .expect(args[0]);
+            assert!(st.success(), "{args:?} failed");
+        };
+        let mnt = self.root.to_str().unwrap().to_string();
+        run(&["umount", &mnt]);
         std::fs::write("/proc/sys/vm/drop_caches", "3\n").expect("drop_caches");
+        run(&["mount", &self.dev, &mnt]);
+        for (h, dir, p) in paths {
+            let f = OpenOptions::new()
+                .read(true)
+                .write(!dir)
+                .open(&p)
+                .expect("reopen");
+            let n = if dir {
+                Node::Dir(p, f)
+            } else {
+                Node::File(p, f)
+            };
+            self.nodes.insert(h, n);
+        }
     }
 }

@@ -72,7 +72,7 @@ run_ext4() {
     [ "$MODE" = encrypted ] && { cryptsetup status $CRYPT >&2; dmsetup table $CRYPT >&2; }
   fi
   drop
-  "$BIN" "$w" --target ext4 --mnt "$MNT" --stat-disk "$DISK" --mode "$MODE" \
+  "$BIN" "$w" --target ext4 --mnt "$MNT" --ext4-dev "$dev" --stat-disk "$DISK" --mode "$MODE" \
     --run "$run" --scale "$SCALE" --out "$OUT"
   umount "$MNT"
   [ "$MODE" = encrypted ] && cryptsetup close $CRYPT

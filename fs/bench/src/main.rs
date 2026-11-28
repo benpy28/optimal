@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! optimalfs-bench <workload> --target ofs  --dev /dev/sdX1 --blocks N [--encrypted]
-//! optimalfs-bench <workload> --target ext4 --mnt /mnt/bench
+//! optimalfs-bench <workload> --target ext4 --mnt /mnt/bench --ext4-dev /dev/sdX1
 //!     common: --stat-disk sdX --run R --mode plain|encrypted --scale S --out results.jsonl
 //! ```
 //!
@@ -445,7 +445,7 @@ fn main() {
             t.unmount();
         }
         "ext4" => {
-            let mut t = Posix::new(&get("mnt"));
+            let mut t = Posix::new(&get("mnt"), &get("ext4-dev"));
             run(&workload, &mut t, &mut r, scale);
         }
         _ => panic!("--target ofs|ext4"),
