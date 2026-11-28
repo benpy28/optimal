@@ -108,18 +108,19 @@ impl Type {
         if t1.same_entries(&t2) {
             return Some(t1);
         }
-        let p = idx(Base::Percent);
-        let has_percent = t1.exp[p] != 0 || t2.exp[p] != 0;
-        let has_other = (0..7).any(|i| i != p && (t1.exp[i] != 0 || t2.exp[i] != 0));
-        if has_percent && has_other {
-            for &hint in &BASES[..6] {
-                let (a, b) = (t1.apply_hint(hint), t2.apply_hint(hint));
-                if a.same_entries(&b) {
-                    return Some(Type {
-                        exp: a.exp,
-                        hint: Some(hint),
-                    });
-                }
+        // Step 4 tries each hint only when a type has a non-zero
+        // "percent" and one of them a non-zero other entry. That test
+        // needs no code: without a "percent", applying a hint changes no
+        // entry, so the entries still differ as step 3 found; with only
+        // "percent" entries, each hint moves them to the same key, where
+        // they still differ. So the loop alone gives the same answers.
+        for &hint in &BASES[..6] {
+            let (a, b) = (t1.apply_hint(hint), t2.apply_hint(hint));
+            if a.same_entries(&b) {
+                return Some(Type {
+                    exp: a.exp,
+                    hint: Some(hint),
+                });
             }
         }
         None
@@ -466,5 +467,165 @@ pub fn function_type(name: &str, args: Values<'_, '_>, ctx: Context, depth: u32)
         }
         ("sign", [a]) => Type::NUMBER.made_consistent(calc(a)?),
         _ => None,
+    }
+}
+
+/// The type algebra on its own, step by step as css-typed-om-1 writes it.
+/// Some of these types (such as an unhinted "percent") never come out of
+/// a calculation here, but the algorithms are defined for every type.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A type with the given (base, exponent) entries and hint.
+    fn ty(entries: &[(Base, i32)], hint: Option<Base>) -> Type {
+        let mut t = Type::NUMBER;
+        for &(b, e) in entries {
+            t.exp[idx(b)] = e;
+        }
+        t.hint = hint;
+        t
+    }
+
+    use Base::{Angle, Length, Percent, Time};
+
+    #[test]
+    fn sum_applies_one_sided_hints_first() {
+        // Step 2: type1 has hint length, type2 none, so type2 gets it:
+        // {percent 1} becomes {length 1}, which differs from {angle 1}, and
+        // neither has a "percent" left, so step 4 doesn't apply: failure.
+        // (Trying hints without step 2 would match at hint angle.)
+        let angle_hinted = ty(&[(Angle, 1)], Some(Length));
+        let percent = ty(&[(Percent, 1)], None);
+        assert_eq!(angle_hinted.sum(percent), None);
+        assert_eq!(percent.sum(angle_hinted), None);
+        // And when the hint makes them equal, the result keeps it.
+        let length_hinted = ty(&[(Length, 1)], Some(Length));
+        assert_eq!(length_hinted.sum(percent), Some(length_hinted));
+        assert_eq!(percent.sum(length_hinted), Some(length_hinted));
+    }
+
+    #[test]
+    fn sum_fails_on_two_different_hints() {
+        // Step 2: both hinted, differently: failure, even though hint
+        // length would make {percent 1} and {length 1} equal.
+        let a = ty(&[(Percent, 1)], Some(Percent));
+        let b = ty(&[(Length, 1)], Some(Length));
+        assert_eq!(a.sum(b), None);
+        // The same hint on both is fine.
+        assert_eq!(b.sum(b), Some(b));
+    }
+
+    #[test]
+    fn sum_tries_each_hint() {
+        // Step 4: a "percent" on either side and another entry on either
+        // side: the first hint that makes them equal wins.
+        let length = ty(&[(Length, 1)], None);
+        let percent = ty(&[(Percent, 1)], None);
+        let want = Some(ty(&[(Length, 1)], Some(Length)));
+        assert_eq!(length.sum(percent), want);
+        assert_eq!(percent.sum(length), want);
+        let time = ty(&[(Time, 1)], None);
+        assert_eq!(percent.sum(time), Some(ty(&[(Time, 1)], Some(Time))));
+        // No hint helps {length 1} + {length 2}, or {percent 1} +
+        // {percent 2}, or a number and a percent.
+        assert_eq!(length.sum(ty(&[(Length, 2)], None)), None);
+        assert_eq!(percent.sum(ty(&[(Percent, 2)], None)), None);
+        assert_eq!(percent.sum(Type::NUMBER), None);
+        // {length 1, percent -1} + number: hint length cancels.
+        let cancel = ty(&[(Length, 1), (Percent, -1)], None);
+        assert_eq!(cancel.sum(Type::NUMBER), Some(ty(&[], Some(Length))));
+    }
+
+    #[test]
+    fn multiply_applies_hints_then_adds_exponents() {
+        // Step 2 as for sums; then entries add, and the result has
+        // type1's hint (after step 2, both have the same one).
+        let length_hinted = ty(&[(Length, 1)], Some(Length));
+        let percent = ty(&[(Percent, 1)], None);
+        let want = Some(ty(&[(Length, 2)], Some(Length)));
+        assert_eq!(length_hinted.multiply(percent), want);
+        assert_eq!(percent.multiply(length_hinted), want);
+        // Two different hints: failure; the same hint: fine.
+        let other = ty(&[(Percent, 1)], Some(Percent));
+        assert_eq!(length_hinted.multiply(other), None);
+        assert_eq!(
+            length_hinted.multiply(length_hinted),
+            Some(ty(&[(Length, 2)], Some(Length)))
+        );
+        // No hints: entries add, the result has none.
+        let angle = ty(&[(Angle, 1)], None);
+        assert_eq!(
+            angle.multiply(angle.invert()),
+            Some(ty(&[], None)),
+            "deg/deg is a number"
+        );
+    }
+
+    #[test]
+    fn made_consistent_takes_the_input_hint() {
+        // "make a type consistent": different hints fail; a missing hint
+        // takes the input's; the same hint stays.
+        let length = ty(&[], Some(Length));
+        let percent = ty(&[], Some(Percent));
+        assert_eq!(length.made_consistent(percent), None);
+        assert_eq!(length.made_consistent(length), Some(length));
+        assert_eq!(Type::NUMBER.made_consistent(percent), Some(percent));
+        assert_eq!(length.made_consistent(Type::NUMBER), Some(length));
+    }
+
+    #[test]
+    fn hints_and_contexts() {
+        // A hinted <number> matches where percentages resolve against the
+        // hint, or, for hint percent, where they are plain percentages;
+        // a <length> never matches with hint percent.
+        let number_percent = ty(&[], Some(Percent));
+        assert!(number_percent.matches_number(Context::Percent));
+        assert!(!number_percent.matches_number(Context::NoPercent));
+        assert!(!number_percent.matches_number(Context::Against(Length)));
+        let length_percent = ty(&[(Length, 1)], Some(Percent));
+        assert!(!length_percent.matches_builtin(Builtin::Length, Context::Percent));
+        let length_hinted = ty(&[(Length, 1)], Some(Length));
+        assert!(length_hinted.matches_builtin(Builtin::Length, Context::Against(Length)));
+        assert!(!length_hinted.matches_builtin(Builtin::Length, Context::Percent));
+    }
+
+    #[test]
+    fn every_numeric_builtin() {
+        // Each base type matches its own builtin and the builtin's
+        // percentage mix; a plain percentage matches only the mixes and
+        // <percentage>.
+        let cases = [
+            (Base::Length, Builtin::Length, Builtin::LengthPercentage),
+            (Base::Angle, Builtin::Angle, Builtin::AnglePercentage),
+            (Base::Time, Builtin::Time, Builtin::TimePercentage),
+            (
+                Base::Frequency,
+                Builtin::Frequency,
+                Builtin::FrequencyPercentage,
+            ),
+        ];
+        let percent = ty(&[(Percent, 1)], None);
+        for (base, plain, mix) in cases {
+            let t = Type::of(base);
+            assert!(t.matches_builtin(plain, Context::NoPercent), "{plain:?}");
+            assert!(t.matches_builtin(mix, Context::Against(base)), "{mix:?}");
+            assert!(!t.matches_builtin(Builtin::Number, Context::NoPercent));
+            assert!(!percent.matches_builtin(plain, Context::NoPercent));
+            assert!(percent.matches_builtin(mix, Context::Against(base)));
+        }
+        let res = Type::of(Base::Resolution);
+        assert!(res.matches_builtin(Builtin::Resolution, Context::NoPercent));
+        assert!(!res.matches_builtin(Builtin::Time, Context::NoPercent));
+        assert!(percent.matches_builtin(Builtin::Percentage, Context::Percent));
+        assert!(!res.matches_builtin(Builtin::String, Context::NoPercent));
+    }
+
+    #[test]
+    fn math_function_names() {
+        assert!(is_math_function("calc"));
+        assert!(is_math_function("ATAN2"));
+        assert!(!is_math_function("var"));
+        assert!(!is_math_function("calc-size"));
     }
 }

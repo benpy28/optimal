@@ -45,4 +45,22 @@ exclude_re = [
     # results and the scaling test the cost. Equivalent. Line-pinned.
     "selectors/src/matching\\.rs:542:21: delete match arm \\(Res::RestartDescendant, Combinator::SubsequentSibling\\) in Matcher<'c, E>::complex",
     "selectors/src/matching\\.rs:565:21: delete match arm Combinator::Descendant \\| Combinator::Child in Matcher<'c, E>::complex",
+    # style value matcher, state(): the position is shifted above the
+    # comma bits (0 to 3) and the bang bit (4), so the three parts share no
+    # bits and `^` gives the same number as `|`. Equivalent. Line-pinned.
+    "style/src/values/matcher\\.rs:51:29: replace \\| with \\^ in state",
+    "style/src/values/matcher\\.rs:51:37: replace \\| with \\^ in state",
+    # style value matcher, the grammar comma: `s & !COMMA_MASK` has the
+    # comma bits clear, so setting PENDING with `^` is the same as with
+    # `|`. Equivalent. Line-pinned.
+    "style/src/values/matcher\\.rs:167:48: replace \\| with \\^ in Run<'_, 't, 'a>::run",
+    # style value matcher, the && / || subset walk: a child is only tried
+    # when its bit is clear in `mask` (the line above checks it), so
+    # `mask ^ (1 << c)` sets the bit exactly as `|` does. Equivalent.
+    "style/src/values/matcher\\.rs:216:36: replace \\| with \\^ in Run<'_, 't, 'a>::run",
+    # The same walk: with `1 >> c` the bit test is 0 for c > 0, so a child
+    # already used in `mask` is tried again. Its states go to t[mask],
+    # which this iteration has already taken and no later one reads, so
+    # they are dropped: same results, only wasted work. Equivalent.
+    "style/src/values/matcher\\.rs:214:38: replace << with >> in Run<'_, 't, 'a>::run",
 ]

@@ -131,11 +131,29 @@ fn builtin(name: &str) -> Option<Builtin> {
     BASIC.iter().find(|(n, _)| *n == name).map(|&(_, b)| b)
 }
 
+/// A property's name and value grammar, for [`compile_with`].
+pub type PropertyGrammar = (&'static str, &'static str);
+
 /// Builds every grammar: the productions, then each property's.
 pub fn compile() -> Result<Compiled, CompileError> {
+    let longhands: Vec<PropertyGrammar> = LONGHANDS.iter().map(|l| (l.name, l.value)).collect();
+    let shorthands: Vec<PropertyGrammar> = SHORTHANDS.iter().map(|s| (s.name, s.value)).collect();
+    compile_with(PRODUCTIONS, &longhands, &shorthands)
+}
+
+/// Builds the grammars of the given productions and properties, as
+/// [`compile`] does for the real tables. The top node of each property's
+/// grammar is in [`Compiled::longhands`] or [`Compiled::shorthands`], in
+/// the order given. The tests use it to check each [`CompileError`] and
+/// grammar features the tables don't use yet.
+pub fn compile_with(
+    table: &[table::Production],
+    longhand_grammars: &[PropertyGrammar],
+    shorthand_grammars: &[PropertyGrammar],
+) -> Result<Compiled, CompileError> {
     let mut g = Grammar::default();
     let mut productions = HashMap::new();
-    for p in PRODUCTIONS {
+    for p in table {
         let top = match p.def {
             Def::Prod(text) | Def::Prose(text, _) | Def::Rule { grammar: text, .. } => {
                 g.read(text).map_err(CompileError::Syntax)?
@@ -152,21 +170,21 @@ pub fn compile() -> Result<Compiled, CompileError> {
         productions.insert(p.name, top);
     }
     let read = |g: &mut Grammar, v| g.read(v).map_err(CompileError::Syntax);
-    let longhands = LONGHANDS
+    let longhands = longhand_grammars
         .iter()
-        .map(|l| read(&mut g, l.value))
+        .map(|&(_, v)| read(&mut g, v))
         .collect::<Result<Vec<_>, _>>()?;
-    let shorthands = SHORTHANDS
+    let shorthands = shorthand_grammars
         .iter()
-        .map(|s| read(&mut g, s.value))
+        .map(|&(_, v)| read(&mut g, v))
         .collect::<Result<Vec<_>, _>>()?;
     let property = |name: &str| -> Option<NodeId> {
-        if let Some(i) = LONGHANDS.iter().position(|l| l.name == name) {
+        if let Some(i) = longhand_grammars.iter().position(|&(n, _)| n == name) {
             return Some(longhands[i]);
         }
-        SHORTHANDS
+        shorthand_grammars
             .iter()
-            .position(|s| s.name == name)
+            .position(|&(n, _)| n == name)
             .map(|i| shorthands[i])
     };
     // Resolve names.
@@ -261,30 +279,27 @@ fn check(g: &Grammar) -> Result<(), CompileError> {
     // Depth-first walk over edges that stay within one list (functions
     // and blocks start a new one), iteratively, with colours.
     let len = g.nodes.len();
+    let in_list = |n: &Node| match n {
+        Node::Function(..) | Node::Block(_) => Vec::new(),
+        n => children(n),
+    };
     let mut colour = vec![0u8; len]; // 0 new, 1 on the path, 2 done
     for root in 0..len {
         if colour[root] != 0 {
             continue;
         }
-        let mut stack: Vec<(usize, usize, bool)> = vec![(root, 0, false)];
+        let mut stack: Vec<(usize, usize)> = vec![(root, 0)];
         colour[root] = 1;
-        while let Some(&mut (node, ref mut next, in_bang)) = stack.last_mut() {
-            let kids = match &g.nodes[node] {
-                Node::Function(..) | Node::Block(_) => Vec::new(),
-                n => children(n),
-            };
+        while let Some(&mut (node, ref mut next)) = stack.last_mut() {
+            let kids = in_list(&g.nodes[node]);
             if *next < kids.len() {
                 let child = kids[*next] as usize;
                 *next += 1;
-                let bang = in_bang || matches!(g.nodes[node], Node::Required(_));
-                if bang && matches!(g.nodes[child], Node::Required(_)) {
-                    return Err(CompileError::NestedRequired);
-                }
                 match colour[child] {
                     1 => return Err(CompileError::Cycle("a reference loop")),
                     0 => {
                         colour[child] = 1;
-                        stack.push((child, 0, bang));
+                        stack.push((child, 0));
                     }
                     _ => {}
                 }
@@ -292,6 +307,24 @@ fn check(g: &Grammar) -> Result<(), CompileError> {
                 colour[node] = 2;
                 stack.pop();
             }
+        }
+    }
+    // A `!` reaching another in its list, however deep: one walk per `!`
+    // (a walk sharing the colours above would miss a `!` reached first
+    // from elsewhere), each node visited once.
+    for n in &g.nodes {
+        let Node::Required(inner) = n else { continue };
+        let mut seen = vec![false; len];
+        let mut todo = vec![*inner];
+        while let Some(m) = todo.pop() {
+            if std::mem::replace(&mut seen[m as usize], true) {
+                continue;
+            }
+            let m = &g.nodes[m as usize];
+            if matches!(m, Node::Required(_)) {
+                return Err(CompileError::NestedRequired);
+            }
+            todo.extend(in_list(m));
         }
     }
     // Function and block contents are new roots, checked by the loop.

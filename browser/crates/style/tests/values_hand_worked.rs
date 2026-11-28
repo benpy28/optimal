@@ -334,3 +334,50 @@ fn css_wide_and_substitution() {
     yes("width", "AUTO");
     yes("display", "Block");
 }
+
+#[test]
+fn math_nesting_limit() {
+    // values-4 10.8: at least 32 levels of nesting must be supported;
+    // deeper ones may be treated as invalid. This engine allows
+    // MAX_NESTING functions and ()-blocks, counting the outermost math
+    // function, and refuses one more.
+    let max = optimal_style::values::MAX_NESTING as usize;
+    let calcs = |n: usize| format!("{}1px{}", "calc(".repeat(n), ")".repeat(n));
+    yes("width", &calcs(max));
+    no("width", &calcs(max + 1));
+    // One calc() and max - 1 parentheses: max levels; then one more.
+    let parens = |n: usize| format!("calc({}1px{})", "(".repeat(n), ")".repeat(n));
+    yes("width", &parens(max - 1));
+    no("width", &parens(max));
+    // Mixed: calc( ( min( ( 1px ) ) ) ) is four levels.
+    let mixed = |n: usize| format!("{}1px{}", "calc((".repeat(n), "))".repeat(n));
+    yes("width", &mixed(max / 2));
+    no("width", &format!("calc({})", mixed(max / 2)));
+}
+
+#[test]
+fn math_function_arities() {
+    // round(A) and round(A, B), with or without a strategy (10.6.1);
+    // log(A) and log(A, B) (10.7).
+    yes("opacity", "round(1.5)");
+    yes("opacity", "round(1.5, 1)");
+    yes("opacity", "round(down, 1.5, 1)");
+    no("opacity", "round(1, 2, 3)");
+    yes("opacity", "log(2)");
+    yes("opacity", "log(8, 2)");
+    no("opacity", "log(2px)");
+    // round(line-width, A, B): A must be a <length>.
+    yes("width", "round(line-width, 3px, 1px)");
+    yes("width", "round(line-width, 3px)");
+    no("opacity", "round(line-width, 3, 1)");
+}
+
+#[test]
+fn number_slot_takes_percent_context() {
+    // line-height: normal | <number [0,∞]> | <length-percentage [0,∞]>.
+    // The <number> shares the slot's context, so calc(10% / 10%) (a
+    // number, hint length) is a valid <number> here (see values::math).
+    yes("line-height", "calc(10% / 10%)");
+    yes("line-height", "calc(10% / 1px)");
+    no("opacity", "calc(10% / 1px)");
+}

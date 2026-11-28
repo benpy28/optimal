@@ -341,7 +341,9 @@ pub fn matches(
                 // A mix's bounds apply to its percentages as written.
                 bounds.contains(*value)
             }
-            (Token::Dimension(n, unit), Some(base)) if base != Base::Percent => {
+            // No unit has the base type Percent, so a dimension never
+            // matches <percentage>.
+            (Token::Dimension(n, unit), Some(base)) => {
                 dimension_matches(n.value, unit, base, bounds)
             }
             // A unitless zero is a <length> (css-values-4 6.1).
