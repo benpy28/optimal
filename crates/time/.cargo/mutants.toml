@@ -19,8 +19,20 @@
 #   1); T_LEVEL and T_INT_ENABLE (bit 2) or 0. On disjoint bits OR and XOR
 #   give the same value, so these mutants are equivalent. Pinned bit for
 #   bit by hpet::level_one_shot_hand_worked and level_one_shot_bits.
+# - `replace | with ^` in fsb_route, fsb_one_shot, legacy_one_shot and
+#   legacy_running, for the same reason: fsb_route joins the address
+#   (bits 63:32) and the data (31:0); fsb_one_shot and legacy_one_shot OR
+#   T_FSB_ENABLE (bit 14) and T_INT_ENABLE (bit 2) or 0 into a value
+#   quiet() has just cleared them in; legacy_running's second | joins
+#   ENABLE and LEGACY_ROUTE (bits 0 and 1). (Its first |, against the
+#   configuration as read, is not excluded: legacy_hand_worked kills it.)
+#   Pinned bit for bit by hpet::fsb_hand_worked, legacy_hand_worked,
+#   fsb_one_shot_bits, legacy_one_shot_bits, legacy_running_bits and
+#   fsb_route_halves.
 exclude_re = [
     "replace \\| with \\^ in (halted|quiet)",
     "replace \\| with \\^ in (lvt|dcr|dcr_log2)",
     "replace \\| with \\^ in level_one_shot",
+    "replace \\| with \\^ in (fsb_route|fsb_one_shot|legacy_one_shot)",
+    "hpet.rs:[0-9]+:21: replace \\| with \\^ in legacy_running",
 ]

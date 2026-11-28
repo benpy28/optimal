@@ -10,6 +10,11 @@
 #   bits OR and XOR give the same value, so these mutants are equivalent.
 #   The encodings themselves are pinned by hand-worked values and by
 #   round trips over every bit pattern in src/suite.
+# - `replace | with ^` in fixed_edge: the destination ID, at most 0xFF
+#   shifted to bits 19:12 (the function refuses wider ones first), never
+#   overlaps 0xFEE00000 (bits 31:20). Pinned by msi::fixed_edge_hand_worked
+#   and fixed_edge_decodes.
 exclude_re = [
+    "replace \\| with \\^ in fixed_edge",
     "replace \\| with \\^ in (Mode::bits|transition|Lvt::encode|Ipi::low|Ipi::x2apic|svr|Redirection::encode)",
 ]
