@@ -184,7 +184,7 @@ pub fn setup() -> Result<(Ev, Estimate), String> {
             against,
             Counter::Hpet(h),
             super::LAPIC_GOAL_PPB,
-            super::LAPIC_WINDOW_NS,
+            super::FALLBACK_WINDOW_NS,
         ) {
             Ok(r) => r,
             Err(e) => {

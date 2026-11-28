@@ -33,7 +33,7 @@ pub fn setup() -> Result<Estimate, String> {
         against,
         Counter::Pit,
         super::LAPIC_GOAL_PPB,
-        super::LAPIC_WINDOW_NS,
+        super::FALLBACK_WINDOW_NS,
     );
     time::pit_stop(port_b);
     let rate = rate.map_err(|e| format!("could not measure the PIT: {e}"))?;

@@ -278,8 +278,9 @@ fn never_early(what: &str) {
 /// Force each way of arming in turn that this machine has, and run `f`
 /// with its name; then put the boot choice back.
 fn each_source(f: impl Fn(&str, Events)) -> u32 {
-    let t = get().unwrap();
-    let was = t.events.expect("timer events on QEMU");
+    // The watchdog may have moved events off the boot choice (TSC-deadline
+    // mode, when the TSC proved unstable): put back what was in use.
+    let was = super::events().expect("timer events on QEMU");
     let mut n = 0;
     for (e, what) in [
         (Events::TscDeadline, "tsc-deadline"),

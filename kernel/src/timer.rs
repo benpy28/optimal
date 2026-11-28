@@ -48,7 +48,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::arch::x86_64::__cpuid_count;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use optimal_apic::lapic as regs;
 use optimal_apic::vectors;
@@ -76,6 +76,15 @@ use crate::time::{self, Counter, Time};
 const LAPIC_GOAL_PPB: u64 = 100_000;
 /// And after this long at most.
 const LAPIC_WINDOW_NS: u64 = 50_000_000;
+/// The HPET's or the PIT's measurement may take up to 100 ms, the TSC
+/// calibration's own limit: they are set up only when the LAPIC timer
+/// cannot be used, and their reads (and the PM timer's, against which
+/// they are measured when it is the clock) can each take tens of
+/// microseconds as VM exits to the emulator, where the bound is the
+/// read time over the window. KVM with the PM timer as the clock gave
+/// the PIT 1150.9 ppm over 52 ms, past WARN_PPB; twice the window halves
+/// that. Real hardware reaches the 100 ppm goal far sooner and stops.
+const FALLBACK_WINDOW_NS: u64 = 100_000_000;
 /// Added to every arming: converting between nanoseconds and counter
 /// ticks is exact to within one nanosecond each way (optimal_time::freq::
 /// Scale), so the clock read at the interrupt could otherwise be 2 ns
@@ -265,6 +274,13 @@ static HOOK: AtomicUsize = AtomicUsize::new(0);
 /// ([`force_events`]).
 static EVENTS: AtomicU8 = AtomicU8::new(0);
 
+/// The divide configuration last written for a one-shot arming, or
+/// [`DCR_UNKNOWN`] after anything else wrote it ([`set_mode`],
+/// [`calibrate`]). See [`program`]: the count is stopped before the divide
+/// changes.
+static LAPIC_DCR: AtomicU32 = AtomicU32::new(DCR_UNKNOWN);
+const DCR_UNKNOWN: u32 = u32::MAX;
+
 /// Tests: the longest piece one arming may cover, to exercise deadlines
 /// reached in several armings without waiting minutes.
 static CHUNK_CAP: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -319,6 +335,7 @@ fn calibrate(l: Lapic, against: Counter) -> Result<Estimate, String> {
         regs::LVT_TIMER,
         lt::lvt(vectors::LAPIC_TIMER, Mode::OneShot, true),
     );
+    LAPIC_DCR.store(DCR_UNKNOWN, Ordering::Relaxed);
     l.write(regs::TIMER_DIVIDE, lt::dcr(0));
     l.write(regs::TIMER_INITIAL, u32::MAX);
     let r = time::measure_to(against, Counter::Lapic(l), LAPIC_GOAL_PPB, LAPIC_WINDOW_NS);
@@ -340,6 +357,7 @@ fn counter_name(c: Counter) -> &'static str {
 fn set_mode(l: Lapic, e: Option<Events>) {
     // Disarm both ways first, so no stale arming fires in the new mode.
     l.write(regs::TIMER_INITIAL, 0);
+    LAPIC_DCR.store(DCR_UNKNOWN, Ordering::Relaxed);
     match e {
         Some(Events::TscDeadline) => {
             l.write(
@@ -588,7 +606,21 @@ fn program(a: &mut Armed) {
             let ns = wait.min(a.rates.longest_ns).min(cap);
             let arm = lt::arm(e.freq, e.ppb, ns).expect("longest_ns always arms");
             reached(a, ns);
-            l.write(regs::TIMER_DIVIDE, arm.dcr());
+            // A new divide goes in with the count stopped. KVM rescales
+            // the last arming's remaining time when the divide changes
+            // and restarts it, and for a one-shot that has already run
+            // out (in this interrupt's handler) the remaining time is 0:
+            // it fires again at once, before the new count is written.
+            // A count of 0 clears that arming first. Real hardware leaves
+            // a run-out count alone; changing the divide of a running
+            // count is not defined anyway (SDM Vol. 3A 11.5.4). The same
+            // divide is not written again.
+            let dcr = arm.dcr();
+            if LAPIC_DCR.load(Ordering::Relaxed) != dcr {
+                l.write(regs::TIMER_INITIAL, 0);
+                l.write(regs::TIMER_DIVIDE, dcr);
+                LAPIC_DCR.store(dcr, Ordering::Relaxed);
+            }
             l.write(regs::TIMER_INITIAL, arm.count);
         }
         Some(Events::HpetOneShot) => {
