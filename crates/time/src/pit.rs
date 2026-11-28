@@ -78,3 +78,16 @@ pub const fn arm0(count: u32) -> [(u16, u8); 3] {
         (CHANNEL0, (c >> 8) as u8),
     ]
 }
+
+/// Read-back command for channel 0's status alone (Intel 8254 datasheet,
+/// "Read-Back Command"): 11 0 1 001 0, count not latched (bit 5 set),
+/// status latched (bit 4 clear), channel 0 (bit 1). The next read of
+/// [`CHANNEL0`] is the status byte.
+pub const READBACK_STATUS0: u8 = 0b1110_0010;
+
+/// The OUT pin's state in a read-back status byte (bit 7). In mode 0 OUT
+/// is high from terminal count until the next mode or count write: high
+/// means the armed count has run out and its edge has been raised.
+pub const fn out(status: u8) -> bool {
+    status & 0x80 != 0
+}

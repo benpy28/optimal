@@ -210,53 +210,6 @@ fn hpet_program_enables_after_the_first_write() {
 }
 
 #[test]
-fn early_possible_hand_worked() {
-    let p = |start, distance, retries, cfg| Programmed {
-        start,
-        value: hpet::deadline(start, distance, cfg),
-        distance,
-        retries,
-    };
-    // 64-bit: the same high half as before is safe; another, or not
-    // knowing, is not; a retry never is.
-    let a = p(0x5_0000_0000, 1000, 0, WIDE);
-    assert!(!early_possible(Some(0x5_FFFF_0000), a, WIDE));
-    assert!(early_possible(Some(0x4_FFFF_0000), a, WIDE));
-    assert!(early_possible(None, a, WIDE));
-    assert!(early_possible(
-        Some(0x5_0000_0000),
-        p(0x5_0000_0000, 1000, 1, WIDE),
-        WIDE
-    ));
-    // Crossing into the next high half: 0x5_FFFF_FF00 + 0x200.
-    let b = p(0x5_FFFF_FF00, 0x200, 0, WIDE);
-    assert_eq!(b.value, 0x6_0000_0100);
-    assert!(early_possible(Some(0x5_FFFF_FE00), b, WIDE));
-    // 32-bit: only an arming across the wrap of the low 32 bits, and the
-    // old value does not matter.
-    assert!(!early_possible(
-        None,
-        p(0x7_FFFF_FF00, 0xFF, 0, NARROW),
-        NARROW
-    ));
-    assert!(early_possible(
-        None,
-        p(0x7_FFFF_FF00, 0x100, 0, NARROW),
-        NARROW
-    ));
-    assert!(!early_possible(
-        Some(1),
-        p(0, 0x7FFF_FFFF, 0, NARROW),
-        NARROW
-    ));
-    assert!(early_possible(
-        Some(1),
-        p(0, 0x7FFF_FFFF, 3, NARROW),
-        NARROW
-    ));
-}
-
-#[test]
 fn hpet_program_gives_up() {
     // A counter that jumps 2^40 on every read passes every value: 17
     // writes, then Missed with the last one.

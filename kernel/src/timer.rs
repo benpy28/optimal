@@ -238,11 +238,6 @@ struct Armed {
     watchdog: Option<u64>,
     /// What the hardware is armed for (clock ns).
     hw: Option<u64>,
-    /// False when an interrupt may legitimately come before `hw`: the
-    /// HPET comparator was moved further ahead after the counter got to
-    /// it first, and the value it replaced may have matched as it went
-    /// (optimal_time::oneshot::Programmed::retries).
-    hw_sure: bool,
     periodic: bool,
     rates: Rates,
     /// The HPET comparator set up for events, if any.
@@ -257,7 +252,6 @@ static ARMED: IrqSpinLock<Armed> = IrqSpinLock::new(Armed {
     refine: None,
     watchdog: None,
     hw: None,
-    hw_sure: true,
     periodic: false,
     rates: Rates::NONE,
     hpet: None,
@@ -277,6 +271,9 @@ static CHUNK_CAP: AtomicU64 = AtomicU64::new(u64::MAX);
 
 static FIRES: AtomicU64 = AtomicU64::new(0);
 static EARLY: AtomicU64 = AtomicU64::new(0);
+/// Interrupts before what the hardware was armed for that its own state
+/// shows are not the armed match (see [`interrupt`]).
+static STRAYS: AtomicU64 = AtomicU64::new(0);
 /// How early (ns) the last early interrupt came, for failure reports.
 static LAST_EARLY: AtomicU64 = AtomicU64::new(0);
 /// One-shot armings that covered only a piece of their wait.
@@ -573,7 +570,6 @@ fn program(a: &mut Armed) {
             now.saturating_add(ns - CONVERSION_PAD_NS.min(ns))
         });
     };
-    a.hw_sure = true;
     match events_now() {
         Some(Events::TscDeadline) => {
             let f = a
@@ -601,9 +597,8 @@ fn program(a: &mut Armed) {
             let ev = a.hpet.as_mut().expect("HPET events have a comparator");
             let ticks =
                 oneshot::hpet_ticks(e.freq, e.ppb, ns, ev.on).expect("hpet_longest_ns always arms");
-            let sure = ev.arm(ticks);
+            ev.arm(ticks);
             reached(a, ns);
-            a.hw_sure = sure;
         }
         Some(Events::PitOneShot) => {
             let e = a.rates.pit.expect("PIT events have the PIT's rate");
@@ -673,9 +668,44 @@ pub fn events() -> Option<Events> {
     events_now()
 }
 
-/// The LAPIC timer interrupt (crate::irq::dispatch, vector 0xF0).
+/// The state of an HPET or PIT event source, read at an interrupt before
+/// the clock is.
+enum Seen {
+    /// The HPET's main counter, read whole.
+    Hpet(u64),
+    /// PIT channel 0's OUT pin.
+    Pit(bool),
+}
+
+fn seen() -> Option<Seen> {
+    match events_now() {
+        Some(Events::HpetOneShot) => time::get()
+            .and_then(|t| t.hpet.as_ref())
+            .map(|h| Seen::Hpet(h.counter_whole())),
+        Some(Events::PitOneShot) => Some(Seen::Pit(time::pit0_out())),
+        _ => None,
+    }
+}
+
+/// The timer interrupt (crate::irq::dispatch): the LAPIC timer's vector
+/// 0xF0, the HPET comparator's and ISA IRQ 0's.
+///
+/// An interrupt before what the hardware was armed for counts as early,
+/// unless the HPET or PIT shows it is not the armed match: an HPET counter
+/// short of the comparator value, or a PIT OUT pin still low. Those are
+/// edges raised before the arming took over (a comparator value the
+/// counter passed, which QEMU fires at once; a replaced value or count
+/// that ran out just before it was replaced, whose edge waits in the
+/// local APIC behind the one being handled), or a 32-bit comparator's
+/// interrupt at the counter's wrap. The source is read before the clock:
+/// if the armed value had been reached at the source's read, the clock,
+/// read after, must be at or past what it was armed for, or the arming
+/// was early. This checks the rate bound the arming used, which is what
+/// the early count is for; the expiry hook never runs early either way,
+/// because it is run by the clock.
 pub fn interrupt() {
     FIRES.fetch_add(1, Ordering::Relaxed);
+    let seen = seen();
     // Reading the clock is also what keeps a narrow counter extended.
     let now = clock::now_ns();
     let mut a = ARMED.lock();
@@ -683,10 +713,18 @@ pub fn interrupt() {
         PERIODIC_TICKS.fetch_add(1, Ordering::Relaxed);
         return;
     }
-    let early = a.hw_sure && a.hw.is_some_and(|hw| now < hw);
+    let matched = match seen {
+        Some(Seen::Hpet(count)) => a.hpet.as_ref().map(|ev| ev.reached(count)),
+        Some(Seen::Pit(out)) => a.pit.then_some(out),
+        None => None,
+    };
+    let before = a.hw.is_some_and(|hw| now < hw);
+    let early = before && matched != Some(false);
     if early {
         EARLY.fetch_add(1, Ordering::Relaxed);
         LAST_EARLY.store(a.hw.unwrap_or(0).saturating_sub(now), Ordering::Relaxed);
+    } else if before {
+        STRAYS.fetch_add(1, Ordering::Relaxed);
     }
     a.hw = None;
     if a.housekeeping.is_some_and(|h| h <= now) {
@@ -930,15 +968,17 @@ pub fn owns_pit() -> bool {
 }
 
 /// HPET comparator retries and misses since boot
-/// (optimal_time::oneshot::hpet_program).
+/// (optimal_time::oneshot::hpet_program), and the interrupts before what
+/// an HPET or PIT was armed for that were not its match ([`interrupt`]).
 #[cfg_attr(
     not(feature = "ktest"),
     expect(dead_code, reason = "tests read them; the scorecard will")
 )]
-pub fn hpet_retries() -> (u64, u64) {
+pub fn hpet_retries() -> (u64, u64, u64) {
     (
         hpet::RETRIES.load(Ordering::SeqCst),
         hpet::MISSED.load(Ordering::SeqCst),
+        STRAYS.load(Ordering::SeqCst),
     )
 }
 

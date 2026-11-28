@@ -54,8 +54,7 @@ pub struct Ev {
     /// [`STEP_NS`] in HPET ticks.
     step: u64,
     enabled: bool,
-    /// The comparator value last written (optimal_time::oneshot::
-    /// early_possible).
+    /// The comparator value last written.
     last: Option<u64>,
     h: &'static Hpet,
 }
@@ -82,10 +81,7 @@ impl Comparator for Cmp {
 
 impl Ev {
     /// Arm `ticks` ahead (at most optimal_time::oneshot::hpet_max_ticks).
-    /// False when an interrupt may come before then through no fault of
-    /// the kernel's (optimal_time::oneshot::early_possible), or the
-    /// arming gave up.
-    pub fn arm(&mut self, ticks: u64) -> bool {
+    pub fn arm(&mut self, ticks: u64) {
         let mut c = Cmp {
             h: self.h,
             n: self.n,
@@ -96,16 +92,20 @@ impl Ev {
         match oneshot::hpet_program(&mut c, ticks, self.step, self.on, enable) {
             Ok(p) => {
                 RETRIES.fetch_add(u64::from(p.retries), Ordering::Relaxed);
-                let sure = !oneshot::early_possible(self.last, p, self.on);
                 self.last = Some(p.value);
-                sure
             }
             Err(m) => {
                 MISSED.fetch_add(1, Ordering::Relaxed);
                 self.last = Some(m.value);
-                false
             }
         }
+    }
+
+    /// Had the counter, read whole as `count`, reached the value last
+    /// written? An interrupt that comes when it had not is not that
+    /// value's match (see crate::timer::interrupt).
+    pub fn reached(&self, count: u64) -> bool {
+        self.last.is_some_and(|v| regs::passed(count, v, self.on))
     }
 
     pub fn disarm(&mut self) {

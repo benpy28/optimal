@@ -118,6 +118,23 @@ impl Hpet {
     pub fn counter(&self) -> u64 {
         self.read(hpet::MAIN_COUNTER)
     }
+
+    /// The main counter, read so that it cannot tear: an emulator that
+    /// takes only 4-byte accesses (QEMU) splits a 64-bit read in two, low
+    /// half first, and a carry between them gives a value 2^32 ticks too
+    /// high. Two reads with the same high half leave no carry between the
+    /// first one's high half and the second one's, so the second one is
+    /// whole.
+    pub fn counter_whole(&self) -> u64 {
+        let mut a = self.counter();
+        loop {
+            let b = self.counter();
+            if a >> 32 == b >> 32 {
+                return b;
+            }
+            a = b;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -207,6 +224,19 @@ pub fn pit0_disarm() {
     let _g = PIT_LOCK.lock();
     // SAFETY: as in pit0_arm; the mode write alone changes only channel 0.
     unsafe { outb(pit::COMMAND, pit::MODE0_CH0) };
+}
+
+/// Has channel 0's armed count run out (its OUT pin, from a read-back
+/// status: optimal_time::pit::out)?
+pub fn pit0_out() -> bool {
+    let _g = PIT_LOCK.lock();
+    // SAFETY: the read-back command latches channel 0's status, which
+    // the next channel 0 read returns; it changes neither the count nor
+    // OUT.
+    unsafe {
+        outb(pit::COMMAND, pit::READBACK_STATUS0);
+        pit::out(inb(pit::CHANNEL0))
+    }
 }
 
 /// Channel 2's count as an up-counter (16 bits).

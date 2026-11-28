@@ -325,21 +325,23 @@ ktest!(every_event_mode_never_fires_early, {
     if no_lapic() {
         return;
     }
-    let (r0, m0) = super::hpet_retries();
+    let (r0, m0, s0) = super::hpet_retries();
     let modes = each_source(|what, e| {
         never_early(what);
         if e != Events::TscDeadline {
             never_early_in_pieces(what);
         }
     });
-    // Every machine the tests run on has at least the PIT, and the HPET
-    // on q35.
-    assert!(modes >= 2, "only {modes} ways of arming");
-    let (r1, m1) = super::hpet_retries();
+    // At least the boot choice. Which others there are depends on the
+    // machine and on notimer= (QEMU's pc machine with notimer=lapic has
+    // only the PIT); the tough-conditions scenarios name each one.
+    assert!(modes >= 1, "no way of arming");
+    let (r1, m1, s1) = super::hpet_retries();
     assert_eq!(m1, m0, "an HPET arming gave up");
     crate::println!(
-        "ktest: {modes} ways of arming checked; {} HPET comparator retries",
-        r1 - r0
+        "ktest: {modes} ways of arming checked; {} HPET comparator retries, {} interrupts before their arming that its source showed were not its match",
+        r1 - r0,
+        s1 - s0
     );
 });
 
@@ -412,7 +414,7 @@ ktest!(cancel_and_past_deadlines, {
         cancel_and_past(what);
         crate::println!("ktest: {what}: cancel, past and replaced deadlines");
     });
-    assert!(n >= 2);
+    assert!(n >= 1);
 });
 
 fn cancel_and_past(what: &str) {

@@ -86,9 +86,7 @@ pub struct Programmed {
     pub value: u64,
     /// Ticks past the first counter read: at least the `ticks` asked for.
     pub distance: u64,
-    /// Writes the counter got past first. After a retry the earlier value
-    /// may still have matched as it was replaced, so one interrupt may
-    /// come before `value`.
+    /// Writes the counter got past first.
     pub retries: u32,
 }
 
@@ -146,30 +144,6 @@ pub fn hpet_program(
         distance = distance.saturating_add(extra).min(max);
     }
     Err(Missed { value })
-}
-
-/// Can the comparator interrupt before [`Programmed::value`] through no
-/// fault of the kernel's? `prev` is the value it held before (None if
-/// unknown). Then the interrupt is not counted as early:
-///
-/// - after a retry, the value replaced may have matched as it went;
-/// - a 64-bit comparator written by an emulator that splits the 8-byte
-///   write in two 4-byte ones, low half first (QEMU's HPET takes only
-///   4-byte accesses), briefly holds the new low half under the old high
-///   half, which is in the past when the high halves differ, and QEMU
-///   fires a past value at once;
-/// - a 32-bit comparator interrupts when the counter's low 32 bits wrap
-///   as well as on the match (IA-PC HPET 1.0a 2.3.9.2.1, and QEMU does
-///   so), which happens before the match when the arming spans the wrap.
-pub fn early_possible(prev: Option<u64>, p: Programmed, timer_config: u64) -> bool {
-    if p.retries > 0 {
-        return true;
-    }
-    if timer_config & hpet::T_64BIT_CAPABLE != 0 {
-        prev.is_none_or(|prev| prev >> 32 != p.value >> 32)
-    } else {
-        (p.start as u32).checked_add(p.distance as u32).is_none()
-    }
 }
 
 /// The PIT's largest count: 0 in the count register means 65,536.

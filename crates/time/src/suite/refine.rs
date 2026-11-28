@@ -83,6 +83,9 @@ fn unwrap_hand_worked() {
     assert_eq!(unwrap(0, 4, 1, 16), Some(16));
     // The raw difference is taken modulo 2^bits: 19 is 3.
     assert_eq!(unwrap(19, 4, 10, 25), Some(19));
+    // A range of one count: 19 fits 19..=19, 18 does not.
+    assert_eq!(unwrap(3, 4, 19, 19), Some(19));
+    assert_eq!(unwrap(3, 4, 18, 18), None);
     // Several wraps: 3 + 5 * 16 = 83 is the one in 80..=90.
     assert_eq!(unwrap(3, 4, 80, 90), Some(83));
     // 64 bits: the difference itself, if it is in range.
