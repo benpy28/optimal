@@ -109,8 +109,10 @@ per-file fsync intent log that carries file data and namespace operations.
   number, or the ring ends, and applies only complete batches. A batch
   starts on a fresh block: no block that was flushed is written again while
   its chain is live, so a torn write loses only the batch in flight.
-- **Replay** runs at mount after an unclean shutdown, after recovery picked
-  the commit: the records go through the ordinary operations, with the
+- **Replay** runs at every mount, after recovery picked the commit (a
+  cleanly unmounted commit's chain is empty unless a later mount fsynced
+  into it, which the clean flag does not show; an empty chain costs one
+  block read): the records go through the ordinary operations, with the
   recorded clock readings, so inode numbers, every timestamp and directory
   sizes come out identical (the hand test compares whole inodes); state
   records put the inode and blocks back. A writable mount then commits, and

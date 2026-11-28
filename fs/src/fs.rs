@@ -945,8 +945,9 @@ impl<D: BlockDevice> Filesystem<D> {
                         }
                     }
                     fs.attach_chain(from_history);
-                    // A clean unmount's commit has an empty chain.
-                    if !clean && !from_history {
+                    // Even a cleanly unmounted commit may have a chain: a
+                    // later mount can fsync into it without committing.
+                    if !from_history {
                         if let Err(stop) = fs.replay_log(limit) {
                             let clock = fs.clock_take();
                             return Ok(Err((fs.into_device(), clock, stop.batches)));
