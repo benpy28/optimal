@@ -44,7 +44,7 @@ fn hostile_selectors_parse_in_linear_time() {
                 let t = std::time::Instant::now();
                 let r = parse_selector(input, &ns);
                 let len = r.as_ref().map(|l| l.to_string().len()).unwrap_or(0);
-                std::hint::black_box((len, r));
+                let _ = std::hint::black_box((len, r));
                 t.elapsed()
             })
             .min()
