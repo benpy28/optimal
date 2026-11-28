@@ -1,0 +1,90 @@
+{
+  "tests/ident-like/0006": {
+    "reason": "css-syntax-3 4.3.4 (consume an ident-like token), after 'url(': \"While the next two input code points are whitespace, consume the next input code point.\" So every whitespace code point but the last belongs to the function token, and one is left for a whitespace token (the spec's own source comment says so). The suite puts all of it in the whitespace token. Token types and values are the same; only raw text and indices of the first two tokens change.",
+    "tokens": [
+      {
+        "type": "function-token",
+        "raw": "url( ",
+        "startIndex": 0,
+        "endIndex": 5,
+        "structured": {
+          "value": "url"
+        }
+      },
+      {
+        "type": "whitespace-token",
+        "raw": " ",
+        "startIndex": 5,
+        "endIndex": 6,
+        "structured": null
+      },
+      {
+        "type": "string-token",
+        "raw": "'foo'",
+        "startIndex": 6,
+        "endIndex": 11,
+        "structured": {
+          "value": "foo"
+        }
+      },
+      {
+        "type": ")-token",
+        "raw": ")",
+        "startIndex": 11,
+        "endIndex": 12,
+        "structured": null
+      },
+      {
+        "type": "whitespace-token",
+        "raw": "\n",
+        "startIndex": 12,
+        "endIndex": 13,
+        "structured": null
+      }
+    ]
+  },
+  "tests/ident-like/0007": {
+    "reason": "css-syntax-3 4.3.4 (consume an ident-like token), after 'url(': \"While the next two input code points are whitespace, consume the next input code point.\" So every whitespace code point but the last belongs to the function token, and one is left for a whitespace token (the spec's own source comment says so). The suite puts all of it in the whitespace token. Token types and values are the same; only raw text and indices of the first two tokens change.",
+    "tokens": [
+      {
+        "type": "function-token",
+        "raw": "url(  ",
+        "startIndex": 0,
+        "endIndex": 6,
+        "structured": {
+          "value": "url"
+        }
+      },
+      {
+        "type": "whitespace-token",
+        "raw": " ",
+        "startIndex": 6,
+        "endIndex": 7,
+        "structured": null
+      },
+      {
+        "type": "string-token",
+        "raw": "'foo'",
+        "startIndex": 7,
+        "endIndex": 12,
+        "structured": {
+          "value": "foo"
+        }
+      },
+      {
+        "type": ")-token",
+        "raw": ")",
+        "startIndex": 12,
+        "endIndex": 13,
+        "structured": null
+      },
+      {
+        "type": "whitespace-token",
+        "raw": "\n",
+        "startIndex": 13,
+        "endIndex": 14,
+        "structured": null
+      }
+    ]
+  }
+}
