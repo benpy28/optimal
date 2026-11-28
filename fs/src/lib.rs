@@ -23,6 +23,8 @@ mod error;
 mod fs;
 pub mod fsck;
 mod io;
+#[cfg(test)]
+mod op_undo_tests;
 mod ptr;
 mod rangeset;
 mod recover;

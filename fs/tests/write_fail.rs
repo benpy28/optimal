@@ -5,8 +5,8 @@
 //!
 //! Checks, for a random workload with snapshots and remounts:
 //! 1. every write the workload makes, failing for good (the blocks it
-//!    covered go bad; superblock slots fail once instead, since a slot
-//!    cannot move): every operation still succeeds and matches the model,
+//!    covered go bad; a superblock slot cannot move, so commits write
+//!    around it): every operation still succeeds and matches the model,
 //!    fsck is clean, and a remount shows the committed model;
 //! 2. every flush failing once: the same;
 //! 3. a write failing for good, then a power cut at each of the next write
@@ -116,18 +116,18 @@ fn every_write_fails_for_good() {
                 continue;
             }
             let (start, n) = rf.writes[w as usize];
-            let persist = !is_slot(start, n);
+            let slot = is_slot(start, n);
             run_hidden(
                 seed,
                 enc,
                 &rf,
                 &format!(
-                    "write {w} of {} ({start}+{n}, persist {persist})",
+                    "write {w} of {} ({start}+{n}, superblock slot {slot})",
                     rf.writes.len()
                 ),
                 |d| {
                     d.faults.fail_write_at = Some(rf.format_writes + w);
-                    d.faults.fail_write_persists = persist;
+                    d.faults.fail_write_persists = true;
                 },
             );
         }
@@ -177,12 +177,11 @@ fn power_cut_while_a_failed_commit_is_retried() {
             if only.is_some_and(|o| o != w) {
                 continue;
             }
-            let (start, n) = rf.writes[w as usize];
             for after in 1..=24u64 {
                 let mut h = Harness::new(BLOCKS, enc, seed).unwrap();
                 let d = h.fs().device_mut();
                 d.faults.fail_write_at = Some(rf.format_writes + w);
-                d.faults.fail_write_persists = !is_slot(start, n);
+                d.faults.fail_write_persists = true;
                 let mut armed = false;
                 let mut cut_op = None;
                 for (i, op) in rf.ops.iter().enumerate() {

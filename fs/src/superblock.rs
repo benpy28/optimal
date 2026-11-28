@@ -609,25 +609,67 @@ pub fn commit<D: BlockDevice>(
     header: &Header,
     body: &Body,
     all_slots: bool,
+    dead: &mut u8,
 ) -> Result<()> {
     io.flush()?;
     let total = io.num_blocks();
-    // Normal commit: its own pair. All slots: two waves, the front slots
-    // (0, 1) then the back slots (2, 3), each flushed, so a power cut
-    // tearing every write in flight still leaves a whole wave intact.
-    let waves: Vec<[u32; 2]> = if all_slots {
-        vec![[0, 1], [2, 3]]
-    } else {
-        vec![slots_for_gen(body.generation)]
-    };
+    let waves = plan_waves(body.generation, all_slots, *dead)?;
     for wave in &waves {
         for &slot in wave {
             let b = encode(header, body, slot, &mut io.sealer);
-            io.write_now(slot_addr(slot, total), &b[..])?;
+            if let Err(e) = io.write_now(slot_addr(slot, total), &b[..]) {
+                // A slot cannot move: it is not written again on this
+                // mount, and the retry writes around it.
+                *dead |= 1 << slot;
+                return Err(e);
+            }
         }
         io.flush()?;
     }
     Ok(())
+}
+
+/// The superblock slots a commit writes, in waves: each wave is written,
+/// then flushed, before the next starts.
+///
+/// With every slot working: a normal commit writes its own pair in one
+/// wave (the other pair keeps the previous commit); with `all_slots`, the
+/// front slots (0, 1) then the back slots (2, 3), so a power cut tearing
+/// every write in flight still leaves a whole wave intact.
+///
+/// With slots in `dead` (bit per slot; a write to it failed on this
+/// mount), each wave is one slot, so at most one copy is ever in flight:
+/// the commit's own live slots first, then live slots of the other pair
+/// until two copies are written (all live slots with `all_slots`). Every
+/// commit thus still lands on two slots, and a cut part way leaves either
+/// the new commit or the previous one whole on some slot. Fewer than two
+/// live slots: refused with [`Error::DeviceFailing`] before any write, as
+/// one copy overwritten in place could be torn with nothing to fall back
+/// to.
+pub fn plan_waves(generation: u64, all_slots: bool, dead: u8) -> Result<Vec<Vec<u32>>> {
+    let live = |s: &u32| dead & (1 << s) == 0;
+    if dead & 0xf == 0 {
+        return Ok(if all_slots {
+            vec![vec![0, 1], vec![2, 3]]
+        } else {
+            vec![slots_for_gen(generation).to_vec()]
+        });
+    }
+    let own = slots_for_gen(generation);
+    let other = [own[0] ^ 1, own[1] ^ 1];
+    let mut order: Vec<u32> = own
+        .iter()
+        .chain(other.iter())
+        .copied()
+        .filter(live)
+        .collect();
+    if order.len() < 2 {
+        return Err(Error::DeviceFailing);
+    }
+    if !all_slots {
+        order.truncate(2);
+    }
+    Ok(order.into_iter().map(|s| vec![s]).collect())
 }
 
 /// Bytes of one history entry / the core of a body.
