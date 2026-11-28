@@ -786,14 +786,40 @@ impl<'p, 'a> Parser<'p, 'a> {
         Ok(Forgiving(items))
     }
 
+    /// An item's text: from its first token to its last, plus the closers
+    /// of any functions and blocks the end of input left open (so that the
+    /// serialization parses back to the same item).
     fn source_text(&self, item: &[V<'_, 'a>]) -> Box<str> {
-        match (item.first(), item.last()) {
-            (Some(first), Some(last)) => {
-                let range = first.span().start..last.span().end;
-                self.parsed.source(range).to_string_lossy().into()
-            }
-            _ => "".into(),
+        let (Some(first), Some(last)) = (item.first(), item.last()) else {
+            return "".into();
+        };
+        let range = first.span().start..last.span().end;
+        let mut text = self.parsed.source(range).to_string_lossy();
+        // Only the last value can be unclosed (it runs to the end), and
+        // then only the last value inside it, and so on.
+        let mut closers = Vec::new();
+        let mut v = Some(*last);
+        while let Some(cv) = v
+            && !cv.is_closed()
+        {
+            v = match cv.kind() {
+                Kind::Function(_, inner) | Kind::Block(BlockKind::Paren, inner) => {
+                    closers.push(')');
+                    inner.last()
+                }
+                Kind::Block(BlockKind::Square, inner) => {
+                    closers.push(']');
+                    inner.last()
+                }
+                Kind::Block(BlockKind::Curly, inner) => {
+                    closers.push('}');
+                    inner.last()
+                }
+                Kind::Token(_) => None,
+            };
         }
+        text.extend(closers.iter().rev());
+        text.into()
     }
 
     /// The pseudo-element at `s[*pos]` (`::name`, `::name(...)`, or a legacy

@@ -1,0 +1,11 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc b3038efb39302b8faf3c4190d5fe56a0ae07e017840b6b7d81401513a4c0fac2 # shrinks to src = ":is(:nth-child(odd of "
+cc df06309411910e59081b2d9f08753456d14867a04c8d18ee866299c1ff8e7a65 # shrinks to src = ":host(:is(a [a=b]"
+cc 4cb811a4bb1d38c84faaf404922b841d97469900e1f93ec4fe16899b31c01462 # shrinks to src = ":is(:nth-last-child(3 of a*a/**/"
+cc 245ca3c87a937c9e8c4849fd489c42324e65fd9ef6398ade6dc2ddeafa1661a4 # shrinks to src = "/**/>.c"
+cc 70b28dfeefeb101183f1df2c841b594601c2cc44c1f9f83ce99c88431bb34b90 # shrinks to src = "a,>a"

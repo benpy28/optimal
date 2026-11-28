@@ -78,13 +78,20 @@ fn nesting_selector_takes_the_parents_specificity() {
     assert_eq!(l.0[0].specificity(parent), Specificity { a: 1, b: 1, c: 1 });
     assert_eq!(l.0[1].specificity(parent), Specificity { a: 2, b: 0, c: 2 });
     // No parent rule: zero.
-    assert_eq!(l.0[0].specificity(Specificity::ZERO), Specificity { a: 0, b: 1, c: 0 });
+    assert_eq!(
+        l.0[0].specificity(Specificity::ZERO),
+        Specificity { a: 0, b: 1, c: 0 }
+    );
 }
 
 #[test]
 fn specificity_saturates() {
     // Section 15: values past the limit clamp instead of overflowing.
-    let s = Specificity { a: u32::MAX, b: 0, c: 0 };
+    let s = Specificity {
+        a: u32::MAX,
+        b: 0,
+        c: 0,
+    };
     let l = parse_selector("& #a", &Namespaces::new()).unwrap();
     assert_eq!(l.0[0].specificity(s).a, u32::MAX);
 }
@@ -127,10 +134,19 @@ fn namespaces() {
     assert_eq!(s("[*|href]"), "[*|href]");
     assert_eq!(s("[|href]"), "[href]");
     // An undeclared prefix makes the selector invalid (3.9).
-    assert_eq!(parse_selector("y|a", &ns), Err(SelectorError::UndeclaredPrefix));
-    assert_eq!(parse_selector("[y|a]", &ns), Err(SelectorError::UndeclaredPrefix));
+    assert_eq!(
+        parse_selector("y|a", &ns),
+        Err(SelectorError::UndeclaredPrefix)
+    );
+    assert_eq!(
+        parse_selector("[y|a]", &ns),
+        Err(SelectorError::UndeclaredPrefix)
+    );
     // Prefixes are case-sensitive (css-namespaces-3 section 3).
-    assert_eq!(parse_selector("SVG|a", &ns), Err(SelectorError::UndeclaredPrefix));
+    assert_eq!(
+        parse_selector("SVG|a", &ns),
+        Err(SelectorError::UndeclaredPrefix)
+    );
 
     // With a default namespace: no prefix means the default, `*|` must be
     // kept to mean any namespace, and a prefix naming the default is left
@@ -148,7 +164,10 @@ fn namespaces() {
         Simple::Type { ns, .. } => ns.clone(),
         other => panic!("{other:?}"),
     };
-    assert_eq!(ns_of(0), Namespace::Url("http://www.w3.org/2000/svg".into()));
+    assert_eq!(
+        ns_of(0),
+        Namespace::Url("http://www.w3.org/2000/svg".into())
+    );
     assert_eq!(ns_of(1), Namespace::Any);
     assert_eq!(ns_of(2), Namespace::None);
     // The default namespace doesn't apply to attributes (6.4).
@@ -160,7 +179,9 @@ fn namespaces() {
     // A later declaration of a prefix replaces the earlier one.
     ns.declare("x", "urn:y");
     let l = parse_selector("x|a", &ns).unwrap();
-    assert!(matches!(&l.0[0].first.compound[0], Simple::Type { ns: Namespace::Url(u), .. } if &**u == "urn:y"));
+    assert!(
+        matches!(&l.0[0].first.compound[0], Simple::Type { ns: Namespace::Url(u), .. } if &**u == "urn:y")
+    );
 }
 
 #[test]
@@ -173,7 +194,10 @@ fn attribute_selectors() {
     assert_eq!(ser("[ a = 'b' i ]"), "[a=\"b\" i]");
     assert_eq!(ser("[a=\"b\"s]"), "[a=\"b\" s]");
     assert_eq!(ser("[a=b I]"), "[a=\"b\" i]");
-    assert_eq!(ser("[a~=b][a|=b][a^=b][a$=b][a*=b]"), "[a~=\"b\"][a|=\"b\"][a^=\"b\"][a$=\"b\"][a*=\"b\"]");
+    assert_eq!(
+        ser("[a~=b][a|=b][a^=b][a$=b][a*=b]"),
+        "[a~=\"b\"][a|=\"b\"][a^=\"b\"][a$=\"b\"][a*=\"b\"]"
+    );
     // `|=` after a name is the dash matcher, not a namespace prefix.
     assert_eq!(ser("[a|=b]"), "[a|=\"b\"]");
     // No whitespace inside a matcher, nothing unknown after the value.
@@ -242,13 +266,19 @@ fn pseudo_class_names() {
     assert_eq!(err(":matches(a)"), SelectorError::UnknownPseudoClass);
     // Every keyword round-trips.
     for k in PseudoClassKeyword::ALL {
-        assert_eq!(ser(&format!(":{}", k.name().to_uppercase())), format!(":{}", k.name()));
+        assert_eq!(
+            ser(&format!(":{}", k.name().to_uppercase())),
+            format!(":{}", k.name())
+        );
     }
 }
 
 #[test]
 fn functional_pseudo_classes() {
-    assert_eq!(ser(":nth-child( 2n + 1 of .a , b )"), ":nth-child(2n+1 of .a, b)");
+    assert_eq!(
+        ser(":nth-child( 2n + 1 of .a , b )"),
+        ":nth-child(2n+1 of .a, b)"
+    );
     assert_eq!(ser(":nth-last-child(-n+3)"), ":nth-last-child(-n+3)");
     assert_eq!(ser(":nth-of-type(even)"), ":nth-of-type(2n)");
     assert_eq!(ser(":nth-last-of-type(5)"), ":nth-last-of-type(5)");
@@ -258,9 +288,15 @@ fn functional_pseudo_classes() {
     assert_eq!(err(":nth-child(of a)"), SelectorError::Syntax);
     // `of S` is unforgiving and takes no pseudo-elements.
     assert_eq!(err(":nth-child(2 of a, 1)"), SelectorError::Syntax);
-    assert_eq!(err(":nth-child(2 of ::before)"), SelectorError::NotAllowedHere);
+    assert_eq!(
+        err(":nth-child(2 of ::before)"),
+        SelectorError::NotAllowedHere
+    );
     // :lang(): identifiers or strings, comma-separated (7.2).
-    assert_eq!(ser(":lang(en, \"*-Latn\", \\*-x)"), ":lang(\"en\", \"*-Latn\", \"*-x\")");
+    assert_eq!(
+        ser(":lang(en, \"*-Latn\", \\*-x)"),
+        ":lang(\"en\", \"*-Latn\", \"*-x\")"
+    );
     assert_eq!(err(":lang()"), SelectorError::Syntax);
     assert_eq!(err(":lang(en,)"), SelectorError::Syntax);
     assert_eq!(err(":lang(en fr)"), SelectorError::Syntax);
@@ -289,7 +325,9 @@ fn logical_combinations() {
     let Simple::PseudoClass(PseudoClass::Is(f)) = &l.0[0].first.compound[0] else {
         panic!()
     };
-    assert!(matches!(&f.0[..], [ForgivingItem::Valid(_), ForgivingItem::Invalid(a), ForgivingItem::Invalid(b), ForgivingItem::Valid(_)] if &**a == "1" && &**b == "::before"));
+    assert!(
+        matches!(&f.0[..], [ForgivingItem::Valid(_), ForgivingItem::Invalid(a), ForgivingItem::Invalid(b), ForgivingItem::Valid(_)] if &**a == "1" && &**b == "::before")
+    );
     assert_eq!(l.to_string(), ":is(.a, 1, ::before, .b)");
     // But <any-value> excludes bad tokens and unmatched closers (16.1).
     assert_eq!(err(":is(a ])"), SelectorError::Syntax);
@@ -327,39 +365,69 @@ fn pseudo_elements_and_what_may_follow_them() {
     assert_eq!(err(": :before"), SelectorError::Syntax);
     assert_eq!(err(":: before"), SelectorError::Syntax);
     for k in PseudoElementKeyword::ALL {
-        if !matches!(k, PseudoElementKeyword::Prefix | PseudoElementKeyword::Suffix) {
+        if !matches!(
+            k,
+            PseudoElementKeyword::Prefix | PseudoElementKeyword::Suffix
+        ) {
             assert_eq!(ser(&format!("::{}", k.name())), format!("::{}", k.name()));
         }
     }
     // 3.6.3: after a pseudo-element, user action and logical combination
     // pseudo-classes only (or anything, after an element-backed one).
-    assert_eq!(ser("::before:hover:focus-visible"), "::before:hover:focus-visible");
+    assert_eq!(
+        ser("::before:hover:focus-visible"),
+        "::before:hover:focus-visible"
+    );
     assert_eq!(ser("::before:is(:hover, .a)"), "::before:is(:hover, .a)");
     assert_eq!(ser("::before:not(:focus)"), "::before:not(:focus)");
     assert_eq!(err("::before:not(.a)"), SelectorError::NotAllowedHere);
-    assert_eq!(err("::before:not(:hover .a)"), SelectorError::NotAllowedHere);
+    assert_eq!(
+        err("::before:not(:hover .a)"),
+        SelectorError::NotAllowedHere
+    );
     assert_eq!(err("::before:first-child"), SelectorError::NotAllowedHere);
     assert_eq!(err("::before:has(a)"), SelectorError::NotAllowedHere);
     assert_eq!(err("::before.a"), SelectorError::NotAllowedHere);
     assert_eq!(err("::before[a]"), SelectorError::NotAllowedHere);
     assert_eq!(err("::before&"), SelectorError::NotAllowedHere);
-    assert_eq!(ser("::part(a):first-child:state(x)"), "::part(a):first-child:state(x)");
+    assert_eq!(
+        ser("::part(a):first-child:state(x)"),
+        "::part(a):first-child:state(x)"
+    );
     assert_eq!(err("::part(a).b"), SelectorError::NotAllowedHere);
-    assert_eq!(ser("::file-selector-button:disabled"), "::file-selector-button:disabled");
+    assert_eq!(
+        ser("::file-selector-button:disabled"),
+        "::file-selector-button:disabled"
+    );
     // 3.6.4: sub-pseudo-elements only where defined.
     assert_eq!(ser("::before::marker"), "::before::marker");
     assert_eq!(ser("::after::marker:hover"), "::after::marker:hover");
-    assert_eq!(ser("::first-letter::prefix, ::first-letter::suffix"), "::first-letter::prefix, ::first-letter::suffix");
+    assert_eq!(
+        ser("::first-letter::prefix, ::first-letter::suffix"),
+        "::first-letter::prefix, ::first-letter::suffix"
+    );
     assert_eq!(err("::prefix"), SelectorError::NotAllowedHere);
     assert_eq!(err("::before::prefix"), SelectorError::NotAllowedHere);
     assert_eq!(err("::marker::marker"), SelectorError::NotAllowedHere);
     assert_eq!(err("::before::before"), SelectorError::NotAllowedHere);
-    assert_eq!(err("::before:hover::marker:hover::marker"), SelectorError::NotAllowedHere);
-    assert_eq!(ser("::part(a)::part(b)::before"), "::part(a)::part(b)::before");
+    assert_eq!(
+        err("::before:hover::marker:hover::marker"),
+        SelectorError::NotAllowedHere
+    );
+    assert_eq!(
+        ser("::part(a)::part(b)::before"),
+        "::part(a)::part(b)::before"
+    );
     assert_eq!(ser("::slotted(a)::before"), "::slotted(a)::before");
     assert_eq!(ser("::slotted(a)::part(b)"), "::slotted(a)::part(b)");
-    assert_eq!(err("::slotted(a)::first-line"), SelectorError::NotAllowedHere);
-    assert_eq!(err("::slotted(a)::selection"), SelectorError::NotAllowedHere);
+    assert_eq!(
+        err("::slotted(a)::first-line"),
+        SelectorError::NotAllowedHere
+    );
+    assert_eq!(
+        err("::slotted(a)::selection"),
+        SelectorError::NotAllowedHere
+    );
     // 3.6.5: no combinators after a pseudo-element.
     assert_eq!(err("::before a"), SelectorError::NotAllowedHere);
     assert_eq!(err("a::before > b"), SelectorError::NotAllowedHere);
@@ -375,7 +443,14 @@ fn pseudo_elements_and_what_may_follow_them() {
     assert_eq!(err("::slotted(a b)"), SelectorError::NotAllowedHere);
     assert_eq!(ser("::highlight( x )"), "::highlight(x)");
     assert_eq!(ser("::highlight(*)"), "::highlight(*)");
-    for kw in ["default", "initial", "INHERIT", "unset", "revert", "revert-layer"] {
+    for kw in [
+        "default",
+        "initial",
+        "INHERIT",
+        "unset",
+        "revert",
+        "revert-layer",
+    ] {
         assert_eq!(err(&format!("::highlight({kw})")), SelectorError::Syntax);
     }
     assert_eq!(err("::highlight(a b)"), SelectorError::Syntax);
@@ -387,7 +462,10 @@ fn unknown_webkit_pseudo_elements() {
     // Appendix B: valid at parse time, serialized ASCII-lowercased; not
     // the functional form.
     assert_eq!(ser("a::-WebKit-Thing"), "a::-webkit-thing");
-    assert_eq!(err("::-webkit-thing()"), SelectorError::UnknownPseudoElement);
+    assert_eq!(
+        err("::-webkit-thing()"),
+        SelectorError::UnknownPseudoElement
+    );
     assert_eq!(err("::-moz-thing"), SelectorError::UnknownPseudoElement);
     assert_eq!(err(":-webkit-thing"), SelectorError::UnknownPseudoClass);
 }
@@ -421,7 +499,10 @@ fn relative_selectors() {
     assert!(!l[1].explicit);
     assert_eq!(parse_relative_selector(">", &ns), Err(SelectorError::Empty));
     // Pseudo-elements are fine in a relative selector of a nested rule.
-    assert_eq!(parse_relative_selector("> ::before", &ns).unwrap()[0].to_string(), "> ::before");
+    assert_eq!(
+        parse_relative_selector("> ::before", &ns).unwrap()[0].to_string(),
+        "> ::before"
+    );
 }
 
 #[test]
@@ -437,11 +518,20 @@ fn nesting_depth_limit() {
     let deep = |n: u32| format!("{}a{}", ":is(".repeat(n as usize), ")".repeat(n as usize));
     assert!(parse_selector(&deep(MAX_NESTING), &Namespaces::new()).is_ok());
     // One more is refused, not forgiven, by :is().
-    assert_eq!(parse_selector(&deep(MAX_NESTING + 1), &Namespaces::new()), Err(SelectorError::TooDeep));
+    assert_eq!(
+        parse_selector(&deep(MAX_NESTING + 1), &Namespaces::new()),
+        Err(SelectorError::TooDeep)
+    );
     let not = format!("{}a{}", ":not(".repeat(300), ")".repeat(300));
-    assert_eq!(parse_selector(&not, &Namespaces::new()), Err(SelectorError::TooDeep));
+    assert_eq!(
+        parse_selector(&not, &Namespaces::new()),
+        Err(SelectorError::TooDeep)
+    );
     let slotted = format!("::slotted({}a{})", ":host(".repeat(300), ")".repeat(300));
-    assert_eq!(parse_selector(&slotted, &Namespaces::new()), Err(SelectorError::TooDeep));
+    assert_eq!(
+        parse_selector(&slotted, &Namespaces::new()),
+        Err(SelectorError::TooDeep)
+    );
     // Deep blocks inside a forgiving argument are walked without recursion.
     let blocks = format!(":is({}", "[".repeat(200_000));
     assert_eq!(ser(&blocks), format!(":is({})", "[".repeat(200_000)));
