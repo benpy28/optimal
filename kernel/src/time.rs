@@ -126,6 +126,10 @@ impl Hpet {
     /// first one's high half and the second one's, so the second one is
     /// whole.
     pub fn counter_whole(&self) -> u64 {
+        // A 32-bit counter's high half is always 0: nothing to tear.
+        if !self.caps.counter_64bit {
+            return self.counter();
+        }
         let mut a = self.counter();
         loop {
             let b = self.counter();
@@ -280,7 +284,15 @@ impl Counter<'_> {
 
     pub fn raw(self) -> Option<u64> {
         match self {
-            Counter::Hpet(h) => Some(h.counter()),
+            // Read whole: on an emulator that splits 64-bit accesses
+            // (QEMU) a carry between the halves would read 2^32 ticks
+            // high, 43 s at 100 MHz, in the clock and in every
+            // measurement. Two reads where one would do on hardware that
+            // reads 64 bits at once; chosen over a 32-bit read extended
+            // in software (one read, but every clock read would take the
+            // narrow-counter lock), left for when SMP makes the trade
+            // measurable.
+            Counter::Hpet(h) => Some(h.counter_whole()),
             Counter::Pm(p) => p.read(),
             Counter::Pit => Some(pit_read()),
             Counter::Tsc | Counter::TscAt(_) => Some(cpu::rdtsc_ordered()),

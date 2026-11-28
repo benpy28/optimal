@@ -13,9 +13,11 @@ use optimal_time::counter::delta;
 use optimal_time::lapic as lt;
 use optimal_time::select::{self, Clock, Events, Sources};
 
+use optimal_time::hpet::Route;
+
 use super::{
-    ARMED, CHUNK_CAP, arm_at, cancel, events_now, fires, force_events, get, release_unused,
-    set_hook,
+    ARMED, CHUNK_CAP, arm_at, cancel, events_now, fires, force_events, get, hpet, hpet_route,
+    release_unused, set_hook,
 };
 use crate::arch::cpu;
 use crate::clock;
@@ -275,29 +277,65 @@ fn never_early(what: &str) {
     crate::println!("ktest: {what}: never early, at worst {worst_late} ns late");
 }
 
-/// Force each way of arming in turn that this machine has, and run `f`
-/// with its name; then put the boot choice back.
+/// Force each way of arming in turn that this machine has, the HPET by
+/// each of its routes, and run `f` with its name; then put the boot
+/// choice back.
 fn each_source(f: impl Fn(&str, Events)) -> u32 {
-    let t = get().unwrap();
-    let was = t.events.expect("timer events on QEMU");
+    assert!(get().unwrap().events.is_some(), "timer events on QEMU");
     let mut n = 0;
-    for (e, what) in [
-        (Events::TscDeadline, "tsc-deadline"),
-        (Events::LapicOneShot, "lapic one-shot"),
-        (Events::HpetOneShot, "hpet one-shot"),
-        (Events::PitOneShot, "pit one-shot"),
+    for (e, only, what) in [
+        (Events::TscDeadline, 0, "tsc-deadline"),
+        (Events::LapicOneShot, 0, "lapic one-shot"),
+        (Events::HpetOneShot, hpet::ONLY_FSB, "hpet one-shot by fsb"),
+        (
+            Events::HpetOneShot,
+            hpet::ONLY_IOAPIC,
+            "hpet one-shot on an i/o apic input",
+        ),
+        (
+            Events::HpetOneShot,
+            hpet::ONLY_LEGACY,
+            "hpet one-shot by legacy replacement",
+        ),
+        (Events::PitOneShot, 0, "pit one-shot"),
     ] {
+        hpet::ONLY.store(only, Ordering::SeqCst);
         match force_events(e) {
             Ok(_) => {
+                if e == Events::HpetOneShot {
+                    let r = hpet_route().expect("HPET events hold a comparator");
+                    assert_eq!(hpet::only_bit(r), only, "{what}: {r:?}");
+                }
                 f(what, e);
                 n += 1;
             }
             Err(why) => crate::println!("ktest: {what}: not on this machine ({why})"),
         }
     }
-    force_events(was).expect("the boot choice still works");
-    release_unused();
+    restore_boot_choice();
     n
+}
+
+/// Events back to the boot choice, the HPET on its boot route, and
+/// whatever else the tests set up given back.
+fn restore_boot_choice() {
+    let t = get().unwrap();
+    let was = t.events.expect("timer events on QEMU");
+    hpet::ONLY.store(
+        t.hpet
+            .map_or(0, |(_, named, _)| hpet::only_bit(named.route)),
+        Ordering::SeqCst,
+    );
+    force_events(was).expect("the boot choice still works");
+    hpet::ONLY.store(0, Ordering::SeqCst);
+    release_unused();
+    if let Some((n, named, _)) = t.hpet
+        && was == Events::HpetOneShot
+    {
+        let a = ARMED.lock();
+        let ev = a.hpet.as_ref().expect("the boot comparator");
+        assert_eq!((ev.n, ev.named()), (n, named));
+    }
 }
 
 /// `what` in several armings: cap each at 3 ms, so 20 ms takes seven.
@@ -325,7 +363,7 @@ ktest!(every_event_mode_never_fires_early, {
     if no_lapic() {
         return;
     }
-    let (r0, m0, s0) = super::hpet_retries();
+    let (r0, m0, s0, p0) = super::hpet_retries();
     let modes = each_source(|what, e| {
         never_early(what);
         if e != Events::TscDeadline {
@@ -336,8 +374,10 @@ ktest!(every_event_mode_never_fires_early, {
     // machine and on notimer= (QEMU's pc machine with notimer=lapic has
     // only the PIT); the tough-conditions scenarios name each one.
     assert!(modes >= 1, "no way of arming");
-    let (r1, m1, s1) = super::hpet_retries();
+    let (r1, m1, s1, p1) = super::hpet_retries();
     assert_eq!(m1, m0, "an HPET arming gave up");
+    // QEMU delivers by every route its HPET offers.
+    assert_eq!(p1, p0, "an HPET route failed its delivery probe");
     crate::println!(
         "ktest: {modes} ways of arming checked; {} HPET comparator retries, {} interrupts before their arming that its source showed were not its match",
         r1 - r0,
@@ -352,9 +392,9 @@ ktest!(pit_reaches_long_deadlines_in_pieces, {
     if no_lapic() {
         return;
     }
-    let was = get().unwrap().events.unwrap();
     if let Err(why) = force_events(Events::PitOneShot) {
         crate::println!("ktest: no PIT events here ({why})");
+        restore_boot_choice();
         return;
     }
     set_hook(Some(hook));
@@ -378,8 +418,7 @@ ktest!(pit_reaches_long_deadlines_in_pieces, {
     set_hook(None);
     let pieces = super::pieces() - p0;
     let (_, early1) = fires();
-    force_events(was).unwrap();
-    release_unused();
+    restore_boot_choice();
     assert_eq!(early1, early0, "the PIT fired before it was armed for");
     // 60 ms is two armings (one piece), 150 ms at least three (two).
     assert!(pieces >= 3, "only {pieces} armings in pieces");
@@ -401,8 +440,17 @@ ktest!(fallbacks_given_back, {
     drop(a);
     let h = time::get().unwrap().hpet.as_ref();
     if let Some(h) = h {
-        let want = t.hpet.map_or(0, |(n, _, _)| 1u32 << n);
+        // Legacy replacement holds comparator 1 beside comparator 0.
+        let want = t.hpet.map_or(0, |(n, named, _)| match named.route {
+            Route::Legacy if h.caps.comparators > 1 => 0b11,
+            _ => 1u32 << n,
+        });
         assert_eq!(h.claimed(), want);
+        assert_eq!(
+            super::hpet::legacy_in_use(),
+            t.hpet
+                .is_some_and(|(_, named, _)| named.route == Route::Legacy)
+        );
     }
 });
 

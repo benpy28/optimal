@@ -63,6 +63,13 @@ make_iso "$BUILD/optimal-kernel-ktest" "$BUILD/optimal-ktest-tsc-back.iso" "tscf
 # from the HPET, and with the HPET ruled out too, from the PIT.
 make_iso "$BUILD/optimal-kernel-ktest" "$BUILD/optimal-ktest-notimer-lapic.iso" "notimer=lapic"
 make_iso "$BUILD/optimal-kernel-ktest" "$BUILD/optimal-ktest-notimer-lapic-hpet.iso" "notimer=lapic,hpet"
+# HPET events by one route each (kernel/src/timer/hpet.rs): FSB ruled out
+# (an I/O APIC input, or legacy replacement where none is free), FSB and
+# the I/O APIC ruled out (legacy replacement), and legacy replacement
+# ruled out (on QEMU's pc machine without msi=on: the PIT).
+make_iso "$BUILD/optimal-kernel-ktest" "$BUILD/optimal-ktest-notimer-lapic-fsb.iso" "notimer=lapic,hpet-fsb"
+make_iso "$BUILD/optimal-kernel-ktest" "$BUILD/optimal-ktest-notimer-lapic-fsb-ioapic.iso" "notimer=lapic,hpet-fsb,hpet-ioapic"
+make_iso "$BUILD/optimal-kernel-ktest" "$BUILD/optimal-ktest-notimer-lapic-legacy.iso" "notimer=lapic,hpet-legacy"
 # HPET events timed against a TSC clock (under TCG, by tscfake=invariant):
 # the 10 s refinement moves the HPET's rate with the clock, and when the
 # TSC is faked 2000 ppm fast the watchdog's fallback carries it across.

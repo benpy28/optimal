@@ -117,6 +117,13 @@ pub type Handler = fn(&mut InterruptFrame);
 
 /// Route `vector` to `handler`. The vector must be one the kernel's map
 /// gives to devices or tests (not exceptions, PIC, spurious or error).
+#[cfg_attr(
+    not(feature = "ktest"),
+    expect(
+        dead_code,
+        reason = "tests use it; the kernel's own users take a vector with try_set_handler"
+    )
+)]
 pub fn set_handler(vector: u8, handler: Handler) {
     assert!(
         (vectors::ISA_BASE..vectors::UNROUTED).contains(&vector),
@@ -125,10 +132,19 @@ pub fn set_handler(vector: u8, handler: Handler) {
     HANDLERS[usize::from(vector)].store(handler as usize, Ordering::SeqCst);
 }
 
-#[cfg_attr(
-    not(feature = "ktest"),
-    expect(dead_code, reason = "first user outside tests is the timer (1c3)")
-)]
+/// [`set_handler`], unless `vector` already has a handler: false then,
+/// and nothing changes. Two users of one vector (the PIT and the HPET's
+/// legacy replacement both want ISA IRQ 0's) are refused this way.
+pub fn try_set_handler(vector: u8, handler: Handler) -> bool {
+    assert!(
+        (vectors::ISA_BASE..vectors::UNROUTED).contains(&vector),
+        "vector {vector:#x} is not a device vector"
+    );
+    HANDLERS[usize::from(vector)]
+        .compare_exchange(0, handler as usize, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+}
+
 pub fn clear_handler(vector: u8) {
     HANDLERS[usize::from(vector)].store(0, Ordering::SeqCst);
 }
@@ -227,10 +243,6 @@ pub fn isa_unmask(irq: u8) -> Result<(), NotRouted> {
     set_isa_mask(irq, false)
 }
 
-#[cfg_attr(
-    not(feature = "ktest"),
-    expect(dead_code, reason = "first user outside tests is the timer (1c3)")
-)]
 pub fn isa_mask(irq: u8) -> Result<(), NotRouted> {
     set_isa_mask(irq, true)
 }

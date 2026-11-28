@@ -286,10 +286,11 @@ ktest!(stray_interrupt_is_counted_and_retired, {
 // Every pin of every used I/O APIC holds what the plan says (masked
 // state included: every test puts its line back), except the lines timer
 // events use: an HPET comparator's edge line holds its claim's entry,
-// and ISA IRQ 0 is unmasked while the PIT drives events.
+// and ISA IRQ 0 is unmasked while the PIT or the HPET's legacy
+// replacement drives events.
 ktest!(ioapic_tables_as_planned, {
     let Some(c) = ctl() else { return };
-    let pit = crate::timer::owns_pit()
+    let pit = crate::timer::owns_isa_irq0()
         .then(|| c.plan.isa_route(0).copied())
         .flatten();
     for (i, regs) in c.ioapics.iter().enumerate() {
@@ -359,8 +360,10 @@ fn pic_vector_counts() -> [u64; 16] {
 // after unmasking (an I/O APIC drops edges on masked pins).
 ktest!(masked_isa_line_stays_quiet, {
     let Some(c) = ctl() else { return };
-    if crate::timer::owns_pit() {
-        crate::println!("ktest: timer events come from the PIT; IRQ 0 is theirs");
+    if crate::timer::owns_isa_irq0() {
+        crate::println!(
+            "ktest: timer events come from IRQ 0 (the PIT or the HPET's legacy replacement)"
+        );
         return;
     }
     let Some(r) = c.plan.isa_route(0) else {
@@ -390,8 +393,10 @@ ktest!(masked_isa_line_stays_quiet, {
 // arrives on an 8259 vector.
 ktest!(pit_interrupt_arrives_through_its_route, {
     let Some(c) = ctl() else { return };
-    if crate::timer::owns_pit() {
-        crate::println!("ktest: timer events come from the PIT; IRQ 0 is theirs");
+    if crate::timer::owns_isa_irq0() {
+        crate::println!(
+            "ktest: timer events come from IRQ 0 (the PIT or the HPET's legacy replacement)"
+        );
         return;
     }
     let Some(r) = c.plan.isa_route(0) else {

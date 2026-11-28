@@ -99,22 +99,28 @@ pub struct Timer {
     pub longest_ns: u64,
     /// Sources the `notimer=` boot option ruled out.
     pub skip: Skip,
-    /// The HPET comparator and GSI events use, when they come from the
+    /// The HPET comparator and route events use, when they come from the
     /// HPET, and its rate against the clock at boot.
-    pub hpet: Option<(u8, u32, Estimate)>,
+    pub hpet: Option<(u8, hpet::Named, Estimate)>,
     /// The PIT's rate against the clock at boot, when events come from it.
     pub pit: Option<Estimate>,
     lapic_regs: Option<Lapic>,
     pub warnings: Vec<String>,
 }
 
-/// What `notimer=` (words `lapic`, `hpet`, `pit`, comma-separated) rules
-/// out. `lapic` covers both LAPIC modes.
+/// What `notimer=` (words `lapic`, `hpet`, `pit`, `hpet-fsb`,
+/// `hpet-ioapic`, `hpet-legacy`, comma-separated) rules out. `lapic`
+/// covers both LAPIC modes; the `hpet-` words rule out one way an HPET
+/// comparator's interrupt can be delivered (crate::timer::hpet), for a
+/// machine where that one is broken, and for the tests.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Skip {
     pub lapic: bool,
     pub hpet: bool,
     pub pit: bool,
+    pub hpet_fsb: bool,
+    pub hpet_ioapic: bool,
+    pub hpet_legacy: bool,
 }
 
 impl Skip {
@@ -128,14 +134,37 @@ impl Skip {
                 "lapic" => s.lapic = true,
                 "hpet" => s.hpet = true,
                 "pit" => s.pit = true,
+                "hpet-fsb" => s.hpet_fsb = true,
+                "hpet-ioapic" => s.hpet_ioapic = true,
+                "hpet-legacy" => s.hpet_legacy = true,
                 w => unknown.push(w),
             }
         }
         (s, unknown)
     }
 
-    fn any(self) -> bool {
-        self.lapic || self.hpet || self.pit
+    fn words(self) -> Vec<&'static str> {
+        [
+            (self.lapic, "lapic"),
+            (self.hpet, "hpet"),
+            (self.pit, "pit"),
+            (self.hpet_fsb, "hpet-fsb"),
+            (self.hpet_ioapic, "hpet-ioapic"),
+            (self.hpet_legacy, "hpet-legacy"),
+        ]
+        .into_iter()
+        .filter_map(|(on, w)| on.then_some(w))
+        .collect()
+    }
+
+    /// The HPET routes left, with legacy replacement only if `legacy`
+    /// (the PIT is not giving events).
+    fn hpet_routes(self, legacy: bool) -> optimal_time::hpet::Allowed {
+        optimal_time::hpet::Allowed {
+            fsb: !self.hpet_fsb,
+            ioapic: !self.hpet_ioapic,
+            legacy: legacy && !self.hpet_legacy,
+        }
     }
 }
 
@@ -432,9 +461,11 @@ pub fn init(t: &'static Time) -> &'static Timer {
     // each) only when they are needed.
     let mut hpet_ev = None;
     if timer.events.is_none() && !skip.hpet && t.hpet.is_some() {
-        match hpet::setup() {
+        // The PIT is tried after the HPET, so legacy replacement takes ISA
+        // IRQ 0 from nothing.
+        match hpet::setup(skip.hpet_routes(true)) {
             Ok((ev, rate)) => {
-                timer.hpet = Some((ev.n, ev.edge.gsi, rate));
+                timer.hpet = Some((ev.n, ev.named(), rate));
                 sources.hpet = true;
                 hpet_ev = Some((ev, rate));
             }
@@ -890,14 +921,39 @@ pub fn hold<R>(f: impl FnOnce() -> R) -> R {
 /// LAPIC timer works). Returns the previous way. Refused (Err) when the
 /// new way lacks what it needs. The HPET and PIT are set up (and their
 /// rates measured) the first time they are asked for; [`release_unused`]
-/// gives them back.
+/// gives them back. An HPET comparator held on a route that
+/// hpet::ONLY no longer allows is given back and set up again.
+///
+/// ISA IRQ 0 is the PIT's or the HPET's legacy replacement's, never
+/// both: forcing the PIT gives back an HPET comparator on legacy
+/// replacement, and setting the HPET up gives back the PIT, so the HPET
+/// can have every route it had at boot. (If what is given back is the
+/// source in use, events stop until the new one is set up.)
 #[cfg(feature = "ktest")]
 pub fn force_events(e: Events) -> Result<Option<Events>, String> {
     let t = STATE.get().ok_or("no timer")?;
     let l = t.lapic_regs.ok_or("no local APIC")?;
-    // Set up outside the lock: measuring takes up to 50 ms.
+    {
+        let mut a = ARMED.lock();
+        let only = hpet::ONLY.load(Ordering::SeqCst);
+        let drop_hpet = a.hpet.as_ref().is_some_and(|ev| {
+            let r = ev.route();
+            (e == Events::PitOneShot && r == optimal_time::hpet::Route::Legacy)
+                || (e == Events::HpetOneShot && only != 0 && only & hpet::only_bit(r) == 0)
+        });
+        if drop_hpet {
+            give_back_hpet(&mut a, l);
+        }
+        if e == Events::HpetOneShot && a.hpet.is_none() && a.pit {
+            give_back_pit(&mut a, l);
+        }
+    }
+    // Set up outside the lock: measuring takes up to 50 ms, and the
+    // HPET's probe needs interrupts.
     let new_hpet = match e {
-        Events::HpetOneShot if ARMED.lock().hpet.is_none() => Some(hpet::setup()?),
+        Events::HpetOneShot if ARMED.lock().hpet.is_none() => {
+            Some(hpet::setup(t.skip.hpet_routes(true))?)
+        }
         _ => None,
     };
     let new_pit = match e {
@@ -927,7 +983,8 @@ pub fn force_events(e: Events) -> Result<Option<Events>, String> {
     // QEMU's PIT keeps counting through a mode write (the 8254 datasheet
     // says the write resets it), so a count armed before the switch can
     // still raise IRQ 0 once: masked while the PIT is not the source, the
-    // I/O APIC drops that edge.
+    // I/O APIC drops that edge. (Never while the HPET's legacy
+    // replacement holds IRQ 0: then the PIT is not set up.)
     if was == Some(Events::PitOneShot) && e != Events::PitOneShot {
         let _ = crate::irq::isa_mask(0);
     }
@@ -941,45 +998,97 @@ pub fn force_events(e: Events) -> Result<Option<Events>, String> {
     Ok(was)
 }
 
-/// Tests: give back the HPET comparator and PIT channel 0 if events no
-/// longer come from them.
+/// Tests: stop events from `e` if they come from it now.
 #[cfg(feature = "ktest")]
-pub fn release_unused() {
-    let mut a = ARMED.lock();
-    let now = events_now();
-    if now != Some(Events::HpetOneShot)
-        && let Some(ev) = a.hpet.take()
-    {
+fn stop_if_current(a: &mut Armed, l: Lapic, e: Events) {
+    if events_now() == Some(e) {
+        disarm(a, l, Some(e));
+        a.hw = None;
+        EVENTS.store(encode(None), Ordering::SeqCst);
+    }
+}
+
+#[cfg(feature = "ktest")]
+fn give_back_hpet(a: &mut Armed, l: Lapic) {
+    stop_if_current(a, l, Events::HpetOneShot);
+    if let Some(ev) = a.hpet.take() {
         ev.release();
         a.rates.hpet = None;
     }
-    if now != Some(Events::PitOneShot) && a.pit {
+}
+
+#[cfg(feature = "ktest")]
+fn give_back_pit(a: &mut Armed, l: Lapic) {
+    stop_if_current(a, l, Events::PitOneShot);
+    if a.pit {
         pit::release();
         a.pit = false;
         a.rates.pit = None;
     }
 }
 
-/// Is PIT channel 0 (and ISA IRQ 0) the timer's? Other users of the PIT's
-/// channel 0 (tests) must leave it alone then.
+/// Tests: give back the HPET comparator and PIT channel 0 if events no
+/// longer come from them.
+#[cfg(feature = "ktest")]
+pub fn release_unused() {
+    let Some(l) = STATE.get().and_then(|t| t.lapic_regs) else {
+        return;
+    };
+    let mut a = ARMED.lock();
+    let now = events_now();
+    if now != Some(Events::HpetOneShot) {
+        give_back_hpet(&mut a, l);
+    }
+    if now != Some(Events::PitOneShot) {
+        give_back_pit(&mut a, l);
+    }
+}
+
+/// Tests: the route of the HPET comparator held for events, and a check
+/// that its registers say so (hpet::Ev::check).
+#[cfg(feature = "ktest")]
+pub fn hpet_route() -> Option<optimal_time::hpet::Route> {
+    let a = ARMED.lock();
+    a.hpet.as_ref().map(|ev| {
+        ev.check();
+        ev.route()
+    })
+}
+
+/// Is ISA IRQ 0 the timer's (the PIT's events, or the HPET's legacy
+/// replacement)? Tests that drive IRQ 0 themselves must leave it alone
+/// then.
 #[cfg_attr(not(feature = "ktest"), expect(dead_code, reason = "tests read it"))]
-pub fn owns_pit() -> bool {
-    ARMED.lock().pit
+pub fn owns_isa_irq0() -> bool {
+    let a = ARMED.lock();
+    a.pit || hpet::legacy_in_use()
 }
 
 /// HPET comparator retries and misses since boot
-/// (optimal_time::oneshot::hpet_program), and the interrupts before what
-/// an HPET or PIT was armed for that were not its match ([`interrupt`]).
+/// (optimal_time::oneshot::hpet_program), the interrupts before what an
+/// HPET or PIT was armed for that were not its match ([`interrupt`]),
+/// and HPET routes that failed their delivery probe.
 #[cfg_attr(
     not(feature = "ktest"),
     expect(dead_code, reason = "tests read them; the scorecard will")
 )]
-pub fn hpet_retries() -> (u64, u64, u64) {
+pub fn hpet_retries() -> (u64, u64, u64, u64) {
     (
         hpet::RETRIES.load(Ordering::SeqCst),
         hpet::MISSED.load(Ordering::SeqCst),
         STRAYS.load(Ordering::SeqCst),
+        hpet::PROBE_FAILURES.load(Ordering::SeqCst),
     )
+}
+
+/// Is the HPET's legacy replacement on? While it is, ISA IRQ 0 and IRQ 8
+/// are the HPET's: the PIT's and the RTC's interrupts do not reach them.
+#[cfg_attr(
+    not(feature = "ktest"),
+    expect(dead_code, reason = "tests read it; the RTC alarm driver will")
+)]
+pub fn hpet_legacy() -> bool {
+    hpet::legacy_in_use()
 }
 
 pub fn report(t: &Timer) {
@@ -1003,12 +1112,8 @@ pub fn report(t: &Timer) {
         _ if t.skip.lapic => line.push_str("skipped"),
         _ => line.push_str("unknown"),
     }
-    if let Some((n, gsi, e)) = t.hpet {
-        let _ = write!(
-            line,
-            "; hpet comparator {n} on GSI {gsi} {}",
-            time::Mhz(e.freq)
-        );
+    if let Some((n, named, e)) = t.hpet {
+        let _ = write!(line, "; hpet comparator {n} {named} {}", time::Mhz(e.freq));
         if e.ppb == 0 && e.window == 0 {
             line.push_str(", the clock itself");
         } else {
@@ -1029,15 +1134,8 @@ pub fn report(t: &Timer) {
             clock_ms(e.window)
         );
     }
-    if t.skip.any() {
-        let words: Vec<&str> = [
-            (t.skip.lapic, "lapic"),
-            (t.skip.hpet, "hpet"),
-            (t.skip.pit, "pit"),
-        ]
-        .into_iter()
-        .filter_map(|(on, w)| on.then_some(w))
-        .collect();
+    let words = t.skip.words();
+    if !words.is_empty() {
         let _ = write!(line, "; notimer {}", words.join(","));
     }
     let _ = write!(

@@ -21,6 +21,7 @@ pub mod base;
 pub mod eoi;
 pub mod ioapic;
 pub mod lapic;
+pub mod msi;
 pub mod pic;
 pub mod plan;
 

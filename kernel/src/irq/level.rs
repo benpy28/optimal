@@ -1,6 +1,8 @@
 //! Level-triggered I/O APIC lines, and the pins whose Remote IRR stays
-//! set; and edge-triggered lines on plan-free GSIs ([`claim_edge`], for
-//! the HPET's timer events), which share the claim rules.
+//! set; edge-triggered lines on plan-free GSIs ([`claim_edge`], for the
+//! HPET's timer events), which share the claim rules; and vectors for
+//! message-signalled interrupts ([`claim_msi`], the HPET's FSB delivery),
+//! which share the vector rules.
 //!
 //! A level line is held masked from the moment its interrupt arrives
 //! until its handler says it is done (design/drivers.md, `IrqHandle`), so
@@ -414,6 +416,52 @@ impl Edge {
         EDGES[v].store(0, Ordering::SeqCst);
         EDGE_LOWS[v].store(0, Ordering::SeqCst);
         HANDLERS[v].store(0, Ordering::SeqCst);
+    }
+}
+
+/// A vector claimed for message-signalled interrupts ([`claim_msi`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Msi {
+    pub vector: u8,
+    /// What the device writes, and where: to the boot CPU's local APIC.
+    pub message: optimal_apic::msi::Message,
+    /// That CPU's APIC ID.
+    pub apic_id: u32,
+}
+
+/// Claim `vector` (0x40 to 0xED, as [`claim_edge`]) for an MSI to the
+/// boot CPU, with `handler` run for each interrupt. Nothing is routed
+/// through an I/O APIC, so there is no pin to claim, mask or EOI: the
+/// local APIC gets its EOI after the handler, as for any handler-table
+/// vector.
+pub fn claim_msi(vector: u8, handler: super::Handler) -> Result<Msi, ClaimError> {
+    let c = controllers().ok_or(ClaimError::Off)?;
+    if !(vectors::DEVICE_FIRST..vectors::UNROUTED).contains(&vector) {
+        return Err(ClaimError::NotDeviceVector(vector));
+    }
+    let message =
+        optimal_apic::msi::fixed_edge(c.lapic_id, vector).map_err(|_| ClaimError::NoDestination)?;
+    let _g = CLAIM.lock();
+    let v = usize::from(vector);
+    if HANDLERS[v].load(Ordering::SeqCst) != 0
+        || LINES[v].load(Ordering::SeqCst) != 0
+        || EDGES[v].load(Ordering::SeqCst) != 0
+    {
+        return Err(ClaimError::VectorBusy(vector));
+    }
+    HANDLERS[v].store(handler as usize, Ordering::SeqCst);
+    Ok(Msi {
+        vector,
+        message,
+        apic_id: c.lapic_id,
+    })
+}
+
+impl Msi {
+    /// Give the vector up. The device must have stopped sending first.
+    pub fn release(self) {
+        let _c = CLAIM.lock();
+        HANDLERS[usize::from(self.vector)].store(0, Ordering::SeqCst);
     }
 }
 

@@ -37,8 +37,18 @@ pub fn setup() -> Result<Estimate, String> {
     );
     time::pit_stop(port_b);
     let rate = rate.map_err(|e| format!("could not measure the PIT: {e}"))?;
-    irq::set_handler(r.entry.vector, interrupt);
-    irq::isa_unmask(0).map_err(|e| format!("ISA IRQ 0: {e:?}"))?;
+    // Refused while the HPET's legacy replacement holds ISA IRQ 0
+    // (crate::timer::hpet).
+    if !irq::try_set_handler(r.entry.vector, interrupt) {
+        return Err(format!(
+            "ISA IRQ 0's vector {:#x} already has a handler (the HPET's legacy replacement)",
+            r.entry.vector
+        ));
+    }
+    if let Err(e) = irq::isa_unmask(0) {
+        irq::clear_handler(r.entry.vector);
+        return Err(format!("ISA IRQ 0: {e:?}"));
+    }
     Ok(rate)
 }
 

@@ -79,8 +79,13 @@ ktest!(hpet_runs_with_every_comparator_quiet, {
     };
     let config = h.read(hpet::CONFIG);
     assert_eq!(config & hpet::ENABLE, hpet::ENABLE);
-    assert_eq!(config & hpet::LEGACY_ROUTE, 0);
-    // Every comparator but one the timer took for its events
+    // Legacy replacement only while the timer's HPET events use it.
+    assert_eq!(
+        config & hpet::LEGACY_ROUTE != 0,
+        crate::timer::hpet_legacy(),
+        "{config:#x}"
+    );
+    // Every comparator but those the timer took for its events
     // (crate::timer's HPET fallback).
     for n in (0..h.caps.comparators).filter(|&n| h.claimed() & (1 << n) == 0) {
         let c = h.read(hpet::timer_config(n));
