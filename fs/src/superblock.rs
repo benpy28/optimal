@@ -69,6 +69,9 @@ pub struct Header {
     pub incompat: u32,
     /// log2 of the metadata chunk size in blocks (0..=6), fixed at format.
     pub chunk_shift: u32,
+    /// The fsync intent log ring: first block and length (0, 0: none).
+    pub log_start: u64,
+    pub log_blocks: u64,
     /// Not part of the header bytes: from the slot's trailer.
     pub generation: u64,
     pub slot: u32,
@@ -119,7 +122,9 @@ pub struct Body {
     /// and every block older is protected. Recovery verifies from here.
     pub window_gen: u64,
     /// Reserved for the per-file fsync intent log. Always null in v1.
-    pub log_root: BlockPtr,
+    /// Ring position where this commit's intent-log chain starts (`None`:
+    /// the volume has no ring).
+    pub log_start: Option<u64>,
     /// The previous [`HISTORY`] commits, newest first (fewer on a young
     /// volume). Their entries have no history of their own. Mount falls
     /// back through these when the newest commit's blocks did not all
@@ -173,6 +178,9 @@ impl Header {
             w.bytes(&ks.wrapped);
             w.bytes(&ks.tag);
         }
+        w.u64(self.log_start);
+        w.u32(self.log_blocks as u32);
+        w.u32(0);
     }
 
     fn decode(b: &[u8], at: u64) -> Result<Header> {
@@ -224,7 +232,26 @@ impl Header {
             ks.wrapped = r.array()?;
             ks.tag = r.array()?;
         }
+        let log_start = r.u64()?;
+        let log_blocks = r.u32()? as u64;
+        if r.u32()? != 0 {
+            return Err(r.err());
+        }
+        let log_ok = if log_blocks == 0 {
+            log_start == 0
+        } else {
+            (crate::fs::LOG_MIN_BLOCKS..=crate::fs::LOG_MAX_BLOCKS).contains(&log_blocks)
+                && log_start >= crate::space::SB_RESERVED_FRONT
+                && log_start.checked_add(log_blocks).is_some_and(|e| {
+                    e <= total_blocks.saturating_sub(crate::space::SB_RESERVED_BACK)
+                })
+        };
+        if !log_ok {
+            return Err(Error::Corrupt("intent log ring in the header", at));
+        }
         Ok(Header {
+            log_start,
+            log_blocks,
             uuid,
             total_blocks,
             suite,
@@ -319,7 +346,7 @@ impl Body {
             replay_value,
             flags,
             window_gen,
-            log_root: BlockPtr::NULL,
+            log_start: None,
             history: Vec::new(),
         }
     }
@@ -426,7 +453,10 @@ impl Body {
     fn encode(&self, header_hash: &[u8; 32], w: &mut Writer) {
         w.bytes(header_hash);
         self.encode_core(w);
-        self.log_root.encode(w);
+        // 64 bytes: start (u64), flags (u32, bit 0 = present), zero.
+        w.u64(self.log_start.unwrap_or(0));
+        w.u32(self.log_start.is_some() as u32);
+        w.zeros(52);
         debug_assert!(self.history.len() <= HISTORY);
         w.u32(self.history.len() as u32);
         w.u32(0);
@@ -439,10 +469,12 @@ impl Body {
         let mut r = Reader::new(b, "superblock body", at);
         let hh = r.array()?;
         let mut body = Body::decode_core(&mut r)?;
-        body.log_root = BlockPtr::decode(&mut r)?;
-        if !body.log_root.is_null() {
-            return Err(Error::Unsupported("fsync log (newer format)"));
+        let start = r.u64()?;
+        let flags = r.u32()?;
+        if flags > 1 || (flags == 0 && start != 0) || r.bytes(52)?.iter().any(|&x| x != 0) {
+            return Err(Error::Unsupported("intent log field"));
         }
+        body.log_start = (flags == 1).then_some(start);
         let n = r.u32()? as usize;
         if n > HISTORY || r.u32()? != 0 {
             return Err(Error::Corrupt("superblock history", at));
@@ -468,7 +500,7 @@ impl Body {
     pub fn core(&self) -> Body {
         Body {
             history: Vec::new(),
-            log_root: BlockPtr::NULL,
+            log_start: None,
             ..self.clone()
         }
     }
@@ -609,25 +641,67 @@ pub fn commit<D: BlockDevice>(
     header: &Header,
     body: &Body,
     all_slots: bool,
+    dead: &mut u8,
 ) -> Result<()> {
     io.flush()?;
     let total = io.num_blocks();
-    // Normal commit: its own pair. All slots: two waves, the front slots
-    // (0, 1) then the back slots (2, 3), each flushed, so a power cut
-    // tearing every write in flight still leaves a whole wave intact.
-    let waves: Vec<[u32; 2]> = if all_slots {
-        vec![[0, 1], [2, 3]]
-    } else {
-        vec![slots_for_gen(body.generation)]
-    };
+    let waves = plan_waves(body.generation, all_slots, *dead)?;
     for wave in &waves {
         for &slot in wave {
             let b = encode(header, body, slot, &mut io.sealer);
-            io.write_now(slot_addr(slot, total), &b[..])?;
+            if let Err(e) = io.write_now(slot_addr(slot, total), &b[..]) {
+                // A slot cannot move: it is not written again on this
+                // mount, and the retry writes around it.
+                *dead |= 1 << slot;
+                return Err(e);
+            }
         }
         io.flush()?;
     }
     Ok(())
+}
+
+/// The superblock slots a commit writes, in waves: each wave is written,
+/// then flushed, before the next starts.
+///
+/// With every slot working: a normal commit writes its own pair in one
+/// wave (the other pair keeps the previous commit); with `all_slots`, the
+/// front slots (0, 1) then the back slots (2, 3), so a power cut tearing
+/// every write in flight still leaves a whole wave intact.
+///
+/// With slots in `dead` (bit per slot; a write to it failed on this
+/// mount), each wave is one slot, so at most one copy is ever in flight:
+/// the commit's own live slots first, then live slots of the other pair
+/// until two copies are written (all live slots with `all_slots`). Every
+/// commit thus still lands on two slots, and a cut part way leaves either
+/// the new commit or the previous one whole on some slot. Fewer than two
+/// live slots: refused with [`Error::DeviceFailing`] before any write, as
+/// one copy overwritten in place could be torn with nothing to fall back
+/// to.
+pub fn plan_waves(generation: u64, all_slots: bool, dead: u8) -> Result<Vec<Vec<u32>>> {
+    let live = |s: &u32| dead & (1 << s) == 0;
+    if dead & 0xf == 0 {
+        return Ok(if all_slots {
+            vec![vec![0, 1], vec![2, 3]]
+        } else {
+            vec![slots_for_gen(generation).to_vec()]
+        });
+    }
+    let own = slots_for_gen(generation);
+    let other = [own[0] ^ 1, own[1] ^ 1];
+    let mut order: Vec<u32> = own
+        .iter()
+        .chain(other.iter())
+        .copied()
+        .filter(live)
+        .collect();
+    if order.len() < 2 {
+        return Err(Error::DeviceFailing);
+    }
+    if !all_slots {
+        order.truncate(2);
+    }
+    Ok(order.into_iter().map(|s| vec![s]).collect())
 }
 
 /// Bytes of one history entry / the core of a body.

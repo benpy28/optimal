@@ -116,6 +116,8 @@ enum Role {
     ChunkCopy,
     /// A chunk-table block (either copy).
     ChunkMap,
+    /// The fsync intent log ring.
+    IntentLog,
 }
 
 struct Ctx {
@@ -266,6 +268,15 @@ pub fn check<D: BlockDevice>(fs: &mut Filesystem<D>, verify_data: bool) -> Resul
     cx.claim_meta(BlockKind::Root, Role::Root, &body.root_block);
 
     check_chunks(fs, &mut cx, &body)?;
+    if fs.header.log_blocks > 0 {
+        cx.claim(
+            fs.header.log_start,
+            fs.header.log_blocks,
+            Role::IntentLog,
+            0,
+            [0; 16],
+        );
+    }
 
     cx.rep.referenced_blocks =
         cx.owners.range(..LOGICAL).count() as u64 + SB_RESERVED_FRONT + SB_RESERVED_BACK;

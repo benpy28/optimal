@@ -23,7 +23,8 @@ address (below 2^45).
 | Blocks | Contents |
 |---|---|
 | 0, 1 | Superblock slots 0 and 1 |
-| 2 .. N-3 | Allocatable space (everything else lives here) |
+| 2 .. 2+L-1 | Intent log ring of L blocks (L = 0 for none; see *Intent log*) |
+| 2+L .. N-3 | Allocatable space (everything else lives here) |
 | N-2, N-1 | Superblock slots 3 and 2 |
 
 Slot `s` lives at block `0, 1, N-1, N-2` for `s = 0, 1, 2, 3`. Commit
@@ -51,7 +52,9 @@ DESIGN "Space accounting"); mount reads volumes down to 64 blocks.
 | 60 | 12 | Argon2id parameters: memory KiB, iterations, lanes |
 | 72 | 32 | KDF salt |
 | 104 | 4 x 80 | key slots: kind (1), zero (7), nonce (24), wrapped key (32), tag (16) |
-| 424 | 88 | reserved, zero |
+| 424 | 8 | intent log ring: first block (2, or 0 with no ring) |
+| 432 | 4 | intent log ring: blocks L (0, or 16..16384 ending at or before N-2) |
+| 436 | 76 | reserved, zero |
 | 512 | 4 | slot number (must match where the copy was read) |
 | 516 | 4 | zero |
 | 520 | 8 | generation (orders the slots) |
@@ -83,7 +86,7 @@ parameters above 4 GiB or 64 passes (a crafted image can't exhaust memory).
 |---|---|
 | 32 | header hash |
 | 176 | this commit's *core* (below) |
-| 64 | fsync intent-log root: reserved, must be null in v1 |
+| 64 | intent log: chain start (u64, ring position 0..L-1), flags (u32: 1 = a chain follows this commit, 0 = none, with start 0), 52 zero bytes |
 | 4 | history length H (at most 8) |
 | 4 | zero |
 | H x 176 | the previous H commits' cores, newest first, strictly older generations |
@@ -137,7 +140,7 @@ drive lost; every older block is protected by the quarantine.
 Associated data for every block is 36 bytes:
 `"OFS" || kind (u8) || address (u64) || birth (u64) || uuid (16)`.
 Kinds: 1 tree node, 2 file data, 3 bitmap, 4 space table, 5 free log, 6 superblock body,
-7 root block, 8 chunk table leaf, 9 chunk table interior. The address is the
+7 root block, 8 chunk table leaf, 9 chunk table interior, 10 intent log block. The address is the
 one in the pointer: logical for metadata, so a block sealed for one logical
 address never verifies at another, wherever it physically sits.
 
@@ -298,6 +301,50 @@ old run goes through the quarantine like any freed block. A chunk table
 block with a bad copy is rewritten to a new pair by that commit. A bad copy
 of a block the repairing commit has already stopped using is left alone:
 older commits still map it through their own tables, with the good copy.
+
+## Intent log
+
+A ring of L blocks right after the front superblock slots, set at format
+(default L = total / 64, clamped to 16..16384) and marked used in the space
+map for the life of the volume. Each commit's body names the ring position
+where its *chain* starts: the position after the previous commit's chain.
+Block `seq` of a chain (0, 1, ...) lives at `start + (seq + chain start) mod L`.
+A chain never holds more than L blocks.
+
+Ring block (4096 bytes):
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 24 | nonce |
+| 24 | 16 | MAC |
+| 40 | 4056 | payload, sealed as kind 10, address = this physical block, birth = the generation of the commit the chain follows |
+
+Payload: sequence number in the chain (u64), stream bytes in this block
+(u32, at most 4040), flags (u32: bit 0 = the last block of a batch; others
+must be zero), then the record stream bytes, then zero. A batch is the
+stream of consecutive blocks ending with a last-block flag. Replay reads
+blocks from sequence 0 until one fails to verify or carries the wrong
+sequence number, applying each complete batch; a batch whose last block it
+never reached is not applied.
+
+Records (concatenated, little-endian): tag (u8), number of clock readings n
+(u8), n readings (i64 each), then by tag. Names and targets are a u32
+length then the bytes.
+
+| Tag | Operation | Fields |
+|---|---|---|
+| 1 | create | dir (u64), name, perm (u32), new inode (u64) |
+| 2 | mkdir | dir, name, perm, new inode |
+| 3 | symlink | dir, name, target, new inode |
+| 4 | link | inode, dir, name |
+| 5 | unlink | dir, name |
+| 6 | rmdir | dir, name |
+| 7 | rename | source dir, name, target dir, name |
+| 8 | setattr | inode, present bits (u8: perm, uid, gid, size, atime, mtime), perm (u32), uid (u32), gid (u32), size (u64), atime (i64), mtime (i64); absent fields are zero |
+| 9 | truncate | inode, size (u64) |
+| 10 | file state | inode, the inode item (80 bytes, as in the tree), block count (u32), then per block: index (u64) and its 4096 bytes |
+
+An unknown tag ends the replay before that batch.
 
 ## Lying drives
 

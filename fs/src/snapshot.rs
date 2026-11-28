@@ -195,10 +195,15 @@ fn delete_deadlist<D: BlockDevice>(
 }
 
 /// Moves blocks the live tree dropped (but a snapshot holds) onto the live deadlist.
+/// The pending list is cleared only once all of it is on the deadlist.
 pub(crate) fn flush_deadlist<D: BlockDevice>(fs: &mut Filesystem<D>) -> Result<()> {
     let pending = core::mem::take(&mut fs.store.dead_pending);
     let dl = fs.live_deadlist;
-    append_deadlist(fs, dl, &pending)
+    let r = append_deadlist(fs, dl, &pending);
+    if r.is_err() {
+        fs.store.dead_pending = pending;
+    }
+    r
 }
 
 pub(crate) fn list_records<D: BlockDevice>(fs: &mut Filesystem<D>) -> Result<Vec<SnapRecord>> {
@@ -232,6 +237,10 @@ impl<D: BlockDevice> Filesystem<D> {
             return Err(Error::NameTooLong);
         }
         self.commit()?;
+        self.op_whole(|fs| fs.snapshot_create_inner(name))
+    }
+
+    fn snapshot_create_inner(&mut self, name: &[u8]) -> Result<u64> {
         let id = self.next_snap_id;
         let rec = SnapRecord {
             id,
@@ -268,9 +277,11 @@ impl<D: BlockDevice> Filesystem<D> {
     /// Deletes a snapshot and frees the blocks only it held.
     pub fn snapshot_delete(&mut self, id: u64) -> Result<()> {
         self.commit()?;
-        self.snapshot_delete_inner(id)?;
-        self.mark_dirty();
-        self.commit()
+        self.op_whole(|fs| {
+            fs.snapshot_delete_inner(id)?;
+            fs.mark_dirty();
+            fs.commit()
+        })
     }
 
     fn snapshot_delete_inner(&mut self, id: u64) -> Result<()> {
@@ -316,8 +327,16 @@ impl<D: BlockDevice> Filesystem<D> {
 
     /// Returns the whole filesystem to snapshot `id`. Every newer snapshot
     /// and every change since is discarded; snapshot `id` itself is kept.
+    ///
+    /// All or nothing up to each of its commits: if it fails part way,
+    /// what its last completed commit made durable stays (newer snapshots
+    /// already deleted, say) and everything after is undone.
     pub fn rollback(&mut self, id: u64) -> Result<()> {
         self.commit()?;
+        self.op_whole(|fs| fs.rollback_inner(id))
+    }
+
+    fn rollback_inner(&mut self, id: u64) -> Result<()> {
         let recs = list_records(self)?;
         let j = recs
             .iter()

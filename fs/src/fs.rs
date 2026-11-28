@@ -10,11 +10,14 @@ use crate::space::Space;
 use crate::superblock::{
     self, Body, Header, KEYSLOTS, KeySlot, SUITE_PLAIN, SUITE_XCHACHA20POLY1305,
 };
-use crate::tree::{Key, MAX_VALUE, NodeCache, SpaceOp, Store, Tree, TreeId};
+use crate::tree::{Key, MAX_VALUE, NodeCache, SpaceOp, Store, Tree, TreeId, Undo};
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec;
 use alloc::vec::Vec;
+
+mod ilog;
+pub use ilog::{LOG_MAX_BLOCKS, LOG_MIN_BLOCKS, LogStats, auto_log_blocks};
 
 pub const ROOT_INO: u64 = 1;
 pub const NAME_MAX: usize = 255;
@@ -279,6 +282,10 @@ pub struct FormatOptions {
     /// size it to the device ([`auto_chunk_blocks`]). Fixed for the life
     /// of the volume.
     pub meta_chunk_blocks: u32,
+    /// Blocks set aside for the fsync intent log: `None` sizes it to the
+    /// device ([`auto_log_blocks`]), `Some(0)` makes none (every `fsync` then
+    /// commits), otherwise [`LOG_MIN_BLOCKS`] to [`LOG_MAX_BLOCKS`].
+    pub intent_log_blocks: Option<u64>,
 }
 
 impl Default for FormatOptions {
@@ -288,6 +295,7 @@ impl Default for FormatOptions {
             kdf: KdfParams::DEFAULT,
             quarantine_min_ns: DEFAULT_QUARANTINE_NS,
             meta_chunk_blocks: 0,
+            intent_log_blocks: None,
         }
     }
 }
@@ -400,6 +408,68 @@ pub struct Filesystem<D: BlockDevice> {
     early_flush_failures: u32,
     /// Attempts the last `commit` call made (tests).
     pub(crate) last_commit_attempts: u32,
+    /// State before the operation in progress (see [`op`](Self::op)).
+    op_cp: Option<OpCheckpoint>,
+    /// The last operation's undo log, emptied, kept for its capacity.
+    undo_spare: Vec<Undo>,
+    /// Dirty-data changes of the operation in progress, made once it
+    /// succeeds (see [`DataChange`]).
+    op_data: Vec<DataChange>,
+    /// Operations rolled back after failing part way (tests).
+    pub(crate) ops_undone: u64,
+    /// Undos that rebuilt the space map because a free failed part way
+    /// ([`Store::space_unlogged`]) (tests).
+    pub(crate) unlogged_rebuilds: u64,
+    /// Superblock slots (bit per slot) a write failed on during this
+    /// mount; commits write around them (see [`superblock::plan_waves`]).
+    pub(crate) dead_slots: u8,
+    /// The fsync intent log ([`ilog`]).
+    ilog: ilog::LogState,
+    /// Clock readings the operation in progress took (for its log record).
+    op_times: Vec<i64>,
+    /// During replay: the readings the replayed operation took.
+    replay_times: Option<VecDeque<i64>>,
+    replay_last: i64,
+}
+
+/// What [`Filesystem::op`] restores when an operation fails part way,
+/// besides the undo log ([`Store::undo`]) the trees keep while it runs.
+struct OpCheckpoint {
+    /// Whole trees, for operations whose undo is not item by item
+    /// (snapshots: see [`Filesystem::op_whole`]). They share their dirty
+    /// nodes with the live trees, so taking them is a pointer copy (a
+    /// change then copies only the nodes it touches).
+    trees: Option<(Tree, Tree)>,
+    log_len: usize,
+    dead_len: usize,
+    next_ino: u64,
+    next_snap_id: u64,
+    live_deadlist: u64,
+    next_deadlist: u64,
+    latest_snap_gen: u64,
+    txn_dirty: bool,
+    txn_data: u64,
+    txn_meta: u64,
+}
+
+/// A change to the dirty file data that an operation makes only once it
+/// has succeeded, so a failure part way leaves the dirty data as it was.
+/// (Writes need none: their data goes in after their last step that can
+/// fail.)
+enum DataChange {
+    /// Drop all of a file's dirty blocks (the file was deleted).
+    DropFile(u64),
+    /// Drop a file's dirty blocks from index `.1` on (it was shrunk).
+    DropFrom(u64, u64),
+    /// Zero block `idx` of file `ino` from byte `from` on (the new last
+    /// block after a shrink). `old` is its content read beforehand when it
+    /// was not dirty.
+    ZeroTail {
+        ino: u64,
+        idx: u64,
+        from: usize,
+        old: Option<Block>,
+    },
 }
 
 /// Most attempts one [`Filesystem::commit`] call makes (the storage
@@ -479,7 +549,28 @@ impl<D: BlockDevice> Filesystem<D> {
                 ));
             }
         };
+        let log_blocks = match opts.intent_log_blocks {
+            None => auto_log_blocks(total),
+            Some(0) => 0,
+            Some(n) if (LOG_MIN_BLOCKS..=LOG_MAX_BLOCKS).contains(&n) && n <= total / 16 => n,
+            Some(_) => {
+                return Err(Error::Invalid(
+                    "intent log size must be 0 or 16 to 16384 blocks, at most 1/16 of the volume",
+                ));
+            }
+        };
+        // The ring sits right after the front superblock slots.
+        let ring = (
+            if log_blocks > 0 {
+                crate::space::SB_RESERVED_FRONT
+            } else {
+                0
+            },
+            log_blocks,
+        );
         let mut header = Header {
+            log_start: ring.0,
+            log_blocks: ring.1,
             uuid,
             total_blocks: total,
             suite: SUITE_PLAIN,
@@ -519,14 +610,20 @@ impl<D: BlockDevice> Filesystem<D> {
         let sealer = Sealer::new(uuid, master.as_ref(), rng);
         let mut space = Space::format(total, header.chunk_shift)?;
         space.quarantine_min_ns = opts.quarantine_min_ns;
+        let mut io = Io::new(dev, sealer);
+        if ring.1 > 0 {
+            space.claim(&mut io, ring.0, ring.1)?;
+        }
         let store = Store {
-            io: Io::new(dev, sealer),
+            io,
             space,
             cache: NodeCache::new(8192),
             latest_snap_gen: 0,
             dead_pending: Vec::new(),
             log: Vec::new(),
             written: BTreeMap::new(),
+            undo: None,
+            space_unlogged: false,
         };
         let body = Body {
             generation: 0,
@@ -547,7 +644,7 @@ impl<D: BlockDevice> Filesystem<D> {
             replay_value: 0,
             flags: 0,
             window_gen: 0,
-            log_root: BlockPtr::NULL,
+            log_start: None,
             history: Vec::new(),
         };
         let mut fs = Filesystem {
@@ -580,6 +677,16 @@ impl<D: BlockDevice> Filesystem<D> {
             sb_started: false,
             early_flush_failures: 0,
             last_commit_attempts: 0,
+            op_cp: None,
+            undo_spare: Vec::new(),
+            op_data: Vec::new(),
+            ops_undone: 0,
+            unlogged_rebuilds: 0,
+            dead_slots: 0,
+            ilog: ilog::LogState::new(ring.0, ring.1),
+            op_times: Vec::new(),
+            replay_times: None,
+            replay_last: 0,
         };
         let now = fs.clock.now_ns();
         let root = Attr {
@@ -611,11 +718,36 @@ impl<D: BlockDevice> Filesystem<D> {
     /// to skip newer commits, new commits are numbered above all of them
     /// and the first one overwrites every superblock slot.
     pub fn mount(
+        dev: D,
+        opts: &MountOptions,
+        rng: &mut dyn Entropy,
+        clock: Box<dyn Clock>,
+    ) -> Result<Self> {
+        match Self::mount_replaying(dev, opts, rng, clock, None)? {
+            Ok(fs) => Ok(fs),
+            // A batch of the intent log failed to apply: mount again with
+            // only the batches before it (the state after each batch is
+            // one the volume really had).
+            Err((dev, clock, batches)) => {
+                match Self::mount_replaying(dev, opts, rng, clock, Some(batches))? {
+                    Ok(fs) => Ok(fs),
+                    Err(_) => Err(Error::Corrupt("intent log replay failed twice", batches)),
+                }
+            }
+        }
+    }
+
+    /// [`mount`](Self::mount), replaying at most `limit` intent-log
+    /// batches. `Ok(Err(..))`: a batch failed; the device, the clock and
+    /// how many batches applied come back for a second mount.
+    #[allow(clippy::type_complexity)]
+    fn mount_replaying(
         mut dev: D,
         opts: &MountOptions,
         rng: &mut dyn Entropy,
         mut clock: Box<dyn Clock>,
-    ) -> Result<Self> {
+        limit: Option<u64>,
+    ) -> Result<core::result::Result<Self, (D, Box<dyn Clock>, u64)>> {
         let cands = superblock::candidates(&mut dev)?;
         if cands.is_empty() {
             return Err(Error::NoFilesystem);
@@ -702,6 +834,15 @@ impl<D: BlockDevice> Filesystem<D> {
             };
             io.repair_enabled = !opts.read_only;
             let mut body = body;
+            let bad_log = match body.log_start {
+                None => false,
+                Some(s) => from_history || s >= header.log_blocks,
+            };
+            if bad_log {
+                last_err = Error::Corrupt("intent log start", body.generation);
+                dev = Some(io.dev);
+                continue;
+            }
             let (mut space, fs_tree, meta) = match Self::open_commit(&mut io, &header, &mut body) {
                 Ok(x) => x,
                 Err(e) => {
@@ -714,6 +855,7 @@ impl<D: BlockDevice> Filesystem<D> {
             let generation = body.generation;
             let mut header = header;
             header.generation = generation;
+            let log_ring = (header.log_start, header.log_blocks);
             let mut fs = Filesystem {
                 store: Store {
                     io,
@@ -723,6 +865,8 @@ impl<D: BlockDevice> Filesystem<D> {
                     dead_pending: Vec::new(),
                     log: Vec::new(),
                     written: BTreeMap::new(),
+                    undo: None,
+                    space_unlogged: false,
                 },
                 fs_tree,
                 meta,
@@ -752,6 +896,16 @@ impl<D: BlockDevice> Filesystem<D> {
                 sb_started: false,
                 early_flush_failures: 0,
                 last_commit_attempts: 0,
+                op_cp: None,
+                undo_spare: Vec::new(),
+                op_data: Vec::new(),
+                ops_undone: 0,
+                unlogged_rebuilds: 0,
+                dead_slots: 0,
+                ilog: ilog::LogState::new(log_ring.0, log_ring.1),
+                op_times: Vec::new(),
+                replay_times: None,
+                replay_last: 0,
             };
             let check = if clean {
                 Ok(())
@@ -790,7 +944,27 @@ impl<D: BlockDevice> Filesystem<D> {
                             fs.txn_dirty = true;
                         }
                     }
-                    return Ok(fs);
+                    fs.attach_chain(from_history);
+                    // Even a cleanly unmounted commit may have a chain: a
+                    // later mount can fsync into it without committing.
+                    if !from_history {
+                        if let Err(stop) = fs.replay_log(limit) {
+                            let clock = fs.clock_take();
+                            return Ok(Err((fs.into_device(), clock, stop.batches)));
+                        }
+                        if fs.ilog.stats.replayed_batches > 0 && !fs.read_only {
+                            // Make the replayed state a commit, so the chain
+                            // can be dropped. If that fails the volume is
+                            // degraded as after any failed commit, and the
+                            // chain stays until a commit lands.
+                            if let Err(e) = fs.commit()
+                                && fs.poisoned
+                            {
+                                return Err(e);
+                            }
+                        }
+                    }
+                    return Ok(Ok(fs));
                 }
                 Err(e) => {
                     last_err = e;
@@ -970,6 +1144,45 @@ impl<D: BlockDevice> Filesystem<D> {
     }
 
     #[doc(hidden)]
+    /// Drops the decoded-node cache, so the next reads of committed tree
+    /// nodes go to the device (cold-cache benchmarks, fault tests).
+    pub fn drop_caches(&mut self) {
+        self.store.cache.clear();
+    }
+
+    /// A file's extents as (first physical block, blocks), in file order
+    /// (tests).
+    pub fn extents_for_tests(&mut self, ino: u64) -> Result<Vec<(u64, u64)>> {
+        let mut out = Vec::new();
+        let mut err = None;
+        self.fs_tree.scan(
+            &mut self.store,
+            &Key::new(ino, K_EXTENT, 0),
+            &Key::new(ino, K_EXTENT, u64::MAX),
+            &mut |_, v| {
+                match Extent::decode(v, ino) {
+                    Ok(e) => out.push((e.phys, e.len)),
+                    Err(e) => {
+                        err = Some(e);
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            },
+        )?;
+        err.map_or(Ok(out), Err)
+    }
+
+    /// Operations undone after failing part way, since mount (tests).
+    pub fn ops_undone_for_tests(&self) -> u64 {
+        self.ops_undone
+    }
+
+    /// Whether an error stopped all writes until remount ([`Error::Poisoned`]).
+    pub fn poisoned(&self) -> bool {
+        self.poisoned
+    }
+
     pub fn next_ino_for_tests(&self) -> u64 {
         self.next_ino
     }
@@ -1022,7 +1235,7 @@ impl<D: BlockDevice> Filesystem<D> {
         if self.poisoned {
             return Err(Error::Poisoned);
         }
-        if self.read_only {
+        if self.read_only && self.replay_times.is_none() {
             return Err(Error::ReadOnly);
         }
         if self.degraded {
@@ -1205,8 +1418,15 @@ impl<D: BlockDevice> Filesystem<D> {
     /// has changed nothing yet) is refused with [`Error::DeviceFailing`]
     /// rather than an I/O error that would stop the volume.
     fn commit_for_space(&mut self) -> Result<()> {
+        // Replay never commits part way: the chain must stay whole until
+        // the commit after it.
+        if self.replay_times.is_some() {
+            return Err(Error::NoSpace);
+        }
         match self.commit_forced() {
-            Err(Error::Io(_)) if !self.poisoned && self.degraded => Err(Error::DeviceFailing),
+            Err(Error::Io(_) | Error::Corrupt(..)) if !self.poisoned && self.degraded => {
+                Err(Error::DeviceFailing)
+            }
             r => r,
         }
     }
@@ -1320,7 +1540,7 @@ impl<D: BlockDevice> Filesystem<D> {
     }
 
     fn new_inode(&mut self, kind: FileKind, perm: u32, parent: u64) -> Attr {
-        let now = self.clock.now_ns();
+        let now = self.op_now();
         let ino = self.next_ino;
         self.next_ino += 1;
         Attr {
@@ -1349,7 +1569,7 @@ impl<D: BlockDevice> Filesystem<D> {
         let a = self.new_inode(kind, perm, dir);
         self.put_inode(&a)?;
         self.add_entry(dir, name, a.ino, kind)?;
-        let now = self.clock.now_ns();
+        let now = self.op_now();
         d.size += 1;
         if kind == FileKind::Dir {
             d.nlink += 1;
@@ -1407,7 +1627,7 @@ impl<D: BlockDevice> Filesystem<D> {
         let mut d = self.check_new_name(dir, name)?;
         self.ensure_space(0, 8, false)?;
         self.add_entry(dir, name, ino, a.kind)?;
-        let now = self.clock.now_ns();
+        let now = self.op_now();
         a.nlink += 1;
         a.ctime_ns = now;
         self.put_inode(&a)?;
@@ -1428,7 +1648,7 @@ impl<D: BlockDevice> Filesystem<D> {
         }
         self.ensure_space(0, 8, true)?;
         self.remove_entry(dir, name)?;
-        let now = self.clock.now_ns();
+        let now = self.op_now();
         let mut d = self.get_inode(dir)?;
         d.size -= 1;
         d.mtime_ns = now;
@@ -1455,7 +1675,7 @@ impl<D: BlockDevice> Filesystem<D> {
         }
         self.ensure_space(0, 8, true)?;
         self.remove_entry(dir, name)?;
-        let now = self.clock.now_ns();
+        let now = self.op_now();
         let mut d = self.get_inode(dir)?;
         d.size -= 1;
         d.nlink -= 1;
@@ -1468,9 +1688,7 @@ impl<D: BlockDevice> Filesystem<D> {
     /// Deletes an inode and everything it owns.
     fn destroy_inode(&mut self, a: &Attr) -> Result<()> {
         self.txn_dirty = true;
-        if let Some(m) = self.dirty_data.remove(&a.ino) {
-            self.dirty_blocks -= m.len();
-        }
+        self.defer(DataChange::DropFile(a.ino));
         self.punch(a.ino, 0, u64::MAX)?;
         self.fs_tree
             .remove(&mut self.store, &Key::new(a.ino, K_INLINE, 0))?;
@@ -1534,7 +1752,7 @@ impl<D: BlockDevice> Filesystem<D> {
             return Err(Error::TooManyLinks);
         }
         self.ensure_space(0, 16, true)?;
-        let now = self.clock.now_ns();
+        let now = self.op_now();
         // Drop the replaced target.
         if let Some(t) = target {
             let mut ta = self.get_inode(t)?;
@@ -1624,12 +1842,18 @@ impl<D: BlockDevice> Filesystem<D> {
     }
 
     pub fn setattr(&mut self, ino: u64, s: &SetAttr) -> Result<Attr> {
+        let a = self.op(|fs| fs.setattr_inner(ino, s))?;
+        self.log_setattr(ino, s);
+        Ok(a)
+    }
+
+    fn setattr_inner(&mut self, ino: u64, s: &SetAttr) -> Result<Attr> {
         self.check_writable()?;
         let mut a = self.get_inode(ino)?;
         if s.perm.is_some_and(|p| p > 0o7777) {
             return Err(Error::Invalid("permission bits"));
         }
-        let now = self.clock.now_ns();
+        let now = self.op_now();
         if let Some(size) = s.size {
             if a.kind != FileKind::File {
                 return Err(if a.kind == FileKind::Dir {
@@ -1638,7 +1862,7 @@ impl<D: BlockDevice> Filesystem<D> {
                     Error::Invalid("truncate of a non-file")
                 });
             }
-            self.truncate(ino, size)?;
+            self.truncate_inner(ino, size)?;
             a = self.get_inode(ino)?;
         }
         if let Some(p) = s.perm {
@@ -1658,55 +1882,67 @@ impl<D: BlockDevice> Filesystem<D> {
         }
         a.ctime_ns = now;
         self.txn_dirty = true;
-        let r = self.put_inode(&a);
-        self.guard(r)?;
+        self.put_inode(&a)?;
         Ok(a)
     }
 
-    // Public mutating operations: see `guard`.
+    // Public mutating operations: see `op`.
     pub fn create(&mut self, dir: u64, name: &[u8], perm: u32) -> Result<u64> {
-        let r = self.create_inner(dir, name, perm);
-        self.guard(r)
+        let ino = self.op(|fs| fs.create_inner(dir, name, perm))?;
+        self.log_create(FileKind::File, dir, name, perm, ino);
+        Ok(ino)
     }
 
     pub fn mkdir(&mut self, dir: u64, name: &[u8], perm: u32) -> Result<u64> {
-        let r = self.mkdir_inner(dir, name, perm);
-        self.guard(r)
+        let ino = self.op(|fs| fs.mkdir_inner(dir, name, perm))?;
+        self.log_create(FileKind::Dir, dir, name, perm, ino);
+        Ok(ino)
     }
 
     pub fn symlink(&mut self, dir: u64, name: &[u8], target: &[u8]) -> Result<u64> {
-        let r = self.symlink_inner(dir, name, target);
-        self.guard(r)
+        let ino = self.op(|fs| fs.symlink_inner(dir, name, target))?;
+        self.log_symlink(dir, name, target, ino);
+        Ok(ino)
     }
 
     pub fn link(&mut self, ino: u64, dir: u64, name: &[u8]) -> Result<()> {
-        let r = self.link_inner(ino, dir, name);
-        self.guard(r)
+        self.op(|fs| fs.link_inner(ino, dir, name))?;
+        self.log_link(ino, dir, name);
+        Ok(())
     }
 
     pub fn unlink(&mut self, dir: u64, name: &[u8]) -> Result<()> {
-        let r = self.unlink_inner(dir, name);
-        self.guard(r)
+        self.op(|fs| fs.unlink_inner(dir, name))?;
+        self.log_remove(false, dir, name);
+        Ok(())
     }
 
     pub fn rmdir(&mut self, dir: u64, name: &[u8]) -> Result<()> {
-        let r = self.rmdir_inner(dir, name);
-        self.guard(r)
+        self.op(|fs| fs.rmdir_inner(dir, name))?;
+        self.log_remove(true, dir, name);
+        Ok(())
     }
 
     pub fn rename(&mut self, sdir: u64, sname: &[u8], ddir: u64, dname: &[u8]) -> Result<()> {
-        let r = self.rename_inner(sdir, sname, ddir, dname);
-        self.guard(r)
+        self.op(|fs| fs.rename_inner(sdir, sname, ddir, dname))?;
+        self.log_rename(sdir, sname, ddir, dname);
+        Ok(())
     }
 
     pub fn write(&mut self, ino: u64, off: u64, data: &[u8]) -> Result<usize> {
-        let r = self.write_inner(ino, off, data);
-        self.guard(r)
+        let n = self.op(|fs| fs.write_inner(ino, off, data))?;
+        // After the operation: the write has happened whatever the flush
+        // does (see `flush_early`).
+        if self.dirty_blocks > self.dirty_limit_blocks {
+            self.flush_early()?;
+        }
+        Ok(n)
     }
 
     pub fn truncate(&mut self, ino: u64, size: u64) -> Result<()> {
-        let r = self.truncate_inner(ino, size);
-        self.guard(r)
+        self.op(|fs| fs.truncate_inner(ino, size))?;
+        self.log_truncate(ino, size);
+        Ok(())
     }
 
     /// Runs `f` against snapshot `id`, read-only. Uncommitted live changes
@@ -1732,14 +1968,210 @@ impl<D: BlockDevice> Filesystem<D> {
         r
     }
 
-    /// Errors that may leave a half-applied change in memory (I/O failures,
-    /// corruption found mid-operation) stop all further writes, so the
-    /// half-applied change can never be committed.
-    pub(crate) fn guard<T>(&mut self, r: Result<T>) -> Result<T> {
-        if let Err(Error::Io(_) | Error::Corrupt(..)) = &r {
-            self.poisoned = true;
+    /// Runs one public operation all or nothing: if `f` fails, everything
+    /// it changed in memory is put back (tree items, counters, the space
+    /// map, the dirty data), so a half-applied change can never be
+    /// committed and the volume stays writable. Only a failure while
+    /// putting things back (a read from a failing device) stops the volume
+    /// ([`Error::Poisoned`] from then on).
+    ///
+    /// While `f` runs, the trees log each item they change with its old
+    /// value ([`Store::undo`], moved, not copied), and file data an item
+    /// stops pointing at is logged as released. Undo puts the items back
+    /// newest first and takes those releases out of the space-map log,
+    /// rebuilding the map only if any were made. Nodes made dirty on the
+    /// way stay dirty: they hold the same items, and the free of their old
+    /// copy stays. Dirty file data changes only once `f` succeeded
+    /// ([`DataChange`]).
+    ///
+    /// A commit inside the operation (to free space, or a snapshot's) moves
+    /// the checkpoint to the state after that commit: what a commit made
+    /// durable is not undone. (A whole-tree operation's commit that fails
+    /// keeps the checkpoint: the operation is undone.) Operations nest;
+    /// the outermost one owns the checkpoint.
+    pub(crate) fn op<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        self.run_op(false, f)
+    }
+
+    /// [`op`](Self::op) for operations that change the trees and the space
+    /// map other than item by item (snapshots replace a whole tree and free
+    /// blocks it still points at): the checkpoint keeps the whole trees,
+    /// and undo restores them and replays the space-map log up to it. Each
+    /// such operation commits first, so the trees it keeps are clean.
+    pub(crate) fn op_whole<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        self.run_op(true, f)
+    }
+
+    fn run_op<T>(&mut self, whole: bool, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        if self.op_cp.is_some() {
+            return f(self);
         }
-        r
+        self.op_cp = Some(self.checkpoint(whole));
+        self.op_times.clear();
+        let gen0 = self.body.generation;
+        let r = f(self);
+        // An operation a commit split, or one that changes whole trees,
+        // has no log record: fsync commits until the next commit.
+        if whole || self.body.generation != gen0 {
+            self.ilog.disable();
+        }
+        let cp = self.op_cp.take().expect("operation checkpoint");
+        let undo = self.store.undo.take();
+        match r {
+            Ok(v) => {
+                if let Some(mut u) = undo {
+                    u.clear();
+                    self.undo_spare = u;
+                }
+                self.apply_data_changes();
+                Ok(v)
+            }
+            Err(e) => {
+                self.op_data.clear();
+                if self.poisoned {
+                    return Err(e);
+                }
+                if let Err(re) = self.undo_op(cp, undo.unwrap_or_default()) {
+                    // Report why recovery stopped (a lost device, say).
+                    self.poisoned = true;
+                    return Err(re);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn checkpoint(&mut self, whole: bool) -> OpCheckpoint {
+        self.store.undo = (!whole).then(|| core::mem::take(&mut self.undo_spare));
+        OpCheckpoint {
+            trees: whole.then(|| (self.fs_tree.clone(), self.meta.clone())),
+            log_len: self.store.log.len(),
+            dead_len: self.store.dead_pending.len(),
+            next_ino: self.next_ino,
+            next_snap_id: self.next_snap_id,
+            live_deadlist: self.live_deadlist,
+            next_deadlist: self.next_deadlist,
+            latest_snap_gen: self.store.latest_snap_gen,
+            txn_dirty: self.txn_dirty,
+            txn_data: self.txn_data,
+            txn_meta: self.txn_meta,
+        }
+    }
+
+    /// Puts back the state of `cp` (see [`op`](Self::op)).
+    fn undo_op(&mut self, cp: OpCheckpoint, undo: Vec<Undo>) -> Result<()> {
+        self.ops_undone += 1;
+        self.next_ino = cp.next_ino;
+        self.next_snap_id = cp.next_snap_id;
+        self.live_deadlist = cp.live_deadlist;
+        self.next_deadlist = cp.next_deadlist;
+        self.store.latest_snap_gen = cp.latest_snap_gen;
+        self.txn_data = cp.txn_data;
+        self.txn_meta = cp.txn_meta;
+        let mut rebuild = core::mem::take(&mut self.store.space_unlogged);
+        self.unlogged_rebuilds += rebuild as u64;
+        if let Some((fs_tree, meta)) = cp.trees {
+            self.fs_tree = fs_tree;
+            self.meta = meta;
+            self.txn_dirty = cp.txn_dirty;
+            rebuild |= self.store.log.len() != cp.log_len;
+            self.store.log.truncate(cp.log_len);
+            self.store.dead_pending.truncate(cp.dead_len);
+        } else {
+            // `txn_dirty` stays set: nodes made dirty stay dirty.
+            let log_frees = self.undo_items(undo)?;
+            rebuild |= !log_frees.is_empty();
+            for i in log_frees {
+                self.store.log.remove(i);
+            }
+        }
+        if rebuild {
+            let relocs = self.store.space.relocations.clone();
+            self.rebuild_space(relocs)?;
+        }
+        Ok(())
+    }
+
+    /// Puts back the tree items in `undo`, newest change first, and takes
+    /// the releases of file data they point at out of
+    /// [`Store::dead_pending`]. Returns the [`Store::log`] entries that
+    /// freed such data, descending, for the caller to remove (the space
+    /// map must then be rebuilt). Nodes this dirties free their old copies
+    /// as usual (logged after every returned index).
+    fn undo_items(&mut self, undo: Vec<Undo>) -> Result<Vec<usize>> {
+        let mut log_frees = Vec::new();
+        for u in undo.into_iter().rev() {
+            match u {
+                Undo::Item(t, key, old) => {
+                    let tree = match t {
+                        TreeId::Meta => &mut self.meta,
+                        _ => &mut self.fs_tree,
+                    };
+                    match old {
+                        Some(v) => tree.insert(&mut self.store, key, v)?,
+                        None => {
+                            tree.remove(&mut self.store, &key)?;
+                        }
+                    }
+                }
+                Undo::LogFree(i) => log_frees.push(i),
+                // Recorded oldest first, undone newest first: descending,
+                // so each removal leaves the indices still to come valid.
+                Undo::DeadPending(i) => {
+                    self.store.dead_pending.remove(i);
+                }
+            }
+        }
+        Ok(log_frees)
+    }
+
+    /// Queues a dirty-data change for when the operation succeeds.
+    fn defer(&mut self, c: DataChange) {
+        debug_assert!(self.op_cp.is_some(), "data change outside an operation");
+        self.op_data.push(c);
+    }
+
+    fn apply_data_changes(&mut self) {
+        if self.op_data.is_empty() {
+            return;
+        }
+        let mut changes = core::mem::take(&mut self.op_data);
+        for c in changes.drain(..) {
+            match c {
+                DataChange::DropFile(ino) => {
+                    self.ilog.note_dropped(ino, 0);
+                    if let Some(m) = self.dirty_data.remove(&ino) {
+                        self.dirty_blocks -= m.len();
+                    }
+                }
+                DataChange::DropFrom(ino, keep) => {
+                    self.ilog.note_dropped(ino, keep);
+                    if let Some(m) = self.dirty_data.get_mut(&ino) {
+                        let dropped = m.split_off(&keep);
+                        self.dirty_blocks -= dropped.len();
+                        if m.is_empty() {
+                            self.dirty_data.remove(&ino);
+                        }
+                    }
+                }
+                DataChange::ZeroTail {
+                    ino,
+                    idx,
+                    from,
+                    old,
+                } => {
+                    if let Some(b) = self.dirty_data.get_mut(&ino).and_then(|m| m.get_mut(&idx)) {
+                        b[from..].fill(0);
+                    } else if let Some(mut b) = old {
+                        b[from..].fill(0);
+                        self.put_dirty(ino, idx, b);
+                    } else {
+                        debug_assert!(false, "tail block neither dirty nor read");
+                    }
+                }
+            }
+        }
+        self.op_data = changes;
     }
 
     // ---- file data ----
@@ -1872,25 +2304,35 @@ impl<D: BlockDevice> Filesystem<D> {
         Ok(len)
     }
 
-    fn dirty_block(&mut self, ino: u64, idx: u64, need_old: bool) -> Result<&mut Block> {
-        let present = self
+    /// Block `idx` of file `ino` as committed, unless it is dirty (then
+    /// `None`: the dirty copy is newer).
+    fn old_block_unless_dirty(&mut self, ino: u64, idx: u64) -> Result<Option<Block>> {
+        if self
             .dirty_data
             .get(&ino)
-            .is_some_and(|m| m.contains_key(&idx));
-        if !present {
-            let mut b = zero_block();
-            if need_old {
-                self.read_disk_blocks(ino, idx, 1, &mut b[..])?;
-            }
-            self.dirty_data.entry(ino).or_default().insert(idx, b);
+            .is_some_and(|m| m.contains_key(&idx))
+        {
+            return Ok(None);
+        }
+        let mut b = zero_block();
+        self.read_disk_blocks(ino, idx, 1, &mut b[..])?;
+        Ok(Some(b))
+    }
+
+    /// The dirty copy of block `idx` of file `ino`, made from `old` (or
+    /// zeros) if it is not dirty yet.
+    fn dirty_block(&mut self, ino: u64, idx: u64, old: Option<Block>) -> &mut Block {
+        self.ilog.note_dirty(ino, idx);
+        let m = self.dirty_data.entry(ino).or_default();
+        let mut added = false;
+        let b = m.entry(idx).or_insert_with(|| {
+            added = true;
+            old.unwrap_or_else(zero_block)
+        });
+        if added {
             self.dirty_blocks += 1;
         }
-        Ok(self
-            .dirty_data
-            .get_mut(&ino)
-            .unwrap()
-            .get_mut(&idx)
-            .unwrap())
+        b
     }
 
     /// Writes `data` at `off`, extending the file if needed.
@@ -1918,6 +2360,27 @@ impl<D: BlockDevice> Filesystem<D> {
         // Data blocks plus about one metadata node per extent.
         self.ensure_space(nblocks, nblocks / 32 + 8, false)?;
         self.txn_dirty = true;
+        // Everything that can fail comes before the data goes in: the old
+        // content of partly written blocks, then the inode.
+        let partial = |idx: u64| {
+            let bstart = idx * bs;
+            let from = if idx == first { off - bstart } else { 0 };
+            let to = if idx == last { end - bstart } else { bs };
+            (from != 0 || to != bs) && bstart < a.size
+        };
+        let mut old = [None, None];
+        for (slot, idx) in [first, last].into_iter().enumerate() {
+            if (slot == 0 || last != first) && partial(idx) {
+                old[slot] = self.old_block_unless_dirty(ino, idx)?;
+            }
+        }
+        let now = self.op_now();
+        if end > a.size {
+            a.size = end;
+        }
+        a.mtime_ns = now;
+        a.ctime_ns = now;
+        self.put_inode(&a)?;
         let mut pos = 0usize;
         for idx in first..=last {
             let bstart = idx * bs;
@@ -1931,21 +2394,16 @@ impl<D: BlockDevice> Filesystem<D> {
             } else {
                 BLOCK_SIZE
             };
-            // Only blocks that existed before need their old content.
-            let need_old = (from != 0 || to != BLOCK_SIZE) && bstart < a.size;
-            let b = self.dirty_block(ino, idx, need_old)?;
+            let prior = if idx == first {
+                old[0].take()
+            } else if idx == last {
+                old[1].take()
+            } else {
+                None
+            };
+            let b = self.dirty_block(ino, idx, prior);
             b[from..to].copy_from_slice(&data[pos..pos + (to - from)]);
             pos += to - from;
-        }
-        let now = self.clock.now_ns();
-        if end > a.size {
-            a.size = end;
-        }
-        a.mtime_ns = now;
-        a.ctime_ns = now;
-        self.put_inode(&a)?;
-        if self.dirty_blocks > self.dirty_limit_blocks {
-            self.flush_early()?;
         }
         Ok(data.len())
     }
@@ -1966,17 +2424,26 @@ impl<D: BlockDevice> Filesystem<D> {
         let bs = BLOCK_SIZE as u64;
         if size < a.size {
             let keep = size.div_ceil(bs);
-            if let Some(m) = self.dirty_data.get_mut(&ino) {
-                let dropped = m.split_off(&keep);
-                self.dirty_blocks -= dropped.len();
-            }
+            // Read the new last block first (it is below `keep`, so the
+            // punch leaves it); the dirty data changes once all succeeded.
+            let tail = if size.is_multiple_of(bs) {
+                None
+            } else {
+                let idx = size / bs;
+                Some((idx, self.old_block_unless_dirty(ino, idx)?))
+            };
             self.punch(ino, keep, u64::MAX)?;
-            if !size.is_multiple_of(bs) {
-                let b = self.dirty_block(ino, size / bs, true)?;
-                b[(size % bs) as usize..].fill(0);
+            self.defer(DataChange::DropFrom(ino, keep));
+            if let Some((idx, old)) = tail {
+                self.defer(DataChange::ZeroTail {
+                    ino,
+                    idx,
+                    from: (size % bs) as usize,
+                    old,
+                });
             }
         }
-        let now = self.clock.now_ns();
+        let now = self.op_now();
         a.size = size;
         a.mtime_ns = now;
         a.ctime_ns = now;
@@ -2023,7 +2490,7 @@ impl<D: BlockDevice> Filesystem<D> {
             let cut_to = to.min(end);
             self.fs_tree
                 .remove(&mut self.store, &Key::new(ino, K_EXTENT, start))?;
-            self.store.release(
+            self.store.release_data(
                 TreeId::Fs,
                 e.phys + (cut_from - start),
                 cut_to - cut_from,
@@ -2051,19 +2518,33 @@ impl<D: BlockDevice> Filesystem<D> {
 
     /// Writes dirty file data to new extents (not yet committed).
     ///
-    /// Never loses data: on any failure every block that did not reach the
-    /// device is back in `dirty_data` (decrypted from the write queue if it
-    /// was already sealed), while extents already in the tree keep pointing
-    /// at the unwritten blocks until the next flush replaces them. Blocks
-    /// whose write failed join the bad set. An error that left the tree
-    /// half-changed stops the volume.
+    /// Never loses data. If building the extents fails (no space, or a
+    /// tree read failing), the flush is undone as a whole: tree items back
+    /// (see [`undo_items`](Self::undo_items)), its allocations and data
+    /// releases out of the space-map log and the map rebuilt, every block
+    /// back in `dirty_data`. If the write itself fails, every block that
+    /// did not reach the device is back in `dirty_data` (decrypted from the
+    /// write queue if it was already sealed), while extents already in the
+    /// tree keep pointing at the unwritten blocks until the next flush
+    /// replaces them; blocks whose write failed join the bad set. Only a
+    /// failure while undoing stops the volume.
     fn flush_data(&mut self) -> Result<()> {
         let mut data = core::mem::take(&mut self.dirty_data);
         self.dirty_blocks = 0;
         let mut queued = Vec::new();
-        let r = self
-            .queue_data(&mut data, &mut queued)
-            .and_then(|()| self.store.io.write_batch());
+        let log0 = self.store.log.len();
+        debug_assert!(self.store.undo.is_none(), "flush inside an operation");
+        self.store.undo = Some(Vec::new());
+        let q = self.queue_data(&mut data, &mut queued);
+        let undo = self.store.undo.take().unwrap_or_default();
+        if let Err(e) = q {
+            if let Err(re) = self.undo_flush(undo, log0, data, queued) {
+                self.poisoned = true;
+                return Err(re);
+            }
+            return Err(e);
+        }
+        let r = self.store.io.write_batch();
         if r.is_err() {
             self.note_failed_writes();
             if let Err(e) = self.restore_data(data, queued) {
@@ -2072,6 +2553,30 @@ impl<D: BlockDevice> Filesystem<D> {
             }
         }
         r
+    }
+
+    /// Undoes a flush whose extents could not all be built (see
+    /// [`flush_data`](Self::flush_data)); `log0` is the log length before it.
+    fn undo_flush(
+        &mut self,
+        undo: Vec<Undo>,
+        log0: usize,
+        data: BTreeMap<u64, BTreeMap<u64, Block>>,
+        queued: Vec<QueuedRun>,
+    ) -> Result<()> {
+        let mut drop = self.undo_items(undo)?;
+        drop.extend(
+            (log0..self.store.log.len())
+                .filter(|&i| matches!(self.store.log[i], SpaceOp::Data { .. })),
+        );
+        drop.sort_unstable();
+        drop.dedup();
+        for i in drop.into_iter().rev() {
+            self.store.log.remove(i);
+        }
+        self.restore_data(data, queued)?;
+        let relocs = self.store.space.relocations.clone();
+        self.rebuild_space(relocs)
     }
 
     /// Seals and queues `data` into new extents. Blocks leave `data` only
@@ -2096,10 +2601,7 @@ impl<D: BlockDevice> Filesystem<D> {
                     ino,
                     idx,
                 });
-                if let Err(e) = self.punch(ino, idx, idx + n) {
-                    self.poisoned = true;
-                    return Err(e);
-                }
+                self.punch(ino, idx, idx + n)?;
                 let nonce = self.store.io.sealer.reserve_nonces(n);
                 let mut macs = Vec::with_capacity(n as usize);
                 for j in 0..n {
@@ -2130,13 +2632,8 @@ impl<D: BlockDevice> Filesystem<D> {
                     nonce,
                     macs,
                 };
-                if let Err(e) =
-                    self.fs_tree
-                        .insert(&mut self.store, Key::new(ino, K_EXTENT, idx), e.encode())
-                {
-                    self.poisoned = true;
-                    return Err(e);
-                }
+                self.fs_tree
+                    .insert(&mut self.store, Key::new(ino, K_EXTENT, idx), e.encode())?;
             }
             entry.remove();
         }
@@ -2174,6 +2671,7 @@ impl<D: BlockDevice> Filesystem<D> {
     }
 
     fn put_dirty(&mut self, ino: u64, idx: u64, b: Block) {
+        self.ilog.note_dirty(ino, idx);
         if self
             .dirty_data
             .entry(ino)
@@ -2251,6 +2749,32 @@ impl<D: BlockDevice> Filesystem<D> {
         relocs: Vec<u64>,
     ) -> Result<()> {
         self.note_failed_writes();
+        self.rebuild_space(relocs)?;
+
+        let mut written = core::mem::take(&mut self.store.written);
+        for a in written.keys() {
+            self.store.cache.forget(*a);
+        }
+        self.fs_tree.unwrite(&mut written, attempted)?;
+        self.meta.unwrite(&mut written, attempted)?;
+        if let Some((&a, _)) = written.first_key_value() {
+            return Err(Error::Corrupt("failed commit wrote an unreachable node", a));
+        }
+        if self.store.io.flush_failed() {
+            self.redirty_unflushed()?;
+        }
+        if sb_started {
+            self.gen_floor = self.gen_floor.max(attempted);
+            self.rewrite_all_slots = true;
+        }
+        Ok(())
+    }
+
+    /// Rebuilds the space map: the last commit's, with the open
+    /// transaction's logged changes ([`Store::log`]) replayed onto it, the
+    /// mount's bad set kept, and chunks `relocs` (plus any with a copy on a
+    /// bad block) queued to move.
+    fn rebuild_space(&mut self, relocs: Vec<u64>) -> Result<()> {
         let b = &self.body;
         let mut space = self.store.space.reopen(
             &mut self.store.io,
@@ -2276,23 +2800,6 @@ impl<D: BlockDevice> Filesystem<D> {
         space.relocations = relocs;
         space.refresh_releasing(&mut self.store.io)?;
         self.store.space = space;
-
-        let mut written = core::mem::take(&mut self.store.written);
-        for a in written.keys() {
-            self.store.cache.forget(*a);
-        }
-        self.fs_tree.unwrite(&mut written, attempted)?;
-        self.meta.unwrite(&mut written, attempted)?;
-        if let Some((&a, _)) = written.first_key_value() {
-            return Err(Error::Corrupt("failed commit wrote an unreachable node", a));
-        }
-        if self.store.io.flush_failed() {
-            self.redirty_unflushed()?;
-        }
-        if sb_started {
-            self.gen_floor = self.gen_floor.max(attempted);
-            self.rewrite_all_slots = true;
-        }
         Ok(())
     }
 
@@ -2362,11 +2869,45 @@ impl<D: BlockDevice> Filesystem<D> {
     /// or once the bad set passes 1/64 of the volume: it then returns the I/O error and the volume is
     /// degraded ([`Error::DeviceFailing`]) until a later `commit` succeeds.
     /// A commit refused for space ([`Error::NoSpace`]) is rebuilt the same
-    /// way and the volume stays writable. On disk the volume is always the
+    /// way and the volume stays writable. A read the commit needed that
+    /// failed its checksum ([`Error::Corrupt`]) is retried the same way,
+    /// since the damage may be in transit; if it persists, the volume
+    /// degrades. With fewer than two superblock slots still taking writes
+    /// it degrades at once ([`Error::DeviceFailing`]). On disk the volume is always the
     /// last completed commit.
     pub fn commit(&mut self) -> Result<()> {
+        // Inside an operation (a commit to free space, or a snapshot's):
+        // drop the checkpoint so the trees are not shared while they are
+        // written, and take a new one at the state the commit leaves.
+        let held = self.op_cp.take();
+        // Operations commit only before they change anything.
+        debug_assert!(self.op_data.is_empty());
+        debug_assert!(
+            self.store
+                .undo
+                .as_ref()
+                .is_none_or(|u| u.iter().all(|x| !matches!(x, Undo::Item(..))))
+        );
+        self.store.undo = None;
+        let r = self.commit_attempts();
+        match held {
+            // A whole-tree operation whose commit failed is undone back to
+            // before its changes (the failed commit left them in memory).
+            Some(cp) if cp.trees.is_some() && r.is_err() => self.op_cp = Some(cp),
+            Some(cp) => self.op_cp = Some(self.checkpoint(cp.trees.is_some())),
+            None => {}
+        }
+        r
+    }
+
+    fn commit_attempts(&mut self) -> Result<()> {
         if self.poisoned {
             return Err(Error::Poisoned);
+        }
+        // A degraded volume tries every superblock slot again: one that
+        // failed may work now.
+        if self.degraded {
+            self.dead_slots = 0;
         }
         // Queued repairs of bad metadata copies are written by the next
         // commit even when nothing else changed.
@@ -2391,11 +2932,19 @@ impl<D: BlockDevice> Filesystem<D> {
                 }
                 Err(e) => e,
             };
+            // Its superblock may have landed with a new chain start: log
+            // nothing more until a commit is known to have landed.
+            self.ilog.disable();
             // The on-disk state is still the previous commit (or the failed
             // one, if its superblock landed).
             self.store.io.discard_batch();
             self.store.io.discard_repairs();
-            if self.poisoned || !matches!(e, Error::Io(_) | Error::NoSpace) {
+            if self.poisoned
+                || !matches!(
+                    e,
+                    Error::Io(_) | Error::Corrupt(..) | Error::NoSpace | Error::DeviceFailing
+                )
+            {
                 self.poisoned = true;
                 return Err(e);
             }
@@ -2406,6 +2955,11 @@ impl<D: BlockDevice> Filesystem<D> {
                 return Err(re);
             }
             if e == Error::NoSpace {
+                return Err(e);
+            }
+            if e == Error::DeviceFailing {
+                // Fewer than two superblock slots still take writes.
+                self.degraded = true;
                 return Err(e);
             }
             if attempt >= COMMIT_ATTEMPTS || self.store.space.bad.len() > self.bad_limit() {
@@ -2433,9 +2987,16 @@ impl<D: BlockDevice> Filesystem<D> {
         }
         self.flush_data()?;
         let fs_root = self.fs_tree.write(&mut self.store, generation)?;
-        if let Err(e) = crate::snapshot::flush_deadlist(self) {
-            // Tree changes a rebuild cannot undo.
-            self.poisoned = true;
+        // Undone item by item if it fails part way (a rebuild does not
+        // undo tree changes).
+        self.store.undo = Some(Vec::new());
+        let r = crate::snapshot::flush_deadlist(self);
+        let undo = self.store.undo.take().unwrap_or_default();
+        if let Err(e) = r {
+            if let Err(re) = self.undo_items(undo) {
+                self.poisoned = true;
+                return Err(re);
+            }
             return Err(e);
         }
         let meta_root = self.meta.write(&mut self.store, generation)?;
@@ -2483,7 +3044,7 @@ impl<D: BlockDevice> Filesystem<D> {
                 .unwrap_or(generation)
                 .min(generation.saturating_sub(crate::space::QUARANTINE_COMMITS - 1))
                 .max(1),
-            log_root: BlockPtr::NULL,
+            log_start: self.ilog.next_start(),
             // Generation 0 is format's starting state, never a commit.
             history: core::iter::once(self.body.core())
                 .filter(|c| c.generation > 0)
@@ -2510,10 +3071,12 @@ impl<D: BlockDevice> Filesystem<D> {
             &self.header,
             &body,
             self.rewrite_all_slots || self.replay_bump,
+            &mut self.dead_slots,
         )?;
         self.rewrite_all_slots = false;
         self.replay_bump = false;
         self.header.generation = generation;
+        self.ilog.committed(generation, body.log_start);
         self.body = body;
         self.store.space.committed(generation, now);
         self.txn_dirty = false;

@@ -22,7 +22,6 @@ use crate::error::{Error, Result};
 use crate::io::{Block, Io, zero_block};
 use crate::ptr::{BlockPtr, PTR_LEN};
 use crate::space::Space;
-use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -84,7 +83,10 @@ pub enum TreeId {
 #[derive(Debug, Clone)]
 pub enum Child {
     Clean(BlockPtr),
-    Dirty(Box<Node>),
+    /// A changed node, not yet written. Shared (copy on write in memory)
+    /// so a [`Tree`] clone is a cheap checkpoint: a change made after the
+    /// clone copies only the nodes it touches (see `Filesystem::op`).
+    Dirty(Arc<Node>),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -272,6 +274,12 @@ impl NodeCache {
     }
 
     /// Drops the entry for logical address `a`, if any.
+    /// Drops every cached node.
+    pub fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
+
     pub fn forget(&mut self, a: u64) {
         self.map.remove(&a);
     }
@@ -311,6 +319,24 @@ pub struct Store<D> {
     /// failed commit can turn them back into dirty nodes
     /// ([`Tree::unwrite`]).
     pub written: BTreeMap<u64, Arc<Node>>,
+    /// Undo log of the operation in progress (`Filesystem::op`), `None`
+    /// outside one.
+    pub undo: Option<Vec<Undo>>,
+    /// A space-map change failed part way, so the map no longer matches
+    /// [`log`](Self::log) until it is rebuilt.
+    pub space_unlogged: bool,
+}
+
+/// One undo record of an operation in progress. Recording costs no copy:
+/// a changed item's old value is moved here.
+#[derive(Debug)]
+pub enum Undo {
+    /// Item `key` of tree `.0` held `.2` (`None`: absent) before.
+    Item(TreeId, Key, Option<Vec<u8>>),
+    /// Entry `.0` of [`Store::log`] freed file data an item pointed at.
+    LogFree(usize),
+    /// Entry `.0` of [`Store::dead_pending`]: the same, for data a snapshot holds.
+    DeadPending(usize),
 }
 
 /// One space-map change of the open transaction, recorded by [`Store`].
@@ -353,10 +379,34 @@ impl<D: BlockDevice> Store<D> {
     }
 
     /// Frees `[addr, addr+len)` in the space map, recording it in the log.
+    /// A free that fails part way sets [`space_unlogged`](Self::space_unlogged).
     pub fn free(&mut self, addr: u64, len: u64) -> Result<()> {
-        self.space.free(&mut self.io, addr, len)?;
+        if let Err(e) = self.space.free(&mut self.io, addr, len) {
+            self.space_unlogged = true;
+            return Err(e);
+        }
         self.log.push(SpaceOp::Free(addr, len));
         Ok(())
+    }
+
+    /// [`release`](Self::release) of file data a tree item stops pointing
+    /// at, recorded for the operation's undo (the item may come back).
+    pub fn release_data(&mut self, tree: TreeId, addr: u64, len: u64, birth: u64) -> Result<()> {
+        let (log, dead) = (self.log.len(), self.dead_pending.len());
+        self.release(tree, addr, len, birth)?;
+        if self.log.len() > log {
+            self.record(Undo::LogFree(log));
+        } else if self.dead_pending.len() > dead {
+            self.record(Undo::DeadPending(dead));
+        }
+        Ok(())
+    }
+
+    /// Adds `u` to the undo log of the operation in progress, if any.
+    pub fn record(&mut self, u: Undo) {
+        if let Some(v) = &mut self.undo {
+            v.push(u);
+        }
     }
 }
 
@@ -370,17 +420,17 @@ fn make_dirty<'a, D: BlockDevice>(
         let n = s.read_node(tree, &p)?;
         let node = (*n).clone();
         s.release(tree, p.addr, 1, p.birth)?;
-        *c = Child::Dirty(Box::new(node));
+        *c = Child::Dirty(Arc::new(node));
     }
     match c {
-        Child::Dirty(n) => Ok(n),
+        Child::Dirty(n) => Ok(Arc::make_mut(n)),
         Child::Clean(_) => unreachable!(),
     }
 }
 
 fn dirty_mut(c: &mut Child) -> &mut Node {
     match c {
-        Child::Dirty(n) => n,
+        Child::Dirty(n) => Arc::make_mut(n),
         Child::Clean(_) => unreachable!("expected a dirty node"),
     }
 }
@@ -469,7 +519,7 @@ impl Tree {
         let id = self.id;
         match &mut self.root {
             None => {
-                self.root = Some(Child::Dirty(Box::new(Node {
+                self.root = Some(Child::Dirty(Arc::new(Node {
                     level: 0,
                     items: alloc::vec![(key, val)],
                     kids: Vec::new(),
@@ -489,12 +539,12 @@ impl Tree {
                         Child::Dirty(n) => n.min_key(),
                         Child::Clean(_) => unreachable!(),
                     };
-                    *root = Child::Dirty(Box::new(Node {
+                    *root = Child::Dirty(Arc::new(Node {
                         level,
                         items: Vec::new(),
                         kids: alloc::vec![
                             (lk, left),
-                            (right.min_key(), Child::Dirty(Box::new(right)))
+                            (right.min_key(), Child::Dirty(Arc::new(right)))
                         ],
                     }));
                 }
@@ -657,10 +707,14 @@ fn insert_rec<D: BlockDevice>(
 ) -> Result<()> {
     let node = make_dirty(c, s, tree)?;
     if node.level == 0 {
-        match node.items.binary_search_by(|(k, _)| k.cmp(&key)) {
-            Ok(i) => node.items[i].1 = val,
-            Err(i) => node.items.insert(i, (key, val)),
-        }
+        let old = match node.items.binary_search_by(|(k, _)| k.cmp(&key)) {
+            Ok(i) => Some(core::mem::replace(&mut node.items[i].1, val)),
+            Err(i) => {
+                node.items.insert(i, (key, val));
+                None
+            }
+        };
+        s.record(Undo::Item(tree, key, old));
         return Ok(());
     }
     let i = node.child_index(&key);
@@ -672,7 +726,7 @@ fn insert_rec<D: BlockDevice>(
     if child.size() > NODE_CAP {
         let right = child.split();
         node.kids
-            .insert(i + 1, (right.min_key(), Child::Dirty(Box::new(right))));
+            .insert(i + 1, (right.min_key(), Child::Dirty(Arc::new(right))));
     }
     Ok(())
 }
@@ -686,7 +740,8 @@ fn remove_rec<D: BlockDevice>(
     let node = make_dirty(c, s, tree)?;
     if node.level == 0 {
         if let Ok(i) = node.items.binary_search_by(|(k, _)| k.cmp(key)) {
-            node.items.remove(i);
+            let (k, v) = node.items.remove(i);
+            s.record(Undo::Item(tree, k, Some(v)));
         }
         return Ok(());
     }
@@ -713,19 +768,21 @@ fn rebalance<D: BlockDevice>(
     } else {
         (i - 1, i)
     };
+    // Both reads first: a failure leaves the tree whole (only underfull).
     make_dirty(&mut node.kids[r].1, s, tree)?;
+    make_dirty(&mut node.kids[l].1, s, tree)?;
     let right = match node.kids.remove(r).1 {
         Child::Dirty(n) => n,
         Child::Clean(_) => unreachable!(),
     };
-    let left = make_dirty(&mut node.kids[l].1, s, tree)?;
-    let right = *right;
+    let left = dirty_mut(&mut node.kids[l].1);
+    let right = Arc::unwrap_or_clone(right);
     left.items.extend(right.items);
     left.kids.extend(right.kids);
     if left.size() > NODE_CAP {
         let nr = left.split();
         node.kids
-            .insert(l + 1, (nr.min_key(), Child::Dirty(Box::new(nr))));
+            .insert(l + 1, (nr.min_key(), Child::Dirty(Arc::new(nr))));
     }
     Ok(())
 }
@@ -745,8 +802,10 @@ fn write_rec<D: BlockDevice>(
     addrs: &mut dyn Iterator<Item = u64>,
 ) -> Result<()> {
     let Child::Dirty(node) = c else { return Ok(()) };
-    for (_, k) in node.kids.iter_mut() {
-        write_rec(k, s, tree, generation, addrs)?;
+    if node.level > 0 {
+        for (_, k) in Arc::make_mut(node).kids.iter_mut() {
+            write_rec(k, s, tree, generation, addrs)?;
+        }
     }
     let addr = addrs.next().expect("allocated too few node blocks");
     let b = node.encode(tree, generation);
@@ -758,7 +817,7 @@ fn write_rec<D: BlockDevice>(
         b,
         node.level as u64,
     )?;
-    let node = Arc::new(core::mem::take(&mut **node));
+    let node = node.clone();
     s.written.insert(p.addr, node.clone());
     s.cache.put(p, node);
     *c = Child::Clean(p);
@@ -778,12 +837,12 @@ fn unwrite_rec(
         let n = written
             .remove(&p.addr)
             .ok_or(Error::Corrupt("failed commit's node not recorded", p.addr))?;
-        *c = Child::Dirty(Box::new(
-            Arc::try_unwrap(n).unwrap_or_else(|n| (*n).clone()),
-        ));
+        *c = Child::Dirty(n);
     }
-    if let Child::Dirty(n) = c {
-        for (_, k) in n.kids.iter_mut() {
+    if let Child::Dirty(n) = c
+        && n.level > 0
+    {
+        for (_, k) in Arc::make_mut(n).kids.iter_mut() {
             unwrite_rec(k, written, generation)?;
         }
     }

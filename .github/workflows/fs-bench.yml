@@ -1,0 +1,126 @@
+name: Filesystem benchmarks against ext4
+
+# OptimalFS against ext4 on the same partition of the same runner, same
+# workloads (fs/bench, method in fs/docs/BENCHMARKS.md). Three VMs per mode,
+# five runs each; the summary job prints the table. CI VMs are trend
+# only: the published numbers name this runner and its disk, and the
+# storage set's real gate runs on reference machines in Phase 4a.
+on:
+  pull_request:
+    paths: ["fs/bench/**", ".github/workflows/fs-bench.yml"]
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "Runs per VM"
+        default: "5"
+  schedule:
+    - cron: "0 20 * * 0" # Mondays 4 AM Perth
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [plain, encrypted]
+        vm: [1, 2, 3]
+    defaults:
+      run:
+        working-directory: fs/bench
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (pinned in fs/rust-toolchain.toml)
+        working-directory: fs
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Lint
+        run: |
+          cargo fmt --check
+          cargo clippy --release -- -D warnings
+      - name: Build
+        run: |
+          command -v cryptsetup >/dev/null || sudo apt-get install -y -q cryptsetup-bin
+          cargo build --release
+      - name: Smoke run (both targets, tiny counts, on a loop device)
+        run: |
+          truncate -s 3G /tmp/smoke.img
+          L=$(sudo losetup -f --show /tmp/smoke.img)
+          sudo DEV=$L DISK=$(basename $L) MODE=${{ matrix.mode }} RUNS=1 SCALE=0.01 SIZE_GIB=2 OUT=/tmp/smoke.jsonl ./run.sh
+          python3 summarize.py /tmp/smoke.jsonl | tail -3
+          sudo losetup -d $L
+      - name: Machine
+        run: |
+          set -x
+          uname -a
+          lscpu | grep -E 'Model name|^CPU\(s\)|Thread|NUMA node\(s\)|Flags' | cut -c1-200
+          free -m
+          lsblk -o NAME,SIZE,TYPE,ROTA,MODEL,MOUNTPOINTS
+          findmnt -n -o SOURCE,FSTYPE,OPTIONS /mnt || true
+          swapon --show || true
+          mke2fs -V 2>&1 | head -1; cryptsetup --version
+          sysctl vm.dirty_ratio vm.dirty_background_ratio vm.dirty_expire_centisecs vm.dirty_writeback_centisecs
+      - name: Pick the benchmark device
+        id: disk
+        run: |
+          # A separate temporary disk at /mnt (older Azure runners) is used
+          # raw once freed. Otherwise (runners whose root is a dm snapshot
+          # over EBS and instance storage, nothing free) a fully allocated
+          # 17 GiB file on the root file system behind a direct-I/O loop
+          # device: both file systems then run on the same loop, dm and EBS
+          # stack, and flushes go all the way down.
+          src=$(findmnt -n -o SOURCE /mnt || true)
+          disk=""
+          if [ -n "$src" ]; then
+            disk=$(lsblk -n -o PKNAME "$src")
+            root=$(lsblk -n -o PKNAME "$(findmnt -n -o SOURCE /)")
+            [ "$disk" != "$root" ] || disk=""
+          fi
+          if [ -n "$disk" ]; then
+            sudo swapoff -a
+            sudo umount /mnt
+          else
+            findmnt -n -o SOURCE,FSTYPE,OPTIONS /
+            sudo fallocate -l 17G /var/tmp/bench.img
+            src=$(sudo losetup -f --show --direct-io=on /var/tmp/bench.img)
+            disk=$(basename "$src")
+            cat /sys/block/$disk/loop/dio
+          fi
+          for f in queue/rotational queue/write_cache queue/scheduler queue/logical_block_size queue/physical_block_size device/model; do
+            echo "$disk $f: $(cat /sys/block/$disk/$f 2>/dev/null)"
+          done
+          echo "$src: $(lsblk -n -b -o SIZE "$src") bytes"
+          echo "dev=$src" >> "$GITHUB_OUTPUT"
+          echo "disk=$disk" >> "$GITHUB_OUTPUT"
+      - name: Benchmark
+        run: |
+          sudo DEV=${{ steps.disk.outputs.dev }} DISK=${{ steps.disk.outputs.disk }} \
+            MODE=${{ matrix.mode }} RUNS=${{ github.event.inputs.runs || '5' }} \
+            OUT=$PWD/results-${{ matrix.mode }}-vm${{ matrix.vm }}.jsonl ./run.sh
+          python3 summarize.py results-*.jsonl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.mode }}-vm${{ matrix.vm }}
+          path: fs/bench/results-*.jsonl
+
+  summary:
+    needs: bench
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: results
+          merge-multiple: true
+      - name: Summary over all VMs
+        run: |
+          ls results
+          python3 fs/bench/summarize.py results/*.jsonl | tee summary.txt
+          { echo '```'; cat summary.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-summary
+          path: summary.txt

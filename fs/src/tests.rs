@@ -105,18 +105,21 @@ fn fresh_volume_space_hand_worked() {
     // blocks: the root inode's tree leaf, the root block, the bitmap and the
     // root table, all in chunk 0. Physically that is 4 superblock slots +
     // 2 x 64 (chunk 0's two copies) + 2 (the chunk-table root leaf's two
-    // copies) = 134 blocks. Nothing was freed, so there is no free log.
+    // copies) = 134 blocks, plus the intent log ring (4096 / 64 = 64
+    // blocks at 2..66). Nothing was freed, so there is no free log.
     let mut rng = Rng::new(3);
     let opts = FormatOptions {
         passphrase: None,
         kdf: crate::KdfParams::INSECURE_FAST_FOR_TESTS,
         quarantine_min_ns: 0,
         meta_chunk_blocks: 0,
+        intent_log_blocks: None,
     };
     let mut fs =
         Filesystem::format(MemDevice::new(4096), &opts, &mut rng, Box::new(ZeroClock)).unwrap();
     assert_eq!(fs.store.space.chunks.chunk_blocks(), 64);
-    assert_eq!(fs.statfs().free_blocks, 4096 - 134);
+    assert_eq!(fs.intent_log_blocks(), 64);
+    assert_eq!(fs.statfs().free_blocks, 4096 - 134 - 64);
     let chunks = fs.metadata_chunks().unwrap();
     assert_eq!(chunks.len(), 1);
     assert_eq!(
@@ -142,8 +145,8 @@ fn fresh_volume_space_hand_worked() {
     fs.write(f, 0, &[5u8; 10_000]).unwrap();
     fs.commit().unwrap();
     let g = fs.generation();
-    assert_eq!(fs.statfs().free_blocks, 4096 - 137);
-    assert_eq!(fs.store.space.allocatable_blocks(), 4096 - 137 - 2);
+    assert_eq!(fs.statfs().free_blocks, 4096 - 137 - 64);
+    assert_eq!(fs.store.space.allocatable_blocks(), 4096 - 137 - 64 - 2);
     let first = fs.store.space.held.front().unwrap().clone();
     assert_eq!(
         (first.generation, first.set.len(), first.lset.len()),
@@ -184,6 +187,7 @@ fn quarantine_time_window_hand_worked() {
             kdf: crate::KdfParams::INSECURE_FAST_FOR_TESTS,
             quarantine_min_ns: window_s * 1_000_000_000,
             meta_chunk_blocks: 0,
+            intent_log_blocks: None,
         };
         let mut fs =
             Filesystem::format(MemDevice::new(4096), &opts, &mut rng, Box::new(Tick(0))).unwrap();
@@ -265,6 +269,8 @@ fn tree_shrinks_after_mass_delete() {
         dead_pending: vec![],
         log: Vec::new(),
         written: Default::default(),
+        undo: None,
+        space_unlogged: false,
     };
     let mut t = Tree::new(TreeId::Meta, BlockPtr::NULL).unwrap();
     for i in 0..20_000u64 {
@@ -386,6 +392,7 @@ fn kdf_for_ram_hand_worked() {
         },
         quarantine_min_ns: 0,
         meta_chunk_blocks: 0,
+        intent_log_blocks: None,
     };
     let r = Filesystem::format(
         MemDevice::new(4096),
@@ -405,6 +412,7 @@ fn replay_bump_reaches_all_four_slots() {
         kdf: crate::KdfParams::INSECURE_FAST_FOR_TESTS,
         quarantine_min_ns: 0,
         meta_chunk_blocks: 0,
+        intent_log_blocks: None,
     };
     let mut fs = Filesystem::format(
         MemDevice::new(4096),
@@ -452,6 +460,7 @@ fn header_bytes_identical_in_every_slot_and_commit() {
         kdf: crate::KdfParams::INSECURE_FAST_FOR_TESTS,
         quarantine_min_ns: 0,
         meta_chunk_blocks: 0,
+        intent_log_blocks: None,
     };
     let mut fs = Filesystem::format(
         MemDevice::new(4096),
@@ -473,8 +482,11 @@ fn header_bytes_identical_in_every_slot_and_commit() {
     }
     let h1 = headers(&mut fs);
     assert!(h1.iter().all(|h| *h == h1[0]), "slots differ");
-    // Bytes 424..512 are reserved and zero.
-    assert!(h1[0][424..].iter().all(|&x| x == 0));
+    // 424..440: the intent log ring (start 2, 64 blocks of 4096), then
+    // reserved and zero up to 512.
+    assert_eq!(h1[0][424..432], 2u64.to_le_bytes());
+    assert_eq!(h1[0][432..436], 64u32.to_le_bytes());
+    assert!(h1[0][436..].iter().all(|&x| x == 0));
     fs.create(ROOT_INO, b"z", 0o644).unwrap();
     fs.commit().unwrap();
     assert_eq!(headers(&mut fs)[0], h1[0], "a commit changed the header");
@@ -489,6 +501,7 @@ fn feature_bits_hand_worked() {
         kdf: crate::KdfParams::INSECURE_FAST_FOR_TESTS,
         quarantine_min_ns: 0,
         meta_chunk_blocks: 0,
+        intent_log_blocks: None,
     };
     for (ro, inc) in [(1u32, 0u32), (0, 1)] {
         let mut fs = Filesystem::format(
@@ -540,6 +553,7 @@ fn redirty_rewrites_exactly_one_clean_chunk_table_path() {
         kdf: crate::KdfParams::INSECURE_FAST_FOR_TESTS,
         quarantine_min_ns: 0,
         meta_chunk_blocks: 1,
+        intent_log_blocks: None,
     };
     let mut fs =
         Filesystem::format(MemDevice::new(40_000), &opts, &mut rng, Box::new(ZeroClock)).unwrap();

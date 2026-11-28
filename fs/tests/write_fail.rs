@@ -5,8 +5,8 @@
 //!
 //! Checks, for a random workload with snapshots and remounts:
 //! 1. every write the workload makes, failing for good (the blocks it
-//!    covered go bad; superblock slots fail once instead, since a slot
-//!    cannot move): every operation still succeeds and matches the model,
+//!    covered go bad; a superblock slot cannot move, so commits write
+//!    around it): every operation still succeeds and matches the model,
 //!    fsck is clean, and a remount shows the committed model;
 //! 2. every flush failing once: the same;
 //! 3. a write failing for good, then a power cut at each of the next write
@@ -116,18 +116,18 @@ fn every_write_fails_for_good() {
                 continue;
             }
             let (start, n) = rf.writes[w as usize];
-            let persist = !is_slot(start, n);
+            let slot = is_slot(start, n);
             run_hidden(
                 seed,
                 enc,
                 &rf,
                 &format!(
-                    "write {w} of {} ({start}+{n}, persist {persist})",
+                    "write {w} of {} ({start}+{n}, superblock slot {slot})",
                     rf.writes.len()
                 ),
                 |d| {
                     d.faults.fail_write_at = Some(rf.format_writes + w);
-                    d.faults.fail_write_persists = persist;
+                    d.faults.fail_write_persists = true;
                 },
             );
         }
@@ -177,12 +177,11 @@ fn power_cut_while_a_failed_commit_is_retried() {
             if only.is_some_and(|o| o != w) {
                 continue;
             }
-            let (start, n) = rf.writes[w as usize];
             for after in 1..=24u64 {
                 let mut h = Harness::new(BLOCKS, enc, seed).unwrap();
                 let d = h.fs().device_mut();
                 d.faults.fail_write_at = Some(rf.format_writes + w);
-                d.faults.fail_write_persists = !is_slot(start, n);
+                d.faults.fail_write_persists = true;
                 let mut armed = false;
                 let mut cut_op = None;
                 for (i, op) in rf.ops.iter().enumerate() {
@@ -241,7 +240,7 @@ fn power_cut_while_a_failed_commit_is_retried() {
                     short(&rf.ops[i])
                 );
                 let mut mh = mount(img);
-                mh.model = cands[hit.unwrap()].clone();
+                mh.set_model(cands[hit.unwrap()].clone());
                 let g = mh.fs().generation();
                 let m = mh.model.clone();
                 mh.committed.insert(g, m);
@@ -296,9 +295,9 @@ fn dead_device_degrades_then_recovers() {
         fs.write(b, 0, &big).unwrap();
         assert!(!fs.degraded(), "enc {enc}: one failed early flush degrades");
         // Two more failed early flushes (three in all) degrade the volume.
-        fs.write(b, big.len() as u64, &big[..1 << 20]).unwrap();
+        fs.write(b, big.len() as u64, &big[..1 << 19]).unwrap();
         assert!(!fs.degraded());
-        fs.write(b, big.len() as u64 + (1 << 20), &big[..1 << 20])
+        fs.write(b, big.len() as u64 + (1 << 19), &big[..1 << 19])
             .unwrap();
         assert!(fs.degraded(), "enc {enc}: three failed early flushes");
         assert_eq!(fs.write(b, 0, b"x"), Err(Error::DeviceFailing));
@@ -312,8 +311,8 @@ fn dead_device_degrades_then_recovers() {
         assert_eq!(fs.write(a, 0, b"x"), Err(Error::DeviceFailing));
         // Reads see the transaction, which is still in memory.
         let mut want = big.clone();
-        want.extend_from_slice(&big[..1 << 20]);
-        want.extend_from_slice(&big[..1 << 20]);
+        want.extend_from_slice(&big[..1 << 19]);
+        want.extend_from_slice(&big[..1 << 19]);
         let mut buf = vec![0u8; want.len()];
         assert_eq!(fs.read(b, 0, &mut buf).unwrap(), want.len());
         assert!(buf == want, "enc {enc}: uncommitted data");
