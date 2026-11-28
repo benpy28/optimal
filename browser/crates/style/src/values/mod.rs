@@ -12,6 +12,10 @@
 //! - [`matcher`] decides whether a value is in the set a grammar
 //!   describes.
 //!
+//! - [`specified`] types a parse tree into a specified value and
+//!   serializes it, with [`calc`] (calculation trees), [`color`] and
+//!   [`serialize`] (single component values).
+//!
 //! [`compile`] builds every grammar once, on first use. [`value_matches`]
 //! is what [`crate::property::classify`] asks; [`parse_value`] says how a
 //! value matched ([`parse`]).
@@ -41,9 +45,14 @@
 //!   in the grammars here) it is this engine's limit, so matching stays
 //!   within a fixed stack.
 
+pub mod calc;
+pub mod color;
 pub mod matcher;
 pub mod math;
 pub mod parse;
+pub mod serialize;
+pub mod shortest;
+pub mod specified;
 pub mod syntax;
 pub mod table;
 pub mod types;
@@ -78,6 +87,9 @@ pub struct Compiled {
     pub shorthands: Vec<NodeId>,
     /// The top node of each production, by name.
     pub productions: HashMap<&'static str, NodeId>,
+    /// The serialization rules ([`shortest`]), by the top node of the
+    /// production or property grammar they apply to.
+    pub rules: HashMap<NodeId, shortest::Rule>,
 }
 
 /// Why the grammars couldn't be compiled. Always a mistake in the tables;
@@ -236,12 +248,14 @@ pub fn compile_with(
     }
     check(&g)?;
     let ctx = contexts(&g)?;
+    let rules = shortest::rules(&productions, property);
     Ok(Compiled {
         nodes: g.nodes,
         ctx,
         longhands,
         shorthands,
         productions,
+        rules,
     })
 }
 
@@ -457,4 +471,19 @@ pub fn parse_value<'t, 'a: 't>(
         Target::All | Target::Custom => return None,
     };
     parse::parse(g, top, values, 0)
+}
+
+/// The typed specified value of `values` for the property `target` names
+/// (see [`specified`]), or `None` where [`parse_value`] gives none.
+pub fn specified_value<'t, 'a: 't>(
+    target: Target,
+    values: impl IntoIterator<Item = ComponentValue<'t, 'a>>,
+) -> Option<specified::Specified> {
+    let tree = parse_value(target, values)?;
+    Some(specified::build(compiled(), &tree))
+}
+
+/// The serialization of a specified value ([`specified_value`]).
+pub fn serialize_specified(value: &specified::Specified) -> String {
+    specified::serialize(value, compiled())
 }

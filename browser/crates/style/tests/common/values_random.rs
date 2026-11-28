@@ -169,5 +169,6 @@ pub fn compiled(nodes: Vec<Node>) -> Compiled {
         longhands: Vec::new(),
         shorthands: Vec::new(),
         productions: HashMap::new(),
+        rules: HashMap::new(),
     }
 }

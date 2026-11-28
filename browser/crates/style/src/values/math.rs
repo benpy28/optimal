@@ -237,8 +237,8 @@ const ROUNDING_STRATEGIES: &[&str] = &["nearest", "up", "down", "to-zero", "line
 /// A component value of a calculation, with whether white space comes
 /// right before and right after it.
 #[derive(Clone, Copy)]
-struct Item<'t, 'a> {
-    v: ComponentValue<'t, 'a>,
+pub(super) struct Item<'t, 'a> {
+    pub(super) v: ComponentValue<'t, 'a>,
     ws_before: bool,
     ws_after: bool,
 }
@@ -249,7 +249,7 @@ fn is_ws(v: &ComponentValue<'_, '_>) -> bool {
 
 /// The arguments of a function: comma-separated runs of items, white
 /// space dropped but remembered on its neighbours.
-fn arguments<'t, 'a>(args: Values<'t, 'a>) -> Vec<Vec<Item<'t, 'a>>> {
+pub(super) fn arguments<'t, 'a>(args: Values<'t, 'a>) -> Vec<Vec<Item<'t, 'a>>> {
     let mut out: Vec<Vec<Item<'t, 'a>>> = vec![Vec::new()];
     let mut ws = false;
     for v in args {

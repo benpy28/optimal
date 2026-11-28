@@ -183,7 +183,8 @@ or canonical, which needs the IANA subtag registry.
 
 | Suite | Pinned commit | Passed | Notes |
 |---|---|---|---|
-| web-platform-tests `test_valid_value` / `test_invalid_value` calls in `css/css-values` and the `parsing` directory of each module the property table cites | 6852422 | 3,120 / 3,334 (214 listed) | `crates/style/tests/wpt_values.rs`: every call whose property and value are string literals, for properties in the table (824 calls for other properties and 264 non-literal calls are counted, not run; `*.tentative.*` pages skipped). Only validity is checked: whether the declaration is kept. Serialization of the valid cases is a later step's |
+| web-platform-tests `test_valid_value` / `test_invalid_value` calls in `css/css-values` and the `parsing` directory of each module the property table cites | 6852422 | 3,120 / 3,334 (214 listed) | `crates/style/tests/wpt_values.rs`: every call whose property and value are string literals, for properties in the table (824 calls for other properties and 264 non-literal calls are counted, not run; `*.tentative.*` pages skipped). Only validity is checked here: whether the declaration is kept |
+| web-platform-tests expected serializations of the valid longhand cases, plus the `css/css-values` math serialization pages and the `css/css-color/parsing` color tables | 6852422 | 2,249 / 2,339 (90 listed) | `wpt_valid_values_serialize` in the same file: the specified value's serialization must be one of the expected strings. 1,253 cases are page calls; 1,086 come from the pages' own helpers (`test_serialization`-style math pages with their templates, the fuzzy `rgb`/`hsl`/`hwb` tables within 0.01 per number, the exact `lab()` table and the `color()` template loop). 317 shorthand cases are counted and not run (shorthand serialization is a later step), as are values holding a substitution function |
 
 The 214 listed cases are in `conformance/wpt-values-expected.json`, each
 with its reason; the harness fails when a listed case passes. 196 are
@@ -231,6 +232,39 @@ function, ranges, unitless zero, the comma rule, colors and the
 reorderable combinators. Matching time grows linearly with the value on
 long and nested hostile values for every property (`scaling.rs`,
 `CSS_SCALING=1`).
+
+The 90 listed serialization cases are in
+`conformance/wpt-serialization-expected.json`, each with its reason; the
+harness fails when a listed case passes. 21 are later spec levels:
+`palette-mix()` percentages, which css-fonts-4 normalizes by css-color-5
+(18), and `sibling-index()`, which is css-values-5 (3). The other 69 are
+places where the test disagrees with the spec text at 7027ab6:
+
+- css-color-4 "Resolving color() values" makes only the computed and used
+  value of `color(xyz ...)` be `xyz-d65`; for the sRGB functions it says
+  "declared, computed and used", so the declared value keeps `xyz` (34);
+- `hanging-punctuation` components are written in grammar order, the
+  canonical order cssom-1 asks for; the tests keep the author's order (8);
+- `transform-origin` with one value stays one value: css-transforms-1
+  assumes the missing ones but has no serialization text that writes them
+  (8);
+- `counter-increment`, `counter-reset` and `counter-set` omit an integer
+  equal to its default, by cssom-1's rule to omit what can be omitted (9);
+- a single-child Product in a calculation is its child, so
+  `calc(pow(2, sign(1em - 18px)))` serializes as `pow(...)`. The literal
+  reading (no unwrap) keeps `calc()` here, but fails 11 cases elsewhere,
+  including `calc(clamp(1px, 1em, 1vh))`, which `clamp-length-serialize`
+  expects as `clamp(1px, 1em, 1vh)`: the tests disagree with each other
+  (3);
+- `background-size: auto` serializes as `auto auto`, as css-backgrounds-3
+  "Serialization of background-size values" says (2);
+- `translateX()` is written `translatex()`, the lowercase name of
+  css-values-4 "Serialization of Functional Notations"; the same page
+  expects `skewx()` (2);
+- `1.28rad` in `lch()` and `oklch()` is `73.338598` to cssom-1's six
+  decimals; the tests expect six significant digits (2);
+- `font-style: oblique 0deg` is not `normal`: css-fonts-4 matches them by
+  different paths and defines no equivalence (1).
 
 There are no computed values yet, so a value is checked as the specified
 value's text (a declaration's value as written, or the property table's
