@@ -47,7 +47,7 @@ enrol "$SB/VARS.fd"
 
 # The image every case starts from: conformance kernel, one module, signed config.
 python3 -c "import sys; sys.stdout.buffer.write(bytes((i*167+13)&0xff for i in range(100003)))" > "$OUT/pattern"
-export OB_REVISION=5 OB_EXPECT_CMDLINE="conformance case=secureboot" OB_EXPECT_MODULES=1
+export OB_REVISION=5 OB_EXPECT_CMDLINE="conformance case=secureboot" OB_EXPECT_MODULES=1 OB_EXPECT_VOLUME=gpt
 scripts/build-conformance.sh "$OUT/conformance-sb"
 KERNEL="$OUT/conformance-sb" CMDLINE="$OB_EXPECT_CMDLINE" MODULES="$OUT/pattern" scripts/build-images.sh >/dev/null
 cp "$OUT/disk.img" "$SB/base.img"

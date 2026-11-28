@@ -1382,6 +1382,55 @@ fn file_ok_in(c: &Ctx, f: u64, types: &[u64]) -> Result<lp::File, &'static str> 
     Ok(file)
 }
 
+/// The disk scripts/build-images.sh writes: GPT disk GUID
+/// 0B0071A1-0000-4000-8000-00000000D15C, one partition with GUID
+/// 0B0071A1-0000-4000-8000-0000000AA27A. Limine's UUID struct is the GPT
+/// on-disk encoding: first three fields little endian, last 8 bytes as is.
+const DISK_GUID: lp::Uuid = lp::Uuid {
+    a: 0x0b00_71a1,
+    b: 0,
+    c: 0x4000,
+    d: [0x80, 0, 0, 0, 0, 0, 0xd1, 0x5c],
+};
+const PART_GUID: lp::Uuid = lp::Uuid {
+    a: 0x0b00_71a1,
+    b: 0,
+    c: 0x4000,
+    d: [0x80, 0, 0, 0, 0, 0x0a, 0xa2, 0x7a],
+};
+
+/// With OB_EXPECT_VOLUME=gpt (the kernel is booted from build-images.sh's
+/// disk), the executable file's volume must be that disk's partition 1.
+/// This is the end-to-end check of the device-path reading in core::devpath
+/// and of the GPT header read that finds the disk GUID.
+fn boot_volume(t: &mut T, c: &Ctx, f: &lp::File) {
+    if option_env!("OB_EXPECT_VOLUME") != Some("gpt") {
+        return;
+    }
+    if !c.ours {
+        t.skip(
+            "ob-boot-volume",
+            "the reference boots its own image, with other GUIDs",
+        );
+        return;
+    }
+    check!(
+        t,
+        "ob-boot-volume",
+        f.media_type == 0
+            && f.partition_index == 1
+            && f.mbr_disk_id == 0
+            && f.gpt_disk_uuid == DISK_GUID
+            && f.gpt_part_uuid == PART_GUID,
+        "media {} partition {} mbr {:#x} disk {:x?} part {:x?}",
+        f.media_type,
+        f.partition_index,
+        f.mbr_disk_id,
+        f.gpt_disk_uuid,
+        f.gpt_part_uuid
+    );
+}
+
 fn files(t: &mut T, c: &Ctx) {
     match c
         .need(t, "executable-file", &req::EXEC_FILE, 2)
@@ -1405,6 +1454,7 @@ fn files(t: &mut T, c: &Ctx) {
                 cstr(c, f.path).unwrap_or("?"),
                 f.size
             );
+            boot_volume(t, c, &f);
         }
         Some(Err(e)) => t.fail("executable-file", format_args!("{e}")),
         None => {}

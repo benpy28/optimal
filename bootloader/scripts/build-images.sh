@@ -61,10 +61,11 @@ mkfs.vfat -F 32 -n OPTIMAL "$OUT/esp.img" >/dev/null 2>&1 || mkfs.vfat -n OPTIMA
 mcopy -s -i "$OUT/esp.img" "$STAGE/EFI" "$STAGE/boot" ::/
 cp "$STAGE/boot/optimal-boot.conf" "$OUT/optimal-boot.conf"
 
-# GPT disk: 1 MiB alignment, one ESP partition.
+# GPT disk: 1 MiB alignment, one ESP partition. Fixed GUIDs, so the
+# conformance kernel's ob-boot-volume check can compare what it is told.
 rm -f "$OUT/disk.img"
 truncate -s $(( size_mb + 2 ))M "$OUT/disk.img"
-printf 'label: gpt\nstart=2048, type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, name="EFI system"\n' | sfdisk -q "$OUT/disk.img" >/dev/null
+printf 'label: gpt\nlabel-id: 0B0071A1-0000-4000-8000-00000000D15C\nstart=2048, type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, uuid=0B0071A1-0000-4000-8000-0000000AA27A, name="EFI system"\n' | sfdisk -q "$OUT/disk.img" >/dev/null
 dd if="$OUT/esp.img" of="$OUT/disk.img" bs=1M seek=1 conv=notrunc status=none
 
 # El Torito CD (UEFI only for now; BIOS boot is a later stage).

@@ -8,6 +8,7 @@ use crate::memory::Pages;
 use alloc::vec::Vec;
 use core::ffi::c_void;
 use core::ptr;
+use optimal_boot_core::devpath;
 
 pub struct Volume {
     root: *mut efi::FileProtocol,
@@ -146,48 +147,38 @@ fn volume_info(device: efi::Handle) -> VolumeInfo {
     let Some(dp) = protocol::<efi::DevicePath>(device, &efi::DEVICE_PATH_GUID) else {
         return v;
     };
-    // Walk the device path; copy it up to (not including) the partition node
-    // so we can find the whole disk and read its GPT header.
-    let mut prefix: Vec<u8> = Vec::new();
-    let mut node = dp as *const u8;
-    for _ in 0..64 {
-        // SAFETY: device path nodes are a firmware-provided list ending in an
-        // end node (type 0x7f); each node's length covers its header.
-        let (typ, sub, len) = unsafe {
-            (
-                *node,
-                *node.add(1),
-                u16::from_le_bytes([*node.add(2), *node.add(3)]) as usize,
-            )
-        };
-        if typ == 0x7f || len < 4 {
-            break;
-        }
-        // SAFETY: the node is `len` bytes long.
-        let bytes = unsafe { core::slice::from_raw_parts(node, len) };
-        match (typ, sub) {
-            (4, 1) if len >= 42 => {
-                v.partition_index = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-                let sig = &bytes[24..40];
-                match bytes[41] {
-                    1 => v.mbr_disk_id = u32::from_le_bytes(sig[0..4].try_into().unwrap()),
-                    2 => {
-                        v.gpt_part_uuid.copy_from_slice(sig);
-                        v.gpt_disk_uuid = gpt_disk_uuid(&prefix).unwrap_or_default();
-                    }
-                    _ => {}
-                }
-            }
-            (4, 2) => v.optical = true,
-            _ => {}
-        }
-        if !(typ == 4 && (sub == 1 || sub == 2)) {
-            prefix.extend_from_slice(bytes);
-        }
-        // SAFETY: advancing by the node length stays inside the path.
-        node = unsafe { node.add(len) };
+    let Some(path) = device_path_bytes(dp) else {
+        return v;
+    };
+    // The path was measured, so `volume` cannot fail on it.
+    let Ok(vol) = devpath::volume(path) else {
+        return v;
+    };
+    v.optical = vol.optical;
+    v.partition_index = vol.partition_index;
+    v.mbr_disk_id = vol.mbr_disk_id;
+    if let Some(uuid) = vol.gpt_part_uuid {
+        v.gpt_part_uuid = uuid;
+        v.gpt_disk_uuid = gpt_disk_uuid(&path[..vol.disk_prefix]).unwrap_or_default();
     }
     v
+}
+
+/// The bytes of a firmware device path's first instance, End node included,
+/// measured node header by node header (core::devpath::measure) up to
+/// devpath::MAX_LEN. None for a malformed path.
+fn device_path_bytes<'a>(dp: *const efi::DevicePath) -> Option<&'a [u8]> {
+    let base = dp as *const u8;
+    let len = devpath::measure(
+        // SAFETY: `measure` asks only for the header at a node boundary it
+        // reached by walking checked node lengths; a firmware device path
+        // is readable through its End node.
+        |off| Some(unsafe { core::ptr::read_unaligned(base.add(off) as *const [u8; 4]) }),
+        devpath::MAX_LEN,
+    )
+    .ok()?;
+    // SAFETY: the measured nodes, End node included, are readable.
+    Some(unsafe { core::slice::from_raw_parts(base, len) })
 }
 
 fn gpt_disk_uuid(prefix: &[u8]) -> Option<[u8; 16]> {
