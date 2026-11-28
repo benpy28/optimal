@@ -151,6 +151,8 @@ name = "optimal-selectors"
 version = "0.1.0"
 dependencies = [
  "optimal-css",
+ "optimal-dom",
+ "optimal-html",
  "optimal-wtf8",
  "proptest",
  "serde_json",

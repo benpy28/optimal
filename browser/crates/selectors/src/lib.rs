@@ -12,10 +12,13 @@
 //!   serializes with `Display` and gives each selector's
 //!   [`Specificity`].
 //!
-//! Matching against elements is the next stage.
+//! - [`matches`] and [`query_all`] match a list against an element or a
+//!   subtree, through the [`Element`] trait (see [`matching`]).
 #![forbid(unsafe_code)]
 
 pub mod ast;
+mod lang;
+pub mod matching;
 mod parse;
 mod serialize;
 mod specificity;
@@ -25,4 +28,6 @@ pub use parse::{
     MAX_NESTING, Namespaces, SelectorError, parse_relative_selector, parse_relative_selector_list,
     parse_selector, parse_selector_list,
 };
+pub use lang::{lang_matches, well_formed as language_tag_well_formed};
+pub use matching::{Direction, Element, MatchContext, Scope, matches, query_all};
 pub use specificity::Specificity;

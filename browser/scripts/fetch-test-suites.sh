@@ -27,11 +27,11 @@ fetch() { # name url commit
 # html5lib-tests: tokenizer suite. (Tree construction tests moved to WPT.)
 fetch html5lib-tests https://github.com/html5lib/html5lib-tests.git c5495c539ca8a79c3c5107f5f14010bcff9a35d5
 
-fetch_sparse() { # name url commit path...
+fetch_sparse() { # name url commit path... (directories or files)
   local name="$1" dir="build/$1" url="$2" commit="$3"
   shift 3
   local paths=("$@") path="$*" patterns=()
-  for p in "${paths[@]}"; do patterns+=("/$p/"); done
+  for p in "${paths[@]}"; do patterns+=("/$p"); done
   if [ -d "$dir/.git" ] && [ "$(git -C "$dir" rev-parse HEAD)" = "$commit" ] \
     && [ "$(git -C "$dir" sparse-checkout list | tr '\n' ' ')" = "${patterns[*]} " ]; then
     echo "$name already at $commit"
@@ -58,6 +58,11 @@ fetch_sparse wpt https://github.com/web-platform-tests/wpt.git 6852422b49e7dc803
 # parsing tests (css/selectors/parsing).
 fetch_sparse wpt-css https://github.com/web-platform-tests/wpt.git 6852422b49e7dc8037d7f130ee07cf991fb73f05 css/css-syntax css/selectors/parsing
 
+# web-platform-tests again, at the same commit: the Selectors API tests
+# (dom/nodes), whose selectors.js cases and fixture the selectors crate's
+# matching runs.
+fetch_sparse wpt-dom https://github.com/web-platform-tests/wpt.git 6852422b49e7dc8037d7f130ee07cf991fb73f05 dom/nodes/selectors.js dom/nodes/ParentNode-querySelector-All.js dom/nodes/ParentNode-querySelector-All-content.html dom/nodes/ParentNode-querySelector-All-content.xht
+
 # romainmenke/css-tokenizer-tests (MIT): the CSS tokenizer suite.
 fetch css-tokenizer-tests https://github.com/romainmenke/css-tokenizer-tests.git 0db1d128d02f0e3e38c9271f377eb8d70f280813
 
@@ -69,5 +74,9 @@ fetch css-parsing-tests https://github.com/SimonSapin/css-parsing-tests.git 203c
 # The specs the CSS crate is written from, at the commit it follows. Not test
 # data, so only fetched on request: ./scripts/fetch-test-suites.sh --specs
 if [ "${1:-}" = "--specs" ]; then
-  fetch_sparse csswg-drafts https://github.com/w3c/csswg-drafts.git 7027ab6fdf3c98d9c44666820041cb075b0e28dd css-syntax-3 selectors-4 cssom-1 css-pseudo-4 css-shadow-1 css-nesting-1 css-namespaces-3
+  fetch_sparse csswg-drafts https://github.com/w3c/csswg-drafts.git 7027ab6fdf3c98d9c44666820041cb075b0e28dd css-syntax-3 selectors-4 cssom-1 css-pseudo-4 css-shadow-1 css-nesting-1 css-namespaces-3 css-text-3
+  # WHATWG HTML (the selector case-sensitivity rules, and the pseudo-classes
+  # HTML defines) and DOM (scope-match a selectors string).
+  fetch_sparse whatwg-html https://github.com/whatwg/html.git 30f7046075a1c19999caef3a52388f64d96acad7 source
+  fetch_sparse whatwg-dom https://github.com/whatwg/dom.git ddfb52fde44069e2f77b839bdf114eeefc87e3f7 dom.bs
 fi

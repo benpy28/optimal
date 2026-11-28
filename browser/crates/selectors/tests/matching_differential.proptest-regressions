@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 687f890a2e34588e9f348fe6baaa0d7cc16a21a0eb36a2faf75a47225033dba8 # shrinks to s = Spec { nodes: [(0, 0, 0, 0)], html: false }, sel = ":scope *", parent = "*", pick = 0, quirks = false

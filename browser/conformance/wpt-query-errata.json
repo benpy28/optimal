@@ -1,0 +1,70 @@
+{
+  "document #pseudo-empty p:empty": {
+    "expect": [
+      "pseudo-empty-p1",
+      "pseudo-empty-p2",
+      "pseudo-empty-p3"
+    ],
+    "reason": "selectors-4 13.2 (csswg-drafts 7027ab6): :empty allows children that are only document white space (css-text-3: spaces, tabs, segment breaks), so <p id=pseudo-empty-p3> </p> is empty. The suite predates that change."
+  },
+  "document #pseudo-empty :empty": {
+    "expect": [
+      "pseudo-empty-p1",
+      "pseudo-empty-p2",
+      "pseudo-empty-p3",
+      "pseudo-empty-span1"
+    ],
+    "reason": "selectors-4 13.2 (csswg-drafts 7027ab6): :empty allows children that are only document white space (css-text-3: spaces, tabs, segment breaks), so <p id=pseudo-empty-p3> </p> is empty. The suite predates that change."
+  },
+  "detached #pseudo-empty p:empty": {
+    "expect": [
+      "pseudo-empty-p1",
+      "pseudo-empty-p2",
+      "pseudo-empty-p3"
+    ],
+    "reason": "selectors-4 13.2 (csswg-drafts 7027ab6): :empty allows children that are only document white space (css-text-3: spaces, tabs, segment breaks), so <p id=pseudo-empty-p3> </p> is empty. The suite predates that change."
+  },
+  "detached #pseudo-empty :empty": {
+    "expect": [
+      "pseudo-empty-p1",
+      "pseudo-empty-p2",
+      "pseudo-empty-p3",
+      "pseudo-empty-span1"
+    ],
+    "reason": "selectors-4 13.2 (csswg-drafts 7027ab6): :empty allows children that are only document white space (css-text-3: spaces, tabs, segment breaks), so <p id=pseudo-empty-p3> </p> is empty. The suite predates that change."
+  },
+  "fragment #pseudo-empty p:empty": {
+    "expect": [
+      "pseudo-empty-p1",
+      "pseudo-empty-p2",
+      "pseudo-empty-p3"
+    ],
+    "reason": "selectors-4 13.2 (csswg-drafts 7027ab6): :empty allows children that are only document white space (css-text-3: spaces, tabs, segment breaks), so <p id=pseudo-empty-p3> </p> is empty. The suite predates that change."
+  },
+  "fragment #pseudo-empty :empty": {
+    "expect": [
+      "pseudo-empty-p1",
+      "pseudo-empty-p2",
+      "pseudo-empty-p3",
+      "pseudo-empty-span1"
+    ],
+    "reason": "selectors-4 13.2 (csswg-drafts 7027ab6): :empty allows children that are only document white space (css-text-3: spaces, tabs, segment breaks), so <p id=pseudo-empty-p3> </p> is empty. The suite predates that change."
+  },
+  "element #pseudo-empty p:empty": {
+    "expect": [
+      "pseudo-empty-p1",
+      "pseudo-empty-p2",
+      "pseudo-empty-p3"
+    ],
+    "reason": "selectors-4 13.2 (csswg-drafts 7027ab6): :empty allows children that are only document white space (css-text-3: spaces, tabs, segment breaks), so <p id=pseudo-empty-p3> </p> is empty. The suite predates that change."
+  },
+  "element #pseudo-empty :empty": {
+    "expect": [
+      "pseudo-empty-p1",
+      "pseudo-empty-p2",
+      "pseudo-empty-p3",
+      "pseudo-empty-span1"
+    ],
+    "reason": "selectors-4 13.2 (csswg-drafts 7027ab6): :empty allows children that are only document white space (css-text-3: spaces, tabs, segment breaks), so <p id=pseudo-empty-p3> </p> is empty. The suite predates that change."
+  }
+}
