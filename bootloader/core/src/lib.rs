@@ -5,13 +5,18 @@
 
 pub mod acpi;
 pub mod config;
+pub mod crc32;
 pub mod devpath;
+pub mod disk;
+pub mod e820;
 pub mod elf;
+pub mod fat;
 #[cfg(test)]
 pub mod fuzzkit;
 pub mod kaslr;
 pub mod memmap;
 pub mod paging;
+pub mod part;
 pub mod protocol;
 pub mod rng;
 pub mod scan;

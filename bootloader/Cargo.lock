@@ -123,6 +123,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "optimal-boot-bios"
+version = "0.1.0"
+dependencies = [
+ "optimal-boot-core",
+]
+
+[[package]]
 name = "optimal-boot-conformance"
 version = "0.1.0"
 dependencies = [
@@ -135,6 +142,13 @@ version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "sha2",
+]
+
+[[package]]
+name = "optimal-boot-install"
+version = "0.1.0"
+dependencies = [
+ "optimal-boot-core",
 ]
 
 [[package]]

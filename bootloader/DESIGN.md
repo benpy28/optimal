@@ -208,6 +208,90 @@ APIC is not available, and the loader leaves it alone.
   enabled with SVR `0x1FF`, so the `quirk-apic-off` case runs under Optimal
   Boot only.
 
+## BIOS stage (part 1 done: up to a verified, loaded kernel)
+
+`bios/` is Optimal Boot for machines without UEFI (boot tier B4 in
+boot.md). Part 1 runs everything up to the handoff, which it refuses with
+`the BIOS stage cannot hand over to the kernel yet`. Part 2 is the handoff
+(page tables, responses, machine state, the jump), shared with the UEFI
+loader rather than copied. Until then BIOS machines keep booting with
+Limine.
+
+**Stage 1** (`bios/src/stage1.s`) is the 440 bytes of MBR code. It needs
+the INT 13h extensions, loads stage 2 to 0x8000 in 32 KiB requests (3 tries
+each, with a drive reset between), checks the `OBSTAGE2` magic and jumps
+to it. The installer records stage 2's LBA (offset 0x1A8) and sector count
+(0x1B0). Any failure prints `OPTIMAL-BOOT: FATAL: stage 1: ...` and calls
+INT 18h, so the BIOS tries the next boot device.
+
+**Stage 2** (`bios/src/stage2.s`, then Rust) enables A20 (BIOS call, then
+port 0x92, each checked by a wrap-around test), refuses CPUs without long
+mode, and enters long mode on an identity map of the first 4 GiB. Rust
+replaces that with tables that also map every E820 range above 4 GiB, so
+files can be loaded anywhere. BIOS services are reached through a thunk
+that drops to real mode, runs `INT n` with interrupts on, and comes back.
+A long-mode IDT turns any CPU exception into a fatal message instead of a
+reset.
+
+Memory below 1 MiB while it runs:
+
+| Range | Use |
+|---|---|
+| 0x00000-0x004FF | IVT and BIOS data area (never written) |
+| 0x00500-0x00FFF | variables shared with real mode |
+| 0x01000-0x07BFF | real-mode stack |
+| 0x07C00-0x07DFF | stage 1 |
+| 0x08000-0x6FFFF | stage 2 and its .bss (the linker script enforces the limit) |
+| 0x70000-0x7FFFF | disk bounce buffer (refused if the EBDA reaches it) |
+
+**What it checks, in order:**
+
+1. Stage 2's own CRC-32 against the installer's header, before anything
+   writes to it. This catches a damaged or half-written install. It is not
+   a security check: on BIOS nothing verifies stage 2, and that is what B4
+   means. (The GDT's accessed bits are preset, so the CPU never changes
+   the bytes under the check.)
+2. The E820 map, converted by `core/src/e820.rs`: disabled entries (ACPI
+   3.0 attribute bit 0 clear) are ignored, non-volatile and unknown types
+   are reserved, type 5 is bad memory, usable RAM is rounded inwards to
+   whole pages and everything else outwards, and overlaps go to the most
+   conservative type through the same `memmap::build` the UEFI loader
+   uses. Fuzzed against a byte-exact reference: a page is reported usable
+   only if every byte of it is usable in every entry that touches it.
+3. The boot volume. The installer records it in stage 2's header: a GPT
+   unique partition GUID, or an MBR partition number, plus its first LBA.
+   GPT headers and entry arrays are CRC checked (`core/src/part.rs`); a bad
+   primary falls back to the backup with a printed warning; both bad, a
+   duplicate GUID, or a partition that moved is a refusal.
+4. The FAT12/16/32 file system (`core/src/fat.rs`, read-only, long names):
+   every BPB field and cluster number is range checked, a directory walk
+   stops at the spec's 65 536 entries, and a file read never follows more
+   clusters than its size needs, so a looped chain cannot hang the boot.
+5. From here as on UEFI: the config signature, strict parsing, the menu,
+   each file's SHA-512, then the ELF, KASLR and the Limine requests, with
+   the same core code.
+
+Not measured: the BIOS stage does not use the TPM yet (TCG BIOS INT 1Ah is
+a later part), and says so. Not supported yet: 4 KiB-sector disks (the
+installer refuses them), CD/DVD (El Torito), logical MBR partitions, and
+`timeout` countdowns timed by anything but INT 15h AH=86h.
+
+**Installer** (`install/`): `optimal-boot-install bios --image <ELF>
+--disk <path> --partition <N>`. Stage 2 goes into the GPT BIOS boot
+partition (exactly one required) or the MBR gap before the first
+partition. Only bytes 0-439 of sector 0 are written, so the disk signature
+and partition table are never touched. Everything is checked before
+anything is written, and every write is read back.
+
+**Tests:** `scripts/bios-case.sh` boots the stage under SeaBIOS: GPT and
+MBR disks with FAT12, FAT16 and FAT32; PIIX IDE, AHCI, virtio-blk, NVMe,
+USB and SCSI; 128 MiB and 6 GiB (files above 4 GiB); KASLR off; the menu;
+and ten damage cases (tampered kernel, module and config, missing or
+foreign signature, damaged or missing stage 2, stage 1 not installed, a
+damaged primary GPT, both GPTs damaged), each of which must stop with its
+own named error. `scripts/bios-mutants.sh` checks that each of ten
+deliberate breaks of the stage is caught by a case.
+
 ## Planned mechanisms
 
 The eight items below are the loader's share of boot.md. Each lists its
