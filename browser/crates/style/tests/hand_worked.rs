@@ -110,10 +110,7 @@ fn nested_names_are_distinct_layers() {
     let css = "@layer base { p { z-index: 1; } }
         @layer framework { @layer base { p { z-index: 2; } } }";
     let t = one("p", &[]);
-    assert_eq!(
-        ident(&author(css), &t, "z-index", 1).as_deref(),
-        Some("2")
-    );
+    assert_eq!(ident(&author(css), &t, "z-index", 1).as_deref(), Some("2"));
     // And framework.theme in a later block joins the same layer (third
     // example): the later block's rule is in framework.theme, which comes
     // after framework.default.
@@ -228,7 +225,10 @@ fn origins_and_importance() {
     // Important user agent over everything.
     assert_eq!(ident(&sheets, &t, "width", 1).as_deref(), Some("ua"));
     // Unopposed: the only one.
-    assert_eq!(ident(&sheets, &t, "padding-left", 1).as_deref(), Some("author"));
+    assert_eq!(
+        ident(&sheets, &t, "padding-left", 1).as_deref(),
+        Some("author")
+    );
     // Normal user over normal user agent.
     let sheets = [
         ("p { color: ua; }", Origin::UserAgent),

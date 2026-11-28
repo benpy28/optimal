@@ -42,6 +42,7 @@ pub struct Longhand {
 pub type LonghandId = u16;
 
 /// Every longhand, sorted by name.
+#[rustfmt::skip]
 pub const LONGHANDS: &[Longhand] = &[
     Longhand { name: "accent-color", inherited: true, initial: "auto", spec: "css-ui-4" },
     Longhand { name: "align-content", inherited: false, initial: "normal", spec: "css-align-3" },
@@ -288,7 +289,11 @@ pub const SHORTHANDS: &[Shorthand] = &[
     },
     Shorthand {
         name: "border-bottom",
-        longhands: &["border-bottom-width", "border-bottom-style", "border-bottom-color"],
+        longhands: &[
+            "border-bottom-width",
+            "border-bottom-style",
+            "border-bottom-color",
+        ],
         spec: "css-backgrounds-3",
     },
     Shorthand {
@@ -303,7 +308,11 @@ pub const SHORTHANDS: &[Shorthand] = &[
     },
     Shorthand {
         name: "border-left",
-        longhands: &["border-left-width", "border-left-style", "border-left-color"],
+        longhands: &[
+            "border-left-width",
+            "border-left-style",
+            "border-left-color",
+        ],
         spec: "css-backgrounds-3",
     },
     Shorthand {
@@ -318,7 +327,11 @@ pub const SHORTHANDS: &[Shorthand] = &[
     },
     Shorthand {
         name: "border-right",
-        longhands: &["border-right-width", "border-right-style", "border-right-color"],
+        longhands: &[
+            "border-right-width",
+            "border-right-style",
+            "border-right-color",
+        ],
         spec: "css-backgrounds-3",
     },
     Shorthand {
@@ -414,7 +427,12 @@ pub const SHORTHANDS: &[Shorthand] = &[
     },
     Shorthand {
         name: "padding",
-        longhands: &["padding-top", "padding-right", "padding-bottom", "padding-left"],
+        longhands: &[
+            "padding-top",
+            "padding-right",
+            "padding-bottom",
+            "padding-left",
+        ],
         spec: "css-box-4",
     },
     Shorthand {
@@ -564,7 +582,15 @@ impl Keyword {
 /// css-variables-2 for `var()`, css-env-1 for `env()` and css-mixins-1
 /// for dashed functions, which start with `--`). A value holding one is
 /// assumed valid at parse time; substitution is a later step.
-const SUBSTITUTION_FUNCTIONS: &[&str] = &["attr", "env", "ident", "if", "inherit", "random-item", "var"];
+const SUBSTITUTION_FUNCTIONS: &[&str] = &[
+    "attr",
+    "env",
+    "ident",
+    "if",
+    "inherit",
+    "random-item",
+    "var",
+];
 
 fn has_substitution(values: Values<'_, '_>) -> bool {
     // Iterative, so deeply nested values can't exhaust the stack.
@@ -574,7 +600,9 @@ fn has_substitution(values: Values<'_, '_>) -> bool {
             match v.kind() {
                 Kind::Function(name, inner) => {
                     if name.starts_with("--")
-                        || SUBSTITUTION_FUNCTIONS.iter().any(|f| f.eq_ignore_ascii_case(name))
+                        || SUBSTITUTION_FUNCTIONS
+                            .iter()
+                            .any(|f| f.eq_ignore_ascii_case(name))
                     {
                         return true;
                     }
@@ -635,9 +663,9 @@ pub fn classify(name: &str, values: Values<'_, '_>) -> Option<Classified> {
     if target == Target::All || values.is_empty() {
         return None;
     }
-    let combined = values.clone().any(|v| {
-        matches!(v.kind(), Kind::Token(Token::Ident(id)) if Keyword::parse(id).is_some())
-    });
+    let mut all_values = values;
+    let combined = all_values
+        .any(|v| matches!(v.kind(), Kind::Token(Token::Ident(id)) if Keyword::parse(id).is_some()));
     if combined { None } else { value }
 }
 

@@ -1,4 +1,4 @@
-//! Collecting and cascading grow linearly with the input on hostile style
+//! Collecting, cascading and defaulting grow linearly with the input on hostile style
 //! sheets and trees: many rules, long selector lists, many layers, deep
 //! and wide trees, deep nesting, long attribute values. Timing is only
 //! meaningful in release builds, so it runs when `CSS_SCALING=1`.
@@ -6,7 +6,7 @@
 mod common;
 
 use common::tree::{HTML, Tree};
-use optimal_style::{Origin, StyleAttribute, StyleSet};
+use optimal_style::{Origin, Style, StyleAttribute, StyleSet};
 use optimal_wtf8::Wtf8;
 use std::time::{Duration, Instant};
 
@@ -44,15 +44,23 @@ fn run(css: &str, t: &Tree) -> usize {
         .collect();
     let c = set.prepare();
     c.with_session(false, |s| {
-        (0..t.nodes.len())
-            .map(|i| {
-                s.cascade(&t.el(i), styles[i].as_ref())
-                    .properties
-                    .iter()
-                    .map(|p| p.1.len())
-                    .sum::<usize>()
-            })
-            .sum()
+        let mut out: Vec<Style<'_>> = Vec::new();
+        let mut sum = 0;
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..t.nodes.len() {
+            sum += s
+                .cascade(&t.el(i), styles[i].as_ref())
+                .properties
+                .iter()
+                .map(|p| p.1.len())
+                .sum::<usize>();
+            let initial = Style::initial();
+            let parent = t.nodes[i].parent.map_or(&initial, |p| &out[p]);
+            let st = s.style(&t.el(i), i as u32, styles[i].as_ref(), parent);
+            sum += st.custom.len();
+            out.push(st);
+        }
+        sum
     })
 }
 
@@ -166,6 +174,23 @@ fn hostile_cascades_run_in_linear_time() {
                     t
                 },
             )
+        }),
+        ("revert-rule chain", |n| {
+            let css = "p { z-index: 1 }\n".to_string() + &"p { z-index: revert-rule }\n".repeat(n);
+            (css, flat(10, |_| vec![]))
+        }),
+        ("revert-layer chain", |n| {
+            let css: String = (0..n / 10)
+                .map(|i| format!("@layer l{i} {{ p {{ color: red; color: revert-layer }} }}\n"))
+                .collect();
+            (css, flat(10, |_| vec![]))
+        }),
+        ("inherited custom properties", |n| {
+            let decls: String = (0..n / 10).map(|i| format!("--v{i}: 1;")).collect();
+            (format!("html {{ {decls} }}"), deep(n, "div"))
+        }),
+        ("all: inherit, deep tree", |n| {
+            ("* { all: inherit }".to_string(), deep(n / 10, "div"))
         }),
         ("long style attributes", |n| {
             (

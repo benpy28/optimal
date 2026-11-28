@@ -17,11 +17,18 @@
 //! - **Rule counts** (`layer-rule-invalid-name.html`): each `<style>`'s
 //!   `cssRules.length` is checked as the number of style rules collected.
 //!
-//! Computed values don't exist yet, so a value is checked as the cascaded
-//! value's text: `rgb(0, 128, 0)` in an assert is the computed value of
-//! the keyword `green` (and `rgb(255, 0, 0)` of `red`, and so on, from
-//! css-color-4's named color table); every other expected value is the
-//! declared text itself.
+//! - **Reftests** of the defaulting keywords: a page that "passes if
+//!   there is a filled green square" is checked by the specified values
+//!   that make it so (written out below, with the reasoning). Pages whose
+//!   result depends on the user agent style sheet get the rules they need,
+//!   copied from the HTML standard's rendering section.
+//!
+//! Computed values don't exist yet, so a value is checked as the
+//! specified value's text: a declaration's value as written, or the
+//! property table's initial value. `rgb(0, 128, 0)` in an assert is the
+//! computed value of the keyword `green` (and `rgb(255, 0, 0)` of `red`,
+//! `rgba(0, 0, 0, 0)` of `transparent`, and so on, from css-color-4);
+//! every other expected value is the specified text itself.
 //!
 //! The asserts that need something not built yet are listed in
 //! conformance/README.md as waiting, with the reason.
@@ -31,6 +38,7 @@
 
 mod common;
 
+use common::specified::specified;
 use common::tree::{HTML, Tree};
 use optimal_dom::{Document, NodeData, NodeId};
 use optimal_html::tree_builder::{ParseOptions, parse_document};
@@ -179,9 +187,18 @@ fn declared(expected: &str) -> &str {
         "rgb(255, 0, 0)" => "red",
         "rgb(255, 255, 0)" => "yellow",
         "rgb(0, 0, 0)" => "black",
+        "rgba(0, 0, 0, 0)" => "transparent",
         e => e,
     }
 }
+
+/// The user agent style sheet rules some pages need: from the HTML
+/// standard's rendering section (15.3.3 Flow content), at the pinned
+/// commit.
+const UA_SHEET: &str = "address, blockquote, center, dialog, div, figure, figcaption, footer, form,
+header, hr, legend, listing, main, p, plaintext, pre, search, xmp {
+  display: block;
+}";
 
 /// JavaScript string literals ('', "" or ``, no escapes or substitutions
 /// in the files read) for `key:` in each case object of a `testCases`
@@ -348,6 +365,67 @@ const STATIC: &[(&str, &[Check])] = &[
         ],
     ),
     (
+        "css-cascade/revert-rule-basic.html",
+        &[
+            ("#test1", "color", "rgb(0, 128, 0)"),
+            ("#test2", "color", "rgb(0, 128, 0)"),
+            ("#test3", "color", "rgb(0, 128, 0)"),
+            ("#test4", "z-index", "2"),
+        ],
+    ),
+    (
+        "css-cascade/revert-rule-important.html",
+        &[
+            ("#test1", "color", "rgb(0, 128, 0)"),
+            ("#test2", "color", "rgb(0, 128, 0)"),
+            ("#test3", "color", "rgb(0, 128, 0)"),
+        ],
+    ),
+    (
+        "css-cascade/revert-rule-layer.html",
+        &[
+            ("#test1", "color", "rgb(0, 128, 0)"),
+            ("#test2", "color", "rgb(0, 128, 0)"),
+        ],
+    ),
+    (
+        "css-cascade/revert-rule-custom-property.html",
+        &[("#test1", "--a", "green"), ("#test1", "--b", "green")],
+    ),
+    (
+        "css-cascade/revert-rule-revert-layer.html",
+        &[
+            ("#test1", "color", "rgb(0, 128, 0)"),
+            ("#test1", "background-color", "rgb(0, 128, 0)"),
+            ("#test2", "color", "rgb(0, 128, 0)"),
+            ("#test2", "background-color", "rgb(0, 128, 0)"),
+            ("#test3", "color", "rgb(0, 128, 0)"),
+            ("#test3", "background-color", "rgb(0, 128, 0)"),
+            ("#test4", "color", "rgb(0, 128, 0)"),
+            ("#test4", "background-color", "rgb(0, 128, 0)"),
+        ],
+    ),
+    (
+        // #test4 waits for @scope.
+        "css-nesting/nesting-revert-rule.html",
+        &[
+            ("#test1", "color", "rgb(0, 128, 0)"),
+            ("#test2", "color", "rgb(0, 128, 0)"),
+            ("#test3", "color", "rgb(0, 128, 0)"),
+        ],
+    ),
+    (
+        // overflow is a shorthand: both longhands are visible.
+        "css-cascade/inherit-initial.html",
+        &[
+            (":root", "z-index", "auto"),
+            (":root", "position", "static"),
+            (":root", "overflow-x", "visible"),
+            (":root", "overflow-y", "visible"),
+            (":root", "background-color", "rgba(0, 0, 0, 0)"),
+        ],
+    ),
+    (
         "css-nesting/nested-declarations-matching.html",
         // The asserts that involve @media, @scope or ::after wait.
         &[
@@ -382,12 +460,185 @@ fn static_pages() {
             );
             let els = select(&p.tree, sel);
             assert!(!els.is_empty(), "{file}: {sel}");
-            let got = cascaded(&sheets, &p.tree, prop);
+            let with_origin: Vec<_> = sheets.iter().map(|s| (*s, Origin::Author)).collect();
+            let got = specified(&with_origin, &p.tree, prop);
             assert_eq!(
                 got[els[0]].as_deref(),
                 Some(declared(expected)),
                 "{file}: {sel} {prop}"
             );
+        }
+    }
+}
+
+/// Reftests: (file, whether it needs [`UA_SHEET`], checks as (element,
+/// property, specified value)). Each page says "Test passes if there is a
+/// filled green square and no red" (or names its own condition), and the
+/// checks are what that takes.
+type RefCheck = (&'static str, &'static str, &'static str);
+const REFTESTS: &[(&str, bool, &[RefCheck])] = &[
+    // revert-layer in a layer rolls back to the layer before.
+    (
+        "css-cascade/revert-layer-001.html",
+        false,
+        &[("#target", "background-color", "green")],
+    ),
+    // From the implicit outer layer to a layer.
+    (
+        "css-cascade/revert-layer-002.html",
+        false,
+        &[("#target", "background-color", "green")],
+    ),
+    // all: revert-layer rolls back every property.
+    (
+        "css-cascade/revert-layer-003.html",
+        false,
+        &[
+            ("#target", "background-color", "green"),
+            ("#target", "width", "100px"),
+            ("#target", "height", "100px"),
+        ],
+    ),
+    // Important revert-layer: rolls back past its layer's normal
+    // declarations too, and the later layer's red !important lost to it.
+    (
+        "css-cascade/revert-layer-005.html",
+        false,
+        &[("#target", "background-color", "green")],
+    ),
+    // With no other layer, revert-layer acts as revert: the UA's block.
+    (
+        "css-cascade/revert-layer-006.html",
+        true,
+        &[
+            ("#inner", "display", "block"),
+            ("#inner", "background-color", "green"),
+        ],
+    ),
+    // A chain of revert-layer across layers.
+    (
+        "css-cascade/revert-layer-007.html",
+        false,
+        &[("#target", "background-color", "green")],
+    ),
+    // From the style attribute to the sheets.
+    (
+        "css-cascade/revert-layer-009.html",
+        false,
+        &[("#target", "background-color", "green")],
+    ),
+    // Important in the style attribute: back to the sheet's important.
+    (
+        "css-cascade/revert-layer-012.html",
+        false,
+        &[("#target", "background-color", "green")],
+    ),
+    // revert: to the UA's display: block for a div.
+    (
+        "css-cascade/revert-val-001.html",
+        true,
+        &[
+            ("#inner", "display", "block"),
+            ("#inner", "background-color", "green"),
+        ],
+    ),
+    // revert loses to an important author declaration.
+    (
+        "css-cascade/revert-val-002.html",
+        true,
+        &[("#inner", "display", "block")],
+    ),
+    // unset: color inherits green from .outer, background-color is
+    // initial (transparent), so .under's green shows.
+    (
+        "css-cascade/unset-val-001.html",
+        false,
+        &[
+            (".inner", "color", "green"),
+            (".inner", "background-color", "transparent"),
+            (".under", "background-color", "green"),
+        ],
+    ),
+    // unset on display: initial, inline (so the red span has no size).
+    (
+        "css-cascade/unset-val-002.html",
+        false,
+        &[(".fail", "display", "inline")],
+    ),
+    // initial: color takes its initial value (not the parent's red), the
+    // background is transparent.
+    (
+        "css-cascade/initial-color-background-001.html",
+        false,
+        &[
+            (".inner", "color", "CanvasText"),
+            (".inner", "background-color", "transparent"),
+        ],
+    ),
+    // all: initial keeps direction and unicode-bidi, resets the rest.
+    (
+        "css-cascade/all-prop-001.html",
+        false,
+        &[
+            (".test", "direction", "rtl"),
+            (".test", "unicode-bidi", "bidi-override"),
+            (".test", "color", "CanvasText"),
+            (".test", "float", "none"),
+            (".test", "display", "inline"),
+            (".test", "border-top-style", "none"),
+            (".test", "font-style", "normal"),
+            (".test", "margin-left", "0"),
+            (".test", "overflow-x", "visible"),
+            (".test", "text-align-all", "start"),
+        ],
+    ),
+    // all: inherit makes display inherit the span's (initial) inline.
+    (
+        "css-cascade/all-prop-002.html",
+        false,
+        &[(".inline", "display", "inline")],
+    ),
+    // all with a later longhand: the longhand wins.
+    (
+        "css-cascade/all-prop-inherit-color.html",
+        false,
+        &[(".inner", "color", "green")],
+    ),
+    (
+        "css-cascade/all-prop-initial-color.html",
+        false,
+        &[(".inner", "color", "green")],
+    ),
+    (
+        "css-cascade/all-prop-revert-color.html",
+        false,
+        &[(".inner", "color", "green")],
+    ),
+    (
+        "css-cascade/all-prop-unset-color.html",
+        false,
+        &[(".inner", "color", "green")],
+    ),
+];
+
+#[test]
+fn reftests() {
+    for (file, ua, checks) in REFTESTS {
+        let src = load(file);
+        assert!(src.contains("Test passes if"), "{file}: not a reftest page");
+        let p = page(&src);
+        let mut sheets: Vec<(&str, Origin)> = Vec::new();
+        if *ua {
+            sheets.push((UA_SHEET, Origin::UserAgent));
+        }
+        sheets.extend(p.styles.iter().map(|s| (s.as_str(), Origin::Author)));
+        for (sel, prop, expected) in *checks {
+            let els = select(&p.tree, sel);
+            assert!(!els.is_empty(), "{file}: {sel}");
+            let got = specified(&sheets, &p.tree, prop);
+            for &e in &els {
+                assert_eq!(got[e].as_deref(), Some(*expected), "{file}: {sel} {prop}");
+            }
         }
     }
 }

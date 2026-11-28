@@ -10,8 +10,8 @@ mod common;
 
 use common::reference::{self, Id, MValue, Model};
 use common::tree::{HTML, SVG, Tree};
-use optimal_style::{Cascaded, Origin, Source, Style, StyleAttribute, StyleSet, Value};
 use optimal_style::property::LONGHANDS;
+use optimal_style::{Cascaded, Origin, Source, Style, StyleAttribute, StyleSet, Value};
 use optimal_wtf8::Wtf8;
 use proptest::prelude::*;
 
@@ -314,7 +314,7 @@ fn id(set: &StyleSet<'_>, s: Source) -> Id {
 fn mstyle(set: &StyleSet<'_>, s: &Style<'_>) -> Vec<(String, MValue)> {
     let v = |v: Value| match v {
         Value::Initial => MValue::Initial,
-        Value::Declared { source, up } => MValue::Declared(id(set, source), up),
+        Value::Declared { source, element } => MValue::Declared(id(set, source), element),
     };
     let mut out: Vec<(String, MValue)> = LONGHANDS
         .iter()
@@ -351,7 +351,9 @@ fn run(seed: u64) {
     let model_styles: Vec<_> = (0..t.nodes.len())
         .map(|i| t.attr(i, "style").map(reference::style_attribute))
         .collect();
-    let elements: Vec<_> = (0..t.nodes.len()).map(|i| (t.el(i), t.nodes[i].parent)).collect();
+    let elements: Vec<_> = (0..t.nodes.len())
+        .map(|i| (t.el(i), t.nodes[i].parent))
+        .collect();
     let model_attrs: Vec<_> = (0..t.nodes.len())
         .map(|i| t.attr(i, "style").map(reference::style_attribute))
         .collect();
@@ -361,7 +363,7 @@ fn run(seed: u64) {
         for i in 0..t.nodes.len() {
             let initial = Style::initial();
             let parent = t.nodes[i].parent.map_or(&initial, |p| &specified[p]);
-            let got = s.style(&t.el(i), styles[i].as_ref(), parent);
+            let got = s.style(&t.el(i), i as u32, styles[i].as_ref(), parent);
             assert_eq!(
                 mstyle(&set, &got),
                 model_specified[i],

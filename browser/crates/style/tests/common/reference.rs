@@ -32,13 +32,13 @@
 #![allow(dead_code)]
 
 use optimal_css::{
-    BlockItem, ComponentValue, Declaration, Kind, Parsed, Rule, RuleId, Token, Tokenizer,
-    Validity, parse_declaration_list, parse_stylesheet,
+    BlockItem, ComponentValue, Declaration, Kind, Parsed, Rule, RuleId, Token, Tokenizer, Validity,
+    parse_declaration_list, parse_stylesheet,
 };
-use optimal_style::property::{ALIASES, LONGHANDS, NOT_RESET_BY_ALL, SHORTHANDS};
 use optimal_selectors::{
     Element, MatchContext, Namespaces, Scope, SelectorList, Specificity, matches, parse_selector,
 };
+use optimal_style::property::{ALIASES, LONGHANDS, NOT_RESET_BY_ALL, SHORTHANDS};
 use optimal_wtf8::Wtf8;
 use std::cmp::Ordering;
 
@@ -103,12 +103,12 @@ pub struct Model {
 
 /// What a declaration's name and value make it: the longhands (or the
 /// custom property) it sets and its keyword; `None` if it is invalid.
-pub fn classify(name: &str, values: &[ComponentValue<'_, '_>]) -> Option<(Vec<String>, Option<String>)> {
+pub fn classify(
+    name: &str,
+    values: &[ComponentValue<'_, '_>],
+) -> Option<(Vec<String>, Option<String>)> {
     // Legacy name aliases are converted at parse time.
-    let name = ALIASES
-        .iter()
-        .find(|a| a.0 == name)
-        .map_or(name, |a| a.1);
+    let name = ALIASES.iter().find(|a| a.0 == name).map_or(name, |a| a.1);
     let custom = name.starts_with("--");
     let sets: Vec<String> = if custom {
         vec![name.to_string()]
@@ -121,13 +121,15 @@ pub fn classify(name: &str, values: &[ComponentValue<'_, '_>]) -> Option<(Vec<St
             .collect()
     } else if let Some(l) = LONGHANDS.iter().find(|l| l.name == name) {
         vec![l.name.to_string()]
-    } else if let Some(sh) = SHORTHANDS.iter().find(|s| s.name == name) {
-        sh.longhands.iter().map(|n| n.to_string()).collect()
     } else {
-        return None;
+        let sh = SHORTHANDS.iter().find(|s| s.name == name)?;
+        sh.longhands.iter().map(|n| n.to_string()).collect()
     };
     let wide = |v: &ComponentValue<'_, '_>| match v.token() {
-        Token::Ident(i) => CSS_WIDE.iter().find(|k| k.eq_ignore_ascii_case(i)).map(|k| k.to_string()),
+        Token::Ident(i) => CSS_WIDE
+            .iter()
+            .find(|k| k.eq_ignore_ascii_case(i))
+            .map(|k| k.to_string()),
         _ => None,
     };
     // A single CSS-wide keyword.
@@ -144,7 +146,16 @@ pub fn classify(name: &str, values: &[ComponentValue<'_, '_>]) -> Option<(Vec<St
             Kind::Function(n, inner) => {
                 let n = n.to_ascii_lowercase();
                 n.starts_with("--")
-                    || ["var", "env", "attr", "if", "inherit", "ident", "random-item"].contains(&n.as_str())
+                    || [
+                        "var",
+                        "env",
+                        "attr",
+                        "if",
+                        "inherit",
+                        "ident",
+                        "random-item",
+                    ]
+                    .contains(&n.as_str())
                     || inner.collect::<Vec<_>>().iter().any(substitution)
             }
             Kind::Block(_, inner) => inner.collect::<Vec<_>>().iter().any(substitution),
@@ -172,7 +183,8 @@ impl Validity for ModelValidity {
     }
 }
 
-/// A specified value in the model.
+/// A specified value in the model: a declaration and the index of the
+/// element it is declared on.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MValue {
     Initial,
@@ -846,7 +858,10 @@ impl Model {
     pub fn resolve<'m>(&'m self, list: &[Applied<'m>]) -> Result<Id, &'static str> {
         let mut gone: Vec<Gone<'m>> = Vec::new();
         loop {
-            let Some(w) = list.iter().find(|x| !gone.iter().any(|g| self.is_gone(g, x))) else {
+            let Some(w) = list
+                .iter()
+                .find(|x| !gone.iter().any(|g| self.is_gone(g, x)))
+            else {
                 return Err("unset");
             };
             match w.keyword.as_deref() {
@@ -894,14 +909,19 @@ impl Model {
                         .find(|(n, _)| n == name)
                         .map(|(_, v)| match v {
                             MValue::Initial => MValue::Initial,
-                            MValue::Declared(id, up) => MValue::Declared(*id, up + 1),
+                            MValue::Declared(id, el) => MValue::Declared(*id, *el),
                         }),
                 }
             };
             let mut style: MStyle = Vec::new();
             let mut names: Vec<String> = LONGHANDS.iter().map(|l| l.name.to_string()).collect();
             if let Some(pi) = parent {
-                names.extend(out[*pi].iter().map(|(n, _)| n.clone()).filter(|n| n.starts_with("--")));
+                names.extend(
+                    out[*pi]
+                        .iter()
+                        .map(|(n, _)| n.clone())
+                        .filter(|n| n.starts_with("--")),
+                );
             }
             names.extend(sorted.iter().map(|(n, _)| n.clone()));
             names.sort();
@@ -909,9 +929,12 @@ impl Model {
             for n in names {
                 let custom = n.starts_with("--");
                 let inherited = custom || LONGHANDS.iter().any(|l| l.name == n && l.inherited);
-                let list = sorted.iter().find(|(m, _)| *m == n).map_or(&[][..], |(_, l)| l);
+                let list = sorted
+                    .iter()
+                    .find(|(m, _)| *m == n)
+                    .map_or(&[][..], |(_, l)| l);
                 let v = match self.resolve(list) {
-                    Ok(id) => Some(MValue::Declared(id, 0)),
+                    Ok(id) => Some(MValue::Declared(id, i as u32)),
                     Err("initial") => Some(MValue::Initial),
                     Err("inherit") => inherit(&n),
                     Err(_) if inherited => inherit(&n),

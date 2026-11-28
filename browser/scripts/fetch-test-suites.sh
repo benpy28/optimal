@@ -71,6 +71,11 @@ fetch css-tokenizer-tests https://github.com/romainmenke/css-tokenizer-tests.git
 # text; corrections are in conformance/css-parsing-errata.json.
 fetch css-parsing-tests https://github.com/SimonSapin/css-parsing-tests.git 203ce36bffd617db7f118c551e32794561fb273d
 
+# csswg-drafts again, at the same commit: the specs whose property definition
+# tables the style crate's property table copies. The table is checked against
+# them (crates/style/tests/property_table.rs), so they are fetched every time.
+fetch_sparse csswg-propdefs https://github.com/w3c/csswg-drafts.git 7027ab6fdf3c98d9c44666820041cb075b0e28dd css-align-3 css-backgrounds-3 css-box-4 css-break-3 css-color-4 css-content-3 css-display-4 css-flexbox-1 css-fonts-4 css-inline-3 css-lists-3 css-overflow-3 css-position-3 css-sizing-3 css-tables-3 css-text-4 css-transforms-1 css-ui-4 css-writing-modes-4 css2 css-cascade-5
+
 # The specs the CSS crate is written from, at the commit it follows. Not test
 # data, so only fetched on request: ./scripts/fetch-test-suites.sh --specs
 if [ "${1:-}" = "--specs" ]; then

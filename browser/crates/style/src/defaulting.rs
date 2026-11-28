@@ -44,16 +44,26 @@
 //!   which loops between `revert-rule` and `revert-layer` (WPT's
 //!   `revert-rule-cycle.tentative.html` asks for `unset` there; the spec
 //!   text doesn't say so, see conformance/README.md).
-//! - **Inheritance copies the parent's specified values** ([`Value`] with
-//!   the number of levels up it came from), because computed values don't
-//!   exist yet; for declarations without CSS-wide keywords, the computed
-//!   value is a function of the specified value and the element, and
-//!   value computation will replace these with computed values.
+//! - **Inheritance copies the parent's specified values** ([`Value`],
+//!   naming the element a declaration is on, by a key the caller gives),
+//!   because computed values don't exist yet; value computation will
+//!   replace these with computed values.
+//! - **Custom properties are shared with the parent** ([`Rc`]) while an
+//!   element declares none, so a tree that inherits many of them costs
+//!   one pointer per element. An element that declares some copies its
+//!   parent's list once, merged with its own (linear in both). Rejected
+//!   for now: a persistent map, which would also make that copy
+//!   logarithmic; the list will hold computed values in the next step,
+//!   and the representation is settled then.
+//! - **Rolled-back rules are a hash set**, so a chain of `revert-rule`
+//!   across many rules stays linear.
 //! - **Arbitrary substitution functions are not resolved yet**, so a
 //!   `var()` that would substitute a CSS-wide keyword isn't treated as
 //!   one (css-values-5 #substitution: it is, after substitution).
 
 use optimal_selectors::Element;
+use std::collections::HashSet;
+use std::rc::Rc;
 
 use crate::cascade::{Entry, Level, Priority, Session, Source};
 use crate::collect::StyleAttribute;
@@ -66,24 +76,15 @@ pub enum Value {
     /// The property's initial value (for a custom property, the
     /// guaranteed-invalid value; [`Style::custom`] leaves those out).
     Initial,
-    /// A declaration's value (never a CSS-wide keyword), declared on the
-    /// element `up` levels up: 0 for the element itself, 1 for its parent,
-    /// and so on.
+    /// A declaration's value (never a CSS-wide keyword).
     Declared {
         /// The declaration.
         source: Source,
-        /// How many levels up the element it is declared on is.
-        up: u32,
+        /// The key of the element it applies to (see [`Session::style`]):
+        /// the element itself, or the ancestor it is inherited from. A
+        /// [`Source::Attribute`] is in that element's style attribute.
+        element: u32,
     },
-}
-
-impl Value {
-    fn inherited(self) -> Value {
-        match self {
-            Value::Initial => Value::Initial,
-            Value::Declared { source, up } => Value::Declared { source, up: up + 1 },
-        }
-    }
 }
 
 /// An element's specified values.
@@ -93,7 +94,7 @@ pub struct Style<'n> {
     pub longhands: Box<[Value]>,
     /// The custom properties that have a value, sorted by name. Each is a
     /// [`Value::Declared`].
-    pub custom: Vec<(&'n str, Value)>,
+    pub custom: Rc<[(&'n str, Value)]>,
 }
 
 impl<'n> Style<'n> {
@@ -102,7 +103,7 @@ impl<'n> Style<'n> {
     pub fn initial() -> Style<'n> {
         Style {
             longhands: vec![Value::Initial; LONGHANDS.len()].into(),
-            custom: Vec::new(),
+            custom: Rc::new([]),
         }
     }
 
@@ -163,7 +164,7 @@ pub fn resolve(entries: &[Entry]) -> Outcome {
     // Only declarations below the floor are still there.
     let mut floor: Option<Priority> = None;
     // The rules rolled back by revert-rule.
-    let mut gone: Vec<u32> = Vec::new();
+    let mut gone: HashSet<u32> = HashSet::new();
     for e in entries {
         let p = e.priority;
         if floor.is_some_and(|f| p >= f) || gone.contains(&e.block) {
@@ -183,7 +184,9 @@ pub fn resolve(entries: &[Entry]) -> Outcome {
             // Element-attached declarations are one layer, and for an
             // important one only they are rolled back: what is left of
             // them is the normal ones, below every important rule.
-            Keyword::RevertLayer if p.attached => gone.push(e.block),
+            Keyword::RevertLayer if p.attached => {
+                gone.insert(e.block);
+            }
             Keyword::RevertLayer => {
                 floor = Some(if p.level == normal(p.level) {
                     lowest(p.level, p.layer)
@@ -192,7 +195,9 @@ pub fn resolve(entries: &[Entry]) -> Outcome {
                     lowest(normal(p.level), u32::MAX - p.layer)
                 });
             }
-            Keyword::RevertRule => gone.push(e.block),
+            Keyword::RevertRule => {
+                gone.insert(e.block);
+            }
         }
     }
     Outcome::Unset
@@ -200,10 +205,13 @@ pub fn resolve(entries: &[Entry]) -> Outcome {
 
 impl<'c, 's: 'c, 'a, E: Element> Session<'c, 's, 'a, E> {
     /// The specified values of `element`, given its `style` attribute and
-    /// its parent's style ([`Style::initial`] for the root element).
+    /// its parent's style ([`Style::initial`] for the root element). `key`
+    /// names the element in the [`Value`]s it declares (a node index, say);
+    /// the session doesn't read it.
     pub fn style<'n>(
         &mut self,
         element: &E,
+        key: u32,
         style: Option<&'n StyleAttribute<'_>>,
         parent: &Style<'n>,
     ) -> Style<'n>
@@ -211,58 +219,56 @@ impl<'c, 's: 'c, 'a, E: Element> Session<'c, 's, 'a, E> {
         'c: 'n,
     {
         let cascaded = self.cascade(element, style);
+        let declared = |e: Entry| Value::Declared {
+            source: e.source,
+            element: key,
+        };
         let mut longhands: Box<[Value]> = LONGHANDS
             .iter()
             .zip(parent.longhands.iter())
-            .map(|(l, &v)| if l.inherited { v.inherited() } else { Value::Initial })
+            .map(|(l, &v)| if l.inherited { v } else { Value::Initial })
             .collect();
-        let mut custom: Vec<(&'n str, Value)> = Vec::new();
-        let mut inherited = parent.custom.iter().peekable();
-        for &(name, ref entries) in &cascaded.properties {
-            let outcome = resolve(entries);
-            if name.starts_with("--") {
-                while let Some(&&(n, v)) = inherited.peek()
-                    && n < name
-                {
-                    custom.push((n, v.inherited()));
-                    inherited.next();
+        // Custom property names start with "--", which sorts before every
+        // longhand name.
+        let split = cascaded
+            .properties
+            .partition_point(|(n, _)| n.starts_with("--"));
+        let (own, rest) = cascaded.properties.split_at(split);
+        let custom = if own.is_empty() {
+            parent.custom.clone()
+        } else {
+            let mut out: Vec<(&'n str, Value)> = Vec::new();
+            let mut inherited = parent.custom.iter().copied().peekable();
+            for &(name, ref entries) in own {
+                while let Some((n, v)) = inherited.next_if(|&(n, _)| n < name) {
+                    out.push((n, v));
                 }
-                let parent_value = match inherited.peek() {
-                    Some(&&(n, v)) if n == name => {
-                        inherited.next();
-                        Some(v.inherited())
-                    }
-                    _ => None,
-                };
+                let parent_value = inherited.next_if(|&(n, _)| n == name).map(|(_, v)| v);
                 // Custom properties are inherited; their initial value is
                 // the guaranteed-invalid value.
-                let v = match outcome {
-                    Outcome::Declared(e) => Some(Value::Declared {
-                        source: e.source,
-                        up: 0,
-                    }),
+                let v = match resolve(entries) {
+                    Outcome::Declared(e) => Some(declared(e)),
                     Outcome::Initial => None,
                     Outcome::Inherit | Outcome::Unset => parent_value,
                 };
                 if let Some(v) = v {
-                    custom.push((name, v));
+                    out.push((name, v));
                 }
-                continue;
             }
+            out.extend(inherited);
+            out.into()
+        };
+        for &(name, ref entries) in rest {
             let id = longhand(name).expect("the cascade lists longhands by name") as usize;
-            let inherit = || parent.longhands[id].inherited();
-            longhands[id] = match outcome {
-                Outcome::Declared(e) => Value::Declared {
-                    source: e.source,
-                    up: 0,
-                },
+            let inherit = parent.longhands[id];
+            longhands[id] = match resolve(entries) {
+                Outcome::Declared(e) => declared(e),
                 Outcome::Initial => Value::Initial,
-                Outcome::Inherit => inherit(),
-                Outcome::Unset if LONGHANDS[id].inherited => inherit(),
+                Outcome::Inherit => inherit,
+                Outcome::Unset if LONGHANDS[id].inherited => inherit,
                 Outcome::Unset => Value::Initial,
             };
         }
-        custom.extend(inherited.map(|&(n, v)| (n, v.inherited())));
         Style { longhands, custom }
     }
 }
