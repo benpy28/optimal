@@ -179,6 +179,59 @@ or canonical, which needs the IANA subtag registry.
 | web-platform-tests reftests of the defaulting keywords in `css/css-cascade` | 6852422 | 36 / 36 (20 pages) | each page "passes if there is a filled green square" (or names its condition, or matches a reference page); the specified values that make it so are written out in `crates/style/tests/wpt.rs` with the reasoning: `revert-layer-001` to `-003`, `-005` to `-007`, `-009`, `-012`, `revert-val-001`, `-002`, `unset-val-001`, `-002`, `initial-color-background-001`, `initial-background-color`, `all-prop-001`, `-002`, `all-prop-{inherit,initial,revert,unset}-color`. Pages whose result depends on the user agent sheet get its `display: block` rule for `div` and `p`, copied from the HTML standard's rendering section |
 | web-platform-tests `*crash*.html` in both directories | 6852422 | 14 / 14 | every page collected and cascaded without a panic |
 
+## Value grammars
+
+| Suite | Pinned commit | Passed | Notes |
+|---|---|---|---|
+| web-platform-tests `test_valid_value` / `test_invalid_value` calls in `css/css-values` and the `parsing` directory of each module the property table cites | 6852422 | 3,120 / 3,334 (214 listed) | `crates/style/tests/wpt_values.rs`: every call whose property and value are string literals, for properties in the table (824 calls for other properties and 264 non-literal calls are counted, not run; `*.tentative.*` pages skipped). Only validity is checked: whether the declaration is kept. Serialization of the valid cases is a later step's |
+
+The 214 listed cases are in `conformance/wpt-values-expected.json`, each
+with its reason; the harness fails when a listed case passes. 196 are
+later spec levels the table doesn't follow yet: css-color-5 (81),
+css-sizing-4 (24), css-fonts-5 (18), css-images-4 `image()` and
+`cross-fade()` (16), css-transforms-2 (16), container query units (8),
+css-backgrounds-4 (6), css-logical-1 (4), css-overflow-4 (3), plus 18
+values holding a substitution function whose own arguments are invalid
+(checked in the `var()` step). The other 18 are errata, where the test
+disagrees with the spec text at 7027ab6:
+
+- css-align-3 gives `align-items` and `justify-items`
+  `<overflow-position>? <self-position>`, which `normal` is not part of, so
+  `safe normal` is invalid (8);
+- css-align-3 defines `<baseline-position> = [ first | last ]? &&
+  baseline`, so `baseline last` is valid (5);
+- css-fonts-4 puts no parse-time limit on the `font-language-override`
+  string (4);
+- css-content-3 replaced `quotes: match-parent` with the placeholder
+  `bikeshed-this` (issue 5478), left out until it is named (2, see
+  `property::GRAMMAR_DEVIATIONS`);
+- css-counter-styles-3 `symbols()` allows `<image>` symbols (1).
+
+The grammars are checked against the spec text
+(`crates/style/tests/value_grammars.rs`): every production and property
+grammar as written in its spec's definition, every unit and its canonical
+factor, the 148 named colors and the system colors. Where the spec states
+a rule in prose (a unitless zero in `flex`, generic names in
+`font-family`, four-character tags, the `circle`/`ellipse` sizes of
+`radial-gradient()`), the table holds an equivalent grammar and the
+sentence it stands for, and the test finds that sentence in the spec.
+Three property grammars deviate on purpose, each with its reason
+(`property::GRAMMAR_DEVIATIONS`).
+
+The matcher is checked against a literal reading of css-values-4 2
+(`crates/style/tests/values_matcher_reference.rs`): on random grammars of
+every combinator and multiplier, with grammar commas and functions, the
+reference writes out every sentence the grammar describes and drops
+grammar commas by the three conditions of "Commas", and the two must agree
+on random values and on sentences of the grammar. This found one bug,
+fixed: a `#` list that could start with an empty repetition didn't try the
+separator after it. Hand-worked cases (`values_hand_worked.rs`) cover the
+calc() white space and type rules, percentage contexts, each math
+function, ranges, unitless zero, the comma rule, colors and the
+reorderable combinators. Matching time grows linearly with the value on
+long and nested hostile values for every property (`scaling.rs`,
+`CSS_SCALING=1`).
+
 There are no computed values yet, so a value is checked as the specified
 value's text (a declaration's value as written, or the property table's
 initial value), and an expected `rgb(0, 128, 0)` is the computed value of

@@ -226,3 +226,86 @@ fn hostile_cascades_run_in_linear_time() {
         );
     }
 }
+
+/// A value shape at size n.
+type ValueCase = fn(usize) -> String;
+
+/// Matching values against every property's grammar grows linearly with
+/// the value: long lists, long runs of one component, long sums inside
+/// calc(), many functions, nesting up to the cap and past it.
+#[test]
+fn hostile_values_match_in_linear_time() {
+    if std::env::var_os("CSS_SCALING").is_none() {
+        return;
+    }
+    use optimal_css::parse_component_values;
+    use optimal_style::property::{LONGHANDS, SHORTHANDS, classify};
+    let cases: &[(&str, ValueCase)] = &[
+        ("idents", |n| "a ".repeat(n)),
+        ("lengths", |n| "1px ".repeat(n)),
+        ("comma list of idents", |n| "a, ".repeat(n) + "a"),
+        ("comma list of colors", |n| "red, ".repeat(n) + "red"),
+        ("commas", |n| ",".repeat(n)),
+        ("family names", |n| "a b c, ".repeat(n) + "serif"),
+        ("shadows", |n| "1px 2px 3px red, ".repeat(n) + "1px 1px red"),
+        ("gradient stops", |n| {
+            format!(
+                "linear-gradient(to right, {} blue)",
+                "red 1%, 2%, ".repeat(n)
+            )
+        }),
+        ("calc sum", |n| {
+            format!("calc({} 1px)", "1px + 2% - ".repeat(n))
+        }),
+        ("calc product", |n| {
+            format!("calc(1px{})", " * 2 / 3".repeat(n))
+        }),
+        ("min arguments", |n| {
+            format!("min({} 1px)", "1em, ".repeat(n))
+        }),
+        ("many functions", |n| "calc(1px) ".repeat(n)),
+        ("many rgb()", |n| "rgb(1 2 3) ".repeat(n)),
+        ("nested parens, capped", |n| {
+            let d = 60;
+            format!("{}{}", "calc(".repeat(d), ")".repeat(d)).repeat(n / 60 + 1)
+        }),
+        ("nested past the cap", |n| {
+            format!("{}1px{}", "calc(".repeat(n), ")".repeat(n))
+        }),
+        ("transform functions", |n| {
+            "translate(1px, 2px) rotate(3deg) ".repeat(n)
+        }),
+        ("grid-like slashes", |n| "1px / ".repeat(n) + "1px"),
+    ];
+    let names: Vec<&str> = LONGHANDS
+        .iter()
+        .map(|l| l.name)
+        .chain(SHORTHANDS.iter().map(|s| s.name))
+        .collect();
+    let time = |make: ValueCase, n: usize| {
+        let text = make(n);
+        let (parsed, range) = parse_component_values(Wtf8::from_str(&text));
+        (0..3)
+            .map(|_| {
+                let start = Instant::now();
+                for name in &names {
+                    std::hint::black_box(classify(name, parsed.values(range.clone())));
+                }
+                start.elapsed()
+            })
+            .min()
+            .unwrap()
+    };
+    let n = 400;
+    for (name, make) in cases {
+        let t1 = time(*make, n);
+        let t4 = time(*make, 4 * n);
+        let t16 = time(*make, 16 * n);
+        println!("{name:32} n={n}: {t1:?}, 4n: {t4:?}, 16n: {t16:?}");
+        let slack = Duration::from_millis(20);
+        assert!(
+            t4 <= t1 * 8 + slack || t16 <= t4 * 8 + slack,
+            "{name}: growth {t1:?} -> {t4:?} -> {t16:?} is not linear"
+        );
+    }
+}

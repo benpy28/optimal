@@ -28,7 +28,7 @@
 //!   are matched as a new list, once per (value, grammar node): memoised.
 
 use optimal_css::{BlockKind, ComponentValue, Kind, Token, Values};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::syntax::{Node, NodeId};
 use super::{Compiled, MAX_NESTING, types};
@@ -285,24 +285,20 @@ impl<'t, 'a> Run<'_, 't, 'a> {
                 // The states after one or more repetitions: a state there
                 // goes on with a separator (for `#`), while the same state
                 // after none goes on without, so the two are kept apart.
-                let mut seen = if count == 0 {
+                let mut frontier = if count == 0 {
                     self.once(child, false, &cur)
                 } else {
                     cur
                 };
-                normalize(&mut seen);
-                // Expand each state once: `seen` holds every state reached.
-                let mut frontier = seen.clone();
+                // Expand each state once: `seen` holds every state reached
+                // (a hash set, so a long value isn't re-sorted per step).
+                let mut seen: HashSet<u32> = frontier.iter().copied().collect();
+                out.extend_from_slice(&frontier);
                 while !frontier.is_empty() {
                     let next = self.once(child, hash, &frontier);
-                    frontier = next
-                        .into_iter()
-                        .filter(|s| seen.binary_search(s).is_err())
-                        .collect();
-                    seen.extend_from_slice(&frontier);
-                    normalize(&mut seen);
+                    frontier = next.into_iter().filter(|&s| seen.insert(s)).collect();
+                    out.extend_from_slice(&frontier);
                 }
-                out.extend(seen);
                 normalize(&mut out);
             }
         }

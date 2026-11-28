@@ -12,13 +12,19 @@
 //!   value: inheritance, initial values and the CSS-wide keywords
 //!   ([`defaulting`]), for the longhands of the property table
 //!   ([`property`]) and custom properties.
+//! - [`values`] checks each declaration's value against its property's
+//!   grammar (css-values-4 2, with the math functions of 10 type-checked),
+//!   so an invalid value drops the declaration at parse time.
 //!
 //! Known gaps, each for a later step: `@import` doesn't load sheets; the
 //! conditional group rules (`@media`, `@supports`, `@container`) and
-//! `@scope` are dropped; values are not parsed against each property's
-//! grammar (only the CSS-wide keyword rules are checked), so no computed
-//! values; arbitrary substitution functions (`var()` and the rest) are not
-//! substituted; the property table has no logical properties, grid,
+//! `@scope` are dropped; no computed values yet (a value is checked, not
+//! parsed into a typed value); arbitrary substitution functions (`var()`
+//! and the rest) are not substituted, and a value holding one is accepted
+//! without checking the function's own arguments; grammars follow the
+//! level each spec in the table cites (no css-color-5, css-sizing-4,
+//! css-transforms-2 or css-fonts-5 values; see
+//! `conformance/wpt-values-expected.json`); the property table has no logical properties, grid,
 //! animation or SVG properties yet; no shadow trees (one encapsulation
 //! context), no animations or transitions, no presentational hints, no
 //! pseudo-element styles.

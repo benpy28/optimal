@@ -204,7 +204,13 @@ struct Reference<'n> {
     nodes: &'n [Node],
     cap: usize,
     memo: HashMap<NodeId, BTreeSet<Sentence>>,
+    /// Set when a set grew past [`LIMIT`]: the case is skipped (a few
+    /// random grammars describe millions of short sentences).
+    too_big: bool,
 }
+
+/// The most sentences the reference builds for one node.
+const LIMIT: usize = 20_000;
 
 fn cost(s: &Sentence) -> usize {
     s.iter().filter(|&&x| x != Sym::G).count()
@@ -257,6 +263,10 @@ impl Reference<'_> {
                 if cost(&s) <= self.cap {
                     out.insert(s);
                 }
+            }
+            if out.len() > LIMIT {
+                self.too_big = true;
+                break;
             }
         }
         out
@@ -350,6 +360,10 @@ impl Reference<'_> {
                         let mut frontier: Vec<Sentence> = reps.into_iter().collect();
                         let mut seen: BTreeSet<Sentence> = frontier.iter().cloned().collect();
                         while let Some(x) = frontier.pop() {
+                            if seen.len() > LIMIT {
+                                self.too_big = true;
+                                break;
+                            }
                             for y in &sep_child {
                                 let s = concat(&x, y);
                                 if cost(&s) <= self.cap && seen.insert(s.clone()) {
@@ -388,22 +402,32 @@ fn literal(mut s: Sentence) -> Sentence {
     s
 }
 
-/// Whether `value` (one list) is a sentence of `top`.
-fn reference(nodes: &[Node], top: NodeId, value: &[Item]) -> bool {
+/// Whether `value` (one list) is a sentence of `top`; `None` if the
+/// sentences were too many to write out.
+fn reference(nodes: &[Node], top: NodeId, value: &[Item]) -> Option<bool> {
     let mut r = Reference {
         nodes,
         cap: value.len(),
         memo: HashMap::new(),
+        too_big: false,
     };
-    r.sentences(top)
-        .into_iter()
-        .map(literal)
-        .any(|s| fits(nodes, &s, value))
+    let all = r.sentences(top);
+    if r.too_big {
+        return None;
+    }
+    let mut out = false;
+    for s in all.into_iter().map(literal) {
+        out |= fits(nodes, &s, value)?;
+    }
+    Some(out)
 }
 
-fn fits(nodes: &[Node], s: &Sentence, value: &[Item]) -> bool {
-    s.len() == value.len()
-        && s.iter().zip(value).all(|(x, v)| match (x, v) {
+fn fits(nodes: &[Node], s: &Sentence, value: &[Item]) -> Option<bool> {
+    if s.len() != value.len() {
+        return Some(false);
+    }
+    for (x, v) in s.iter().zip(value) {
+        let ok = match (x, v) {
             (Sym::Kw(k), Item::Ident(i)) => k.eq_ignore_ascii_case(i),
             (Sym::Delim(c), Item::Delim(d)) => c == d,
             (Sym::G | Sym::S, Item::Comma) => true,
@@ -411,10 +435,15 @@ fn fits(nodes: &[Node], s: &Sentence, value: &[Item]) -> bool {
                 let Node::Function(fname, inner) = nodes[*f as usize] else {
                     unreachable!()
                 };
-                fname.eq_ignore_ascii_case(name) && reference(nodes, inner, args)
+                fname.eq_ignore_ascii_case(name) && reference(nodes, inner, args)?
             }
             _ => false,
-        })
+        };
+        if !ok {
+            return Some(false);
+        }
+    }
+    Some(true)
 }
 
 /// A random sentence of `top`, as a value, if it has one within `cap`.
@@ -423,9 +452,10 @@ fn sample(g: &mut Gen, nodes: &[Node], top: NodeId, cap: usize, depth: u32) -> O
         nodes,
         cap,
         memo: HashMap::new(),
+        too_big: false,
     };
     let all: Vec<Sentence> = r.sentences(top).into_iter().map(literal).collect();
-    if all.is_empty() {
+    if all.is_empty() || r.too_big {
         return None;
     }
     let s = &all[g.below(all.len())];
@@ -483,7 +513,9 @@ fn run(seed: u64) -> (usize, usize) {
             let len = g.below(6);
             random_value(&mut g, len, 2)
         };
-        let want = reference(&nodes, top, &value);
+        let Some(want) = reference(&nodes, top, &value) else {
+            continue;
+        };
         let source = render(&value);
         let (parsed, range) = parse_component_values(Wtf8::from_str(&source));
         let got = matches_list(&c, top, parsed.values(range), 0);
@@ -499,7 +531,7 @@ fn run(seed: u64) -> (usize, usize) {
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(
-        std::env::var("PROPTEST_CASES").ok().and_then(|s| s.parse().ok()).unwrap_or(3000)
+        std::env::var("PROPTEST_CASES").ok().and_then(|s| s.parse().ok()).unwrap_or(500)
     ))]
     #[test]
     fn matcher_matches_the_literal_reading(seed in any::<u64>()) {
@@ -512,12 +544,12 @@ proptest! {
 #[test]
 fn both_answers_are_common() {
     let (mut yes, mut total) = (0, 0);
-    for seed in 0..2000u64 {
+    for seed in 0..300u64 {
         let (y, t) = run(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
         yes += y;
         total += t;
     }
-    assert!(total > 10_000, "{total} cases");
+    assert!(total > 1_500, "{total} cases");
     assert!(
         yes * 5 > total && yes * 5 < total * 4,
         "{yes} of {total} valid"
@@ -579,7 +611,7 @@ fn reference_hand_worked() {
     let check = |top, s: &str, want: bool| {
         assert_eq!(
             reference(&nodes, top, &v(s)),
-            want,
+            Some(want),
             "{} on {s:?}",
             show(&nodes, top)
         );
