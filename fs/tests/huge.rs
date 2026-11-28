@@ -10,6 +10,7 @@ fn opts() -> FormatOptions {
         kdf: KdfParams::INSECURE_FAST_FOR_TESTS,
         quarantine_min_ns: 0,
         meta_chunk_blocks: 0,
+        intent_log_blocks: None,
     }
 }
 
@@ -104,7 +105,9 @@ fn format_footprint_hand_worked() {
     // + the distinct tables and bitmaps on the paths to bitmap 0, to the
     // bitmap holding copy 1 of chunk 0 (half the usable area away) and to
     // the last bitmap. Each is stored twice, plus the chunk leaf's two
-    // copies and the two superblock slots gen 1 writes.
+    // copies and the two superblock slots gen 1 writes. The intent log
+    // ring (16384 blocks on volumes this big) sits at 2, before chunk 0,
+    // and format writes none of it.
     //  16 TiB (3 levels): 3 paths x (2 tables + 1 bitmap) = 9, + 3 = 12.
     //  8 GiB + 12345 (2 levels): bitmaps 0, 32, 64; level-1 tables 0 and 1
     //   (bitmaps 0 and 32 share table 0): 3 + 2 = 5, + 3 = 8.
@@ -122,10 +125,10 @@ fn format_footprint_hand_worked() {
         let e = ch[0].1;
         assert_eq!(
             (e.p0, e.len, e.used.count_ones()),
-            (2, 64, logical),
+            (2 + LOG_MAX_BLOCKS, 64, logical),
             "{blocks}"
         );
-        assert_eq!(e.p1, 2 + (blocks - 4) / 2, "{blocks}");
+        assert_eq!(e.p1, e.p0 + (blocks - 4) / 2, "{blocks}");
         assert_eq!(
             fs.device().stored_blocks(),
             2 * logical as usize + 2 + 2,

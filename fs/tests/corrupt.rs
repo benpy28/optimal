@@ -129,6 +129,7 @@ fn chaos(fs: &mut Filesystem<CrashDevice>, m: &Model, seed: u64) {
             Op::SnapDelete(id) => drop(fs.snapshot_delete(id)),
             Op::Rollback(id) => drop(fs.rollback(id)),
             Op::Remount => {}
+            Op::Fsync(i) => drop(fs.fsync(i)),
         }
     }
     let _ = fs.commit();
