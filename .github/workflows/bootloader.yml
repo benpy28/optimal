@@ -62,6 +62,11 @@ jobs:
           OPTIMAL_BOOT_PUBKEYS=/tmp/ci.pub cargo clippy -p optimal-boot --target x86_64-unknown-uefi -- -D warnings
           cargo clippy -p optimal-boot-conformance --target x86_64-unknown-none -- -D warnings
           cargo clippy -p optimal-boot-quirk --target x86_64-unknown-uefi -- -D warnings
+          OPTIMAL_BOOT_PUBKEYS=/tmp/ci.pub cargo clippy -p optimal-boot-bios --target x86_64-unknown-none -- -D warnings
+          cargo clippy -p optimal-boot-install --all-targets -- -D warnings
+
+      - name: Installer tests
+        run: cargo test -p optimal-boot-install
 
   # Every case boots the conformance kernel under Optimal Boot AND under
   # Limine (the reference): a check failing only under ours is our bug.
@@ -104,6 +109,46 @@ jobs:
         with:
           name: conformance-${{ matrix.case }}
           path: build/ob/*.log
+          if-no-files-found: ignore
+
+  # The BIOS stage under SeaBIOS (QEMU's default firmware): GPT and MBR
+  # disks, FAT12/16/32, IDE, AHCI, virtio, NVMe, USB and SCSI, small and
+  # large memory, and every damage and tampering case, which must stop with
+  # its own named error. Then each deliberate break of the BIOS stage must
+  # be caught by a case.
+  bios:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: bootloader
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (version pinned in bootloader/rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Install QEMU (with SeaBIOS) and image tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q qemu-system-x86 mtools dosfstools fdisk
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm || true
+
+      - name: BIOS cases
+        run: scripts/bios-case.sh
+
+      - name: BIOS stage mutants (each must be killed)
+        run: scripts/bios-mutants.sh
+
+      - name: Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bios
+          path: |
+            build/ob/bios-*.log
+            build/ob/bios-mutant-*.out
           if-no-files-found: ignore
 
   # The firmware-quirk injector must refuse bad input rather than run a

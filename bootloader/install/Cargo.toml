@@ -1,0 +1,13 @@
+[package]
+name = "optimal-boot-install"
+description = "Installs Optimal Boot's BIOS stage onto a disk or disk image."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "optimal-boot-install"
+path = "src/main.rs"
+
+[dependencies]
+optimal-boot-core = { path = "../core" }

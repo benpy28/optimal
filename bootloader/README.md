@@ -6,6 +6,9 @@ specifications. It will replace Limine once it passes the full boot matrix.
 - `core/`: the pure logic (config, signatures, ELF loading, memory map, page
   tables, ACPI, KASLR), tested and fuzzed on the host.
 - `loader/`: the UEFI application (`optimal-boot.efi`).
+- `bios/`: the BIOS stage (MBR boot sector and stage 2), and `install/`,
+  `optimal-boot-install`, which puts it on a disk. Part 1 reaches a
+  verified, loaded kernel; the handoff is next.
 - `sign/`: `optimal-boot-sign`, which makes keys and signs the boot config.
 - `conformance/`: a test kernel that checks every promise of the Limine
   protocol handoff (and Optimal Boot's stronger ones: no writable+executable
