@@ -448,6 +448,14 @@ What this work found, each now a fixed regression test:
   Instance included, and the whole-disk prefix is the path before the first
   media node.
 
+## Boot media (done)
+
+Conformance cases `cd`, `usb`, `nvme` and `virtio` boot from each kind of
+medium QEMU's q35 offers besides SATA (`small` and the rest use SATA), under
+ours and under Limine. `ob-boot-volume` checks what the kernel is told about
+the volume. These are QEMU's emulated controllers; real hardware is not
+covered yet.
+
 ## Not yet: MP, BIOS
 
 - The MP request (starting the APs with the same LAPIC, x2APIC and PAT
