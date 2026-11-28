@@ -6,6 +6,8 @@
 //! best of 5 runs per phase.
 //!
 //! `cargo test --release --test bench_ops -- --ignored --nocapture`
+//! (`OFS_BENCH_LOG=0` formats without an intent log ring, to measure what
+//! recording the log's records costs).
 
 use optimalfs::sim::Rng;
 use optimalfs::*;
@@ -17,7 +19,9 @@ fn fmt(blocks: u64) -> Filesystem<MemDevice> {
         kdf: KdfParams::INSECURE_FAST_FOR_TESTS,
         quarantine_min_ns: 0,
         meta_chunk_blocks: 0,
-        intent_log_blocks: None,
+        intent_log_blocks: std::env::var("OFS_BENCH_LOG")
+            .ok()
+            .map(|v| v.parse().unwrap()),
     };
     Filesystem::format(
         MemDevice::new(blocks),
