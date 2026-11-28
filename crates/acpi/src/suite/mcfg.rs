@@ -215,18 +215,21 @@ proptest! {
         }
     }
 
-    /// Every entry lands in exactly one of `entries` and `bad`, in order,
-    /// with its fields as written.
+    /// Every entry lands in exactly one of `entries` and `bad`, with its
+    /// fields as written.
     #[test]
     fn entries_round_trip(es in proptest::collection::vec(arb_entry(), 0..6)) {
         let raw: Vec<[u8; 16]> = es.iter().map(|&(b, g, s, e)| entry(b, g, s, e)).collect();
         let m = Mcfg::parse(&mcfg(&raw)).unwrap();
         prop_assert_eq!(m.entries.len() + m.bad.len(), es.len());
-        let mut all: Vec<Ecam> = m.entries.iter().chain(m.bad.iter()).copied().collect();
-        all.sort_by_key(|e| es.iter().position(|&(b, g, s, x)| (b, g, s, x) == (e.base, e.segment, e.start_bus, e.end_bus)));
-        for (e, &(b, g, s, x)) in all.iter().zip(es.iter()) {
-            prop_assert_eq!((e.base, e.segment, e.start_bus, e.end_bus), (b, g, s, x));
-        }
+        // Every entry comes back exactly once, as usable or bad: compare as
+        // multisets, since the list may hold duplicates (a seed once gave
+        // [A, (0, 0, 0, 0), A] with A = (0, 2, 63, 118)).
+        let mut all: Vec<(u64, u16, u8, u8)> = m.entries.iter().chain(m.bad.iter()).map(|e| (e.base, e.segment, e.start_bus, e.end_bus)).collect();
+        let mut want = es.clone();
+        all.sort_unstable();
+        want.sort_unstable();
+        prop_assert_eq!(all, want);
         // Usable entries never overlap within a segment.
         for (i, a) in m.entries.iter().enumerate() {
             for b in &m.entries[..i] {

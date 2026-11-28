@@ -2,6 +2,7 @@
 //! small reference models of the hardware, and random inputs.
 
 mod base;
+mod eoi;
 mod ioapic;
 mod lapic;
 mod pic;

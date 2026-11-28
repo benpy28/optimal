@@ -204,8 +204,15 @@ impl Lvt {
     }
 }
 
+/// SVR bit 12: EOIs of level-triggered interrupts are not broadcast to
+/// the I/O APICs (SDM 11.8.5). Only settable when the version register
+/// says the APIC can ([`Version::eoi_broadcast_suppression`]); the kernel
+/// sets it only in directed-EOI mode (crate::eoi).
+pub const SVR_SUPPRESS_EOI_BROADCAST: u32 = 1 << 12;
+
 /// The spurious-interrupt vector register: software enable (bit 8) and the
-/// spurious vector. Focus checking and EOI-broadcast suppression stay off.
+/// spurious vector. Focus checking and EOI-broadcast suppression stay off
+/// (crate::eoi adds [`SVR_SUPPRESS_EOI_BROADCAST`] when it chooses to).
 pub fn svr(vector: u8, enabled: bool) -> u32 {
     u32::from(vector) | if enabled { 1 << 8 } else { 0 }
 }
