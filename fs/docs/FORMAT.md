@@ -29,8 +29,9 @@ address (below 2^45).
 Slot `s` lives at block `0, 1, N-1, N-2` for `s = 0, 1, 2, 3`. Commit
 generation `g` writes slots `g % 2` and `2 + g % 2`. After a fallback mount
 and for a replay-value bump it writes all four in two waves: slots 0 and 1,
-flush, then slots 2 and 3, flush. A volume needs
-at least 64 blocks and at most 2^45 blocks (128 PiB).
+flush, then slots 2 and 3, flush. A volume has at most 2^45 blocks
+(128 PiB). `format` creates volumes of at least 1024 blocks (4 MiB, see
+DESIGN "Space accounting"); mount reads volumes down to 64 blocks.
 
 ## Superblock (4096 bytes)
 

@@ -678,6 +678,21 @@ impl Harness {
     }
 
     /// Wraps an already-mounted filesystem whose state is `model`.
+    /// The model has no space limit, so a namespace op that allocates may
+    /// fail with `NoSpace` where the model succeeds, but only when the
+    /// volume's space check refuses such an op (8 metadata blocks) even
+    /// after the drain `ensure_space` tried. A `NoSpace` from anywhere else
+    /// (an allocation failing inside the op) still fails the comparison.
+    fn full_disk_refusal<T, U>(
+        &mut self,
+        fr: &Result<T>,
+        mr: &core::result::Result<U, Error>,
+    ) -> bool {
+        matches!(fr, Err(Error::NoSpace))
+            && mr.is_ok()
+            && !self.fs.as_mut().unwrap().has_room_for(0, 8, false).unwrap()
+    }
+
     pub fn from_mounted(
         fs: Filesystem<CrashDevice>,
         model: Model,
@@ -761,33 +776,45 @@ impl Harness {
             Op::Create(d, n, p) => {
                 let mut m = self.model.live.clone();
                 let mr = m.create(d, &n, FileKind::File, p);
-                cmp!(self.fs().create(d, &n, p), mr);
-                if mr.is_ok() {
-                    self.model.live = m;
+                let fr = self.fs().create(d, &n, p);
+                if !self.full_disk_refusal(&fr, &mr) {
+                    cmp!(fr, mr);
+                    if mr.is_ok() {
+                        self.model.live = m;
+                    }
                 }
             }
             Op::Mkdir(d, n, p) => {
                 let mut m = self.model.live.clone();
                 let mr = m.create(d, &n, FileKind::Dir, p);
-                cmp!(self.fs().mkdir(d, &n, p), mr);
-                if mr.is_ok() {
-                    self.model.live = m;
+                let fr = self.fs().mkdir(d, &n, p);
+                if !self.full_disk_refusal(&fr, &mr) {
+                    cmp!(fr, mr);
+                    if mr.is_ok() {
+                        self.model.live = m;
+                    }
                 }
             }
             Op::Symlink(d, n, t) => {
                 let mut m = self.model.live.clone();
                 let mr = m.symlink(d, &n, &t);
-                cmp!(self.fs().symlink(d, &n, &t), mr);
-                if mr.is_ok() {
-                    self.model.live = m;
+                let fr = self.fs().symlink(d, &n, &t);
+                if !self.full_disk_refusal(&fr, &mr) {
+                    cmp!(fr, mr);
+                    if mr.is_ok() {
+                        self.model.live = m;
+                    }
                 }
             }
             Op::Link(i, d, n) => {
                 let mut m = self.model.live.clone();
                 let mr = m.link(i, d, &n);
-                cmp!(self.fs().link(i, d, &n), mr);
-                if mr.is_ok() {
-                    self.model.live = m;
+                let fr = self.fs().link(i, d, &n);
+                if !self.full_disk_refusal(&fr, &mr) {
+                    cmp!(fr, mr);
+                    if mr.is_ok() {
+                        self.model.live = m;
+                    }
                 }
             }
             Op::Unlink(d, n) => {

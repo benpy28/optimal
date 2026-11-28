@@ -12,7 +12,7 @@ use crate::superblock::{
 };
 use crate::tree::{Key, MAX_VALUE, NodeCache, Store, Tree, TreeId};
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -378,7 +378,27 @@ pub struct Filesystem<D: BlockDevice> {
     recovery: Option<crate::recover::RecoveryStats>,
     /// The next commit raises the replay value by one.
     replay_bump: bool,
+    /// Data blocks the operations of the open transaction asked
+    /// [`ensure_space`](Self::ensure_space) for (written by the next commit,
+    /// so they stay budgeted until then).
+    txn_data: u64,
+    /// The same for logical metadata blocks.
+    txn_meta: u64,
+    /// Per-commit overhead of recent commits: (logical metadata blocks,
+    /// chunk-table node pairs) that the commit itself allocated beyond the
+    /// trees, newest last, at most [`COST_RING`] entries.
+    commit_costs: VecDeque<(u64, u64)>,
 }
+
+/// Smallest volume `format` accepts. Metadata is stored twice and freed
+/// space is quarantined for QUARANTINE_COMMITS commits, so the space kept
+/// back for the next commit and the drain after it (see
+/// [`Filesystem::space_needed`]) is a fixed few hundred blocks: about 29% of a
+/// 1024-block volume, 11% at 4096, 2.3% (the 2% gap) from 65536 up.
+pub const MIN_BLOCKS: u64 = 1024;
+
+/// How many recent commits' overhead [`Filesystem::commit_costs`] keeps.
+const COST_RING: usize = 2 * (crate::space::QUARANTINE_COMMITS as usize + 1);
 
 impl<D: BlockDevice> core::fmt::Debug for Filesystem<D> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -406,8 +426,10 @@ impl<D: BlockDevice> Filesystem<D> {
         clock: Box<dyn Clock>,
     ) -> Result<Self> {
         let total = dev.num_blocks();
-        if total < 64 {
-            return Err(Error::Invalid("device too small (need at least 64 blocks)"));
+        if total < MIN_BLOCKS {
+            return Err(Error::Invalid(
+                "device too small (need at least 1024 blocks, 4 MiB)",
+            ));
         }
         let mut uuid = [0u8; 16];
         rng.fill(&mut uuid);
@@ -514,6 +536,9 @@ impl<D: BlockDevice> Filesystem<D> {
             fell_back_from: None,
             recovery: None,
             replay_bump: false,
+            txn_data: 0,
+            txn_meta: 0,
+            commit_costs: VecDeque::new(),
         };
         let now = fs.clock.now_ns();
         let root = Attr {
@@ -677,6 +702,9 @@ impl<D: BlockDevice> Filesystem<D> {
                 fell_back_from: None,
                 recovery: None,
                 replay_bump: false,
+                txn_data: 0,
+                txn_meta: 0,
+                commit_costs: VecDeque::new(),
             };
             let check = if clean {
                 Ok(())
@@ -709,6 +737,11 @@ impl<D: BlockDevice> Filesystem<D> {
                         fs.gen_floor = floor;
                         fs.rewrite_all_slots = true;
                         fs.fell_back_from = Some(floor);
+                        // The first commit runs even if nothing changes, so
+                        // the skipped copies are replaced as soon as possible.
+                        if !fs.read_only {
+                            fs.txn_dirty = true;
+                        }
                     }
                     return Ok(fs);
                 }
@@ -918,7 +951,7 @@ impl<D: BlockDevice> Filesystem<D> {
             .store
             .space
             .allocatable_blocks()
-            .saturating_sub(reserve_for(total) + self.dirty_blocks as u64);
+            .saturating_sub(self.space_needed(0, 0) + self.space_gap(false));
         StatFs {
             total_blocks: total,
             free_blocks: self.store.space.free_blocks(),
@@ -942,35 +975,154 @@ impl<D: BlockDevice> Filesystem<D> {
         Ok(())
     }
 
-    /// Fails with `NoSpace` unless `blocks` more can be allocated while
-    /// keeping the commit reserve. Deletes pass `use_reserve = true`.
-    fn ensure_space(&mut self, blocks: u64, use_reserve: bool) -> Result<()> {
-        let total = self.store.space.total_blocks();
-        let reserve = if use_reserve {
-            reserve_for(total) / 2
-        } else {
-            reserve_for(total)
-        };
-        let need = |fs: &Self| blocks + fs.dirty_blocks as u64 + reserve;
-        if self.store.space.allocatable_blocks() >= need(self) {
-            return Ok(());
+    /// Upper bounds for one commit's own overhead: (logical metadata blocks,
+    /// chunk-table node pairs). The larger of what recent commits used and a
+    /// structural floor: the root block, a free-log block, two bitmaps and
+    /// one table per space-map level; one pair per chunk-table level plus
+    /// one for growth.
+    fn commit_overhead(&self) -> (u64, u64) {
+        let s = &self.store.space;
+        let l_floor = 4 + s.levels() as u64;
+        let p_floor = s.chunks.depth() as u64 + 2;
+        self.commit_costs
+            .iter()
+            .fold((l_floor, p_floor), |(l, p), &(cl, cp)| {
+                (l.max(cl), p.max(cp))
+            })
+    }
+
+    /// Physical blocks that must stay allocatable so that, after an
+    /// operation needing `data` data blocks and `meta` logical metadata
+    /// blocks, the next commit and then QUARANTINE_COMMITS + 1 empty commits
+    /// (which drain freed space back into use) can all complete. Metadata
+    /// slots come from mapped chunks first; each further chunk costs two
+    /// copies of `chunk_blocks`; each chunk-table pair costs two blocks.
+    /// Slots freed during the drain are not counted (they are quarantined).
+    fn space_needed(&self, data: u64, meta: u64) -> u64 {
+        let (l, p) = self.commit_overhead();
+        let k = crate::space::QUARANTINE_COMMITS;
+        let cb = self.store.space.chunks.chunk_blocks();
+        let mut slots = self.store.space.usable_meta_slots();
+        let mut chunks = 0;
+        for want in [self.txn_meta + meta + l, (k + 1) * l] {
+            let short = want.saturating_sub(slots);
+            let new = short.div_ceil(cb);
+            chunks += new;
+            slots = slots + new * cb - want;
         }
-        // Quarantined blocks become usable once they are QUARANTINE_COMMITS
-        // commits and the minimum time old. Cycle commits while that could
-        // still help; past the time window the caller must wait and retry.
-        if self.txn_dirty {
-            self.commit()?;
+        data + self.dirty_blocks as u64 + self.txn_data + 2 * cb * chunks + 2 * (k + 2) * p
+    }
+
+    /// Extra allocatable blocks an operation must leave on top of
+    /// [`space_needed`](Self::space_needed). Deletes keep 1% of the volume
+    /// (at least 32 blocks) so the allocator never runs completely dry.
+    /// Ordinary operations keep enough more that a delete (16 metadata
+    /// blocks) can still be committed and drained when they are refused:
+    /// using up mapped metadata slots raises `space_needed` a whole chunk at
+    /// a time, so the difference covers the chunks such a delete can map,
+    /// one more for rounding, and a chunk-table path; and at least 2%.
+    fn space_gap(&self, use_reserve: bool) -> u64 {
+        let r = reserve_for(self.store.space.total_blocks());
+        if use_reserve {
+            return r / 2;
         }
-        let mut cycles = 0;
-        while self.store.space.allocatable_blocks() < need(self) {
-            let could =
-                self.store.space.allocatable_blocks() + self.store.space.quarantined_blocks();
-            if could < need(self) || cycles > crate::space::QUARANTINE_COMMITS {
-                return Err(Error::NoSpace);
+        let (l, p) = self.commit_overhead();
+        let cb = self.store.space.chunks.chunk_blocks();
+        r.max(r / 2 + 2 * cb * ((16 + l).div_ceil(cb) + 1) + 2 * p)
+    }
+
+    /// Whether an operation needing `data_blocks` data blocks and
+    /// `meta_blocks` logical metadata blocks passes the space check right
+    /// now without committing (a create or mkdir needs 0 and 8; a delete
+    /// passes `delete = true`).
+    pub fn has_room_for(
+        &mut self,
+        data_blocks: u64,
+        meta_blocks: u64,
+        delete: bool,
+    ) -> Result<bool> {
+        self.store.space.refresh_releasing(&mut self.store.io)?;
+        Ok(self.store.space.allocatable_blocks()
+            >= self.space_needed(data_blocks, meta_blocks) + self.space_gap(delete))
+    }
+
+    /// How many empty commits make `need` blocks allocatable, counting only
+    /// blocks already quarantined (by generation and age) and charging each
+    /// commit its overhead (slot-aware, as in `space_needed`). `None` if no
+    /// number up to QUARANTINE_COMMITS + 1 can, or a commit can't be afforded.
+    fn drain_plan(&self, need: u64, now: i64) -> Option<u64> {
+        let s = &self.store.space;
+        let k = crate::space::QUARANTINE_COMMITS;
+        let (l, p) = self.commit_overhead();
+        let cb = s.chunks.chunk_blocks();
+        let mut slots = s.usable_meta_slots();
+        let mut avail = s.allocatable_blocks();
+        let mut released = 0;
+        let first = self.txn_generation();
+        for j in 0..=k {
+            let new = l.saturating_sub(slots).div_ceil(cb);
+            let cost = 2 * cb * new + 2 * p;
+            if avail < cost {
+                return None;
             }
-            self.commit_forced()?;
-            cycles += 1;
+            avail -= cost;
+            slots = slots + new * cb - l;
+            let generation = first + j;
+            while let Some(h) = s.held.get(released) {
+                let old_enough = generation.saturating_sub(h.generation) >= k;
+                let long_enough = now.saturating_sub(h.time_ns) >= s.quarantine_min_ns;
+                if !(old_enough && long_enough) {
+                    break;
+                }
+                avail += h.set.len();
+                released += 1;
+            }
+            if avail >= need {
+                return Some(j + 1);
+            }
         }
+        None
+    }
+
+    /// Fails with `NoSpace` unless an operation needing `data` data blocks
+    /// and `meta` logical metadata blocks leaves enough allocatable space
+    /// ([`space_needed`](Self::space_needed) plus [`space_gap`](Self::space_gap)).
+    /// Deletes pass `use_reserve = true` and keep only half the gap. May
+    /// commit, and cycle empty commits to drain quarantined space, but only
+    /// after checking that the drain ends with enough space: a refusal writes
+    /// nothing, and no commit is started that the volume can't afford.
+    fn ensure_space(&mut self, data: u64, meta: u64, use_reserve: bool) -> Result<()> {
+        self.store.space.refresh_releasing(&mut self.store.io)?;
+        let need = |fs: &Self| fs.space_needed(data, meta) + fs.space_gap(use_reserve);
+        if self.store.space.allocatable_blocks() < need(self) {
+            // The open transaction's commit was budgeted by the operations
+            // that made it. Committing it frees that budget; then
+            // quarantined blocks become usable once they are
+            // QUARANTINE_COMMITS commits and the minimum time old. Past the
+            // time window the caller must wait and retry.
+            if self.txn_dirty || self.dirty_blocks > 0 {
+                self.commit_forced()?;
+                self.store.space.refresh_releasing(&mut self.store.io)?;
+            }
+            if self.store.space.allocatable_blocks() < need(self) {
+                let now = self.clock.now_ns();
+                let Some(cycles) = self.drain_plan(need(self), now) else {
+                    return Err(Error::NoSpace);
+                };
+                for _ in 0..cycles {
+                    if self.store.space.allocatable_blocks() >= need(self) {
+                        break;
+                    }
+                    self.commit_forced()?;
+                    self.store.space.refresh_releasing(&mut self.store.io)?;
+                }
+                if self.store.space.allocatable_blocks() < need(self) {
+                    return Err(Error::NoSpace);
+                }
+            }
+        }
+        self.txn_data += data;
+        self.txn_meta += meta;
         Ok(())
     }
 
@@ -1105,7 +1257,7 @@ impl<D: BlockDevice> Filesystem<D> {
     fn create_common(&mut self, dir: u64, name: &[u8], kind: FileKind, perm: u32) -> Result<Attr> {
         self.check_writable()?;
         let mut d = self.check_new_name(dir, name)?;
-        self.ensure_space(8, false)?;
+        self.ensure_space(0, 8, false)?;
         if kind == FileKind::Dir && d.nlink >= LINK_MAX {
             return Err(Error::TooManyLinks);
         }
@@ -1168,7 +1320,7 @@ impl<D: BlockDevice> Filesystem<D> {
             return Err(Error::TooManyLinks);
         }
         let mut d = self.check_new_name(dir, name)?;
-        self.ensure_space(8, false)?;
+        self.ensure_space(0, 8, false)?;
         self.add_entry(dir, name, ino, a.kind)?;
         let now = self.clock.now_ns();
         a.nlink += 1;
@@ -1189,7 +1341,7 @@ impl<D: BlockDevice> Filesystem<D> {
         if a.kind == FileKind::Dir {
             return Err(Error::IsDir);
         }
-        self.ensure_space(8, true)?;
+        self.ensure_space(0, 8, true)?;
         self.remove_entry(dir, name)?;
         let now = self.clock.now_ns();
         let mut d = self.get_inode(dir)?;
@@ -1216,7 +1368,7 @@ impl<D: BlockDevice> Filesystem<D> {
         if a.size != 0 {
             return Err(Error::NotEmpty);
         }
-        self.ensure_space(8, true)?;
+        self.ensure_space(0, 8, true)?;
         self.remove_entry(dir, name)?;
         let now = self.clock.now_ns();
         let mut d = self.get_inode(dir)?;
@@ -1296,7 +1448,7 @@ impl<D: BlockDevice> Filesystem<D> {
         {
             return Err(Error::TooManyLinks);
         }
-        self.ensure_space(16, true)?;
+        self.ensure_space(0, 16, true)?;
         let now = self.clock.now_ns();
         // Drop the replaced target.
         if let Some(t) = target {
@@ -1679,7 +1831,7 @@ impl<D: BlockDevice> Filesystem<D> {
         let last = (end - 1) / bs;
         let nblocks = last - first + 1;
         // Data blocks plus about one metadata node per extent.
-        self.ensure_space(nblocks + nblocks / 32 + 8, false)?;
+        self.ensure_space(nblocks, nblocks / 32 + 8, false)?;
         self.txn_dirty = true;
         let mut pos = 0usize;
         for idx in first..=last {
@@ -1724,7 +1876,7 @@ impl<D: BlockDevice> Filesystem<D> {
         if size > MAX_FILE_SIZE {
             return Err(Error::FileTooBig);
         }
-        self.ensure_space(8, true)?;
+        self.ensure_space(0, 8, true)?;
         self.txn_dirty = true;
         let bs = BLOCK_SIZE as u64;
         if size < a.size {
@@ -1915,6 +2067,10 @@ impl<D: BlockDevice> Filesystem<D> {
         let fs_root = self.fs_tree.write(&mut self.store, generation)?;
         crate::snapshot::flush_deadlist(self)?;
         let meta_root = self.meta.write(&mut self.store, generation)?;
+        let cost_from = (
+            self.store.space.allocated_l,
+            self.store.space.allocated_pairs,
+        );
         let now = self.clock.now_ns();
         // A new root block every commit; the old one is quarantined.
         if !self.body.root_block.is_null() {
@@ -1971,6 +2127,10 @@ impl<D: BlockDevice> Filesystem<D> {
             body.encode_root(),
             0,
         )?;
+        let cost = (
+            self.store.space.allocated_l - cost_from.0,
+            self.store.space.allocated_pairs - cost_from.1,
+        );
         self.store.io.write_batch()?;
         superblock::commit(
             &mut self.store.io,
@@ -1984,6 +2144,12 @@ impl<D: BlockDevice> Filesystem<D> {
         self.body = body;
         self.store.space.committed(generation, now);
         self.txn_dirty = false;
+        self.txn_data = 0;
+        self.txn_meta = 0;
+        if self.commit_costs.len() == COST_RING {
+            self.commit_costs.pop_front();
+        }
+        self.commit_costs.push_back(cost);
         Ok(())
     }
 
