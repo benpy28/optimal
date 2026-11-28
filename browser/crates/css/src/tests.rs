@@ -444,6 +444,13 @@ fn stream_retries_once_the_unscanned_text_doubles() {
     // Finishing always scans.
     s.finish();
     assert_eq!(s.next_token(false), Next::End);
+    // The threshold is unscanned text plus what has arrived, not a product:
+    // 3 unscanned at length 3 means retry at length 6.
+    let mut s = StreamTokenizer::new();
+    s.push(Wtf8::from_str("abc"));
+    assert_eq!(s.next_token(false), Next::NeedInput);
+    s.push(Wtf8::from_str("de;"));
+    assert_eq!(drain(&mut s), [ident("abcde"), Token::Semicolon]);
 }
 
 #[test]
@@ -493,6 +500,18 @@ fn stream_drops_consumed_text() {
         [(Token::String("x".repeat(1001).into()), 200_000, 201_003)]
     );
     assert_eq!(s.errors(), []);
+    // Consumed text is dropped once it is half the buffer, even while much
+    // unconsumed text remains: 200 000 consumed bytes before a 150 000 byte
+    // unfinished string.
+    let mut s = StreamTokenizer::new();
+    s.push(Wtf8::from_str(&format!(
+        "{}'{}",
+        "a ".repeat(100_000),
+        "x".repeat(150_000)
+    )));
+    assert_eq!(drain(&mut s).len(), 200_000);
+    s.push(Wtf8::from_str("x"));
+    assert!(s.buf.len() < 160_000, "buffer still {} bytes", s.buf.len());
     // Below 64 KiB consumed, nothing is dropped (copying would cost more
     // than it saves).
     let mut s = StreamTokenizer::new();
