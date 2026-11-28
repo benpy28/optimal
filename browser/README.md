@@ -11,7 +11,9 @@ gates, Optimal ships a borrowed browser.
 | Crate | What it is | Status |
 |---|---|---|
 | `crates/wtf8` | Web strings: UTF-8 that can also hold lone surrogates | done |
-| `crates/html` | WHATWG HTML parser | tokenizer done (html5lib-tests 7046/7046); tree builder next |
+| `crates/dom` | Arena DOM, with the element behaviour that changes the tree while parsing (the `select` element model) | the subset parsing needs |
+| `crates/html` | WHATWG HTML parser | tokenizer done (html5lib-tests 7046/7046); tree builder done (WPT 3898/3898 runnable) |
+| `crates/css` | CSS Syntax Level 3 | tokenizer done (css-tokenizer-tests 287/287, 2 with errata); parser next |
 
 ## Building and testing
 
@@ -27,6 +29,8 @@ higher still.
 
 ## Licences of test data
 
-- html5lib-tests (MIT), fetched by the script, not vendored.
+- html5lib-tests (MIT), web-platform-tests (BSD-3-Clause),
+  romainmenke/css-tokenizer-tests (MIT) and SimonSapin/css-parsing-tests
+  (CC0), fetched by the script, not vendored.
 - `crates/html/data/entities.json`: the WHATWG named character reference
   table, CC BY 4.0, Copyright WHATWG (Apple, Google, Mozilla, Microsoft).

@@ -171,6 +171,7 @@ fn run_errors(t: &Test, scripting: bool, chunks: &[usize]) -> (String, Vec<Strin
         scripting,
         iframe_srcdoc: false,
         collect_errors: true,
+        reference_dom: false,
     };
     let mut p = match &t.fragment {
         Some(c) => Parser::new_fragment(&context(c), options),

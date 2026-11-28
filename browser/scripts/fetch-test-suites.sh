@@ -48,3 +48,17 @@ fetch_sparse() { # name url commit path
 
 # web-platform-tests: the tree construction tests (html/syntax/parsing).
 fetch_sparse wpt https://github.com/web-platform-tests/wpt.git 6852422b49e7dc8037d7f130ee07cf991fb73f05 html/syntax/parsing/resources
+
+# romainmenke/css-tokenizer-tests (MIT): the CSS tokenizer suite.
+fetch css-tokenizer-tests https://github.com/romainmenke/css-tokenizer-tests.git 0db1d128d02f0e3e38c9271f377eb8d70f280813
+
+# SimonSapin/css-parsing-tests (CC0): CSS parser tests (component values,
+# rules, declarations, An+B, colours). Some predate the 2026 css-syntax-3
+# text; corrections are in conformance/css-parsing-errata.json.
+fetch css-parsing-tests https://github.com/SimonSapin/css-parsing-tests.git 203ce36bffd617db7f118c551e32794561fb273d
+
+# The specs the CSS crate is written from, at the commit it follows. Not test
+# data, so only fetched on request: ./scripts/fetch-test-suites.sh --specs
+if [ "${1:-}" = "--specs" ]; then
+  fetch_sparse csswg-drafts https://github.com/w3c/csswg-drafts.git 7027ab6fdf3c98d9c44666820041cb075b0e28dd css-syntax-3
+fi

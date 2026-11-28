@@ -14,11 +14,18 @@
 //!   so a stale handle is a checked error, never a use of the wrong node.
 //!
 //! Status: the subset the HTML parser needs, with the invariants the DOM
-//! standard requires for it. The full DOM API comes with the script engine.
+//! standard requires for it, and the element behaviour that changes the tree
+//! during parsing (the `select` element model, see [`select`]). The full DOM
+//! API comes with the script engine.
+//!
+//! Mutation follows the DOM standard's insert and remove algorithms: they
+//! run the HTML element insertion, post-connection and removing steps, so
+//! every caller (the parser now, scripts later) gets the same behaviour.
 
 #![forbid(unsafe_code)]
 
 pub mod names;
+pub mod select;
 
 pub use names::{Interner, LocalName, Namespace, local, static_name_count};
 use optimal_wtf8::{Wtf8, Wtf8Buf};
@@ -102,6 +109,8 @@ pub struct Element {
     pub attributes: Vec<Attribute>,
     /// For `template` elements: the contents fragment.
     pub template_contents: Option<NodeId>,
+    /// State the element's behaviour keeps (selectedness, cached select...).
+    pub(crate) behaviour: select::Behaviour,
 }
 
 impl Element {
@@ -140,6 +149,8 @@ pub struct Document {
     pub names: Interner,
     /// Quirks mode.
     pub quirks_mode: QuirksMode,
+    /// Element behaviour bookkeeping: microtasks, ancestor-context memos.
+    pub(crate) model: select::Model,
 }
 
 impl Default for Document {
@@ -165,7 +176,22 @@ impl Document {
             }],
             names: Interner::new(),
             quirks_mode: QuirksMode::NoQuirks,
+            model: select::Model {
+                flagged: vec![false],
+                ..select::Model::default()
+            },
         }
+    }
+
+    /// An empty document that runs element behaviour exactly as the
+    /// standard words it: full ancestor walks, full descendant traversals
+    /// and the full selectedness setting algorithm every time, with no
+    /// memos or fast paths. Tests run the same operations on this and on
+    /// [`Document::new`] and require identical results.
+    pub fn new_reference() -> Self {
+        let mut d = Self::new();
+        d.model.reference = true;
+        d
     }
 
     /// Number of nodes ever created (attached or not).
@@ -184,6 +210,7 @@ impl Document {
             next_sibling: None,
             data,
         });
+        self.model.flagged.push(false);
         id
     }
 
@@ -197,12 +224,23 @@ impl Document {
     ) -> NodeId {
         let template_contents = (namespace == Namespace::Html && local == local::TEMPLATE)
             .then(|| self.create(NodeData::DocumentFragment));
-        self.create(NodeData::Element(Element {
+        let host = NodeId(u32::try_from(self.nodes.len()).expect("more than 4 billion nodes"));
+        if let Some(c) = template_contents {
+            self.model.hosts.insert(c, host);
+        }
+        let behaviour = select::Behaviour::for_new_element(namespace, local, &attributes);
+        let relevant = behaviour.is_relevant();
+        let id = self.create(NodeData::Element(Element {
             namespace,
             local,
             attributes,
             template_contents,
-        }))
+            behaviour,
+        }));
+        if relevant {
+            self.model.flagged[id.index()] = true;
+        }
+        id
     }
 
     /// The node's data.
@@ -286,14 +324,27 @@ impl Document {
     }
 
     /// Would inserting `child` into `parent` make a node its own ancestor?
-    /// A node with no children can only do so by being `parent`, which keeps
-    /// the parser's inserts (always of new, empty nodes) O(1) at any depth.
+    /// This is the DOM's "host-including inclusive ancestor" check: a
+    /// template's contents count as being inside the template, so a
+    /// template cannot go into its own contents. A node with no children
+    /// and no template contents can only cycle by being `parent`, which
+    /// keeps the parser's inserts (always of new, empty nodes) O(1) at any
+    /// depth.
     pub fn would_cycle(&self, child: NodeId, parent: NodeId) -> bool {
-        if self.nodes[child.index()].first_child.is_none() {
-            child == parent
-        } else {
-            self.is_inclusive_ancestor(child, parent)
+        let contents = self.element(child).and_then(|e| e.template_contents);
+        let has_contents = contents.is_some_and(|c| self.nodes[c.index()].first_child.is_some());
+        if self.nodes[child.index()].first_child.is_none() && !has_contents {
+            // Below an empty node there is only an empty contents fragment.
+            return child == parent || contents == Some(parent);
         }
+        let mut n = Some(parent);
+        while let Some(x) = n {
+            if x == child {
+                return true;
+            }
+            n = self.parent(x).or_else(|| self.model.hosts.get(&x).copied());
+        }
+        false
     }
 
     /// Does the node have an element child?
@@ -301,11 +352,18 @@ impl Document {
         self.children(id).any(|c| self.element(c).is_some())
     }
 
-    /// Detach `child` from its parent, if it has one.
+    /// The DOM's "remove": detach `child` from its parent, if it has one,
+    /// then run the removing steps for it and its descendants.
     pub fn remove(&mut self, child: NodeId) {
         let Some(parent) = self.nodes[child.index()].parent else {
             return;
         };
+        self.unlink(child, parent);
+        self.after_removal(child, parent);
+    }
+
+    /// Detach `child` from `parent`, touching links only.
+    fn unlink(&mut self, child: NodeId, parent: NodeId) {
         let prev = self.nodes[child.index()].prev_sibling;
         let next = self.nodes[child.index()].next_sibling;
         match prev {
@@ -322,8 +380,11 @@ impl Document {
         c.next_sibling = None;
     }
 
-    /// Insert `child` into `parent` before `reference` (or at the end when
-    /// `reference` is `None`). `child` is first removed from wherever it is.
+    /// The DOM's "pre-insert" and "insert": insert `child` into `parent`
+    /// before `reference` (or at the end when `reference` is `None`). A
+    /// document fragment inserts its children instead. `child` is first
+    /// removed from wherever it is (with its removing steps), then the
+    /// insertion and post-connection steps run.
     ///
     /// # Panics
     /// If `reference` is not a child of `parent`, or if the insertion would
@@ -334,17 +395,39 @@ impl Document {
             !self.would_cycle(child, parent),
             "insertion would create a cycle"
         );
+        let mut reference = reference;
         if let Some(r) = reference {
             assert_eq!(
                 self.parent(r),
                 Some(parent),
                 "reference is not a child of parent"
             );
+            // Pre-insert: inserting a node before itself inserts it before
+            // its next sibling (it is removed and put back in place).
             if r == child {
-                return;
+                reference = self.next_sibling(child);
             }
         }
-        self.remove(child);
+        let nodes: Vec<NodeId> = if matches!(self.data(child), NodeData::DocumentFragment) {
+            let nodes: Vec<NodeId> = self.children(child).collect();
+            for &n in &nodes {
+                self.remove(n);
+            }
+            nodes
+        } else {
+            vec![child]
+        };
+        for &n in &nodes {
+            self.remove(n);
+            self.link(parent, n, reference);
+            self.after_link(n, parent);
+        }
+        self.post_connection(&nodes);
+    }
+
+    /// Link a detached `child` into `parent` before `reference`, touching
+    /// links only.
+    fn link(&mut self, parent: NodeId, child: NodeId, reference: Option<NodeId>) {
         let prev = match reference {
             Some(r) => self.nodes[r.index()].prev_sibling,
             None => self.nodes[parent.index()].last_child,
@@ -415,6 +498,7 @@ impl Document {
                 "cycle"
             );
         }
+        self.check_behaviour();
     }
 }
 
