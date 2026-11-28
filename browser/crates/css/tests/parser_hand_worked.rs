@@ -407,3 +407,65 @@ fn views_report_lengths_and_spans() {
     };
     assert!(empty.is_empty());
 }
+
+#[test]
+fn at_rule_ends_a_run_of_declarations_even_if_rejected_5_5_5() {
+    // 5.5.5's <at-keyword-token> branch moves the declarations so far into
+    // the rules before it consumes the at-rule, so a rejected "@bad" still
+    // splits "w:1" from "y:2".
+    let src = "a{w:1; @bad; y:2}";
+    assert_eq!(
+        sheet(src).0,
+        json!([[
+            "qr",
+            "a",
+            [["d", "w", "1", false]],
+            [["nd", [["d", "y", "2", false]]]]
+        ]])
+    );
+    // With nothing before it there is nothing to move, and the rejected
+    // rule adds nothing, so "y:2" is the first run: the rule's own
+    // declarations.
+    assert_eq!(
+        sheet("a{@bad; y:2}").0,
+        json!([["qr", "a", [["d", "y", "2", false]], []]])
+    );
+}
+
+#[test]
+fn close_curly_in_top_level_at_rule_prelude_5_5_2() {
+    // Not nested, a "}" is consumed into the prelude.
+    let (r, e) = sheet("@m } x; b{}");
+    assert_eq!(r, json!([["at", "m", " } x", null], ["qr", "b", [], []]]));
+    assert_eq!(e, json!([]));
+}
+
+#[test]
+fn declaration_edge_cases_5_5_6() {
+    use optimal_css::{parse_declaration, parse_declaration_list};
+    let decl = |s: &str| parse_declaration(Wtf8::from_str(s), &mut AcceptAll).1;
+    // "--" is reserved, so not a custom property name: step 8's {}-block
+    // rule applies to it, but not to "--x".
+    assert_eq!(decl("--:{b} c").unwrap_err(), SyntaxError::Invalid);
+    assert_eq!(decl("--x:{b} c").unwrap().original_text, Some(4..9));
+    assert_eq!(decl("--:b").unwrap().original_text, None);
+    // Two {}-blocks are "a {}-block and anything else".
+    assert_eq!(decl("a:{x}{y}").unwrap_err(), SyntaxError::Invalid);
+    assert_eq!(decl("a:{x} {y}").unwrap_err(), SyntaxError::Invalid);
+    assert!(decl("a:{x}").is_ok());
+    // An empty custom property value: its original text is empty, at
+    // where the value would be.
+    assert_eq!(decl("--x:").unwrap().original_text, Some(4..4));
+    assert_eq!(decl("--x: ").unwrap().original_text, Some(5..5));
+    let (_, list) = parse_declaration_list(Wtf8::from_str("--x:;a:b"), &mut AcceptAll);
+    assert_eq!(list[0].original_text, Some(4..4));
+    assert_eq!(list.len(), 2);
+    // A bad declaration's remnants run to the ";": "b:c" is not read as a
+    // declaration of its own.
+    let (p, list) = parse_declaration_list(Wtf8::from_str("a b:c;d:e"), &mut AcceptAll);
+    let names: Vec<&str> = list.iter().map(|d| p.name(d.name)).collect();
+    assert_eq!(names, ["d"]);
+    let (p, list) = parse_declaration_list(Wtf8::from_str("a;b:c"), &mut AcceptAll);
+    let names: Vec<&str> = list.iter().map(|d| p.name(d.name)).collect();
+    assert_eq!(names, ["b"]);
+}

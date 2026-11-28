@@ -472,8 +472,11 @@ impl<'p, 'a, V: Validity> Parser<'p, 'a, V> {
             };
             match t {
                 Token::Semicolon if stop_semicolon => return self.i,
-                Token::CloseCurly if nested => return self.i,
                 Token::CloseCurly => {
+                    // In a block, the `}` at this level is its closer, which
+                    // is the limit; so a `}` seen here is outside any block
+                    // (5.5.7: with nested false, a parse error, consumed).
+                    debug_assert!(!nested, "a block's closer is its limit");
                     self.error(ParserErrorKind::StrayCloseCurly, self.i);
                     self.i += 1;
                 }
@@ -482,18 +485,17 @@ impl<'p, 'a, V: Validity> Parser<'p, 'a, V> {
         }
     }
 
-    /// 5.5.6 Consume the remnants of a bad declaration.
+    /// 5.5.6 Consume the remnants of a bad declaration, stopping before a
+    /// `;` (every caller discards it next, as the spec's version does).
     fn bad_declaration_remnants(&mut self, nested: bool, limit: u32) {
         while let Some(t) = self.token(self.i).filter(|_| self.i < limit) {
-            match t {
-                Token::Semicolon => {
-                    self.i += 1;
-                    return;
-                }
-                Token::CloseCurly if nested => return,
-                Token::CloseCurly => self.i += 1,
-                _ => self.i = self.skip(self.i),
+            if let Token::Semicolon = t {
+                return;
             }
+            // A `}` here is outside any block (see component_values), and
+            // is consumed like any other token.
+            debug_assert!(!nested || !matches!(t, Token::CloseCurly));
+            self.i = self.skip(self.i);
         }
     }
 
@@ -503,7 +505,9 @@ impl<'p, 'a, V: Validity> Parser<'p, 'a, V> {
     fn declaration(&mut self, nested: bool, speculative: bool, limit: u32) -> Option<Declaration> {
         // Step 1.
         let name = self.i;
-        let Some(Token::Ident(name_text)) = self.token(name).filter(|_| name < limit) else {
+        // Callers only start a declaration before the limit.
+        debug_assert!(name < limit);
+        let Some(Token::Ident(name_text)) = self.token(name) else {
             if !speculative {
                 self.bad_declaration_remnants(nested, limit);
             }
@@ -516,9 +520,9 @@ impl<'p, 'a, V: Validity> Parser<'p, 'a, V> {
         let unicode_range = name_text.eq_ignore_ascii_case("unicode-range");
         self.i += 1;
         // Steps 2 to 4.
-        self.discard_whitespace_to(limit);
+        self.discard_whitespace();
         if !matches!(
-            self.token(self.i).filter(|_| self.i < limit),
+            self.token(self.i),
             Some(Token::Colon)
         ) {
             if !speculative {
@@ -527,7 +531,7 @@ impl<'p, 'a, V: Validity> Parser<'p, 'a, V> {
             return None;
         }
         self.i += 1;
-        self.discard_whitespace_to(limit);
+        self.discard_whitespace();
         // Step 5, watching for a certain failure of step 8's {}-block rule.
         let start = self.i;
         let list_end = if speculative && !custom {
@@ -556,11 +560,6 @@ impl<'p, 'a, V: Validity> Parser<'p, 'a, V> {
         self.v.declaration(self.p, &decl, nested).then_some(decl)
     }
 
-    fn discard_whitespace_to(&mut self, limit: u32) {
-        while self.i < limit && matches!(self.next(), Some(Token::Whitespace)) {
-            self.i += 1;
-        }
-    }
 
     /// Step 5 of 5.5.6 for a speculative, non-custom declaration: the same
     /// list, but `None` as soon as step 8 is sure to reject it (a `{}`-block
@@ -575,7 +574,7 @@ impl<'p, 'a, V: Validity> Parser<'p, 'a, V> {
                 return Some(self.i);
             };
             match t {
-                Token::Semicolon | Token::CloseCurly => return Some(self.i),
+                Token::Semicolon => return Some(self.i),
                 Token::Whitespace => {}
                 Token::OpenCurly => {
                     if seen_block || before_block > 0 {
@@ -697,17 +696,15 @@ impl<'p, 'a, V: Validity> Parser<'p, 'a, V> {
                         self.i += 1;
                         return Ok(self.finish_at(rule, nested));
                     }
-                    Token::CloseCurly if nested => {
-                        let rule = Rule::At {
-                            name,
-                            prelude: start..self.i,
-                            block: None,
-                        };
-                        return Ok(self.finish_at(rule, nested));
-                    }
-                    Token::CloseCurly => self.i += 1,
                     Token::OpenCurly => return Err(self.open_block(Some(name), start, nested)),
-                    _ => self.i = self.skip(self.i),
+                    _ => {
+                        // A `}` before the limit is outside any block (see
+                        // component_values) and goes into the prelude; in a
+                        // block, reaching the limit (its closer) ends the
+                        // rule above, as 5.5.2's `}` branch does.
+                        debug_assert!(!(nested && matches!(t, Token::CloseCurly)));
+                        self.i = self.skip(self.i);
+                    }
                 }
             }
         }
@@ -731,10 +728,10 @@ impl<'p, 'a, V: Validity> Parser<'p, 'a, V> {
                     return Ok(Made::Nothing);
                 }
                 Token::CloseCurly => {
+                    // Outside any block (see component_values); in a block,
+                    // the closer is the limit, handled above.
+                    debug_assert!(!nested);
                     self.error(ParserErrorKind::CloseCurlyInRule, self.i);
-                    if nested {
-                        return Ok(Made::Nothing);
-                    }
                     self.i += 1;
                 }
                 Token::OpenCurly => {
@@ -949,13 +946,11 @@ impl<'p, 'a, V: Validity> Parser<'p, 'a, V> {
                     }
                 }
             } else {
-                match (top, made) {
-                    (Parent::Sheet | Parent::Single, Made::Rule(r)) => out.push(r),
-                    (Parent::Single, Made::InvalidRule) => {
-                        // Parse a rule: an invalid rule error is a syntax error.
-                        return out;
-                    }
-                    _ => {}
+                // For parse a rule (Parent::Single), an invalid rule error
+                // leaves `out` empty, which the caller reports as a syntax
+                // error.
+                if let (Parent::Sheet | Parent::Single, Made::Rule(r)) = (top, made) {
+                    out.push(r);
                 }
                 if top != Parent::Sheet {
                     return out;
@@ -1101,10 +1096,9 @@ pub fn parse_component_values(src: Wtf8<'_>) -> (Parsed<'_>, Range<u32>) {
 pub fn parse_comma_separated_component_values(src: Wtf8<'_>) -> (Parsed<'_>, Vec<Range<u32>>) {
     parse(src, &mut AcceptAll, |p| {
         let mut groups = Vec::new();
-        let end = p.end;
         while p.next().is_some() {
             let start = p.i;
-            let stop = p.component_values_until_comma(end);
+            let stop = p.component_values_until_comma();
             groups.push(start..stop);
             // Discard the comma.
             if p.next().is_some() {
@@ -1117,9 +1111,9 @@ pub fn parse_comma_separated_component_values(src: Wtf8<'_>) -> (Parsed<'_>, Vec
 
 impl<V: Validity> Parser<'_, '_, V> {
     /// 5.5.7 with `<comma-token>` as the stop token, not nested.
-    fn component_values_until_comma(&mut self, limit: u32) -> u32 {
+    fn component_values_until_comma(&mut self) -> u32 {
         loop {
-            match self.token(self.i).filter(|_| self.i < limit) {
+            match self.next() {
                 None | Some(Token::Comma) => return self.i,
                 Some(Token::CloseCurly) => {
                     self.error(ParserErrorKind::StrayCloseCurly, self.i);
@@ -1128,5 +1122,38 @@ impl<V: Validity> Parser<'_, '_, V> {
                 Some(_) => self.i = self.skip(self.i),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod early_exit_tests {
+    use super::*;
+
+    /// Runs the early-exit value scan on all of `src` (or up to `limit`):
+    /// its result and where it stopped.
+    fn scan(src: &str, limit: Option<u32>) -> (Option<u32>, u32) {
+        parse(Wtf8::from_str(src), &mut AcceptAll, |p| {
+            let limit = limit.unwrap_or(p.end);
+            let r = p.declaration_value_early_exit(limit);
+            (r, p.i)
+        })
+        .1
+    }
+
+    #[test]
+    fn stops_at_the_first_certain_failure() {
+        // Tokens: { a } ws b ws c ws d. Three values after the block: the
+        // third ("d", token 8) is where step 8 is sure to fail.
+        assert_eq!(scan("{a} b c d", None), (None, 8));
+        // Two after it may still be "! important".
+        assert_eq!(scan("{a} ! important", None), (Some(7), 7));
+        // A block after another value (token 2), or a second block (3).
+        assert_eq!(scan("b {a}", None), (None, 2));
+        assert_eq!(scan("{a}{b}", None), (None, 3));
+        // No block: the whole list, to the end or the ";".
+        assert_eq!(scan("b c", None), (Some(3), 3));
+        assert_eq!(scan("b;c", None), (Some(1), 1));
+        // It stops at the limit.
+        assert_eq!(scan("b c", Some(1)), (Some(1), 1));
     }
 }
