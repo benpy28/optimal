@@ -152,6 +152,9 @@ struct Ctx {
     /// follows a pseudo-element: only the pseudo-classes allowed after that
     /// pseudo-element (3.6.3), `true` if it is element-backed.
     after_element_backed: Option<bool>,
+    /// Inside the argument of an `:is()` or `:where()`, which has already
+    /// been checked to be an `<any-value>`, nested arguments included.
+    any_value_checked: bool,
 }
 
 impl Ctx {
@@ -161,6 +164,7 @@ impl Ctx {
         no_pseudo_elements: false,
         in_has: false,
         after_element_backed: None,
+        any_value_checked: false,
     };
 
     fn deeper(self) -> Result<Ctx, SelectorError> {
@@ -666,9 +670,16 @@ impl<'p, 'a> Parser<'p, 'a> {
             ..inner
         };
         if is("is") || is("where") {
-            if !is_any_value(args) {
+            // Scanned once, at the outermost :is() or :where(): a nested one
+            // lies inside the part already scanned, and scanning again at
+            // every level would cost depth times the input.
+            if !ctx.any_value_checked && !is_any_value(args) {
                 return Err(SelectorError::Syntax);
             }
+            let logical = Ctx {
+                any_value_checked: true,
+                ..logical
+            };
             let f = self.forgiving(s, logical)?;
             return Ok(if is("is") {
                 PseudoClass::Is(f)

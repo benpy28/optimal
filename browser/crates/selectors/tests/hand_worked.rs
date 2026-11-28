@@ -532,7 +532,10 @@ fn nesting_depth_limit() {
         parse_selector(&slotted, &Namespaces::new()),
         Err(SelectorError::TooDeep)
     );
-    // Deep blocks inside a forgiving argument are walked without recursion.
+    // Deep blocks inside a forgiving argument are walked without recursion,
+    // and the kept item gets the closers the end of input left out.
     let blocks = format!(":is({}", "[".repeat(200_000));
-    assert_eq!(ser(&blocks), format!(":is({})", "[".repeat(200_000)));
+    assert_eq!(ser(&blocks), format!(":is({}{})", "[".repeat(200_000), "]".repeat(200_000)));
+    assert_eq!(ser(":is(a, b(c [d"), ":is(a, b(c [d]))");
+    assert_eq!(ser(":is(a, (b) c"), ":is(a, (b) c)");
 }

@@ -108,3 +108,33 @@ integers to the range it supports), with the negation in clauses such as
 against a literal model that writes out each clause of the grammar in 6.2
 as a sequence of token matchers, for whole values and for the longest
 matching prefix.
+
+## Selectors
+
+| Suite | Pinned commit | Passed | Notes |
+|---|---|---|---|
+| web-platform-tests `css/selectors/parsing` | 6852422 | 352 / 352 | every `test_valid_selector`, `test_invalid_selector` and related call, read from the files' JavaScript; each run through "parse a selector" and as a style rule's prelude (the two must agree), and each valid serialization parsed again (it must give itself back) |
+
+Four files are left out because their features are Selectors Level 5 or
+tentative: `parse-heading.html` (`:heading`), the two
+`*class-prefix.tentative.html` files, and `parse-has-slotted.tentative.html`
+(functional `:has-slotted()`; css-shadow-1 has only `:has-slotted`).
+
+[`wpt-selectors-errata.json`](wpt-selectors-errata.json) records 5 cases
+where the 2026 spec text gives another answer than the test: `:lang()`
+arguments serialize as strings (cssom-1 5.2), `:has()` is syntactically
+allowed after the element-backed `::part()` (css-pseudo-4 section 5), and
+user action pseudo-classes are allowed after `::slotted()` (selectors-4
+3.6.3). The harness fails if an erratum stops being needed.
+
+`crates/selectors/tests/common/reference.rs` is a literal model written
+separately: it builds its own component value tree, parses the section 16
+grammar production by production with no restrictions, and then checks
+every validity rule in a second pass, with its own cssom-1 serializer.
+Random selectors (from fragments, and from the grammar's shapes with
+nested functional pseudo-classes) must get the same validity and
+serialization from both, with and without a default namespace. Valid
+serializations must parse back to themselves with the same specificity.
+`crates/selectors/tests/scaling.rs` times 17 hostile shapes (long
+compounds and lists, deep blocks in forgiving arguments, nesting past the
+limit) at three sizes with `CSS_SCALING=1`.
