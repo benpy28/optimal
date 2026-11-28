@@ -62,8 +62,10 @@ jobs:
           TOKENIZER_RANDOM_ROUNDS: ${{ github.event_name == 'schedule' && '200' || '25' }}
           TREE_RANDOM_ROUNDS: ${{ github.event_name == 'schedule' && '100' || '10' }}
           TREE_SCALING: "1"
+          CSS_SCALING: "1"
           CONFORMANCE_OUT: ${{ github.workspace }}/browser/build/html5lib-tokenizer.json
           TREE_CONFORMANCE_OUT: ${{ github.workspace }}/browser/build/wpt-tree-construction.json
+          CSS_TOKENIZER_CONFORMANCE_OUT: ${{ github.workspace }}/browser/build/css-tokenizer-tests.json
         run: cargo test --workspace --release -- --nocapture 2>&1 | tee build/test-output.txt
       - name: Conformance summary
         if: always()
