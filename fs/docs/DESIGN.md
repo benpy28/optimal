@@ -182,6 +182,38 @@ chunk table root) where a single-copy design would use 8; on real volumes
 the extra is about the size of the metadata, which is a small fraction of
 the data.
 
+## Space accounting
+
+Freed blocks stay quarantined for 8 commits, metadata is written twice, and
+a metadata slot freed by a commit can't be reused inside that window either.
+So a commit costs fresh space even when nothing changed, and getting freed
+space back after a delete takes up to 9 more commits. A full volume must be
+able to do that without running dry, or it would lock up (issue 27: a
+400-block volume poisoned itself after a delete and a create).
+
+Before any operation that allocates, `ensure_space` checks that, after the
+operation, the volume could still complete its next commit and then 9 empty
+commits that drain quarantined space back into use. Metadata is counted in
+slots: free, unquarantined slots of mapped chunks come first, and every
+further chunk costs two copies of `chunk_blocks`. A commit's own overhead
+(root block, free log, bitmaps and tables) is the larger of what the last
+18 commits used and a structural floor (4 plus one per space-map level, one
+chunk-table pair per level plus one). On top of that, deletes leave 1% of
+the volume (at least 32 blocks), and other operations leave enough more
+that a delete can still be committed and drained when they are refused.
+
+When space is short, `ensure_space` commits the open transaction, then
+simulates the drain from the quarantined batches before writing anything.
+If the drain can't produce enough space, the operation is refused with
+`NoSpace` and nothing is written, so a program retrying on a full disk
+costs no I/O. No commit is started that the volume can't afford.
+
+Measured on one-file fills (`tests/full.rs`), the data that fits before the
+first refusal is 540 of 1024 blocks, 1500 of 2048, 3348 of 4096 and 15256
+of 16384. Above about 65536 blocks the 2% gap dominates. Because the space
+kept back is a fixed few hundred blocks, `format` refuses volumes below
+1024 blocks (4 MiB).
+
 ## Snapshots
 
 A snapshot is just a saved tree root: O(1), and it shares every block.
@@ -268,6 +300,11 @@ the heaviest testing in the project:
 - Copy-on-write tree, not a journal: atomic commits and snapshots fall out
   of it, and data is written once. Rejected: ext4-style journaling (double
   writes, no snapshots, no data checksums).
+- Space checks plan the post-delete drain up front (slot-aware, refuse
+  without writing) and keep its cost back, rather than cycling commits until
+  space appears. Rejected: shorter quarantine (it is the fallback depth),
+  and letting a commit fail for space and roll back (ZFS-style reserved
+  space is simpler and never loses the transaction).
 - Checksum in the parent pointer, not in the block: catches lost and
   misdirected writes, which an in-block checksum can't.
 - XChaCha20-Poly1305 first: fast everywhere in software and its large nonce

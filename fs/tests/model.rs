@@ -51,7 +51,7 @@ fn model_tiny_disk() {
         run(
             base_seed() + 2000 + i,
             i % 2 == 1,
-            600,
+            1024,
             500,
             &GenCfg {
                 max_write: 60_000,

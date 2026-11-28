@@ -46,9 +46,15 @@ fn previous_commit_survives_remount_and_reuse() {
     let mut fs = mount(dev, 2);
     let g = fs.create(ROOT_INO, b"g", 0o644).unwrap();
     let mut off = 0;
-    while fs.write(g, off, &vec![0x33u8; 64 * 1024]).is_ok() && off < 3_000_000 {
+    // Stop while the space check still passes without committing (past that
+    // point it would commit, and there would be nothing to fall back to).
+    while fs.statfs().available_blocks > 32
+        && fs.write(g, off, &vec![0x33u8; 64 * 1024]).is_ok()
+        && off < 3_000_000
+    {
         off += 64 * 1024;
     }
+    assert_eq!(fs.generation(), newest, "the fill must not commit");
     let mut dev = fs.into_device();
     dev.flush().unwrap();
 
