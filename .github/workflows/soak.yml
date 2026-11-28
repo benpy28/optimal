@@ -125,14 +125,6 @@ jobs:
           ./scripts/secureboot.sh
           ./scripts/fetch-firmware.sh
 
-      # The acpi-ram-* scenarios boot through it; without this step they all
-      # failed with "injector not built" (nightly runs of 27 Nov).
-      - name: Build the firmware-quirk injector (breaks ACPI tables in RAM)
-        working-directory: bootloader
-        run: |
-          rustup show active-toolchain || rustup toolchain install
-          cargo build --release -p optimal-boot-quirk --target x86_64-unknown-uefi
-
       - name: Soak tough conditions
         env:
           REPEAT: ${{ inputs.tough_repeat || '10' }}
