@@ -235,6 +235,8 @@ fn matches_hand_worked() {
     );
     assert!(m(i32::MAX, i32::MIN, 2_147_483_646), "n = 2");
     assert!(m(1, i32::MIN, u32::MAX));
+    // n = 3: A*n is past i64 if multiplied by d instead of divided.
+    assert!(m(i32::MAX, i32::MIN, 4_294_967_293));
 }
 
 // ---- The literal model -------------------------------------------------
