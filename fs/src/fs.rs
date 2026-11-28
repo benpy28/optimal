@@ -709,6 +709,11 @@ impl<D: BlockDevice> Filesystem<D> {
                         fs.gen_floor = floor;
                         fs.rewrite_all_slots = true;
                         fs.fell_back_from = Some(floor);
+                        // The first commit runs even if nothing changes, so
+                        // the skipped copies are replaced as soon as possible.
+                        if !fs.read_only {
+                            fs.txn_dirty = true;
+                        }
                     }
                     return Ok(fs);
                 }
