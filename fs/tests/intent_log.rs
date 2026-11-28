@@ -29,8 +29,10 @@ impl Clock for Tick {
     }
 }
 
+/// A fresh volume, unmounted and mounted again so it runs with the test
+/// mount options (a 256 KiB dirty limit, so big writes flush early).
 fn format(enc: bool, log: Option<u64>) -> Filesystem<CrashDevice> {
-    Filesystem::format(
+    let fs = Filesystem::format(
         CrashDevice::new(BLOCKS, 77),
         &FormatOptions {
             intent_log_blocks: log,
@@ -39,7 +41,8 @@ fn format(enc: bool, log: Option<u64>) -> Filesystem<CrashDevice> {
         &mut Rng::new(5),
         Box::new(Tick(1_000_000)),
     )
-    .unwrap()
+    .unwrap();
+    mount_with(fs.unmount().unwrap(), enc, false)
 }
 
 fn mount_with(dev: CrashDevice, enc: bool, read_only: bool) -> Filesystem<CrashDevice> {
@@ -256,7 +259,9 @@ fn truncate_and_regrow_replays_exactly() {
     fs.write(f, 6 * 4096 + 10, &[b'b'; 3000]).unwrap();
     // Enough other dirty data to force an early flush of f's blocks.
     let g = fs.create(ROOT_INO, b"g", 0o644).unwrap();
+    let w0 = fs.io_stats().blocks_written;
     fs.write(g, 0, &vec![b'g'; 512 * 1024]).unwrap();
+    assert!(fs.io_stats().blocks_written > w0, "no early flush");
     let mut want = vec![0u8; 6 * 4096 + 10 + 3000];
     want[..1000].fill(b'a');
     want[6 * 4096 + 10..].fill(b'b');
@@ -413,33 +418,135 @@ fn failed_ring_write_falls_back_to_a_commit() {
     fsck_ok(&mut fs);
 }
 
-/// The ring flush fails and loses the device cache, which held a file's
-/// early-flushed blocks: before committing instead, fsync must make that
-/// data dirty again, or the commit would point at blocks that never landed.
+/// The ring flush fails. If the device kept its cache, fsync commits
+/// instead and everything is durable. If the failed flush lost the cache,
+/// it took a file's early-flushed blocks with it: fsync must read them back
+/// before committing, find them gone and fail (the volume stops, as after
+/// a commit's lost flush), never commit pointers to blocks that never
+/// landed and report success.
 #[test]
-fn failed_ring_flush_rewrites_unflushed_data() {
+fn failed_ring_flush_never_claims_lost_data() {
     for enc in [false, true] {
-        let mut fs = format(enc, None);
-        let big = fs.create(ROOT_INO, b"big", 0o644).unwrap();
+        for loses_cache in [false, true] {
+            let mut fs = format(enc, None);
+            let big = fs.create(ROOT_INO, b"big", 0o644).unwrap();
+            let f = fs.create(ROOT_INO, b"f", 0o644).unwrap();
+            fs.commit().unwrap();
+            let g = fs.generation();
+            let body: Vec<u8> = (0..600_000u32).map(|i| (i % 253) as u8).collect();
+            let w0 = fs.io_stats().blocks_written;
+            fs.write(big, 0, &body).unwrap();
+            assert!(
+                fs.io_stats().blocks_written > w0,
+                "the big write flushed early"
+            );
+            fs.write(f, 0, b"small").unwrap();
+            let d = fs.device_mut();
+            d.faults.fail_flush_at = Some(d.flushes);
+            d.faults.failed_flush_loses_cache = loses_cache;
+            let r = fs.fsync(f);
+            let what = format!("enc {enc} loses_cache {loses_cache}");
+            if loses_cache {
+                assert!(r.is_err(), "{what}: fsync claimed lost data");
+                assert_eq!(fs.generation(), g, "{what}");
+            } else {
+                assert_eq!(r, Ok(()), "{what}");
+                assert_eq!(fs.intent_log_stats().fsync_commits, 1, "{what}");
+            }
+            let mut fs = crash(fs, enc, 14);
+            if loses_cache {
+                assert_eq!(fs.generation(), g, "{what}");
+                assert_eq!(fs.getattr(big).unwrap().size, 0, "{what}");
+            } else {
+                assert!(data(&mut fs, big) == body, "{what}");
+                assert_eq!(data(&mut fs, f), b"small", "{what}");
+            }
+            fsck_ok(&mut fs);
+        }
+    }
+}
+
+/// A volume degraded by failed early flushes (no commit tried yet): fsync
+/// commits rather than logging, since a commit is the only way back from
+/// degraded. Once the device works again, that clears it.
+#[test]
+fn fsync_on_a_degraded_volume_commits() {
+    for enc in [false, true] {
+        // A ring bigger than the file's changed blocks, so only the
+        // degraded state decides.
+        let mut fs = format(enc, Some(256));
         let f = fs.create(ROOT_INO, b"f", 0o644).unwrap();
         fs.commit().unwrap();
-        let body: Vec<u8> = (0..600_000u32).map(|i| (i % 253) as u8).collect();
-        fs.write(big, 0, &body).unwrap();
-        assert!(
-            fs.io_stats().blocks_written > 0,
-            "the big write flushed early"
-        );
-        fs.write(f, 0, b"small").unwrap();
-        let d = fs.device_mut();
-        d.faults.fail_flush_at = Some(d.flushes);
-        d.faults.failed_flush_loses_cache = true;
+        let g = fs.generation();
+        fs.device_mut().faults.all_writes_fail = true;
+        let body = vec![0x3cu8; 300 * 1024];
+        fs.write(f, 0, &body).unwrap();
+        fs.write(f, body.len() as u64, &[1u8; 4096]).unwrap();
+        fs.write(f, body.len() as u64 + 4096, &[2u8; 4096]).unwrap();
+        assert!(fs.degraded(), "enc {enc}: three failed early flushes");
+        fs.device_mut().faults.all_writes_fail = false;
         fs.fsync(f).unwrap();
-        assert_eq!(fs.intent_log_stats().fsync_commits, 1);
-        let mut fs = crash(fs, enc, 14);
-        assert_eq!(data(&mut fs, big), body, "enc {enc}");
-        assert_eq!(data(&mut fs, f), b"small");
+        assert_eq!(fs.generation(), g + 1, "enc {enc}: fsync must commit");
+        assert!(!fs.degraded(), "enc {enc}");
+        assert_eq!(fs.intent_log_stats().batches, 0, "enc {enc}");
+        let want = data(&mut fs, f);
+        let mut fs = crash(fs, enc, 15);
+        assert!(data(&mut fs, f) == want, "enc {enc}");
         fsck_ok(&mut fs);
     }
+}
+
+/// A fallback mount to a commit found only in a newer body's history (the
+/// newest commit's tree lost, the older commit's own superblocks too) has
+/// no chain: fsync must
+/// commit until a commit starts one. A batch written then would follow no
+/// chain the next mount looks for, and be lost.
+#[test]
+fn fsync_after_a_fallback_mount_commits() {
+    for enc in [false, true] {
+        let mut fs = format(enc, None);
+        let f = fs.create(ROOT_INO, b"f", 0o644).unwrap();
+        fs.write(f, 0, &[0x11u8; 5000]).unwrap();
+        fs.commit().unwrap();
+        let prev = fs.generation();
+        let mut dev = fs.into_device();
+        dev.flush().unwrap();
+        let old = dev.clean_image();
+        let mut fs = mount_with(dev, enc, false);
+        fs.write(f, 0, &[0x22u8; 5000]).unwrap();
+        fs.commit().unwrap();
+        let newest = fs.generation();
+        let mut dev = fs.into_device();
+        dev.flush().unwrap();
+        let new = dev.clean_image();
+        // Only the newest commit's superblock pair reached the disk, and
+        // the previous commit's own pair is unreadable: the previous commit
+        // is found only in the newest body's history.
+        let mut img = old;
+        for b in slots_of(newest) {
+            img[b * 4096..(b + 1) * 4096].copy_from_slice(&new[b * 4096..(b + 1) * 4096]);
+        }
+        for b in slots_of(prev) {
+            img[b * 4096..(b + 1) * 4096].fill(0);
+        }
+        let mut fs = mount_with(CrashDevice::from_image(img, 3), enc, false);
+        assert_eq!(fs.generation(), prev, "enc {enc}: should fall back");
+        assert_eq!(fs.fell_back_from(), Some(newest), "enc {enc}");
+        let g = fs.create(ROOT_INO, b"g", 0o644).unwrap();
+        fs.write(g, 0, b"kept").unwrap();
+        fs.fsync(g).unwrap();
+        assert!(fs.generation() > newest, "enc {enc}: fsync must commit");
+        assert_eq!(fs.intent_log_stats().batches, 0, "enc {enc}");
+        let mut fs = crash(fs, enc, 16);
+        assert_eq!(data(&mut fs, g), b"kept", "enc {enc}");
+        fsck_ok(&mut fs);
+    }
+}
+
+/// Block numbers of the superblock pair a commit of `generation` writes.
+fn slots_of(generation: u64) -> [usize; 2] {
+    let p = (generation % 2) as usize;
+    [p, BLOCKS as usize - 1 - p]
 }
 
 // ---- power cuts at every write point ----

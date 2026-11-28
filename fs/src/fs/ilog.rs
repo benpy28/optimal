@@ -937,4 +937,141 @@ mod tests {
                 .is_err()
         );
     }
+
+    /// The blocks waiting to be logged follow each file: a shrink drops
+    /// those past the new end, a deleted file drops all of them, and a file
+    /// with more than the ring holds keeps none (fsync commits it).
+    #[test]
+    fn marked_blocks_follow_the_file() {
+        let mut fs = fresh();
+        let f = fs.create(ROOT_INO, b"f", 0o644).unwrap();
+        fs.write(f, 0, &[1u8; 8 * BLOCK_SIZE]).unwrap();
+        assert_eq!(fs.ilog.unlogged[&f].len(), 8);
+        fs.truncate(f, 100).unwrap();
+        assert_eq!(
+            fs.ilog.unlogged[&f].iter().copied().collect::<Vec<_>>(),
+            [0]
+        );
+        fs.unlink(ROOT_INO, b"f").unwrap();
+        assert!(!fs.ilog.unlogged.contains_key(&f));
+        let ring = fs.ilog.ring_len as usize;
+        let g = fs.create(ROOT_INO, b"g", 0o644).unwrap();
+        fs.write(g, 0, &vec![2u8; ring * BLOCK_SIZE]).unwrap();
+        assert_eq!(fs.ilog.unlogged[&g].len(), ring);
+        fs.write(g, (ring * BLOCK_SIZE) as u64, &[3u8; 1]).unwrap();
+        assert!(!fs.ilog.unlogged.contains_key(&g), "one past the ring");
+        assert!(fs.ilog.too_big.contains(&g));
+        fs.unlink(ROOT_INO, b"g").unwrap();
+        assert!(!fs.ilog.too_big.contains(&g));
+        assert!(fs.ilog.unlogged.is_empty());
+    }
+
+    /// Records that would not fit the ring are not kept piling up in
+    /// memory: past the ring's capacity they are dropped and fsync commits.
+    #[test]
+    fn pending_records_never_outgrow_the_ring() {
+        let mut fs = Filesystem::format(
+            CrashDevice::new(4096, 3),
+            &FormatOptions {
+                passphrase: None,
+                kdf: crate::KdfParams::INSECURE_FAST_FOR_TESTS,
+                quarantine_min_ns: 0,
+                meta_chunk_blocks: 0,
+                intent_log_blocks: Some(LOG_MIN_BLOCKS),
+            },
+            &mut Rng::new(1),
+            Box::new(ZeroClock),
+        )
+        .unwrap();
+        fs.mark_dirty();
+        fs.commit().unwrap();
+        let cap = fs.ilog.capacity_bytes();
+        let mut most = 0;
+        let mut i = 0;
+        while fs.ilog.tracking() {
+            let name = alloc::format!("{i:0>200}");
+            fs.create(ROOT_INO, name.as_bytes(), 0o644).unwrap();
+            most = most.max(fs.ilog.pending.len());
+            i += 1;
+            assert!(i < 1000, "records never filled a 16-block ring");
+        }
+        assert!(most <= cap, "{most} bytes held for a {cap}-byte ring");
+        assert!(fs.ilog.pending.is_empty());
+        let g = fs.generation();
+        fs.fsync(ROOT_INO).unwrap();
+        assert_eq!(fs.generation(), g + 1);
+        let mut fs = crash_mount(fs);
+        assert!(
+            fs.lookup(ROOT_INO, alloc::format!("{:0>200}", i - 1).as_bytes())
+                .is_ok()
+        );
+        fsck_ok(&mut fs);
+    }
+
+    /// Replay never commits part way (the chain must stay whole until the
+    /// commit after it): a space check that would commit refuses instead.
+    #[test]
+    fn replay_refuses_a_commit_for_space() {
+        let mut fs = fresh();
+        fs.create(ROOT_INO, b"a", 0o644).unwrap();
+        let g = fs.generation();
+        fs.replay_times = Some(VecDeque::new());
+        assert_eq!(fs.commit_for_space(), Err(Error::NoSpace));
+        assert_eq!(fs.generation(), g);
+        fs.replay_times = None;
+        assert_eq!(fs.commit_for_space(), Ok(()));
+        assert_eq!(fs.generation(), g + 1);
+    }
+
+    /// A superblock body whose chain start lies outside the ring is not
+    /// mounted (a plain volume's MAC key is no secret, so a crafted image
+    /// can carry one): mount falls back to the commit before it.
+    #[test]
+    fn a_chain_start_outside_the_ring_is_not_mounted() {
+        let mut fs = fresh();
+        let a = fs.create(ROOT_INO, b"a", 0o644).unwrap();
+        fs.commit().unwrap();
+        let prev = fs.generation();
+        fs.create(ROOT_INO, b"b", 0o644).unwrap();
+        let ring = fs.ilog.ring_len;
+        fs.ilog.ring_len = 1 << 20;
+        fs.ilog.chain_start = ring + 5;
+        fs.commit().unwrap();
+        assert_eq!(fs.body.log_start, Some(ring + 5));
+        let fs = crash_mount(fs);
+        assert_eq!(fs.generation(), prev);
+        let mut fs = fs;
+        assert_eq!(fs.lookup(ROOT_INO, b"a"), Ok(a));
+        assert_eq!(fs.lookup(ROOT_INO, b"b"), Err(Error::NotFound));
+        fsck_ok(&mut fs);
+    }
+
+    /// A header whose ring overlaps a superblock slot, is shorter than the
+    /// minimum, or runs past the end is refused.
+    #[test]
+    fn a_header_with_a_bad_ring_is_refused() {
+        for (start, blocks) in [(1, 64), (2, LOG_MIN_BLOCKS - 1), (4096 - 2 - 63, 64)] {
+            let mut fs = fresh();
+            fs.header.log_start = start;
+            fs.header.log_blocks = blocks;
+            for _ in 0..2 {
+                fs.mark_dirty();
+                fs.commit().unwrap();
+            }
+            let mut dev = fs.into_device();
+            let img = dev.crash_image();
+            let r = Filesystem::mount(
+                CrashDevice::from_image(img, 9),
+                &MountOptions::default(),
+                &mut Rng::new(2),
+                Box::new(ZeroClock),
+            );
+            // No slot decodes, so no superblock is found at all.
+            assert!(
+                matches!(r, Err(Error::NoFilesystem)),
+                "({start}, {blocks}): {:?}",
+                r.err()
+            );
+        }
+    }
 }
