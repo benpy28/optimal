@@ -33,6 +33,8 @@ mod superblock;
 #[cfg(test)]
 mod tests;
 mod tree;
+#[cfg(test)]
+mod write_fail_tests;
 
 #[cfg(feature = "std")]
 pub use crypto::OsEntropy;
@@ -42,8 +44,8 @@ pub use device::FileDevice;
 pub use device::{BLOCK_SIZE, BlockDevice, IoError, MemDevice};
 pub use error::{Error, Result};
 pub use fs::{
-    Attr, Clock, DirEntry, FileKind, Filesystem, FormatOptions, MountOptions, ROOT_INO, SetAttr,
-    StatFs, ZeroClock, auto_chunk_blocks,
+    Attr, Clock, DirEntry, FileKind, Filesystem, FormatOptions, MIN_BLOCKS, MountOptions, ROOT_INO,
+    SetAttr, StatFs, ZeroClock, auto_chunk_blocks,
 };
 pub use io::IoStats;
 pub use recover::RecoveryStats;

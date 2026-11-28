@@ -96,6 +96,13 @@ pub struct Space {
     /// Blocks freed by recent commits, still quarantined (oldest first).
     pub held: VecDeque<FreedBatch>,
     held_blocks: u64,
+    /// Logical metadata blocks allocated since this `Space` was loaded (a
+    /// counter, so callers can measure what a step allocated).
+    pub allocated_l: u64,
+    /// The same for chunk-table node pairs.
+    pub allocated_pairs: u64,
+    /// See [`refresh_releasing`](Self::refresh_releasing).
+    releasing_slots: u64,
     /// Free-log blocks of the last commit.
     log_addrs: Vec<u64>,
     /// Old copies of space tables that became garbage this transaction.
@@ -115,6 +122,13 @@ pub struct Space {
     /// This commit moved a run holding live metadata blocks (see
     /// [`Body::last_move_gen`](crate::superblock::Body::last_move_gen)).
     pub moved_live_run: bool,
+    /// Physical blocks a write failed on this mount: never allocated
+    /// again. Kept in memory only (a remount forgets them).
+    pub bad: RangeSet,
+    /// Physical blocks [`alloc_run`](Self::alloc_run) handed out in the
+    /// transaction being built. No commit references them, so freeing one
+    /// makes it usable again at once instead of quarantining it.
+    alloc_now: RangeSet,
 }
 
 fn span(level: u32) -> u64 {
@@ -171,6 +185,8 @@ impl Space {
             maybe_empty: BTreeSet::new(),
             relocations: Vec::new(),
             moved_live_run: false,
+            bad: RangeSet::new(),
+            alloc_now: RangeSet::new(),
             total,
             levels,
             root_ptr,
@@ -180,6 +196,9 @@ impl Space {
             freed_now: RangeSet::new(),
             held: VecDeque::new(),
             held_blocks: 0,
+            allocated_l: 0,
+            allocated_pairs: 0,
+            releasing_slots: 0,
             log_addrs: Vec::new(),
             pending_table_frees: Vec::new(),
             cursor: SB_RESERVED_FRONT,
@@ -354,14 +373,38 @@ impl Space {
         self.free_total
     }
 
-    /// Free blocks that can actually be allocated right now.
-    pub fn allocatable_blocks(&self) -> u64 {
-        self.free_total
-            .saturating_sub(self.freed_now.len() + self.held_blocks)
+    /// Metadata slots a commit can take without mapping a new chunk: free
+    /// slots of mapped chunks that are neither quarantined nor in a chunk
+    /// that may be released at the next commit.
+    pub fn usable_meta_slots(&self) -> u64 {
+        let quarantined =
+            self.freed_now_l.len() + self.held.iter().map(|h| h.lset.len()).sum::<u64>();
+        self.chunks
+            .free_slots()
+            .saturating_sub(quarantined + self.releasing_slots)
     }
 
-    pub fn quarantined_blocks(&self) -> u64 {
-        self.freed_now.len() + self.held_blocks
+    /// Counts the slots of chunks the next commit may release (empty ones
+    /// among those that may have become empty), for
+    /// [`usable_meta_slots`](Self::usable_meta_slots).
+    pub fn refresh_releasing<D: BlockDevice>(&mut self, io: &mut Io<D>) -> Result<()> {
+        let mut n = 0;
+        for &id in &self.maybe_empty {
+            let e = self.chunks.entry(io, id)?;
+            if e.mapped() && e.used == 0 {
+                n += e.len as u64;
+            }
+        }
+        self.releasing_slots = n;
+        Ok(())
+    }
+
+    /// Free blocks that can actually be allocated right now.
+    pub fn allocatable_blocks(&self) -> u64 {
+        // Bad blocks count whether or not they are currently free (a few
+        // blocks too pessimistic at most, never optimistic).
+        self.free_total
+            .saturating_sub(self.freed_now.len() + self.held_blocks + self.bad.len())
     }
 
     /// The table at `(level, idx)`, loading (or synthesising) it if needed.
@@ -528,7 +571,8 @@ impl Space {
 
     /// Frees `[start, start+len)`. Every block must currently be used.
     /// Logical (metadata) addresses free chunk slots; physical ones free
-    /// bitmap bits. Both are quarantined.
+    /// bitmap bits. Both are quarantined, except file blocks allocated in
+    /// this same transaction, which no commit references.
     pub fn free<D: BlockDevice>(&mut self, io: &mut Io<D>, start: u64, len: u64) -> Result<()> {
         if is_logical(start) {
             return self.free_meta(io, start, len);
@@ -544,9 +588,25 @@ impl Space {
                 start,
             ));
         }
-        self.set_range(io, start, len, false)?;
-        let ok = self.freed_now.insert(start, len);
-        debug_assert!(ok, "freed range already in freed_now");
+        // Split into parts this transaction allocated (free now) and the
+        // rest (quarantined).
+        let mut b = start;
+        let end = start + len;
+        while b < end {
+            let (part_end, fresh) = match self.alloc_now.next_range_from(b) {
+                Some((s, e)) if s == b => (e.min(end), true),
+                Some((s, _)) => (s.min(end), false),
+                None => (end, false),
+            };
+            self.set_range(io, b, part_end - b, false)?;
+            if fresh {
+                self.alloc_now.remove(b, part_end - b);
+            } else {
+                let ok = self.freed_now.insert(b, part_end - b);
+                debug_assert!(ok, "freed range already in freed_now");
+            }
+            b = part_end;
+        }
         Ok(())
     }
 
@@ -621,6 +681,7 @@ impl Space {
         io: &mut Io<D>,
         n: u64,
     ) -> Result<Vec<(u64, u64)>> {
+        self.allocated_l += n;
         let mut out = Vec::new();
         let mut left = n;
         while left > 0 {
@@ -738,6 +799,7 @@ impl Space {
 
     /// Two single blocks for a chunk-table node's copies.
     fn alloc_pair<D: BlockDevice>(&mut self, io: &mut Io<D>) -> Result<(u64, u64)> {
+        self.allocated_pairs += 1;
         let (p0, p1, _) = self.alloc_chunk_runs(io, 1, false)?;
         Ok((p0, p1))
     }
@@ -951,10 +1013,13 @@ impl Space {
         Ok(())
     }
 
-    /// End of the quarantined range starting exactly at `b`, if any.
+    /// End of the quarantined (or bad) range starting exactly at `b`, if any.
     fn quarantined_until(&self, b: u64) -> Option<u64> {
         let mut end: Option<u64> = None;
-        for set in core::iter::once(&self.freed_now).chain(self.held.iter().map(|h| &h.set)) {
+        for set in [&self.freed_now, &self.bad]
+            .into_iter()
+            .chain(self.held.iter().map(|h| &h.set))
+        {
             if let Some((s, e)) = set.next_range_from(b)
                 && s == b
             {
@@ -995,6 +1060,69 @@ impl Space {
         Ok(None)
     }
 
+    /// Marks `[start, start+len)` used: replays an allocation this
+    /// transaction made (see [`Filesystem::commit`](crate::Filesystem::commit)).
+    pub fn claim<D: BlockDevice>(&mut self, io: &mut Io<D>, start: u64, len: u64) -> Result<()> {
+        if len == 0
+            || start < SB_RESERVED_FRONT
+            || start
+                .checked_add(len)
+                .is_none_or(|e| e > self.total - SB_RESERVED_BACK)
+        {
+            return Err(Error::Corrupt(
+                "claim of reserved or out-of-range block",
+                start,
+            ));
+        }
+        self.set_range(io, start, len, true)?;
+        self.alloc_now.add(start, len);
+        Ok(())
+    }
+
+    /// Re-opens commit (`chunk_root`, `chunk_depth`, `space_root`,
+    /// `free_log`) after a failed commit, with the quarantine as it stood
+    /// once that commit (`generation` at `time_ns`) was durable. Carries
+    /// over what belongs to the mount rather than to a commit: bad blocks,
+    /// the allocation cursor and the quarantine time.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reopen<D: BlockDevice>(
+        &self,
+        io: &mut Io<D>,
+        chunk_shift: u32,
+        (chunk_root, chunk_depth): (BlockPtr, u32),
+        (space_root, free_log): (BlockPtr, BlockPtr),
+        generation: u64,
+        time_ns: i64,
+    ) -> Result<Space> {
+        let mut s = Space::open(io, self.total, chunk_shift, chunk_root, chunk_depth)?;
+        s.attach(io, space_root, free_log)?;
+        s.quarantine_min_ns = self.quarantine_min_ns;
+        s.committed(generation, time_ns);
+        s.bad = self.bad.clone();
+        s.cursor = self.cursor;
+        Ok(s)
+    }
+
+    /// Chunks with a copy on a block of `set`.
+    pub fn chunks_touching<D: BlockDevice>(
+        &mut self,
+        io: &mut Io<D>,
+        set: &RangeSet,
+    ) -> Result<Vec<u64>> {
+        if set.len() == 0 {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .chunks
+            .all_entries(io)?
+            .into_iter()
+            .filter(|(_, e)| {
+                e.mapped() && (set.overlaps(e.p0, e.len as u64) || set.overlaps(e.p1, e.len as u64))
+            })
+            .map(|(id, _)| id)
+            .collect())
+    }
+
     /// Allocates a run of up to `want` contiguous blocks (at least 1),
     /// next-fit from the allocation cursor.
     pub fn alloc_run<D: BlockDevice>(&mut self, io: &mut Io<D>, want: u64) -> Result<(u64, u64)> {
@@ -1007,6 +1135,7 @@ impl Space {
             while let Some(i) = self.next_free_bmp(io, from_block / BITS_PER_BMP)? {
                 if let Some((s, l)) = self.find_in(io, i, from_block, want)? {
                     self.set_range(io, s, l, true)?;
+                    self.alloc_now.add(s, l);
                     self.cursor = if s + l >= self.total {
                         SB_RESERVED_FRONT
                     } else {
@@ -1233,6 +1362,7 @@ impl Space {
     /// the quarantine; batches that are both at least
     /// [`QUARANTINE_COMMITS`] commits and `quarantine_min_ns` old leave it.
     pub fn committed(&mut self, generation: u64, now_ns: i64) {
+        self.alloc_now = RangeSet::new();
         let set = core::mem::take(&mut self.freed_now);
         let lset = core::mem::take(&mut self.freed_now_l);
         self.held_blocks += set.len();
@@ -1300,7 +1430,6 @@ impl Space {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn levels(&self) -> u32 {
         self.levels
     }

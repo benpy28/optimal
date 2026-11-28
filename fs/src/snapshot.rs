@@ -290,7 +290,7 @@ impl<D: BlockDevice> Filesystem<D> {
         for (_, entries) in &items {
             for &(a, l, b) in entries {
                 if b > p_gen {
-                    self.store.space.free(&mut self.store.io, a, l)?;
+                    self.store.free(a, l)?;
                 } else {
                     keep.push((a, l, b));
                 }
@@ -361,7 +361,7 @@ fn free_younger<D: BlockDevice>(
             if k.kind == K_EXTENT {
                 let e = Extent::decode(v, k.obj)?;
                 if e.birth > generation {
-                    fs.store.space.free(&mut fs.store.io, e.phys, e.len)?;
+                    fs.store.free(e.phys, e.len)?;
                 }
             }
         }
@@ -372,5 +372,5 @@ fn free_younger<D: BlockDevice>(
             }
         }
     }
-    fs.store.space.free(&mut fs.store.io, p.addr, 1)
+    fs.store.free(p.addr, 1)
 }
